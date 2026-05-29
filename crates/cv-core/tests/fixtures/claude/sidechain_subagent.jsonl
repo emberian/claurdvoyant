@@ -1,0 +1,5 @@
+{"type":"user","uuid":"a1","parentUuid":null,"isSidechain":true,"agentId":"a4a55af","slug":"magical-wondering-rabbit","cwd":"/work/proj","sessionId":"sub1","timestamp":"2026-02-18T08:00:00Z","isMeta":true,"message":{"role":"user","content":[{"type":"text","text":"You are a sub-agent. Do the task."}]}}
+{"type":"progress","parentUuid":"a1","isSidechain":true,"agentId":"a4a55af","toolUseID":"toolu_017","parentToolUseID":"toolu_017","data":{"type":"hook_progress","hookEvent":"PostToolUse"},"timestamp":"2026-02-18T08:09:42Z","uuid":"p1"}
+{"type":"assistant","uuid":"a2","parentUuid":"a1","isSidechain":true,"agentId":"a4a55af","attributionAgent":"general-purpose","sessionId":"sub1","timestamp":"2026-02-18T08:10:00Z","message":{"role":"assistant","model":"claude-opus-4","content":[{"type":"text","text":"done"}]}}
+{"type":"started","key":"v2:abc","agentId":"a4a55af"}
+{"type":"result","key":"v2:abc","agentId":"a4a55af","result":{"rootCause":"x"}}

@@ -13,7 +13,7 @@
 use crate::harness::EmitResult;
 use crate::ir::{Block, GitInfo, Harness, Role, Session};
 use anyhow::{Context, Result};
-use chrono::{SecondsFormat, Utc};
+use chrono::{DateTime, SecondsFormat, Utc};
 use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 use serde_json::{Map, Value, json};
 use std::fs;
@@ -41,13 +41,32 @@ pub fn emit(
         Harness::Claude => emit_claude(session, out_dir, opts),
         Harness::Codex => emit_codex(session, out_dir, opts),
         Harness::Grok => emit_grok(session, out_dir, opts),
-        other => anyhow::bail!("emit to {other} not implemented yet"),
+        Harness::OpenCode => emit_opencode(session, out_dir, opts),
+        Harness::OpenClaw => emit_openclaw(session, out_dir, opts),
+        Harness::Gemini => emit_gemini(session, out_dir, opts),
+        #[cfg(feature = "sqlite")]
+        Harness::Hermes => emit_hermes(session, out_dir, opts),
+        #[cfg(not(feature = "sqlite"))]
+        Harness::Hermes => {
+            anyhow::bail!("emit to hermes requires the `sqlite` feature")
+        }
+        // Parse-only harnesses (Cursor, desktop apps, …) aren't conversion targets.
+        other => anyhow::bail!("emit to {other} is not supported yet"),
     }
 }
 
 /// Which targets [`emit`] can currently write.
 pub fn supported_targets() -> &'static [Harness] {
-    &[Harness::Claude, Harness::Codex, Harness::Grok]
+    &[
+        Harness::Claude,
+        Harness::Codex,
+        Harness::Grok,
+        Harness::OpenCode,
+        Harness::OpenClaw,
+        Harness::Gemini,
+        #[cfg(feature = "sqlite")]
+        Harness::Hermes,
+    ]
 }
 
 /// Effective cwd after applying any rehome override.
@@ -545,6 +564,786 @@ fn grok_concat_text(msg: &crate::ir::Message) -> String {
 }
 
 // ------------------------------------------------------------------------------------------------
+// OpenCode (parts generation)
+// ------------------------------------------------------------------------------------------------
+
+/// Epoch-millis for an optional timestamp, falling back to `now`.
+fn epoch_ms(t: Option<DateTime<Utc>>) -> i64 {
+    t.unwrap_or_else(Utc::now).timestamp_millis()
+}
+
+/// Emit into OpenCode's newer "parts" storage generation:
+///   out_dir/session/<projectID>/ses_<id>.json
+///   out_dir/message/<sid>/msg_<mid>.json
+///   out_dir/part/<mid>/prt_<pid>.json
+///
+/// The OpenCode reader (see `harness/opencode.rs`) keys parts by *messageID*, orders messages by
+/// `time.created` and parts by filename, and splits tool parts into a trailing Tool-role IR
+/// message. We honour all of that. Tool results are folded back onto the originating assistant
+/// message's `tool` part (matched by `tool_use_id`), since OpenCode has no standalone tool turn.
+fn emit_opencode(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<EmitResult> {
+    let new_id = opts
+        .new_id
+        .clone()
+        .unwrap_or_else(|| format!("ses_{}", Uuid::now_v7().simple()));
+    let cwd = effective_cwd(session, opts);
+    let cwd_str = cwd
+        .as_ref()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_default();
+
+    // OpenCode shards sessions under a per-project directory. We don't reproduce its exact project
+    // hashing; a deterministic dir keyed off the cwd is enough for the reader (it WalkDirs).
+    let project_id = if cwd_str.is_empty() {
+        "global".to_string()
+    } else {
+        format!("prj_{}", short_hash(&cwd_str))
+    };
+
+    let session_dir = out_dir.join("session").join(&project_id);
+    let msg_dir = out_dir.join("message").join(&new_id);
+    fs::create_dir_all(&session_dir)
+        .with_context(|| format!("creating {}", session_dir.display()))?;
+    fs::create_dir_all(&msg_dir).with_context(|| format!("creating {}", msg_dir.display()))?;
+
+    let created = epoch_ms(session.created_at.or(session.updated_at));
+    let updated = epoch_ms(session.updated_at.or(session.created_at));
+
+    // ── session metadata file ──
+    let mut meta = Map::new();
+    meta.insert("id".into(), json!(new_id));
+    if !cwd_str.is_empty() {
+        meta.insert("directory".into(), json!(cwd_str));
+    }
+    if let Some(t) = &session.title {
+        meta.insert("title".into(), json!(t));
+    }
+    meta.insert(
+        "time".into(),
+        json!({ "created": created, "updated": updated }),
+    );
+    let ses_path = session_dir.join(format!("{new_id}.json"));
+    fs::write(&ses_path, serde_json::to_string_pretty(&meta)?)
+        .with_context(|| format!("writing {}", ses_path.display()))?;
+
+    // Pre-index tool results (from Role::Tool turns) by tool_use_id so we can attach them to the
+    // matching `tool` part on the assistant message that produced the call.
+    let mut tool_results: std::collections::HashMap<String, &Block> =
+        std::collections::HashMap::new();
+    for msg in &session.messages {
+        if msg.role == Role::Tool {
+            for b in &msg.content {
+                if let Block::ToolResult { tool_use_id, .. } = b {
+                    tool_results.insert(tool_use_id.clone(), b);
+                }
+            }
+        }
+    }
+
+    let mut seq: u64 = 0;
+    for msg in &session.messages {
+        // Tool turns are folded into the assistant's tool parts; don't emit standalone messages.
+        if msg.role == Role::Tool {
+            continue;
+        }
+        let role = match msg.role {
+            Role::Assistant => "assistant",
+            Role::System => "system",
+            _ => "user",
+        };
+        let mid = format!("msg_{}", Uuid::now_v7().simple());
+        let mts = epoch_ms(msg.timestamp.or(session.created_at));
+
+        let mut mrec = Map::new();
+        mrec.insert("id".into(), json!(mid));
+        mrec.insert("sessionID".into(), json!(new_id));
+        mrec.insert("role".into(), json!(role));
+        mrec.insert("time".into(), json!({ "created": mts }));
+        if let Some(model) = msg.model.as_ref().or(session.model.as_ref()) {
+            mrec.insert("modelID".into(), json!(model));
+        }
+        let mrec_path = msg_dir.join(format!("{mid}.json"));
+        fs::write(&mrec_path, serde_json::to_string_pretty(&Value::Object(mrec))?)
+            .with_context(|| format!("writing {}", mrec_path.display()))?;
+
+        let part_dir = out_dir.join("part").join(&mid);
+        fs::create_dir_all(&part_dir)
+            .with_context(|| format!("creating {}", part_dir.display()))?;
+
+        let mut pidx: u64 = 0;
+        let mut write_part = |part: Value| -> Result<()> {
+            // Zero-padded prefix keeps the reader's filename sort == emission order.
+            let pid = format!("prt_{seq:08}_{pidx:04}_{}", Uuid::now_v7().simple());
+            let p = part_dir.join(format!("{pid}.json"));
+            fs::write(&p, serde_json::to_string_pretty(&part)?)
+                .with_context(|| format!("writing {}", p.display()))?;
+            pidx += 1;
+            Ok(())
+        };
+
+        for b in &msg.content {
+            match b {
+                Block::Text { text } => {
+                    write_part(json!({ "type": "text", "text": text }))?;
+                }
+                Block::Thinking { text, signature, .. } => {
+                    let mut p = Map::new();
+                    p.insert("type".into(), json!("reasoning"));
+                    p.insert("text".into(), json!(text));
+                    if let Some(sig) = signature {
+                        p.insert(
+                            "metadata".into(),
+                            json!({ "anthropic": { "signature": sig } }),
+                        );
+                    }
+                    write_part(Value::Object(p))?;
+                }
+                Block::ToolUse { id, name, input } => {
+                    let mut state = Map::new();
+                    state.insert("input".into(), input.clone());
+                    // Attach the paired result, if we have one.
+                    if let Some(Block::ToolResult {
+                        content, is_error, ..
+                    }) = tool_results.get(id).copied()
+                    {
+                        if *is_error {
+                            state.insert("status".into(), json!("error"));
+                            state.insert("error".into(), json!(content));
+                        } else {
+                            state.insert("status".into(), json!("completed"));
+                            state.insert("output".into(), json!(content));
+                        }
+                    } else {
+                        state.insert("status".into(), json!("completed"));
+                    }
+                    write_part(json!({
+                        "type": "tool",
+                        "callID": id,
+                        "tool": name,
+                        "state": Value::Object(state),
+                    }))?;
+                }
+                Block::Image { media_type, data_ref } => {
+                    let mut p = Map::new();
+                    p.insert("type".into(), json!("file"));
+                    if let Some(mt) = media_type {
+                        p.insert("mime".into(), json!(mt));
+                    }
+                    if let Some(d) = data_ref {
+                        p.insert("url".into(), json!(d));
+                    }
+                    write_part(Value::Object(p))?;
+                }
+                Block::ToolResult { .. } => {}
+            }
+        }
+        seq += 1;
+    }
+
+    let resume = format!("opencode (session {new_id})");
+    Ok(EmitResult {
+        path: ses_path,
+        new_id,
+        resume_hint: Some(resume),
+    })
+}
+
+/// A short, stable, filesystem-safe hash of a string (FNV-1a, hex). Used for project-dir names.
+fn short_hash(s: &str) -> String {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in s.bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    format!("{h:016x}")
+}
+
+// ------------------------------------------------------------------------------------------------
+// OpenClaw
+// ------------------------------------------------------------------------------------------------
+
+/// Emit into OpenClaw's `agents/<agentId>/sessions/<sid>.jsonl` transcript (v3 parent-linked) plus
+/// a `sessions.json` index entry. Mirrors `harness/openclaw.rs`'s reader: a `{type:session,…}`
+/// header line followed by `{type:message,id,parentId,timestamp,message:{role,content,…}}` lines.
+fn emit_openclaw(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<EmitResult> {
+    let new_id = opts
+        .new_id
+        .clone()
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
+    let agent_id = "main";
+    let cwd = effective_cwd(session, opts);
+    let cwd_str = cwd
+        .as_ref()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_default();
+
+    let sessions_dir = out_dir
+        .join("agents")
+        .join(agent_id)
+        .join("sessions");
+    fs::create_dir_all(&sessions_dir)
+        .with_context(|| format!("creating {}", sessions_dir.display()))?;
+    let file_path = sessions_dir.join(format!("{new_id}.jsonl"));
+
+    let created = session
+        .created_at
+        .or(session.updated_at)
+        .unwrap_or_else(Utc::now);
+    let created_iso = created.to_rfc3339_opts(SecondsFormat::Millis, true);
+
+    let mut lines: Vec<Value> = Vec::new();
+    // Header line.
+    let mut header = Map::new();
+    header.insert("type".into(), json!("session"));
+    header.insert("version".into(), json!(3));
+    header.insert("id".into(), json!(new_id));
+    header.insert("timestamp".into(), json!(created_iso));
+    if !cwd_str.is_empty() {
+        header.insert("cwd".into(), json!(cwd_str));
+    }
+    lines.push(Value::Object(header));
+
+    // Message lines, parent-linked (v3).
+    let mut parent: Option<String> = None;
+    for msg in &session.messages {
+        let entry_id = openclaw_short_id();
+        let ts = msg.timestamp.unwrap_or(created);
+        let ts_iso = ts.to_rfc3339_opts(SecondsFormat::Millis, true);
+        let ts_ms = ts.timestamp_millis();
+
+        let inner = match msg.role {
+            Role::User => json!({
+                "role": "user",
+                "content": openclaw_content_blocks(&msg.content),
+                "timestamp": ts_ms,
+            }),
+            Role::System => json!({
+                "role": "system",
+                "content": openclaw_content_blocks(&msg.content),
+                "timestamp": ts_ms,
+            }),
+            Role::Assistant => {
+                let mut m = Map::new();
+                m.insert("role".into(), json!("assistant"));
+                m.insert("content".into(), openclaw_content_blocks(&msg.content));
+                m.insert("timestamp".into(), json!(ts_ms));
+                if let Some(model) = msg.model.as_ref().or(session.model.as_ref()) {
+                    m.insert("model".into(), json!(model));
+                }
+                Value::Object(m)
+            }
+            Role::Tool => {
+                // OpenClaw models each tool result as its own `toolResult` message.
+                let (tool_use_id, content, is_error, tool_name) =
+                    openclaw_tool_result(&msg.content);
+                let mut m = Map::new();
+                m.insert("role".into(), json!("toolResult"));
+                m.insert("toolCallId".into(), json!(tool_use_id));
+                if let Some(tn) = tool_name {
+                    m.insert("toolName".into(), json!(tn));
+                }
+                m.insert(
+                    "content".into(),
+                    json!([{ "type": "text", "text": content }]),
+                );
+                m.insert("isError".into(), json!(is_error));
+                m.insert("timestamp".into(), json!(ts_ms));
+                Value::Object(m)
+            }
+        };
+
+        lines.push(json!({
+            "type": "message",
+            "id": entry_id,
+            "parentId": parent,
+            "timestamp": ts_iso,
+            "message": inner,
+        }));
+        parent = Some(entry_id);
+    }
+
+    write_jsonl(&file_path, &lines)?;
+
+    // sessions.json index: merge-or-create.
+    let index_path = sessions_dir.join("sessions.json");
+    let mut index: Map<String, Value> = fs::read_to_string(&index_path)
+        .ok()
+        .and_then(|t| serde_json::from_str::<Value>(&t).ok())
+        .and_then(|v| v.as_object().cloned())
+        .unwrap_or_default();
+    let mut entry = Map::new();
+    entry.insert("sessionId".into(), json!(new_id));
+    if let Some(t) = session.title.as_ref().or(session.first_user_text().as_ref()) {
+        entry.insert("label".into(), json!(crate::ir::truncate(t, 80)));
+    }
+    if !cwd_str.is_empty() {
+        entry.insert("cwd".into(), json!(cwd_str));
+    }
+    entry.insert(
+        "updatedAt".into(),
+        json!(epoch_ms(session.updated_at.or(session.created_at))),
+    );
+    index.insert(new_id.clone(), Value::Object(entry));
+    fs::write(&index_path, serde_json::to_string_pretty(&Value::Object(index))?)
+        .with_context(|| format!("writing {}", index_path.display()))?;
+
+    Ok(EmitResult {
+        path: file_path,
+        new_id: new_id.clone(),
+        resume_hint: Some(format!("openclaw --session {new_id}")),
+    })
+}
+
+/// 8-hex-char id slice, matching OpenClaw's entry-id convention.
+fn openclaw_short_id() -> String {
+    Uuid::new_v4().simple().to_string()[..8].to_string()
+}
+
+/// Map IR blocks → an OpenClaw content array (`text`/`thinking`/`toolCall`/`image`).
+fn openclaw_content_blocks(content: &[Block]) -> Value {
+    let mut out = Vec::new();
+    for b in content {
+        match b {
+            Block::Text { text } => out.push(json!({ "type": "text", "text": text })),
+            Block::Thinking { text, signature, .. } => {
+                let mut m = Map::new();
+                m.insert("type".into(), json!("thinking"));
+                m.insert("thinking".into(), json!(text));
+                if let Some(sig) = signature {
+                    m.insert("thinkingSignature".into(), json!(sig));
+                }
+                out.push(Value::Object(m));
+            }
+            Block::ToolUse { id, name, input } => out.push(json!({
+                "type": "toolCall",
+                "id": id,
+                "name": name,
+                "arguments": input,
+            })),
+            Block::Image { media_type, data_ref } => {
+                let mut m = Map::new();
+                m.insert("type".into(), json!("image"));
+                if let Some(mt) = media_type {
+                    m.insert("mimeType".into(), json!(mt));
+                }
+                if let Some(d) = data_ref {
+                    m.insert("data".into(), json!(d));
+                }
+                out.push(Value::Object(m));
+            }
+            Block::ToolResult { .. } => {}
+        }
+    }
+    Value::Array(out)
+}
+
+/// Pull the (id, content, is_error, name) out of a Tool turn's blocks.
+fn openclaw_tool_result(content: &[Block]) -> (String, String, bool, Option<String>) {
+    for b in content {
+        if let Block::ToolResult {
+            tool_use_id,
+            content,
+            is_error,
+        } = b
+        {
+            return (tool_use_id.clone(), content.clone(), *is_error, None);
+        }
+    }
+    (String::new(), String::new(), false, None)
+}
+
+// ------------------------------------------------------------------------------------------------
+// Gemini (legacy ConversationRecord)
+// ------------------------------------------------------------------------------------------------
+
+/// Emit a gemini-cli legacy chat recording: `out_dir/<sessionId>.json`, a single whole-file
+/// `ConversationRecord` `{sessionId, projectHash, startTime, lastUpdated, messages[]}`. The reader
+/// (`harness/gemini.rs`) requires the file to live under a `chats/` dir to be picked up by
+/// `discover`, but `parse_all_str` / `parse` will read it directly from any path.
+fn emit_gemini(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<EmitResult> {
+    let new_id = opts
+        .new_id
+        .clone()
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
+    let cwd = effective_cwd(session, opts);
+
+    // gemini stores recordings under chats/; place ours there so discover() can find it too.
+    let chats_dir = out_dir.join("chats");
+    fs::create_dir_all(&chats_dir)
+        .with_context(|| format!("creating {}", chats_dir.display()))?;
+    let file_path = chats_dir.join(format!("session-{new_id}.json"));
+
+    let start = session
+        .created_at
+        .or(session.updated_at)
+        .unwrap_or_else(Utc::now)
+        .to_rfc3339_opts(SecondsFormat::Millis, true);
+    let last = session
+        .updated_at
+        .or(session.created_at)
+        .unwrap_or_else(Utc::now)
+        .to_rfc3339_opts(SecondsFormat::Millis, true);
+
+    // Index tool results by tool_use_id so they can be folded into the producing assistant's
+    // `toolCalls[].result` (the canonical legacy shape the reader pairs from).
+    let mut tool_results: std::collections::HashMap<String, (String, bool)> =
+        std::collections::HashMap::new();
+    for msg in &session.messages {
+        if msg.role == Role::Tool {
+            for b in &msg.content {
+                if let Block::ToolResult {
+                    tool_use_id,
+                    content,
+                    is_error,
+                } = b
+                {
+                    tool_results.insert(tool_use_id.clone(), (content.clone(), *is_error));
+                }
+            }
+        }
+    }
+
+    let mut messages: Vec<Value> = Vec::new();
+    for msg in &session.messages {
+        let ts = msg
+            .timestamp
+            .map(|t| t.to_rfc3339_opts(SecondsFormat::Millis, true));
+        match msg.role {
+            Role::User | Role::System => {
+                let mty = if msg.role == Role::System { "info" } else { "user" };
+                let mut m = Map::new();
+                m.insert("id".into(), json!(Uuid::new_v4().to_string()));
+                m.insert("type".into(), json!(mty));
+                if let Some(t) = &ts {
+                    m.insert("timestamp".into(), json!(t));
+                }
+                m.insert("content".into(), gemini_parts(&msg.content));
+                messages.push(Value::Object(m));
+            }
+            Role::Assistant => {
+                let mut m = Map::new();
+                m.insert("id".into(), json!(Uuid::new_v4().to_string()));
+                m.insert("type".into(), json!("gemini"));
+                if let Some(t) = &ts {
+                    m.insert("timestamp".into(), json!(t));
+                }
+                if let Some(model) = msg.model.as_ref().or(session.model.as_ref()) {
+                    m.insert("model".into(), json!(model));
+                }
+                // Thoughts (thinking) ride in `thoughts[]`, the rest in `content`.
+                let mut thoughts = Vec::new();
+                for b in &msg.content {
+                    if let Block::Thinking { text, .. } = b {
+                        thoughts.push(json!({ "subject": "", "description": text }));
+                    }
+                }
+                if !thoughts.is_empty() {
+                    m.insert("thoughts".into(), Value::Array(thoughts));
+                }
+                m.insert("content".into(), gemini_parts(&msg.content));
+                // Tool calls → toolCalls[] (legacy ToolCallRecord), folding in the paired result so
+                // the reader emits a proper Tool turn for it.
+                let mut calls = Vec::new();
+                for b in &msg.content {
+                    if let Block::ToolUse { id, name, input } = b {
+                        let mut call = Map::new();
+                        call.insert("id".into(), json!(id));
+                        call.insert("name".into(), json!(name));
+                        call.insert("args".into(), input.clone());
+                        if let Some((content, is_error)) = tool_results.get(id) {
+                            call.insert(
+                                "status".into(),
+                                json!(if *is_error { "error" } else { "success" }),
+                            );
+                            call.insert(
+                                "result".into(),
+                                json!([{
+                                    "functionResponse": {
+                                        "id": id,
+                                        "name": name,
+                                        "response": { "output": content },
+                                    }
+                                }]),
+                            );
+                        }
+                        calls.push(Value::Object(call));
+                    }
+                }
+                if !calls.is_empty() {
+                    m.insert("toolCalls".into(), Value::Array(calls));
+                }
+                messages.push(Value::Object(m));
+            }
+            // Tool turns are folded into the assistant's toolCalls[].result above.
+            Role::Tool => {}
+        }
+    }
+
+    let mut record = Map::new();
+    record.insert("sessionId".into(), json!(new_id));
+    // gemini keys recordings by an opaque projectHash; synthesize a stable one from the cwd.
+    let cwd_str = cwd
+        .as_ref()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_default();
+    record.insert("projectHash".into(), json!(short_hash(&cwd_str)));
+    record.insert("startTime".into(), json!(start));
+    record.insert("lastUpdated".into(), json!(last));
+    if let Some(t) = &session.title {
+        record.insert("summary".into(), json!(t));
+    }
+    if let Some(c) = &cwd {
+        record.insert("directories".into(), json!([c.to_string_lossy()]));
+    }
+    record.insert("messages".into(), Value::Array(messages));
+
+    fs::write(&file_path, serde_json::to_string_pretty(&Value::Object(record))?)
+        .with_context(|| format!("writing {}", file_path.display()))?;
+
+    Ok(EmitResult {
+        path: file_path,
+        new_id: new_id.clone(),
+        resume_hint: Some(format!("gemini --resume {new_id}")),
+    })
+}
+
+/// Map IR blocks → a Gemini `Part[]` (`text` / thought `text` / `inlineData`). Tool calls are
+/// emitted separately via `toolCalls[]`, so they're skipped here.
+fn gemini_parts(content: &[Block]) -> Value {
+    let mut out = Vec::new();
+    for b in content {
+        match b {
+            Block::Text { text } => out.push(json!({ "text": text })),
+            Block::Thinking { text, .. } => {
+                out.push(json!({ "text": text, "thought": true }))
+            }
+            Block::Image { media_type, .. } => {
+                let mut inline = Map::new();
+                if let Some(mt) = media_type {
+                    inline.insert("mimeType".into(), json!(mt));
+                }
+                out.push(json!({ "inlineData": Value::Object(inline) }));
+            }
+            // Tool use/result handled out of band.
+            Block::ToolUse { .. } | Block::ToolResult { .. } => {}
+        }
+    }
+    Value::Array(out)
+}
+
+// ------------------------------------------------------------------------------------------------
+// Hermes (SQLite)
+// ------------------------------------------------------------------------------------------------
+
+/// Emit into Hermes's `state.db` SQLite store (creating/appending). Mirrors the schema the Hermes
+/// reader (`harness/hermes.rs`) expects: a `sessions` row + OpenAI-shaped `messages` rows
+/// (role/content/tool_calls JSON/reasoning/timestamps as REAL unix secs). Multimodal content uses
+/// the `\x00json:` sentinel prefix.
+#[cfg(feature = "sqlite")]
+fn emit_hermes(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<EmitResult> {
+    use rusqlite::{params, Connection};
+
+    const MULTIMODAL_SENTINEL: &str = "\u{0}json:";
+
+    let new_id = opts
+        .new_id
+        .clone()
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
+
+    fs::create_dir_all(out_dir).with_context(|| format!("creating {}", out_dir.display()))?;
+    let db_path = out_dir.join("state.db");
+    let conn = Connection::open(&db_path)
+        .with_context(|| format!("opening {}", db_path.display()))?;
+
+    // Create the (subset of) v14 schema if the DB is fresh. `IF NOT EXISTS` makes append safe.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS sessions (
+            id TEXT PRIMARY KEY,
+            source TEXT NOT NULL,
+            user_id TEXT,
+            model TEXT,
+            model_config TEXT,
+            system_prompt TEXT,
+            parent_session_id TEXT,
+            started_at REAL NOT NULL,
+            ended_at REAL,
+            end_reason TEXT,
+            message_count INTEGER DEFAULT 0,
+            tool_call_count INTEGER DEFAULT 0,
+            input_tokens INTEGER DEFAULT 0,
+            output_tokens INTEGER DEFAULT 0,
+            cache_read_tokens INTEGER DEFAULT 0,
+            cache_write_tokens INTEGER DEFAULT 0,
+            reasoning_tokens INTEGER DEFAULT 0,
+            title TEXT
+         );
+         CREATE TABLE IF NOT EXISTS messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT NOT NULL,
+            role TEXT NOT NULL,
+            content TEXT,
+            tool_call_id TEXT,
+            tool_calls TEXT,
+            tool_name TEXT,
+            timestamp REAL NOT NULL,
+            token_count INTEGER,
+            finish_reason TEXT,
+            reasoning TEXT,
+            reasoning_content TEXT,
+            reasoning_details TEXT,
+            codex_reasoning_items TEXT,
+            codex_message_items TEXT,
+            platform_message_id TEXT,
+            observed INTEGER DEFAULT 0
+         );",
+    )
+    .context("creating hermes schema")?;
+
+    let started = session
+        .created_at
+        .or(session.updated_at)
+        .unwrap_or_else(Utc::now)
+        .timestamp_millis() as f64
+        / 1000.0;
+    let ended = session
+        .updated_at
+        .or(session.created_at)
+        .map(|t| t.timestamp_millis() as f64 / 1000.0);
+
+    conn.execute(
+        "INSERT OR REPLACE INTO sessions (id, source, model, started_at, ended_at, message_count, title) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            new_id,
+            "claurdvoyant",
+            session.model,
+            started,
+            ended,
+            session.messages.len() as i64,
+            session.title,
+        ],
+    )
+    .context("inserting hermes session")?;
+
+    let mut base_ts = started;
+    for msg in &session.messages {
+        let ts = msg
+            .timestamp
+            .map(|t| t.timestamp_millis() as f64 / 1000.0)
+            .unwrap_or_else(|| {
+                base_ts += 0.001;
+                base_ts
+            });
+
+        let role = match msg.role {
+            Role::User => "user",
+            Role::Assistant => "assistant",
+            Role::System => "system",
+            Role::Tool => "tool",
+        };
+
+        // Reasoning text/encrypted from any Thinking blocks.
+        let mut reasoning = String::new();
+        let mut reasoning_details: Option<String> = None;
+        for b in &msg.content {
+            if let Block::Thinking { text, encrypted, .. } = b {
+                if !text.is_empty() {
+                    if !reasoning.is_empty() {
+                        reasoning.push_str("\n\n");
+                    }
+                    reasoning.push_str(text);
+                }
+                if let Some(enc) = encrypted {
+                    reasoning_details = Some(
+                        json!([{ "type": "reasoning.encrypted_content", "encrypted_content": enc }])
+                            .to_string(),
+                    );
+                }
+            }
+        }
+        let reasoning = (!reasoning.is_empty()).then_some(reasoning);
+
+        if msg.role == Role::Tool {
+            for b in &msg.content {
+                if let Block::ToolResult {
+                    tool_use_id,
+                    content,
+                    ..
+                } = b
+                {
+                    conn.execute(
+                        "INSERT INTO messages (session_id, role, content, tool_call_id, timestamp) \
+                         VALUES (?1, 'tool', ?2, ?3, ?4)",
+                        params![new_id, content, tool_use_id, ts],
+                    )
+                    .context("inserting hermes tool message")?;
+                }
+            }
+            continue;
+        }
+
+        // Content: plain text, or the multimodal sentinel form if there are images.
+        let has_image = msg.content.iter().any(|b| matches!(b, Block::Image { .. }));
+        let content: Option<String> = if has_image {
+            let mut parts = Vec::new();
+            for b in &msg.content {
+                match b {
+                    Block::Text { text } => {
+                        parts.push(json!({ "type": "text", "text": text }))
+                    }
+                    Block::Image { data_ref, .. } => {
+                        parts.push(json!({
+                            "type": "image_url",
+                            "image_url": { "url": data_ref.clone().unwrap_or_default() },
+                        }));
+                    }
+                    _ => {}
+                }
+            }
+            Some(format!(
+                "{MULTIMODAL_SENTINEL}{}",
+                serde_json::to_string(&Value::Array(parts))?
+            ))
+        } else {
+            msg.text()
+        };
+
+        // Assistant tool calls → OpenAI-shaped tool_calls JSON.
+        let tool_calls: Option<String> = {
+            let calls: Vec<Value> = msg
+                .content
+                .iter()
+                .filter_map(|b| match b {
+                    Block::ToolUse { id, name, input } => Some(json!({
+                        "id": id,
+                        "type": "function",
+                        "function": {
+                            "name": name,
+                            "arguments": serde_json::to_string(input).unwrap_or_else(|_| "{}".into()),
+                        },
+                    })),
+                    _ => None,
+                })
+                .collect();
+            (!calls.is_empty()).then(|| Value::Array(calls).to_string())
+        };
+
+        conn.execute(
+            "INSERT INTO messages (session_id, role, content, tool_calls, timestamp, reasoning, reasoning_details) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![new_id, role, content, tool_calls, ts, reasoning, reasoning_details],
+        )
+        .context("inserting hermes message")?;
+    }
+
+    Ok(EmitResult {
+        path: db_path,
+        new_id: new_id.clone(),
+        resume_hint: Some(format!("hermes --session {new_id}")),
+    })
+}
+
+// ------------------------------------------------------------------------------------------------
 // shared
 // ------------------------------------------------------------------------------------------------
 
@@ -561,7 +1360,10 @@ fn write_jsonl(path: &Path, lines: &[Value]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::harness::{Adapter, claude::Claude, codex::Codex, grok::Grok};
+    use crate::harness::{
+        Adapter, claude::Claude, codex::Codex, gemini::Gemini, grok::Grok,
+        opencode::OpenCode, openclaw::OpenClaw,
+    };
     use crate::ir::*;
 
     fn temp_dir() -> PathBuf {
@@ -791,5 +1593,196 @@ mod tests {
         assert_eq!(res.new_id, "forced-id");
         assert!(res.path.to_string_lossy().contains("-tmp-rehomed"));
         assert!(res.path.ends_with("forced-id.jsonl"));
+    }
+
+    #[test]
+    fn opencode_round_trip() {
+        // OpenCode::new() reads $HOME/.local/share/opencode/storage and its parse() resolves
+        // message/part dirs relative to that root. Redirect HOME at a temp home and emit there.
+        // Serialize HOME mutation across this binary's threads.
+        use std::sync::Mutex;
+        static HOME_LOCK: Mutex<()> = Mutex::new(());
+        let _guard = HOME_LOCK.lock().unwrap();
+
+        let home = temp_dir();
+        let storage = home.join(".local/share/opencode/storage");
+        fs::create_dir_all(&storage).unwrap();
+
+        let s = sample_session(Harness::OpenCode);
+        let res = emit(&s, Harness::OpenCode, &storage, &EmitOptions::default()).unwrap();
+        assert!(res.path.exists());
+
+        let prev_home = std::env::var_os("HOME");
+        // SAFETY: guarded by HOME_LOCK; restored before releasing the lock.
+        unsafe {
+            std::env::set_var("HOME", &home);
+        }
+        let oc = OpenCode::new();
+        let refs = oc.discover().unwrap();
+        let parsed = refs
+            .iter()
+            .find(|r| r.id == res.new_id)
+            .map(|r| oc.parse(r).unwrap());
+        unsafe {
+            match prev_home {
+                Some(h) => std::env::set_var("HOME", h),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+        drop(_guard);
+
+        let parsed = parsed.expect("emitted opencode session should be discoverable");
+        assert_eq!(parsed.cwd, Some(PathBuf::from("/Users/test/project")));
+        assert_eq!(texts(&parsed, Role::User), vec!["list the files please"]);
+        assert_eq!(texts(&parsed, Role::Assistant), vec!["Sure, listing now."]);
+        assert_eq!(tool_names(&parsed), vec!["run_shell"]);
+        // tool result split into a Tool turn
+        let tool_results: Vec<_> = parsed
+            .messages
+            .iter()
+            .filter(|m| m.role == Role::Tool)
+            .collect();
+        assert_eq!(tool_results.len(), 1);
+        if let Block::ToolResult { content, .. } = &tool_results[0].content[0] {
+            assert_eq!(content, "file_a.txt\nfile_b.txt");
+        } else {
+            panic!("expected tool result");
+        }
+        // reasoning survives
+        assert!(parsed.messages.iter().any(|m| m
+            .content
+            .iter()
+            .any(|b| matches!(b, Block::Thinking { .. }))));
+    }
+
+    #[test]
+    fn openclaw_round_trip() {
+        let s = sample_session(Harness::OpenClaw);
+        let out = temp_dir();
+        let res = emit(&s, Harness::OpenClaw, &out, &EmitOptions::default()).unwrap();
+        assert!(res.path.exists());
+        // sessions.json index written
+        assert!(res.path.parent().unwrap().join("sessions.json").exists());
+
+        // OpenClaw::parse reads r.path directly; cwd/created come from the header line.
+        let r = SessionRef {
+            id: res.new_id.clone(),
+            harness: Harness::OpenClaw,
+            path: res.path.clone(),
+            cwd: None,
+            title: None,
+            created_at: None,
+            updated_at: None,
+            message_count: 0,
+        };
+        let parsed = OpenClaw::new().parse(&r).unwrap();
+
+        assert_eq!(parsed.id, res.new_id);
+        assert_eq!(parsed.cwd, Some(PathBuf::from("/Users/test/project")));
+        assert_eq!(texts(&parsed, Role::User), vec!["list the files please"]);
+        assert_eq!(texts(&parsed, Role::Assistant), vec!["Sure, listing now."]);
+        assert_eq!(tool_names(&parsed), vec!["run_shell"]);
+        // tool result → toolResult message (Role::Tool)
+        let tool_results: Vec<_> = parsed
+            .messages
+            .iter()
+            .filter(|m| m.role == Role::Tool)
+            .collect();
+        assert_eq!(tool_results.len(), 1);
+        // thinking survives
+        assert!(parsed.messages.iter().any(|m| m
+            .content
+            .iter()
+            .any(|b| matches!(b, Block::Thinking { .. }))));
+        // model promoted
+        assert_eq!(parsed.model.as_deref(), Some("test-model"));
+    }
+
+    #[test]
+    fn gemini_round_trip() {
+        let s = sample_session(Harness::Gemini);
+        let out = temp_dir();
+        let res = emit(&s, Harness::Gemini, &out, &EmitOptions::default()).unwrap();
+        assert!(res.path.exists());
+
+        // gemini parse keys off the `chats/` dir in the path; emit places the file there.
+        let r = SessionRef {
+            id: res.new_id.clone(),
+            harness: Harness::Gemini,
+            path: res.path.clone(),
+            cwd: None,
+            title: None,
+            created_at: None,
+            updated_at: None,
+            message_count: 0,
+        };
+        let parsed = Gemini::new().parse(&r).unwrap();
+
+        assert_eq!(parsed.id, res.new_id);
+        assert_eq!(parsed.title.as_deref(), Some("a test session"));
+        assert_eq!(parsed.cwd, Some(PathBuf::from("/Users/test/project")));
+        assert_eq!(texts(&parsed, Role::User), vec!["list the files please"]);
+        assert_eq!(texts(&parsed, Role::Assistant), vec!["Sure, listing now."]);
+        assert_eq!(tool_names(&parsed), vec!["run_shell"]);
+        assert_eq!(parsed.model.as_deref(), Some("test-model"));
+        // tool result is retagged to a Tool turn by the reader
+        assert!(parsed.messages.iter().any(|m| m.role == Role::Tool
+            && m.content.iter().any(|b| matches!(b, Block::ToolResult { content, .. }
+                if content == "file_a.txt\nfile_b.txt"))));
+        // thinking → thoughts survives
+        assert!(parsed.messages.iter().any(|m| m
+            .content
+            .iter()
+            .any(|b| matches!(b, Block::Thinking { .. }))));
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn hermes_round_trip() {
+        use crate::harness::hermes::Hermes;
+        let s = sample_session(Harness::Hermes);
+        let out = temp_dir();
+        let res = emit(&s, Harness::Hermes, &out, &EmitOptions::default()).unwrap();
+        assert!(res.path.exists());
+        assert_eq!(res.path.file_name().unwrap(), "state.db");
+
+        // Point Hermes at the emitted DB via HERMES_HOME (its new() honours it).
+        use std::sync::Mutex;
+        static HERMES_LOCK: Mutex<()> = Mutex::new(());
+        let _guard = HERMES_LOCK.lock().unwrap();
+        let prev = std::env::var_os("HERMES_HOME");
+        unsafe {
+            std::env::set_var("HERMES_HOME", &out);
+        }
+        let h = Hermes::new();
+        let refs = h.discover().unwrap();
+        let parsed = refs
+            .iter()
+            .find(|r| r.id == res.new_id)
+            .map(|r| h.parse(r).unwrap());
+        unsafe {
+            match prev {
+                Some(p) => std::env::set_var("HERMES_HOME", p),
+                None => std::env::remove_var("HERMES_HOME"),
+            }
+        }
+        drop(_guard);
+
+        let parsed = parsed.expect("emitted hermes session should be discoverable");
+        assert_eq!(parsed.id, res.new_id);
+        assert_eq!(parsed.title.as_deref(), Some("a test session"));
+        assert_eq!(parsed.model.as_deref(), Some("test-model"));
+        assert_eq!(texts(&parsed, Role::User), vec!["list the files please"]);
+        assert_eq!(texts(&parsed, Role::Assistant), vec!["Sure, listing now."]);
+        assert_eq!(tool_names(&parsed), vec!["run_shell"]);
+        // tool result row → Tool turn
+        assert!(parsed.messages.iter().any(|m| m.role == Role::Tool
+            && m.content.iter().any(|b| matches!(b, Block::ToolResult { content, .. }
+                if content == "file_a.txt\nfile_b.txt"))));
+        // reasoning → Thinking
+        assert!(parsed.messages.iter().any(|m| m
+            .content
+            .iter()
+            .any(|b| matches!(b, Block::Thinking { .. }))));
     }
 }

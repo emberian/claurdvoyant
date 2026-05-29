@@ -1,0 +1,7 @@
+{
+  "id": "prt_u01",
+  "sessionID": "ses_FIX01",
+  "messageID": "msg_user01",
+  "type": "text",
+  "text": "Please list the files and read @Makefile"
+}

@@ -20,10 +20,16 @@ pub enum Harness {
     Gemini,
     Hermes,
     OpenClaw,
+    /// Cursor IDE (chat/composer history in `state.vscdb`).
+    Cursor,
+    /// The Claude desktop app (macOS/Windows).
+    ClaudeApp,
+    /// The ChatGPT desktop app (macOS/Windows).
+    ChatGptApp,
 }
 
 impl Harness {
-    pub const ALL: [Harness; 7] = [
+    pub const ALL: [Harness; 10] = [
         Harness::Claude,
         Harness::Codex,
         Harness::Grok,
@@ -31,6 +37,9 @@ impl Harness {
         Harness::Gemini,
         Harness::Hermes,
         Harness::OpenClaw,
+        Harness::Cursor,
+        Harness::ClaudeApp,
+        Harness::ChatGptApp,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -42,6 +51,9 @@ impl Harness {
             Harness::Gemini => "gemini",
             Harness::Hermes => "hermes",
             Harness::OpenClaw => "openclaw",
+            Harness::Cursor => "cursor",
+            Harness::ClaudeApp => "claude-app",
+            Harness::ChatGptApp => "chatgpt-app",
         }
     }
 
@@ -54,6 +66,9 @@ impl Harness {
             "gemini" | "antigravity" => Harness::Gemini,
             "hermes" | "hermes-agent" => Harness::Hermes,
             "openclaw" | "claw" => Harness::OpenClaw,
+            "cursor" => Harness::Cursor,
+            "claude-app" | "claude-desktop" | "claudeapp" => Harness::ClaudeApp,
+            "chatgpt-app" | "chatgpt" | "chatgpt-desktop" | "openai-app" => Harness::ChatGptApp,
             _ => return None,
         })
     }

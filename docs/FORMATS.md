@@ -74,6 +74,46 @@ decouples them via a unified IR.
   `knowledge/`, `context_state/`, `implicit/`.
 - Note: open-source `gemini-cli` (cloned at `~/pug/gemini-cli`) uses JSON checkpoints, a *different* format
   from the closed Antigravity IDE — consult its `packages/cli/src/utils/sessions.ts` for that variant.
+- Also handled now: the gemini-cli JSON **chat recordings** (`~/.gemini/tmp/<projectHash>/chats/session-*.json`
+  legacy object + modern append-only `.jsonl` with `$set`/`$rewindTo`) and `checkpoint-*.json` — far richer
+  than logs.json (real assistant turns, thoughts, tool calls). Qwen Code reuses this format under `~/.qwen/`.
+
+## Hermes (Nous) — `~/.hermes/state.db` (SQLite, schema v14; `$HERMES_HOME` overrides)
+
+- `sessions` + `messages` tables (OpenAI-shaped rows). cwd is NOT persisted (runtime-only).
+- Multimodal content uses a `\x00json:` sentinel prefix. Reasoning spans several columns
+  (`reasoning`, `reasoning_content`, `reasoning_details`, `codex_reasoning_items`, `codex_message_items`).
+- **Schema drift:** Hermes ALTERs columns in live (no version gate) — older DBs lack newer columns, so probe
+  `PRAGMA table_info` and select only what exists. Compression chains link sessions via `parent_session_id`
+  (parent `end_reason='compression'`); walk root→tip and dedup the replayed boundary user message.
+
+## OpenClaw — `~/.openclaw/agents/<agentId>/sessions/`
+
+- `sessions.json` index + `<sid>.jsonl` (and `<sid>-topic-<id>.jsonl`) transcripts; a `{type:session,version:N}`
+  header (v1/v2 linear → v3 parent-linked, migrated in place) then `{type:message,...}` lines.
+- Roles user/assistant/toolResult + custom (bashExecution, branchSummary, compactionSummary, custom).
+  Blocks: text(+textSignature), thinking(+thinkingSignature,redacted), toolCall, image. Secrets redacted at
+  write time (no fixed sentinel). ACP-bridged sessions are text-only echoes (`model:"acp-runtime"`).
+
+## Cursor IDE — `~/Library/Application Support/Cursor/User/` (mac; `%APPDATA%/Cursor/User` Win; `$XDG_CONFIG_HOME/Cursor/User` Linux)
+
+- VS Code-derived; SQLite `state.vscdb` (`ItemTable` + `cursorDiskKV`; JSON values, TEXT or BLOB). Open READ-ONLY.
+- **Global content:** `globalStorage/state.vscdb` → `cursorDiskKV`: `composerData:<id>` (one thread; metadata +
+  either inline `conversation[]` (older `_v`) or `fullConversationHeadersOnly[]` pointers (newer)), and
+  `bubbleId:<composerId>:<bubbleId>` (one message: `type` 1=user/2=assistant, `text`, `richText` Lexical,
+  `thinking{text}`, `toolFormerData{name,rawArgs,params,result,error,status}`, `tokenCount`).
+- **cwd:** per-workspace `workspaceStorage/<hash>/state.vscdb` `ItemTable.composer.composerData.allComposers[]`
+  links composerIds → workspace; sibling `workspace.json` `folder:"file://…"` is the cwd. Legacy: in-workspace
+  `workbench.panel.aichat.view.aichat.chatdata`. Closed-source & churny (`_v` 1..=10+) — skip the unknown.
+
+## Desktop apps (detected, not parseable)
+
+- **Claude app** — `~/Library/Application Support/Claude/` (Electron). Transcripts are **server-side** (claude.ai);
+  local LevelDB/IndexedDB holds only auth/settings/UI state. `claude-code-sessions/*.json` are metadata stubs
+  pointing (via `cliSessionId`) at `~/.claude/projects/` transcripts the Claude Code adapter already handles.
+- **ChatGPT app** — `~/Library/Application Support/com.openai.chat/` (native AppKit, not Electron). Offline
+  history is local as one **encrypted** file per conversation (`conversations-v3-<acct>/<uuid>.data`); the key is
+  app-held (not in a readable Keychain item). We detect the install + count convos but cannot decrypt.
 
 ---
 
@@ -83,4 +123,5 @@ decouples them via a unified IR.
 - `agent-transcript-parser` (Python) — Claude↔Codex conversion, "lossless on round-trip". Only those two.
 - `trail-cli`, Contextify, Automagik, `claude_codex_bridge` — Python, 2–3 harnesses, mostly read/HTML.
 
-Gap claurdvoyant fills: one **Rust** IR across **all five** harnesses with **index + search + port + convert**.
+Gap claurdvoyant fills: one **Rust** IR across **all of them** (10 harnesses) with **index + search + port +
+convert + live-follow + an MCP server + a coordination board**.

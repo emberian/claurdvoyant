@@ -1,0 +1,7 @@
+{"type":"user","uuid":"u1","parentUuid":null,"cwd":"/work/proj","sessionId":"s2","timestamp":"2026-03-20T04:00:00Z","message":{"role":"user","content":"hi"}}
+{"type":"system","subtype":"compact_boundary","content":"Conversation compacted","level":"info","isMeta":false,"uuid":"sys1","parentUuid":"u1","timestamp":"2026-03-20T04:35:08Z","compactMetadata":{"trigger":"manual","preTokens":151817}}
+{"type":"system","subtype":"turn_duration","durationMs":170357,"uuid":"sys2","parentUuid":"sys1","timestamp":"2026-03-20T04:37:59Z","isMeta":false}
+{"type":"system","subtype":"away_summary","content":"CI failed; I fixed the missing dep.","uuid":"sys3","parentUuid":"sys1","timestamp":"2026-05-21T00:29:05Z","isMeta":false}
+{"type":"system","subtype":"local_command","content":"<local-command-stderr>Error: Compaction canceled.</local-command-stderr>","level":"info","uuid":"sys4","parentUuid":"sys3","timestamp":"2026-03-21T02:45:17Z","isMeta":false}
+{"type":"system","subtype":"agents_killed","uuid":"sys5","parentUuid":"sys4","timestamp":"2026-03-20T05:52:24Z","isMeta":false}
+{"type":"system","subtype":"api_error","level":"error","cause":{"code":"ConnectionRefused"},"retryAttempt":1,"uuid":"sys6","parentUuid":"sys5","timestamp":"2026-03-20T05:00:00Z","content":"Connection refused, retrying"}

@@ -5,8 +5,12 @@ use crate::ir::{Harness, Session, SessionRef};
 use anyhow::Result;
 use std::path::{Path, PathBuf};
 
+pub mod chatgpt_app;
 pub mod claude;
+pub mod claude_app;
 pub mod codex;
+#[cfg(feature = "sqlite")]
+pub mod cursor;
 pub mod gemini;
 pub mod grok;
 #[cfg(feature = "sqlite")]
@@ -59,9 +63,14 @@ pub fn all() -> Vec<Box<dyn Adapter>> {
         Box::new(opencode::OpenCode::new()),
         Box::new(gemini::Gemini::new()),
         Box::new(openclaw::OpenClaw::new()),
+        Box::new(claude_app::ClaudeApp::new()),
+        Box::new(chatgpt_app::ChatGptApp::new()),
     ];
     #[cfg(feature = "sqlite")]
-    adapters.push(Box::new(hermes::Hermes::new()));
+    {
+        adapters.push(Box::new(hermes::Hermes::new()));
+        adapters.push(Box::new(cursor::Cursor::new()));
+    }
     adapters
 }
 

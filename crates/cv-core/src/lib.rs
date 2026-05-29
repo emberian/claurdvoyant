@@ -6,6 +6,7 @@
 //! Every harness has an [`Adapter`](harness::Adapter) that *discovers* sessions on disk and *parses*
 //! them into the common [`Session`] IR. Cross-harness porting is then `parse(A) -> IR -> emit(B)`.
 
+pub mod board;
 pub mod emit;
 pub mod harness;
 #[cfg(feature = "sqlite")]

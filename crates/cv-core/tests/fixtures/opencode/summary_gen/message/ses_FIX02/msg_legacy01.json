@@ -1,0 +1,13 @@
+{
+  "id": "msg_legacy01",
+  "sessionID": "ses_FIX02",
+  "role": "user",
+  "time": { "created": 1766000000000 },
+  "summary": {
+    "title": "Removing debug comments from codebase",
+    "body": "I removed temporary debug comments and redundant explanatory comments throughout the codebase.",
+    "diffs": [
+      { "file": "src/foo.rs", "before": "// TODO debug\nfn foo() {}", "after": "fn foo() {}" }
+    ]
+  }
+}

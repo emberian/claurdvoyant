@@ -1,0 +1,15 @@
+{
+  "id": "msg_asst01",
+  "sessionID": "ses_FIX01",
+  "role": "assistant",
+  "parentID": "msg_user01",
+  "time": { "created": 1767000001000, "completed": 1767000005000 },
+  "modelID": "anthropic.claude-sonnet-4-5",
+  "providerID": "amazon-bedrock",
+  "mode": "build",
+  "agent": "build",
+  "path": { "cwd": "/home/dev/proj", "root": "/home/dev/proj" },
+  "cost": 0.0123,
+  "finish": "tool-calls",
+  "tokens": { "input": 100, "output": 20, "reasoning": 7, "cache": { "read": 50, "write": 10 } }
+}

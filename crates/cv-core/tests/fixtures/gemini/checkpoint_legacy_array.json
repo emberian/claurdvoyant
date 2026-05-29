@@ -1,0 +1,4 @@
+[
+  { "role": "user", "parts": [{ "text": "hi" }] },
+  { "role": "model", "parts": [{ "text": "Hello! How can I help?" }] }
+]

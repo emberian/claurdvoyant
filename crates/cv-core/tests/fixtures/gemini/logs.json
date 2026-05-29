@@ -1,0 +1,5 @@
+[
+  { "sessionId": "sess-a", "messageId": 0, "type": "user", "message": "hello from a", "timestamp": "2026-02-07T07:31:00.000Z" },
+  { "sessionId": "sess-b", "messageId": 0, "type": "user", "message": "hello from b", "timestamp": "2026-02-07T07:32:00.000Z" },
+  { "sessionId": "sess-a", "messageId": 1, "type": "user", "message": "second a message", "timestamp": "2026-02-07T07:33:00.000Z" }
+]

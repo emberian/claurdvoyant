@@ -216,6 +216,50 @@ fn tool_list() -> Value {
                 },
                 "required": ["regex"]
             }
+        },
+        {
+            "name": "board_post",
+            "description": "Post a message to a coordination-board channel so OTHER agents can see it. Use to broadcast status, leave a note, or hand off work (e.g. channel='myproj', body='done: migrated auth, tests green').",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "channel": { "type": "string", "description": "Channel/room name (often a project path or topic)." },
+                    "body": { "type": "string", "description": "The message text." },
+                    "from": { "type": "string", "description": "Who's posting (agent/session name). Default 'agent'." },
+                    "kind": { "type": "string", "description": "msg | status | event (default msg)." },
+                    "tags": { "type": "array", "items": { "type": "string" }, "description": "Optional tags." },
+                    "session_ref": { "type": "string", "description": "Optional session id this message is about." }
+                },
+                "required": ["channel", "body"]
+            }
+        },
+        {
+            "name": "board_read",
+            "description": "Read recent messages from a coordination-board channel — see what other agents have posted. Pass `since` (a message id cursor) to get only newer messages.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "channel": { "type": "string", "description": "Channel/room name." },
+                    "since": { "type": "string", "description": "Return only messages after this message id." },
+                    "limit": { "type": "number", "description": "Max messages (default 50, 0 = all)." }
+                },
+                "required": ["channel"]
+            }
+        },
+        {
+            "name": "board_await",
+            "description": "Block until a NEW message on a board channel matches a regex (or timeout). The way to wait on a sibling agent: board_await(channel='myproj', regex='BUILD (PASSED|FAILED)').",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "channel": { "type": "string", "description": "Channel/room name." },
+                    "regex": { "type": "string", "description": "Rust regex matched against message bodies." },
+                    "since": { "type": "string", "description": "Start cursor (default: current tail — only new posts)." },
+                    "timeout_secs": { "type": "number", "description": "Give up after this many seconds (default 120)." },
+                    "interval_secs": { "type": "number", "description": "Poll interval (default 2)." }
+                },
+                "required": ["channel", "regex"]
+            }
         }
     ])
 }
@@ -257,7 +301,73 @@ fn call_tool(name: &str, args: &Value) -> anyhow::Result<String> {
         "read_session" => read_session(args),
         "project_sessions" => project_sessions(args),
         "await_omen" => await_omen(args),
+        "board_post" => board_post(args),
+        "board_read" => board_read(args),
+        "board_await" => board_await(args),
         other => anyhow::bail!("unknown tool: {other}"),
+    }
+}
+
+/// Post a message to a coordination-board channel (so other agents can see it).
+fn board_post(args: &Value) -> anyhow::Result<String> {
+    let channel = arg_str(args, "channel").context("`channel` is required")?;
+    let from = arg_str(args, "from").unwrap_or("agent");
+    let body = arg_str(args, "body").context("`body` is required")?;
+    let kind = arg_str(args, "kind");
+    let tags = args
+        .get("tags")
+        .and_then(Value::as_array)
+        .map(|a| a.iter().filter_map(|t| t.as_str().map(String::from)).collect())
+        .unwrap_or_default();
+    let session_ref = arg_str(args, "session_ref").map(String::from);
+    let msg = cv_core::board::post(channel, from, body, kind, tags, session_ref)?;
+    Ok(serde_json::to_string_pretty(&msg)?)
+}
+
+/// Read recent messages from a board channel (optionally only those after a cursor id).
+fn board_read(args: &Value) -> anyhow::Result<String> {
+    let channel = arg_str(args, "channel").context("`channel` is required")?;
+    let since = arg_str(args, "since");
+    let limit = arg_usize(args, "limit", 50);
+    let msgs = cv_core::board::read(channel, since, limit)?;
+    Ok(serde_json::to_string_pretty(&msgs)?)
+}
+
+/// Block until a board message body matches a regex (or timeout). The polling loop runs on a
+/// blocking worker thread (tools dispatch via spawn_blocking), so blocking here is fine.
+fn board_await(args: &Value) -> anyhow::Result<String> {
+    let channel = arg_str(args, "channel").context("`channel` is required")?;
+    let pattern = arg_str(args, "regex").context("`regex` is required")?;
+    let re = regex::Regex::new(pattern).with_context(|| format!("invalid regex: {pattern:?}"))?;
+    let timeout = Duration::from_secs(arg_usize(args, "timeout_secs", 120) as u64);
+    let interval = Duration::from_secs(arg_usize(args, "interval_secs", 2).max(1) as u64);
+    // Start the cursor at the current tail so we only react to *new* posts (unless caller gives one).
+    let mut cursor = arg_str(args, "since").map(String::from).or_else(|| {
+        cv_core::board::read(channel, None, 0)
+            .ok()
+            .and_then(|m| m.last().map(|x| x.id.clone()))
+    });
+    let start = Instant::now();
+    loop {
+        let fresh = cv_core::board::read(channel, cursor.as_deref(), 0)?;
+        for m in &fresh {
+            cursor = Some(m.id.clone());
+            if re.is_match(&m.body) {
+                return Ok(serde_json::to_string_pretty(&json!({
+                    "matched": true,
+                    "message": m,
+                    "cursor": m.id,
+                }))?);
+            }
+        }
+        if start.elapsed() >= timeout {
+            return Ok(serde_json::to_string_pretty(&json!({
+                "matched": false,
+                "timed_out": true,
+                "cursor": cursor,
+            }))?);
+        }
+        std::thread::sleep(interval);
     }
 }
 

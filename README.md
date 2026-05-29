@@ -2,110 +2,115 @@
 
 # 🔮 claurdvoyant
 
-**Peer into, search, and port the sessions of _any_ coding agent — across projects, across time, across harnesses.**
+### Your AI coding sessions are gold. Stop letting them rot in scattered folders.
 
-*one IR to parse them all* ✨
+**One tool to find, read, search, port, and stream every agent session you've ever run — across every harness.**
+
+`claude` · `codex` · `grok` · `opencode` · `gemini` · `hermes` · `openclaw` · `cursor` · …
+
+*parse anything · search by meaning · resume anywhere · let your agents read each other's minds*
 
 </div>
 
 ---
 
-Your agent sessions are some of the most valuable context you'll ever produce. And yet today they're:
+## The problem (you've felt this)
 
-- 🙈 **unfindable** — scattered across dozens of project dirs (be honest, you track the important ones by hand)
-- ⛓️ **dir-jailed** — most harnesses only let you resume a session from the *exact* directory it ran in
-- 🏝️ **siloed** — every harness invents its own on-disk format and never speaks to the others
+You spent three hours teaching an agent your codebase. That context — the dead ends, the decisions, the hard-won understanding — is some of the most valuable output you produce. And then:
 
-claurdvoyant fixes all three with one stubborn idea: **parse every harness into a single intermediate representation (IR)**. Once everything is in one shape, the magic falls right out:
+- 🙈 **You can't find it.** It's one of hundreds of `.jsonl` files in a folder named after a path. (Yes, you keep the important session IDs in a notes app. Everyone does.)
+- ⛓️ **It's trapped.** Most harnesses only resume a session from the *exact directory* it ran in. Move the project, lose the thread.
+- 🏝️ **It's stranded.** Started in Claude Code but want to continue in Codex? Tough. Every tool speaks its own dialect and none of them talk.
 
-```
-parse(any harness)  →  🔮 unified IR  →  search · convert · port · archive · view · stream
-```
+Restarting from scratch is the most expensive thing you do all day. **claurdvoyant makes sure you never have to.**
 
-## 🪐 Supported harnesses (7!)
-
-| Harness | Where it lives | Parse | Convert *to* |
-|---|---|:--:|:--:|
-| **Claude Code** | `~/.claude/projects/**/*.jsonl` | ✅ | ✅ |
-| **Codex CLI** | `~/.codex/sessions/**/rollout-*.jsonl` (+ legacy) | ✅ | ✅ |
-| **Grok CLI** | `~/.grok/sessions/<cwd>/<sid>/` | ✅ | ✅ |
-| **OpenCode** | `~/.local/share/opencode/storage/` | ✅ | — |
-| **Gemini / Antigravity** | `~/.gemini/tmp/**/logs.json` (+ opaque `.pb`) | ✅ | — |
-| **Hermes** (Nous) | `~/.hermes/state.db` (SQLite) | ✅ | — |
-| **OpenClaw** | `~/.openclaw/agents/*/sessions/*.jsonl` | ✅ | — |
-
-📖 Every format is reverse-engineered in [`docs/FORMATS.md`](docs/FORMATS.md). Want to add yours? → [`ADDING_HARNESS.md`](ADDING_HARNESS.md) 💛
-
-## 🛠️ `cv` — the CLI
+## What you can actually do with it
 
 ```sh
-cargo build --release          # → target/release/{cv, cv-mcp, cvd}
+# 🔎 find that session from last week by what it was ABOUT, not where it lived
+cv search "the flux inference refactor"        # full-text, instant
+cv-search semantic "formalizing proofs"        # by meaning — no keyword overlap needed
 
-cv ls                          # every session, every harness, newest first
-cv search "flux klein"         # full-text search  (instant after `cv index`)
-cv index                       # build the search index
-cv show da9174f4               # render a transcript (id or prefix)
-cv export da9174f4 --format md > session.md
+# 🚀 take a Claude session and continue it in Codex. for real.
+cv convert da9174f4 --to codex
+#   ✦ wrote ~/.codex/sessions/2026/…/rollout-….jsonl
+#   ↳ codex resume 019e75e0-…
 
-# 🚀 port-a-sesh — the headline trick
-cv convert da9174f4 --to codex          # a Claude session → a resumable Codex rollout (!!)
-cv port    da9174f4 --to-dir ~/elsewhere  # rehome a session to a new cwd (escape the dir-jail)
+# 🧳 break a session out of its directory jail (brings CLAUDE.md / MEMORY.md along)
+cv port da9174f4 --to-dir ~/new/home
 
-# 👁️ scry — follow live agent activity (tail -f, across harnesses)
-cv scry --cwd ~/myproject
+# 👁️ watch every agent on your machine work, live, in one feed
+cv scry
 ```
 
-Conversion **round-trips through the target's own parser** (verified by tests), and prints a `resume` hint so you can pick the session back up in the other tool. (ﾉ◕ヮ◕)ﾉ*:･ﾟ✧
+…and a couple that didn't exist before:
 
-## 🧠 `cv-mcp` — let agents read each other's minds
+- 🧠 **An MCP server** so a *running* agent can read **other** agents' sessions — "what happened in this project before?", "what's my sibling agent doing right now?" — and even **`await_omen`**: block until another session prints something matching a regex.
+- 📣 **A coordination board** (`cv board` + MCP): agents post status and hand off work to each other. With the daemon mirroring activity, it's a live feed across your whole **cloud fleet**.
+- 🌐 **A zero-install web viewer**: drag a zip of any harness folder into your browser and explore it. Nothing uploaded, all WASM.
 
-A stdio [MCP](https://modelcontextprotocol.io) server so a *running* agent can introspect what other agents have done — this project, the past, any harness:
+## 🪐 Harnesses
+
+| | Harness | Parse | Convert *to* |
+|---|---|:--:|:--:|
+| ✅ | **Claude Code** | ✅ | ✅ |
+| ✅ | **Codex CLI** | ✅ | ✅ |
+| ✅ | **Grok CLI** | ✅ | ✅ |
+| ✅ | **OpenCode** | ✅ | ✅ |
+| ✅ | **Gemini / Antigravity** | ✅ | ✅ |
+| ✅ | **Hermes** (Nous) | ✅ | ✅ |
+| ✅ | **OpenClaw** | ✅ | ✅ |
+| ✅ | **Cursor** | ✅ | — |
+| 🔒 | **Claude / ChatGPT desktop apps** | detected¹ | — |
+
+<sub>¹ The Claude app keeps transcripts server-side; the ChatGPT app keeps them locally but encrypted at rest. We detect the install and document exactly why neither is readable — see [`docs/FORMATS.md`](docs/FORMATS.md).</sub>
+
+**Conversion is N-way**: any ✅ source → any ✅ target, mediated by one unified IR. Every format reverse-engineered in [`docs/FORMATS.md`](docs/FORMATS.md). Bringing your own? → [`ADDING_HARNESS.md`](ADDING_HARNESS.md) 💛
+
+## 🛠️ Install
+
+```sh
+cargo build --release          # → target/release/{cv, cv-mcp, cvd, cv-search}
+```
+
+(Prebuilt binaries for macOS/Linux/Windows × arm64/x64/x86 ship on each release via `dist`.)
+
+## 🧠 Let agents read each other's minds (MCP)
 
 ```sh
 claude mcp add claurdvoyant -- /path/to/target/release/cv-mcp
 ```
 
-Tools: `list_sessions` · `search_sessions` · `read_session` · `project_sessions` ("what happened in *this* project before / what are my sibling agents up to?") · **`await_omen`** — block until a session emits a message matching a regex (wait for a sibling agent to print `BUILD PASSED` 👀).
+Tools: `list_sessions` · `search_sessions` · `read_session` · `project_sessions` · **`await_omen`** (block until a session matches a regex) · `board_*` (post/read/await on the coordination board).
 
-## 📡 `cvd` — the archival daemon
-
-Watches every harness and archives sessions into one central store (`~/.claurdvoyant`). Point it at your laptop, your servers, your whole cloud fleet — centralize everything.
+## 📡 Archive your whole fleet (`cvd`)
 
 ```sh
-cvd sync     # snapshot everything now
-cvd watch    # follow live and archive as sessions change
-cvd ls       # what's in the vault
-```
-
-## 🌐 The web viewer (WASM, no server)
-
-`crates/cv-web` compiles the parser to WebAssembly; the app in `web/` lets *anyone* **drop a zip of a harness directory into their browser** and search/view it — 100% client-side, nothing uploaded. Ships to GitHub Pages.
-
-```sh
-wasm-pack build --target web --out-dir ../../web/pkg crates/cv-web -- --no-default-features
-python3 -m http.server --directory web 8080   # → http://localhost:8080
+cvd sync     # snapshot every session into ~/.claurdvoyant
+cvd watch    # follow live + archive as sessions change → a fleet activity feed
 ```
 
 ## 🧬 The OpenSession standard
 
-Having stared into the abyss of seven different transcript formats, we wrote down what they *should* have agreed on: **[OpenSession](docs/OPENSESSION.md)** — a small, honest, harness-neutral interchange format for agent sessions. claurdvoyant's IR is its reference implementation. 🤝
+After staring into seven different transcript formats, we wrote down the one they *should* have agreed on: **[OpenSession](docs/OPENSESSION.md)** — a small, honest, harness-neutral interchange format (the key heresy: *cwd is metadata, not identity*). claurdvoyant's IR is its reference implementation. If you ship a harness, emit OpenSession and everyone's sessions become portable by construction. 🤝
 
-## 🏗️ Architecture
+## 🏗️ Under the hood
 
-- **`cv-core`** — the IR (`Session → Message → Block{Text|Thinking|ToolUse|ToolResult|Image}`), one `Adapter` per harness (`discover` + `parse`), the `emit` engine (IR → native), the `watch` live engine, the FTS `index`, and `ingest` (in-memory/wasm parsing).
-- **`cv`** CLI · **`cv-mcp`** MCP server · **`cvd`** daemon · **`cv-web`** WASM.
+One IR (`Session → Message → Block{Text|Thinking|ToolUse|ToolResult|Image}`), one `Adapter` per harness (`discover` + `parse` + `emit`), and a handful of small crates on top: **`cv`** (CLI) · **`cv-mcp`** (MCP) · **`cvd`** (daemon) · **`cv-search`** (tantivy FTS + `model2vec` semantic) · **`cv-web`** (WASM).
 
-Cross-platform releases (macOS/Linux/Windows × arm64/x64/x86) via [`dist`](https://opensource.axo.dev/cargo-dist/) — tag `vX.Y.Z` and CI ships it. 📦
+```
+parse(any harness) → 🔮 unified IR → search · convert · port · archive · view · stream · coordinate
+```
 
-## 🧪 Status & honesty corner
+## 🧪 Status
 
-Built in one (very fun) Friday-night session, largely by a swarm of agents working disjoint files. ✨ It's young:
+Built in a couple of (gleeful) sessions, much of it by a swarm of agents working disjoint files. ✨ Young and honest:
 
-- Conversion **emits** to Claude/Codex/Grok today; the other four are parse-only (PRs welcome!).
-- The search index trades disk for speed (it stores full content — compression is a TODO).
-- Gemini `.pb` is opaque; Grok/OpenCode tool-calls in sidecar logs aren't ingested yet.
-- Historical format variants are an explicit goal — see [`ADDING_HARNESS.md`](ADDING_HARNESS.md).
+- Conversion **emits** to all 7 core harnesses; Cursor + desktop apps are parse-only and landing now.
+- The search index trades disk for speed (full content; compression is on the list).
+- Gemini's protobuf `.pb` is opaque; some sidecar tool-call streams aren't merged yet.
+- Historical format variants are an explicit goal — see [`ADDING_HARNESS.md`](ADDING_HARNESS.md), and **please send your own harness logs** (we can only test what we can see).
 
-PRs, especially **your own harness logs**, are deeply welcome — we can't test variants we've never seen. 💜
+PRs and weird old transcripts deeply welcome. 💜
 
-<div align="center"><sub>made with 🔮 and far too much enthusiasm</sub></div>
+<div align="center"><sub>made with 🔮 and an unreasonable amount of enthusiasm · MIT/Apache-2.0</sub></div>

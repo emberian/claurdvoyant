@@ -1,0 +1,8 @@
+{"sessionId":"11112222-3333-4444-5555-666677778888","projectHash":"deadbeef","startTime":"2026-02-11T20:55:00.000Z","lastUpdated":"2026-02-11T20:55:00.000Z","kind":"main"}
+{"id":"a1","timestamp":"2026-02-11T20:55:01.000Z","type":"user","content":"list the files here"}
+{"id":"a2","timestamp":"2026-02-11T20:55:02.000Z","type":"gemini","model":"gemini-3-pro","content":"Listing now.","toolCalls":[{"id":"ls-1","name":"list_directory","args":{"path":"."},"status":"success","timestamp":"2026-02-11T20:55:02.500Z","result":[{"functionResponse":{"id":"ls-1","name":"list_directory","response":{"output":"main.py\nspec.txt"}}}]}]}
+{"$set":{"lastUpdated":"2026-02-11T20:55:03.000Z","summary":"Listed the project files."}}
+{"id":"a3","timestamp":"2026-02-11T20:55:04.000Z","type":"gemini","model":"gemini-3-pro","content":"There are two files: main.py and spec.txt."}
+{"id":"bad","this":"line should be tolerated even though it is junk"}
+{"$rewindTo":"a3"}
+{"id":"a3","timestamp":"2026-02-11T20:55:05.000Z","type":"gemini","model":"gemini-3-pro","content":"There are exactly two files: main.py and spec.txt."}

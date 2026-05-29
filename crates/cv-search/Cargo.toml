@@ -1,0 +1,35 @@
+[package]
+name = "cv-search"
+description = "Pure-Rust full-text (tantivy) + semantic (embeddings) search over claurdvoyant sessions."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+cv-core = { path = "../cv-core" }
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+dirs.workspace = true
+chrono.workspace = true
+clap.workspace = true
+uuid.workspace = true
+
+# Full-text: pure-Rust Lucene-like engine. Always on.
+tantivy = "0.26"
+
+# Semantic: distilled *static* embeddings (model2vec). Tiny, no ONNX runtime — just
+# `tokenizers` + `safetensors` + `ndarray`. `hf-hub` lets us fetch + cache a small model
+# (e.g. potion-base-8M, ~30MB) on first use. Gated so a minimal FTS-only build is possible
+# via `--no-default-features`.
+model2vec-rs = { version = "0.2", default-features = false, features = ["onig", "hf-hub"], optional = true }
+
+[features]
+default = ["semantic"]
+semantic = ["dep:model2vec-rs"]
+
+[[bin]]
+name = "cv-search"
+path = "src/main.rs"

@@ -1,0 +1,2 @@
+{"type":"session","version":3,"id":"sess-1","timestamp":"2026-05-29T15:00:00.000Z","cwd":"/work/topic"}
+{"type":"message","id":"t1","parentId":null,"timestamp":"2026-05-29T15:00:01.000Z","message":{"role":"user","content":"topic thread message","timestamp":1748530801000}}

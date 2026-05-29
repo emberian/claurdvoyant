@@ -1,0 +1,9 @@
+{
+  "id": "msg_user01",
+  "sessionID": "ses_FIX01",
+  "role": "user",
+  "time": { "created": 1767000000000 },
+  "agent": "build",
+  "model": { "providerID": "amazon-bedrock", "modelID": "anthropic.claude-sonnet-4-5" },
+  "path": { "cwd": "/home/dev/proj", "root": "/home/dev/proj" }
+}

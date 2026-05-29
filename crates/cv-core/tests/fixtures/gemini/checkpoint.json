@@ -1,0 +1,21 @@
+{
+  "authType": "oauth-personal",
+  "history": [
+    { "role": "user", "parts": [{ "text": "what is 2+2?" }] },
+    {
+      "role": "model",
+      "parts": [
+        { "text": "Let me compute that.", "thought": false },
+        { "text": "The user wants simple arithmetic.", "thought": true },
+        { "functionCall": { "id": "calc-1", "name": "calculator", "args": { "expr": "2+2" } } }
+      ]
+    },
+    {
+      "role": "user",
+      "parts": [
+        { "functionResponse": { "id": "calc-1", "name": "calculator", "response": { "output": "4" } } }
+      ]
+    },
+    { "role": "model", "parts": [{ "text": "It is 4." }] }
+  ]
+}

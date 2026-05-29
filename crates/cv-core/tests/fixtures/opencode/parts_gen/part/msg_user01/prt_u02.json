@@ -1,0 +1,14 @@
+{
+  "id": "prt_u02",
+  "sessionID": "ses_FIX01",
+  "messageID": "msg_user01",
+  "type": "file",
+  "mime": "text/plain",
+  "filename": "Makefile",
+  "url": "file:///home/dev/proj/Makefile",
+  "source": {
+    "text": { "value": "@Makefile", "start": 28, "end": 37 },
+    "type": "file",
+    "path": "Makefile"
+  }
+}

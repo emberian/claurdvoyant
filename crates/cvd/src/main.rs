@@ -174,6 +174,16 @@ fn archive_event(archive: &Archive, r: &SessionRef, kind: EventKind, delta: usiz
                 short(&r.id),
                 ref_cwd(r)
             );
+            // Mirror the event onto the coordination board's #fleet channel: a live, centralized
+            // activity feed across every machine pointed at this archive.
+            let _ = cv_core::board::post(
+                "fleet",
+                &format!("{}:{}", r.harness, short(&r.id)),
+                &format!("{verb} +{delta} msg  {}", ref_cwd(r)),
+                Some("event"),
+                vec![r.harness.as_str().to_string()],
+                Some(r.id.clone()),
+            );
         }
         Ok(StoreOutcome::Skipped) => {}
         Err(e) => eprintln!("[store-fail] {} {}: {e:#}", r.harness, short(&r.id)),

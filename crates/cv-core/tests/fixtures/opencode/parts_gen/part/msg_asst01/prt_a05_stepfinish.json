@@ -1,0 +1,9 @@
+{
+  "id": "prt_a05",
+  "sessionID": "ses_FIX01",
+  "messageID": "msg_asst01",
+  "type": "step-finish",
+  "reason": "tool-calls",
+  "cost": 0.0123,
+  "tokens": { "input": 100, "output": 20, "reasoning": 7, "cache": { "read": 50, "write": 10 } }
+}

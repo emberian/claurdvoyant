@@ -1,0 +1,16 @@
+{
+  "id": "prt_a04",
+  "sessionID": "ses_FIX01",
+  "messageID": "msg_asst01",
+  "type": "tool",
+  "callID": "toolu_fix_bash_1",
+  "tool": "bash",
+  "state": {
+    "status": "completed",
+    "input": { "command": "ls", "description": "List files" },
+    "output": "Makefile\nsrc\n",
+    "title": "List files",
+    "metadata": { "exit": 0, "output": "Makefile\nsrc\n", "description": "List files" },
+    "time": { "start": 1767000002000, "end": 1767000002300 }
+  }
+}

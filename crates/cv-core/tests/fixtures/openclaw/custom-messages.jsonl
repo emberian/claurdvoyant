@@ -1,0 +1,5 @@
+{"type":"session","version":3,"id":"sess-custom","timestamp":"2026-05-29T12:00:00.000Z","cwd":"/work"}
+{"type":"message","id":"c1","parentId":null,"timestamp":"2026-05-29T12:00:01.000Z","message":{"role":"bashExecution","command":"ls -la","output":"total 0","exitCode":0,"cancelled":false,"truncated":false,"timestamp":1748520001000}}
+{"type":"message","id":"c2","parentId":"c1","timestamp":"2026-05-29T12:00:02.000Z","message":{"role":"branchSummary","summary":"explored an alternate fix","fromId":"abc123","timestamp":1748520002000}}
+{"type":"message","id":"c3","parentId":"c2","timestamp":"2026-05-29T12:00:03.000Z","message":{"role":"compactionSummary","summary":"earlier history compacted","tokensBefore":5000,"tokensAfter":800,"firstKeptEntryId":"c2","timestamp":1748520003000}}
+{"type":"message","id":"c4","parentId":"c3","timestamp":"2026-05-29T12:00:04.000Z","message":{"role":"custom","customType":"openclaw.cache-ttl","content":[{"type":"text","text":"cache ttl marker"}],"display":false,"details":{"ttlMs":3600000},"timestamp":1748520004000}}

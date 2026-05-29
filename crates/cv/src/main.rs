@@ -5,6 +5,7 @@ use clap::{Parser, Subcommand};
 use cv_core::ir::*;
 use cv_core::watch::{Filter, Watcher};
 use cv_core::EmitOptions;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -88,6 +89,9 @@ enum Cmd {
         /// Write under this directory instead of the target's real storage root.
         #[arg(long)]
         out: Option<PathBuf>,
+        /// Don't copy project context files (CLAUDE.md, MEMORY.md, AGENTS.md, …) to the new cwd.
+        #[arg(long = "no-context")]
+        no_context: bool,
     },
     /// Follow live agent activity across harnesses (tail -f for sessions).
     Scry {
@@ -105,6 +109,50 @@ enum Cmd {
     },
     /// Build/refresh the SQLite FTS index that makes `cv search` instant.
     Index,
+    /// Post to / read from the agent coordination board.
+    Board {
+        #[command(subcommand)]
+        action: BoardCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum BoardCmd {
+    /// Post a message to a channel.
+    Post {
+        channel: String,
+        body: String,
+        #[arg(long, default_value = "cv")]
+        from: String,
+        #[arg(long)]
+        kind: Option<String>,
+        #[arg(long = "tag")]
+        tags: Vec<String>,
+        #[arg(long = "session-ref")]
+        session_ref: Option<String>,
+    },
+    /// Read messages from a channel.
+    Read {
+        channel: String,
+        #[arg(long)]
+        since: Option<String>,
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+        #[arg(long)]
+        json: bool,
+    },
+    /// List all channels.
+    Channels,
+    /// Follow a channel live; with --match, exit when a body contains the substring.
+    Watch {
+        channel: String,
+        #[arg(long)]
+        since: Option<String>,
+        #[arg(long = "match")]
+        pattern: Option<String>,
+        #[arg(long, default_value_t = 2.0)]
+        interval: f64,
+    },
 }
 
 fn main() -> Result<()> {
@@ -115,10 +163,67 @@ fn main() -> Result<()> {
         Cmd::Show { id, harness, json } => cmd_show(&id, harness, json),
         Cmd::Export { id, format, harness } => cmd_export(&id, &format, harness),
         Cmd::Convert { id, to, from, out, cwd } => cmd_convert(&id, &to, from, out, cwd),
-        Cmd::Port { id, to, from, to_dir, out } => cmd_port(&id, to, from, to_dir, out),
+        Cmd::Port { id, to, from, to_dir, out, no_context } => cmd_port(&id, to, from, to_dir, out, no_context),
         Cmd::Scry { harness, cwd, interval, existing } => cmd_scry(harness, cwd, interval, existing),
         Cmd::Index => cmd_index(),
+        Cmd::Board { action } => cmd_board(action),
     }
+}
+
+fn cmd_board(action: BoardCmd) -> Result<()> {
+    use cv_core::board;
+    match action {
+        BoardCmd::Post { channel, body, from, kind, tags, session_ref } => {
+            let m = board::post(&channel, &from, &body, kind.as_deref(), tags, session_ref)?;
+            println!("✦ posted {} to #{}", short_id(&m.id), channel);
+        }
+        BoardCmd::Read { channel, since, limit, json } => {
+            let msgs = board::read(&channel, since.as_deref(), limit)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&msgs)?);
+            } else {
+                for m in &msgs {
+                    print_board_msg(m);
+                }
+                if msgs.is_empty() {
+                    println!("(no messages on #{channel})");
+                }
+            }
+        }
+        BoardCmd::Channels => {
+            for c in board::channels()? {
+                println!("#{c}");
+            }
+        }
+        BoardCmd::Watch { channel, since, pattern, interval } => {
+            eprintln!("✦ watching #{channel} … (Ctrl-C to stop)");
+            let mut cursor = since;
+            loop {
+                for m in board::read(&channel, cursor.as_deref(), 0)? {
+                    cursor = Some(m.id.clone());
+                    print_board_msg(&m);
+                    if let Some(p) = &pattern {
+                        if m.body.contains(p.as_str()) {
+                            println!("✓ matched {p:?} — done");
+                            return Ok(());
+                        }
+                    }
+                }
+                std::thread::sleep(Duration::from_secs_f64(interval.max(0.25)));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn print_board_msg(m: &cv_core::board::BoardMessage) {
+    println!(
+        "{}  {}  ({}) {}",
+        m.ts.format("%H:%M:%S"),
+        m.from,
+        m.kind,
+        m.body
+    );
 }
 
 fn cmd_index() -> Result<()> {
@@ -323,6 +428,7 @@ fn cmd_port(
     from: Option<String>,
     to_dir: Option<PathBuf>,
     out: Option<PathBuf>,
+    no_context: bool,
 ) -> Result<()> {
     let from_h = parse_harness(&from)?;
     let (r, adapter) =
@@ -333,7 +439,53 @@ fn cmd_port(
         Some(s) => Harness::parse(&s).with_context(|| format!("unknown target harness: {s}"))?,
         None => session.harness,
     };
-    emit_session(&session, to_h, out, EmitOptions { new_cwd: to_dir, new_id: None })
+    let new_cwd = to_dir.clone();
+    emit_session(&session, to_h, out, EmitOptions { new_cwd: to_dir, new_id: None })?;
+
+    // Carry the project's context files to the new home, so the ported session keeps its memory.
+    if !no_context {
+        if let (Some(src), Some(dst)) = (session.cwd.as_deref(), new_cwd.as_deref()) {
+            carry_context(src, dst);
+        }
+    }
+    Ok(())
+}
+
+/// Project context files a harness reads from the cwd. We copy these alongside a ported session so
+/// it lands with its memory/instructions intact. Best-effort: never overwrite, never fatal.
+const CONTEXT_FILES: &[&str] = &[
+    "CLAUDE.md",
+    "CLAUDE.local.md",
+    "AGENTS.md",
+    "GEMINI.md",
+    "MEMORY.md",
+    ".cursorrules",
+    ".windsurfrules",
+];
+
+fn carry_context(src: &Path, dst: &Path) {
+    if src == dst {
+        return;
+    }
+    let mut copied = Vec::new();
+    for name in CONTEXT_FILES {
+        let from = src.join(name);
+        if !from.is_file() {
+            continue;
+        }
+        let to = dst.join(name);
+        if to.exists() {
+            eprintln!("  ↳ context: {name} already exists at target — left as-is");
+            continue;
+        }
+        match fs::create_dir_all(dst).and_then(|_| fs::copy(&from, &to)) {
+            Ok(_) => copied.push(*name),
+            Err(e) => eprintln!("  ↳ context: couldn't copy {name}: {e}"),
+        }
+    }
+    if !copied.is_empty() {
+        println!("  ↳ carried context: {}", copied.join(", "));
+    }
 }
 
 fn emit_session(
