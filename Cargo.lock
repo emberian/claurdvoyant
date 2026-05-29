@@ -391,6 +391,7 @@ dependencies = [
  "chrono",
  "clap",
  "cv-core",
+ "cv-search",
  "serde_json",
 ]
 

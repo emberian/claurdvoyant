@@ -41,6 +41,10 @@ enum Cmd {
         harness: Option<String>,
         #[arg(long, default_value_t = 20)]
         limit: usize,
+        /// Use semantic (embedding) search instead of full-text. Requires `cv index --semantic`
+        /// to have been run; downloads a small embedding model on first use.
+        #[arg(long)]
+        semantic: bool,
     },
     /// Print a single session (by id or id-prefix).
     Show {
@@ -107,8 +111,30 @@ enum Cmd {
         #[arg(long)]
         existing: bool,
     },
-    /// Build/refresh the SQLite FTS index that makes `cv search` instant.
-    Index,
+    /// Build/refresh the tantivy full-text index that makes `cv search` instant.
+    Index {
+        /// Also build semantic embeddings (`cv search --semantic`). Downloads a small embedding
+        /// model (~30MB) on first use.
+        #[arg(long)]
+        semantic: bool,
+    },
+    /// Fleet analytics over all discovered sessions.
+    Stats,
+    /// Print (or with --launch, run) the resume incantation for a session in its native harness.
+    Resume {
+        id: String,
+        #[arg(long)]
+        harness: Option<String>,
+        /// Actually spawn the harness (cd to the session's cwd) instead of just printing.
+        #[arg(long)]
+        launch: bool,
+    },
+    /// Render a session's message threading (DAG if parent_ids exist, else a numbered list).
+    Tree {
+        id: String,
+        #[arg(long)]
+        harness: Option<String>,
+    },
     /// Post to / read from the agent coordination board.
     Board {
         #[command(subcommand)]
@@ -159,13 +185,16 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
         Cmd::Ls { harness, cwd, limit } => cmd_ls(harness, cwd, limit),
-        Cmd::Search { query, harness, limit } => cmd_search(&query, harness, limit),
+        Cmd::Search { query, harness, limit, semantic } => cmd_search(&query, harness, limit, semantic),
         Cmd::Show { id, harness, json } => cmd_show(&id, harness, json),
         Cmd::Export { id, format, harness } => cmd_export(&id, &format, harness),
         Cmd::Convert { id, to, from, out, cwd } => cmd_convert(&id, &to, from, out, cwd),
         Cmd::Port { id, to, from, to_dir, out, no_context } => cmd_port(&id, to, from, to_dir, out, no_context),
         Cmd::Scry { harness, cwd, interval, existing } => cmd_scry(harness, cwd, interval, existing),
-        Cmd::Index => cmd_index(),
+        Cmd::Index { semantic } => cmd_index(semantic),
+        Cmd::Stats => cmd_stats(),
+        Cmd::Resume { id, harness, launch } => cmd_resume(&id, harness, launch),
+        Cmd::Tree { id, harness } => cmd_tree(&id, harness),
         Cmd::Board { action } => cmd_board(action),
     }
 }
@@ -226,13 +255,294 @@ fn print_board_msg(m: &cv_core::board::BoardMessage) {
     );
 }
 
-fn cmd_index() -> Result<()> {
-    let path = cv_core::index::default_index_path();
-    let idx = cv_core::index::Index::open_or_create(path.clone())?;
-    eprintln!("✦ indexing all sessions…");
-    let n = idx.rebuild()?;
-    println!("indexed {n} session(s) → {}", path.display());
+fn cmd_index(semantic: bool) -> Result<()> {
+    eprintln!("✦ building full-text index…");
+    let n = cv_search::index_all(None)?;
+    println!(
+        "indexed {n} session(s) → {}",
+        cv_search::default_tantivy_dir().display()
+    );
+    if semantic {
+        eprintln!("✦ embedding sessions (downloads a small model on first use)…");
+        let e = cv_search::embed_all(None)?;
+        println!(
+            "embedded {e} session(s) → {}",
+            cv_search::default_embeddings_path().display()
+        );
+    }
     Ok(())
+}
+
+// ---------- stats ----------
+
+fn cmd_stats() -> Result<()> {
+    use std::collections::HashMap;
+    let refs = cv_core::discover_all();
+    let total = refs.len();
+    if total == 0 {
+        println!("no sessions discovered.");
+        return Ok(());
+    }
+
+    let mut per_harness: HashMap<&'static str, usize> = HashMap::new();
+    let mut per_cwd: HashMap<String, usize> = HashMap::new();
+    let mut total_messages: usize = 0;
+    let mut min_created: Option<chrono::DateTime<chrono::Utc>> = None;
+    let mut max_updated: Option<chrono::DateTime<chrono::Utc>> = None;
+
+    for r in &refs {
+        *per_harness.entry(r.harness.as_str()).or_default() += 1;
+        total_messages += r.message_count;
+        let cwd = r
+            .cwd
+            .as_deref()
+            .map(home_rel)
+            .unwrap_or_else(|| "(no cwd)".into());
+        *per_cwd.entry(cwd).or_default() += 1;
+        if let Some(c) = r.created_at {
+            min_created = Some(min_created.map_or(c, |m| m.min(c)));
+        }
+        if let Some(u) = r.updated_at {
+            max_updated = Some(max_updated.map_or(u, |m| m.max(u)));
+        }
+    }
+
+    println!("✦ claurdvoyant fleet stats\n");
+    println!("{total} session(s) · {total_messages} message(s)\n");
+
+    println!("by harness:");
+    let mut hv: Vec<_> = per_harness.into_iter().collect();
+    hv.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+    for (h, n) in hv {
+        println!("  {h:12} {n:>5}");
+    }
+
+    println!("\ntop cwds:");
+    let mut cv: Vec<_> = per_cwd.into_iter().collect();
+    cv.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    for (c, n) in cv.into_iter().take(10) {
+        println!("  {n:>5}  {}", truncate(&c, 70));
+    }
+
+    println!("\ndate range:");
+    println!(
+        "  earliest created: {}",
+        min_created
+            .map(|d| d.format("%Y-%m-%d %H:%M").to_string())
+            .unwrap_or_else(|| "?".into())
+    );
+    println!(
+        "  latest updated:   {}",
+        max_updated
+            .map(|d| d.format("%Y-%m-%d %H:%M").to_string())
+            .unwrap_or_else(|| "?".into())
+    );
+    Ok(())
+}
+
+// ---------- resume ----------
+
+fn cmd_resume(id: &str, harness: Option<String>, launch: bool) -> Result<()> {
+    let want = parse_harness(&harness)?;
+    let (r, _adapter) =
+        cv_core::find(id, want)?.with_context(|| format!("no session matching {id:?}"))?;
+    let cwd = r.cwd.clone();
+    let (program, args) = resume_command(r.harness, &r.id);
+
+    if launch {
+        let dir = cwd.clone().unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+        eprintln!(
+            "✦ launching: (cd {}) {} {}",
+            home_rel(&dir),
+            program,
+            args.join(" ")
+        );
+        let status = std::process::Command::new(&program)
+            .args(&args)
+            .current_dir(&dir)
+            .status()
+            .with_context(|| format!("failed to launch {program:?}"))?;
+        if !status.success() {
+            bail!("{program} exited with status {status}");
+        }
+        return Ok(());
+    }
+
+    // Print the incantation.
+    if let Some(dir) = &cwd {
+        println!("cd {}", shell_quote(&dir.display().to_string()));
+    }
+    println!("{} {}", program, args.join(" "));
+    Ok(())
+}
+
+/// Best-known resume incantation per harness: the program + its args (the cwd is handled
+/// separately, since most harnesses resume relative to the directory they're launched in).
+fn resume_command(h: Harness, id: &str) -> (String, Vec<String>) {
+    match h {
+        Harness::Claude => ("claude".into(), vec!["--resume".into(), id.into()]),
+        Harness::Codex => ("codex".into(), vec!["resume".into(), id.into()]),
+        Harness::Grok => ("grok".into(), vec!["--resume".into(), id.into()]),
+        Harness::OpenCode => ("opencode".into(), vec!["--session".into(), id.into()]),
+        Harness::Gemini => ("gemini".into(), vec!["--resume".into(), id.into()]),
+        Harness::Hermes => ("hermes".into(), vec!["resume".into(), id.into()]),
+        Harness::OpenClaw => ("openclaw".into(), vec!["--resume".into(), id.into()]),
+        // Desktop/IDE apps and others have no documented CLI resume — emit a best-effort hint.
+        Harness::Cursor | Harness::ClaudeApp | Harness::ChatGptApp => (
+            format!("# no CLI resume for {h}; open the app and find session"),
+            vec![id.into()],
+        ),
+    }
+}
+
+fn shell_quote(s: &str) -> String {
+    if s.is_empty() {
+        return "''".into();
+    }
+    if s.bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'/' | b'.' | b'_' | b'-' | b'~' | b'+' | b':' | b'@'))
+    {
+        s.to_string()
+    } else {
+        format!("'{}'", s.replace('\'', r"'\''"))
+    }
+}
+
+// ---------- tree ----------
+
+fn cmd_tree(id: &str, harness: Option<String>) -> Result<()> {
+    let want = parse_harness(&harness)?;
+    let (r, adapter) =
+        cv_core::find(id, want)?.with_context(|| format!("no session matching {id:?}"))?;
+    let session = adapter.parse(&r)?;
+
+    println!("# {}", session.label());
+    println!(
+        "{} · {} · {} msg",
+        session.harness,
+        session.id,
+        session.messages.len()
+    );
+    println!();
+
+    // Threaded view only if at least one message carries a parent_id.
+    let has_threading = session.messages.iter().any(|m| m.parent_id.is_some());
+    if has_threading {
+        render_tree_dag(&session);
+    } else {
+        for (i, m) in session.messages.iter().enumerate() {
+            println!("{:>4}. {}", i + 1, tree_line(m));
+        }
+    }
+    Ok(())
+}
+
+/// Render messages as an indented DAG by `parent_id`. Roots (no/unknown parent) sit at depth 0.
+fn render_tree_dag(session: &Session) {
+    use std::collections::HashMap;
+    // children: parent_id -> ordered list of child message indices.
+    let mut by_id: HashMap<&str, usize> = HashMap::new();
+    for (i, m) in session.messages.iter().enumerate() {
+        if let Some(id) = &m.id {
+            by_id.insert(id.as_str(), i);
+        }
+    }
+    let mut children: HashMap<Option<usize>, Vec<usize>> = HashMap::new();
+    for (i, m) in session.messages.iter().enumerate() {
+        let parent = m
+            .parent_id
+            .as_deref()
+            .and_then(|p| by_id.get(p).copied())
+            .filter(|&p| p != i);
+        children.entry(parent).or_default().push(i);
+    }
+
+    fn walk(
+        node: Option<usize>,
+        depth: usize,
+        session: &Session,
+        children: &std::collections::HashMap<Option<usize>, Vec<usize>>,
+    ) {
+        if let Some(kids) = children.get(&node) {
+            for &c in kids {
+                let indent = "  ".repeat(depth);
+                println!("{indent}• {}", tree_line(&session.messages[c]));
+                walk(Some(c), depth + 1, session, children);
+            }
+        }
+    }
+    walk(None, 0, session, &children);
+}
+
+/// One-line preview of a message for the tree: role, markers for tool turns / sub-agent spawns,
+/// and a text preview.
+fn tree_line(m: &Message) -> String {
+    let role = cv_core::render::role_label(m.role);
+    let mut tags = Vec::new();
+    let has_tool_use = m
+        .content
+        .iter()
+        .any(|b| matches!(b, Block::ToolUse { .. }));
+    let has_tool_result = m
+        .content
+        .iter()
+        .any(|b| matches!(b, Block::ToolResult { .. }));
+    if has_tool_use {
+        tags.push("🔧 tool".to_string());
+        // Surface a sub-agent spawn if the tool looks like one.
+        for b in &m.content {
+            if let Block::ToolUse { name, .. } = b {
+                let n = name.to_ascii_lowercase();
+                if n.contains("task") || n.contains("agent") || n.contains("dispatch") || n.contains("spawn") {
+                    tags.push(format!("↳ sub-agent ({name})"));
+                }
+            }
+        }
+    }
+    if has_tool_result {
+        tags.push("↩ result".to_string());
+    }
+    // Sub-agent spawns recorded in `extra` (harness-specific).
+    if let Some(sub) = sub_agent_from_extra(m) {
+        tags.push(format!("↳ sub-agent ({sub})"));
+    }
+
+    let preview = m
+        .text()
+        .map(|t| truncate(&t, 80))
+        .unwrap_or_else(|| {
+            if has_tool_use {
+                m.content
+                    .iter()
+                    .find_map(|b| match b {
+                        Block::ToolUse { name, .. } => Some(format!("[{name}]")),
+                        _ => None,
+                    })
+                    .unwrap_or_default()
+            } else {
+                String::new()
+            }
+        });
+
+    let tagstr = if tags.is_empty() {
+        String::new()
+    } else {
+        format!(" [{}]", tags.join(", "))
+    };
+    format!("{role}{tagstr}  {preview}")
+}
+
+/// Look for a sub-agent spawn recorded in `Message::extra` under common harness keys.
+fn sub_agent_from_extra(m: &Message) -> Option<String> {
+    for key in ["subagent", "sub_agent", "subAgent", "spawn", "agent", "child_agent"] {
+        if let Some(v) = m.extra.get(key) {
+            return Some(match v {
+                serde_json::Value::String(s) => s.clone(),
+                other => truncate(&other.to_string(), 40),
+            });
+        }
+    }
+    None
 }
 
 fn parse_harness(s: &Option<String>) -> Result<Option<Harness>> {
@@ -283,11 +593,31 @@ fn cmd_ls(harness: Option<String>, cwd: Option<String>, limit: usize) -> Result<
     Ok(())
 }
 
-fn cmd_search(query: &str, harness: Option<String>, limit: usize) -> Result<()> {
+fn cmd_search(query: &str, harness: Option<String>, limit: usize, semantic: bool) -> Result<()> {
     let want = parse_harness(&harness)?;
 
-    // Fast path: a prebuilt FTS index. If it exists, it's authoritative — an empty result means
-    // "no match", not "fall back to a 90-second live scan". Only scan live if there's no index.
+    // Semantic search: embed the query and rank stored vectors. Requires `cv index --semantic`.
+    if semantic {
+        let hits = cv_search::semantic_search(None, query, limit.saturating_mul(4))
+            .context("semantic search failed (run `cv index --semantic` first?)")?;
+        render_search_hits(&hits, want, limit, query, "semantic");
+        return Ok(());
+    }
+
+    // Preferred path: the tantivy full-text index (real tokenization + BM25). Authoritative when
+    // present — an empty result means "no match", not "fall back to a live scan".
+    if cv_search::default_tantivy_dir().exists() {
+        match cv_search::text_search(None, query, limit.saturating_mul(4)) {
+            Ok(hits) => {
+                render_search_hits(&hits, want, limit, query, "index");
+                return Ok(());
+            }
+            Err(e) => eprintln!("(tantivy index unavailable: {e:#}; trying sqlite/live)"),
+        }
+    }
+
+    // Fallback: a prebuilt SQLite FTS index. If it exists, it's authoritative — an empty result
+    // means "no match", not "fall back to a 90-second live scan". Only scan live if there's none.
     let idx_path = cv_core::index::default_index_path();
     if idx_path.exists() {
         match cv_core::index::Index::open_or_create(idx_path)
@@ -323,6 +653,62 @@ fn cmd_search(query: &str, harness: Option<String>, limit: usize) -> Result<()> 
     } else {
         eprintln!("(no index yet — scanning live; run `cv index` for instant search)");
     }
+    cmd_search_live(query, want, limit)
+}
+
+/// Render a slice of cv-search [`cv_search::Hit`]s with harness/short-id/date/title/snippet,
+/// applying the `--harness` filter and `--limit`. `source` labels the empty-result hint.
+fn render_search_hits(
+    hits: &[cv_search::Hit],
+    want: Option<Harness>,
+    limit: usize,
+    query: &str,
+    source: &str,
+) {
+    // Dates aren't carried on Hit; pull them cheaply from discovery (no parse) for the rows we show.
+    let dates = session_date_map();
+    let rows: Vec<&cv_search::Hit> = hits
+        .iter()
+        .filter(|h| want.map_or(true, |w| h.harness == w.as_str()))
+        .take(limit)
+        .collect();
+    if rows.is_empty() {
+        let hint = if source == "semantic" {
+            "(semantic; run `cv index --semantic` to (re)build embeddings)"
+        } else {
+            "(index; try `cv index` to refresh)"
+        };
+        println!("no matches for {query:?} {hint}");
+        return;
+    }
+    for h in rows {
+        let date = dates
+            .get(&h.id)
+            .and_then(|d| *d)
+            .map(|d| d.format("%Y-%m-%d").to_string())
+            .unwrap_or_else(|| "----------".into());
+        println!(
+            "{:8}  {:8}  {:10}  {}",
+            h.harness,
+            short_id(&h.id),
+            date,
+            h.title.clone().unwrap_or_default(),
+        );
+        if !h.snippet.trim().is_empty() {
+            println!("          … {}", truncate(&h.snippet, 120));
+        }
+    }
+}
+
+/// id → updated_at (falling back to created_at) from a cheap discovery pass.
+fn session_date_map() -> std::collections::HashMap<String, Option<chrono::DateTime<chrono::Utc>>> {
+    cv_core::discover_all()
+        .into_iter()
+        .map(|r| (r.id, r.updated_at.or(r.created_at)))
+        .collect()
+}
+
+fn cmd_search_live(query: &str, want: Option<Harness>, limit: usize) -> Result<()> {
     let needle = query.to_lowercase();
     let mut hits = 0;
 
