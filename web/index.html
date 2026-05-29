@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="en" data-theme="auto">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>claurdvoyant — agent session viewer</title>
+  <meta name="description" content="Drop a .zip of an agent harness directory and browse its sessions, fully client-side." />
+  <link rel="stylesheet" href="./styles.css" />
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E%F0%9F%94%AE%3C/text%3E%3C/svg%3E" />
+</head>
+<body>
+  <cv-app></cv-app>
+
+  <!--
+    The page works two ways:
+      1) If the wasm module (./pkg/cv_web.js) is present, we use it to ingest .zip uploads.
+      2) Otherwise we fall back to the bundled sample dataset so the UI is demoable immediately.
+    All loading logic lives in main.js.
+  -->
+  <script type="module" src="./main.js"></script>
+</body>
+</html>

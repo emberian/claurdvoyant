@@ -1,0 +1,21 @@
+[package]
+name = "cvd"
+description = "claurdvoyant daemon — watches harness storage roots and archives agent sessions (incl. cloud-fleet logs) into a central store."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "cvd"
+path = "src/main.rs"
+
+[dependencies]
+cv-core = { path = "../cv-core" }
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+clap.workspace = true
+chrono.workspace = true
+dirs.workspace = true

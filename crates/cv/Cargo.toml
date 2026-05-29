@@ -1,0 +1,19 @@
+[package]
+name = "cv"
+description = "claurdvoyant CLI — search, read, and port AI coding-agent sessions across harnesses."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "cv"
+path = "src/main.rs"
+
+[dependencies]
+cv-core = { path = "../cv-core" }
+clap.workspace = true
+anyhow.workspace = true
+serde_json.workspace = true
+chrono.workspace = true

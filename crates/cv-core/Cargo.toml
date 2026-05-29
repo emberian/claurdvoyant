@@ -1,0 +1,26 @@
+[package]
+name = "cv-core"
+description = "Unified parser and intermediate representation for AI coding-agent session transcripts across harnesses (Claude Code, Codex, Grok, OpenCode, Gemini)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+walkdir.workspace = true
+percent-encoding.workspace = true
+rusqlite = { workspace = true, optional = true }
+dirs.workspace = true
+uuid.workspace = true
+
+[features]
+default = ["sqlite"]
+# `sqlite` pulls in rusqlite (native C SQLite) for the Hermes adapter and the FTS index.
+# Disable it (e.g. `--no-default-features`) to compile cv-core for wasm32.
+sqlite = ["dep:rusqlite"]

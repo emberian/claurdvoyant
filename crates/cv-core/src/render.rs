@@ -1,0 +1,108 @@
+//! Rendering an IR [`Session`] to human/LLM-friendly text. Shared by the `cv` CLI and `cv-mcp`.
+
+use crate::ir::*;
+
+/// Render a session as Markdown (good for sharing / feeding to another model).
+pub fn to_markdown(s: &Session) -> String {
+    let mut out = String::new();
+    out.push_str(&format!("# {}\n\n", s.label()));
+    out.push_str(&format!("- harness: {}\n- id: {}\n", s.harness, s.id));
+    if let Some(cwd) = &s.cwd {
+        out.push_str(&format!("- cwd: {}\n", cwd.display()));
+    }
+    if let Some(m) = &s.model {
+        out.push_str(&format!("- model: {m}\n"));
+    }
+    if let Some(t) = &s.created_at {
+        out.push_str(&format!("- started: {}\n", t.to_rfc3339()));
+    }
+    out.push('\n');
+    for m in &s.messages {
+        let who = role_label(m.role);
+        out.push_str(&format!("## {who}\n\n"));
+        for b in &m.content {
+            render_block_md(b, &mut out);
+        }
+    }
+    out
+}
+
+fn render_block_md(b: &Block, out: &mut String) {
+    match b {
+        Block::Text { text } => {
+            out.push_str(text);
+            out.push_str("\n\n");
+        }
+        Block::Thinking { text, .. } => {
+            out.push_str("> 🧠 ");
+            out.push_str(&text.replace('\n', "\n> "));
+            out.push_str("\n\n");
+        }
+        Block::ToolUse { name, input, .. } => {
+            out.push_str(&format!("**🔧 {name}**\n\n```json\n{input}\n```\n\n"));
+        }
+        Block::ToolResult {
+            content, is_error, ..
+        } => {
+            out.push_str(&format!(
+                "**↩ result{}**\n\n```\n{}\n```\n\n",
+                if *is_error { " (error)" } else { "" },
+                truncate(content, 4000)
+            ));
+        }
+        Block::Image { .. } => out.push_str("_[image]_\n\n"),
+    }
+}
+
+/// Compact plain-text rendering (terminal `show`).
+pub fn to_plain(s: &Session, block_limit: usize) -> String {
+    let mut out = String::new();
+    for m in &s.messages {
+        out.push_str(&format!("── {} ──\n", role_label(m.role)));
+        for b in &m.content {
+            match b {
+                Block::Text { text } => {
+                    out.push_str(text);
+                    out.push('\n');
+                }
+                Block::Thinking { text, .. } => {
+                    out.push_str(&format!("[thinking] {}\n", truncate(text, block_limit)))
+                }
+                Block::ToolUse { name, input, .. } => out.push_str(&format!(
+                    "[tool_use {name}] {}\n",
+                    truncate(&input.to_string(), block_limit)
+                )),
+                Block::ToolResult {
+                    content, is_error, ..
+                } => out.push_str(&format!(
+                    "[tool_result{}] {}\n",
+                    if *is_error { " error" } else { "" },
+                    truncate(content, block_limit)
+                )),
+                Block::Image { .. } => out.push_str("[image]\n"),
+            }
+        }
+        out.push('\n');
+    }
+    out
+}
+
+pub fn role_label(r: Role) -> &'static str {
+    match r {
+        Role::System => "system",
+        Role::User => "user",
+        Role::Assistant => "assistant",
+        Role::Tool => "tool",
+    }
+}
+
+fn truncate(s: &str, max: usize) -> String {
+    let s = s.replace('\n', " ");
+    if s.chars().count() <= max {
+        s
+    } else {
+        let mut o: String = s.chars().take(max.saturating_sub(1)).collect();
+        o.push('…');
+        o
+    }
+}

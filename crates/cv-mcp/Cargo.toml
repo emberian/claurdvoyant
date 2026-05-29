@@ -1,0 +1,21 @@
+[package]
+name = "cv-mcp"
+description = "MCP server exposing claurdvoyant — lets a running agent search and read other agents' sessions (this project, across time, across harnesses)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "cv-mcp"
+path = "src/main.rs"
+
+[dependencies]
+cv-core = { path = "../cv-core" }
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+chrono.workspace = true
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std", "io-util"] }
+regex = "1"
