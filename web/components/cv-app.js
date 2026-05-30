@@ -12,17 +12,23 @@
 //   opensession— the OpenSession standard (<cv-opensession>)
 import "./cv-session-list.js";
 import "./cv-transcript.js";
+import "./cv-projects.js";
 import "./cv-timeline.js";
 import "./cv-compare.js";
 import "./cv-stats.js";
 import "./cv-loom.js";
 import "./cv-fleet.js";
 import "./cv-opensession.js";
-import { esc, normalizeSessions, randomId } from "./util.js";
-import { isTauri, listen } from "../tauri.js";
+import { esc, normalizeSession, normalizeSessions, randomId } from "./util.js";
+import { isTauri, listen, invoke, canInvokeNative } from "../tauri.js";
+
+// A running `cvd serve` (always the case inside the desktop app) exposes the machine's real local
+// sessions. The main viewer prefers these over the bundled sample; same base URL the Fleet tab uses.
+const CVD_BASE = "http://localhost:7777";
 
 const VIEWS = [
   ["sessions", "Sessions", "🗂"],
+  ["projects", "Projects", "◈"],
   ["timeline", "Timeline", "📈"],
   ["compare", "Compare", "🔍"],
   ["stats", "Stats", "📊"],
@@ -58,8 +64,16 @@ class CvApp extends HTMLElement {
     this._ingestZip = main.ingestZip;
     this._loadSample = main.loadSample;
 
+    // Load sessions FIRST, before the wasm gate — wasm is only needed for .zip ingest, and a stalled
+    // wasm import under the tauri:// scheme must never block showing the user's real sessions.
+    // First choice: the machine's real local sessions (native command in the desktop; a local cvd
+    // over HTTP in a browser). Only if that's unreachable/empty do we fall back to the sample.
+    const loadedLocal = await this._tryLoadLocal();
+
+    // Now settle the wasm status (for the ingest/status UI), independently of session loading.
     this._wasmState = await main.wasmReady();
     this._updateStatus();
+    if (loadedLocal) return;
 
     try {
       const sample = await main.loadSample();
@@ -69,12 +83,106 @@ class CvApp extends HTMLElement {
         this._isSample = true;
         this._refreshViews();
         this._setStatus(isTauri()
-          ? "Showing the bundled sample — use File → Open in the desktop app, or drop .zip / .json files, to load your own."
+          ? "Showing the bundled sample — couldn't reach a local cvd. Use File → Open, or drop .zip / .json files, to load your own."
           : "Showing the bundled sample dataset — drop one or more .zip / .json files to load your own.");
       }
     } catch (e) {
       console.warn("[claurdvoyant] failed to load sample:", e);
     }
+  }
+
+  // ---- Local sessions via cvd ------------------------------------------------
+  // Load the real on-disk sessions as lightweight *stubs* (metadata, no messages). The full
+  // transcript is fetched lazily in `_showSession` when a row is opened, so startup is fast even
+  // with thousands of sessions. Returns true if it populated the pool.
+  async _tryLoadLocal() {
+    try {
+      let refs;
+      if (canInvokeNative()) {
+        // Desktop: ask the native side directly — no HTTP, no CORS, no mixed-content surprises.
+        // No limit: show every session the user has (stubs are tiny; the list filters/searches them).
+        refs = JSON.parse(await invoke("local_sessions", {}));
+      } else {
+        // Browser: a user may be running `cvd serve`. Try it, but never block startup on it.
+        refs = await this._fetchJsonWithTimeout(`${CVD_BASE}/api/sessions`, 4000);
+        if (!refs) return false;
+      }
+      if (!Array.isArray(refs) || !refs.length) return false;
+      const sessions = normalizeSessions(refs).map((s) => ((s._stub = true), s));
+      if (!sessions.length) return false;
+      this._sessions = sessions;
+      this._sources = [{ name: "local (cvd)", count: sessions.length }];
+      this._isSample = false;
+      this._renderSources?.();
+      this._refreshViews();
+      this._setStatus(
+        `Showing ${sessions.length} local session${sessions.length === 1 ? "" : "s"} from cvd — select one to load its transcript.`,
+        "ok"
+      );
+      return true;
+    } catch (e) {
+      // cvd not running (normal for the static web deploy) — caller falls back to the sample.
+      console.info("[claurdvoyant] no local cvd, using fallback:", e?.message ?? e);
+      return false;
+    }
+  }
+
+  /** Whether a session is a not-yet-hydrated stub (metadata only, no messages loaded). */
+  _needsHydration(s) {
+    return !!(s && s._stub && !(s.messages && s.messages.length));
+  }
+
+  /** Fetch and swap in the full transcript for a stub (native command in the desktop, HTTP in a
+   *  browser). Returns the hydrated session. */
+  async _hydrate(stub) {
+    let raw;
+    if (canInvokeNative()) {
+      raw = JSON.parse(await invoke("local_session", { harness: stub.harness, id: stub.id }));
+    } else {
+      const url = `${CVD_BASE}/api/session/${encodeURIComponent(stub.harness)}/${encodeURIComponent(stub.id)}`;
+      const resp = await fetch(url, { headers: { Accept: "application/json" } });
+      if (!resp.ok) throw new Error(`cvd ${resp.status}`);
+      raw = await resp.json();
+    }
+    const full = normalizeSession(raw);
+    full._stub = false;
+    const i = this._sessions.findIndex((x) => x.id === stub.id && x.harness === stub.harness);
+    if (i >= 0) this._sessions[i] = full; // cache so we don't refetch
+    return full;
+  }
+
+  /** GET JSON with a hard timeout; returns null on any failure/timeout (never throws, never hangs). */
+  async _fetchJsonWithTimeout(url, ms) {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), ms);
+    try {
+      const resp = await fetch(url, { headers: { Accept: "application/json" }, signal: ctrl.signal });
+      return resp.ok ? await resp.json() : null;
+    } catch {
+      return null;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  /** Show a session in the transcript, hydrating from cvd first if it's only a stub. */
+  async _showSession(session) {
+    if (!session) return;
+    let full = session;
+    if (this._needsHydration(session)) {
+      this._transcript.session = session; // render header immediately
+      this._setStatus(`Loading transcript for ${session.title || session.id}…`);
+      try {
+        full = await this._hydrate(session);
+      } catch (e) {
+        console.error("[claurdvoyant] hydrate failed:", e);
+        this._setStatus(`Couldn't load that transcript from cvd (${e?.message ?? e}).`, "error");
+        return;
+      }
+      this._setStatus("", "ok");
+    }
+    this._transcript.session = full;
+    this._list.selectedId = full.id;
   }
 
   // ---- Tauri: native File→Open pushes sessions via the cv://open-sessions event
@@ -124,7 +232,7 @@ class CvApp extends HTMLElement {
           <span class="dz-glyph" aria-hidden="true">📦</span>
           <div class="dz-text">
             <strong>Drop <code>.zip</code> or <code>.json</code> files here</strong>
-            <span class="muted">multiple at once — harness <code>.zip</code>s are parsed by WASM; an OpenSession <code>.json</code> loads directly. Everything merges into one pool.</span>
+            <span class="muted">multiple at once — harness <code>.zip</code>s and OpenSession <code>.json</code> files both load right here. Everything merges into one pool.</span>
           </div>
           <div class="dz-sources" aria-live="polite"></div>
         </div>
@@ -184,6 +292,7 @@ class CvApp extends HTMLElement {
     host.className = "view-host view-" + this._view;
     switch (this._view) {
       case "sessions": host.innerHTML = ""; host.appendChild(this._sessionsView()); break;
+      case "projects": host.innerHTML = `<cv-projects></cv-projects>`; break;
       case "timeline": host.innerHTML = `<cv-timeline></cv-timeline>`; break;
       case "compare": host.innerHTML = `<cv-compare></cv-compare>`; break;
       case "stats": host.innerHTML = `<cv-stats></cv-stats>`; break;
@@ -212,7 +321,7 @@ class CvApp extends HTMLElement {
       this._transcript = layout.querySelector("cv-transcript");
 
       this._list.addEventListener("select", (e) => {
-        this._transcript.session = e.detail.session;
+        this._showSession(e.detail.session);
         layout.classList.add("show-transcript");
         layout.querySelector(".pane-transcript")?.scrollTo?.(0, 0);
       });
@@ -226,28 +335,36 @@ class CvApp extends HTMLElement {
     if (this._list) {
       this._list.sessions = this._sessions;
       if (!this._list.selectedId && this._sessions[0]) {
-        this._transcript.session = this._sessions[0];
-        this._list.selectedId = this._sessions[0].id;
+        // Don't auto-hydrate the first stub on load — it'd fire a fetch for a transcript the user
+        // may never open. Just mark it selected; opening a row hydrates via `_showSession`.
+        if (this._needsHydration(this._sessions[0])) {
+          this._list.selectedId = this._sessions[0].id;
+        } else {
+          this._transcript.session = this._sessions[0];
+          this._list.selectedId = this._sessions[0].id;
+        }
       }
     }
+    const pr = this._host?.querySelector("cv-projects"); if (pr) pr.sessions = this._sessions;
     const t = this._host?.querySelector("cv-timeline"); if (t) t.sessions = this._sessions;
     const c = this._host?.querySelector("cv-compare"); if (c) c.sessions = this._sessions;
     const st = this._host?.querySelector("cv-stats"); if (st) st.sessions = this._sessions;
     const lo = this._host?.querySelector("cv-loom"); if (lo) lo.sessions = this._sessions;
 
-    // Timeline → open in the sessions view.
-    const tl = this._host?.querySelector("cv-timeline");
-    if (tl && !tl._wired) {
-      tl._wired = true;
-      tl.addEventListener("open", (e) => this._openInSessions(e.detail.session));
+    // Timeline + Projects → open a session in the sessions view.
+    for (const sel of ["cv-timeline", "cv-projects"]) {
+      const el = this._host?.querySelector(sel);
+      if (el && !el._wired) {
+        el._wired = true;
+        el.addEventListener("open", (e) => this._openInSessions(e.detail.session));
+      }
     }
   }
 
   _openInSessions(session) {
     this._setView("sessions");
     const v = this._sessionsView();
-    this._transcript.session = session;
-    this._list.selectedId = session.id;
+    this._showSession(session);
     v.classList.add("show-transcript");
   }
 
@@ -450,7 +567,7 @@ class CvApp extends HTMLElement {
   _updateStatus() {
     if (this._wasmState === "missing") {
       this._setStatus(
-        "Demo mode: the WASM parser isn't in this build, so .zip ingest is disabled. You can still drop OpenSession .json files and explore the sample.",
+        "Demo mode: .zip ingest isn't available in this build. You can still drop OpenSession .json files and explore the sample.",
         "warn"
       );
     }

@@ -66,7 +66,8 @@ impl Adapter for Codex {
     }
 
     fn discover(&self) -> Result<Vec<SessionRef>> {
-        let mut out = Vec::new();
+        // Walk (cheap) to collect candidate paths, then scan (file read + parse) them in parallel.
+        let mut paths = Vec::new();
         for root in &self.roots {
             for entry in WalkDir::new(root).into_iter().filter_map(|e| e.ok()) {
                 let path = entry.path();
@@ -77,13 +78,18 @@ impl Adapter for Codex {
                 if !name.ends_with(".jsonl") && !name.ends_with(".json") {
                     continue;
                 }
-                match scan(path) {
-                    Ok(r) => out.push(r),
-                    Err(e) => eprintln!("cv: skipping {}: {e:#}", path.display()),
-                }
+                paths.push(path.to_path_buf());
             }
         }
-        Ok(out)
+        Ok(crate::par_filter_map(paths, |path| {
+            crate::discover_cache::cached_scan(&path, || match scan(&path) {
+                Ok(r) => Some(r),
+                Err(e) => {
+                    eprintln!("cv: skipping {}: {e:#}", path.display());
+                    None
+                }
+            })
+        }))
     }
 
     fn parse(&self, r: &SessionRef) -> Result<Session> {
@@ -759,110 +765,181 @@ fn parse_ts(s: &str) -> Option<DateTime<Utc>> {
         .map(|d| d.with_timezone(&Utc))
 }
 
-/// Cheap metadata scan for `discover`.
-fn scan(path: &Path) -> Result<SessionRef> {
-    let text = fs::read_to_string(path)?;
-    let mut id = String::new();
-    let mut cwd = None;
-    let mut title: Option<String> = None;
-    let mut created_at: Option<DateTime<Utc>> = None;
-    let mut updated_at: Option<DateTime<Utc>> = None;
-    let mut message_count = 0usize;
+/// Accumulates the cheap metadata `discover` needs, one record at a time. Factored out of [`scan`]
+/// so it can be fed either the whole file (small sessions) or just a head+tail sample (huge ones).
+#[derive(Default)]
+struct CodexScan {
+    id: String,
+    cwd: Option<PathBuf>,
+    title: Option<String>,
+    created_at: Option<DateTime<Utc>>,
+    updated_at: Option<DateTime<Utc>>,
+    message_count: usize,
+}
 
-    let mut consider_title = |t: String| {
+impl CodexScan {
+    fn consider_title(&mut self, t: &str) {
         let trimmed = t.trim();
         // Skip Codex's injected preambles — they aren't the user's first words.
         let is_injected = trimmed.starts_with("<environment_context")
             || trimmed.starts_with("<user_instructions")
             || trimmed.starts_with("# Codex CLI");
-        if title.is_none() && !trimmed.is_empty() && !is_injected {
-            title = Some(crate::ir::truncate(trimmed, 80));
+        if self.title.is_none() && !trimmed.is_empty() && !is_injected {
+            self.title = Some(crate::ir::truncate(trimmed, 80));
         }
-    };
+    }
 
-    if path.extension().and_then(|e| e.to_str()) == Some("jsonl") {
-        for line in text.lines() {
-            let line = line.trim();
-            if line.is_empty() {
-                continue;
-            }
-            let Ok(v) = serde_json::from_str::<Value>(line) else {
-                continue;
-            };
-            if let Some(ts) = top_ts(&v) {
-                created_at.get_or_insert(ts);
-                updated_at = Some(ts);
-            }
-            match v.get("type").and_then(Value::as_str) {
-                None => {
-                    if id.is_empty() {
-                        if let Some(i) = v.get("id").and_then(Value::as_str) {
-                            id = i.to_string();
-                        }
-                    }
-                }
-                Some("session_meta") => {
-                    let p = v.get("payload");
-                    if id.is_empty() {
-                        if let Some(i) = p.and_then(|p| p.get("id")).and_then(Value::as_str) {
-                            id = i.to_string();
-                        }
-                    }
-                    if cwd.is_none() {
-                        cwd = p
-                            .and_then(|p| p.get("cwd"))
-                            .and_then(Value::as_str)
-                            .map(PathBuf::from);
-                    }
-                }
-                Some("event_msg") => {
-                    if v.pointer("/payload/type").and_then(Value::as_str) == Some("user_message") {
-                        message_count += 1;
-                        if let Some(t) = v.pointer("/payload/message").and_then(Value::as_str) {
-                            consider_title(t.to_string());
-                        }
-                    } else if v.pointer("/payload/type").and_then(Value::as_str)
-                        == Some("agent_message")
-                    {
-                        message_count += 1;
-                    }
-                }
-                Some("response_item") => {
-                    if v.pointer("/payload/type").and_then(Value::as_str) == Some("message") {
-                        message_count += 1;
-                        if v.pointer("/payload/role").and_then(Value::as_str) == Some("user") {
-                            consider_title(coerce_content(v.pointer("/payload/content")));
-                        }
-                    }
-                }
-                _ => {}
-            }
+    /// Ingest one `.jsonl` record line.
+    fn feed(&mut self, line: &str) {
+        let line = line.trim();
+        if line.is_empty() {
+            return;
         }
-    } else if let Ok(root) = serde_json::from_str::<Value>(&text) {
-        id = root
+        let Ok(v) = serde_json::from_str::<Value>(line) else {
+            return;
+        };
+        if let Some(ts) = top_ts(&v) {
+            self.created_at.get_or_insert(ts);
+            self.updated_at = Some(ts);
+        }
+        match v.get("type").and_then(Value::as_str) {
+            None => {
+                if self.id.is_empty() {
+                    if let Some(i) = v.get("id").and_then(Value::as_str) {
+                        self.id = i.to_string();
+                    }
+                }
+            }
+            Some("session_meta") => {
+                let p = v.get("payload");
+                if self.id.is_empty() {
+                    if let Some(i) = p.and_then(|p| p.get("id")).and_then(Value::as_str) {
+                        self.id = i.to_string();
+                    }
+                }
+                if self.cwd.is_none() {
+                    self.cwd = p
+                        .and_then(|p| p.get("cwd"))
+                        .and_then(Value::as_str)
+                        .map(PathBuf::from);
+                }
+            }
+            Some("event_msg") => {
+                let pt = v.pointer("/payload/type").and_then(Value::as_str);
+                if pt == Some("user_message") {
+                    self.message_count += 1;
+                    if let Some(t) = v.pointer("/payload/message").and_then(Value::as_str) {
+                        self.consider_title(t);
+                    }
+                } else if pt == Some("agent_message") {
+                    self.message_count += 1;
+                }
+            }
+            Some("response_item") => {
+                if v.pointer("/payload/type").and_then(Value::as_str) == Some("message") {
+                    self.message_count += 1;
+                    if v.pointer("/payload/role").and_then(Value::as_str) == Some("user") {
+                        self.consider_title(&coerce_content(v.pointer("/payload/content")));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Ingest a legacy single-object `.json` recording.
+    fn feed_json_object(&mut self, root: &Value) {
+        self.id = root
             .pointer("/session/id")
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_string();
-        created_at = root
+        self.created_at = root
             .pointer("/session/timestamp")
             .and_then(Value::as_str)
             .and_then(parse_ts);
-        updated_at = created_at;
+        self.updated_at = self.created_at;
         if let Some(items) = root.get("items").and_then(Value::as_array) {
             for it in items {
                 if it.get("type").and_then(Value::as_str) == Some("message") {
-                    message_count += 1;
+                    self.message_count += 1;
                     if it.get("role").and_then(Value::as_str) == Some("user") {
-                        consider_title(coerce_content(it.get("content")));
+                        self.consider_title(&coerce_content(it.get("content")));
                     }
                 }
             }
         }
     }
+}
 
-    if id.is_empty() {
-        id = path
+/// Read at most `n` bytes from the start of `path`, trimmed back to the last complete line.
+fn read_head(path: &Path, n: usize) -> Result<String> {
+    use std::io::Read;
+    let f = fs::File::open(path)?;
+    let mut buf = Vec::with_capacity(n.min(1 << 20));
+    f.take(n as u64).read_to_end(&mut buf)?;
+    if let Some(pos) = buf.iter().rposition(|&b| b == b'\n') {
+        buf.truncate(pos);
+    }
+    Ok(String::from_utf8_lossy(&buf).into_owned())
+}
+
+/// Read the last `n` bytes of `path` (the first line is likely partial — callers should skip it).
+fn read_tail(path: &Path, n: usize) -> Result<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = fs::File::open(path)?;
+    let len = f.metadata()?.len();
+    f.seek(SeekFrom::Start(len.saturating_sub(n as u64)))?;
+    let mut buf = Vec::new();
+    f.read_to_end(&mut buf)?;
+    Ok(String::from_utf8_lossy(&buf).into_owned())
+}
+
+/// Cheap metadata scan for `discover`. Files up to [`FULL_SCAN_CAP`] are parsed in full; larger ones
+/// (Codex rollout logs can be hundreds of MB) are sampled head+tail so discovery never reads — and
+/// JSON-parses — gigabytes just to list sessions. Exact content is parsed lazily on actual open.
+fn scan(path: &Path) -> Result<SessionRef> {
+    const FULL_SCAN_CAP: u64 = 8 << 20; // 8 MiB
+    const SAMPLE: usize = 1 << 20; // 1 MiB head, 1 MiB tail
+
+    let size = fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    let is_jsonl = path.extension().and_then(|e| e.to_str()) == Some("jsonl");
+    let mut s = CodexScan::default();
+
+    if is_jsonl {
+        if size <= FULL_SCAN_CAP {
+            let text = fs::read_to_string(path)?;
+            for line in text.lines() {
+                s.feed(line);
+            }
+        } else {
+            // Head: id / cwd / title / created_at all live near the top.
+            let head = read_head(path, SAMPLE)?;
+            let head_len = head.len().max(1) as u128;
+            for line in head.lines() {
+                s.feed(line);
+            }
+            let head_msgs = s.message_count;
+            // Tail: the last record carries the real updated_at. Skip the (likely partial) first line.
+            let tail = read_tail(path, SAMPLE)?;
+            for line in tail.lines().skip(1) {
+                s.feed(line);
+            }
+            // We never read the middle, so the count is a head-density estimate — kept roughly
+            // monotonic with file growth. The true count comes from a full parse on open.
+            let est = (head_msgs as u128 * size as u128 / head_len) as usize;
+            s.message_count = est.max(s.message_count);
+        }
+    } else {
+        // Legacy single-object `.json` recordings are small; read fully.
+        let text = fs::read_to_string(path)?;
+        if let Ok(root) = serde_json::from_str::<Value>(&text) {
+            s.feed_json_object(&root);
+        }
+    }
+
+    if s.id.is_empty() {
+        s.id = path
             .file_stem()
             .and_then(|s| s.to_str())
             .unwrap_or("")
@@ -870,14 +947,14 @@ fn scan(path: &Path) -> Result<SessionRef> {
     }
 
     Ok(SessionRef {
-        id,
+        id: s.id,
         harness: Harness::Codex,
         path: path.to_path_buf(),
-        cwd,
-        title,
-        created_at,
-        updated_at,
-        message_count,
+        cwd: s.cwd,
+        title: s.title,
+        created_at: s.created_at,
+        updated_at: s.updated_at,
+        message_count: s.message_count,
     })
 }
 

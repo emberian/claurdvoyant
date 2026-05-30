@@ -38,7 +38,10 @@ pub struct EmitResult {
 }
 
 /// A harness adapter. Implementors live in submodules and are registered in [`all`].
-pub trait Adapter {
+///
+/// `Send + Sync` so [`crate::discover_all`] can fan discovery across adapters in parallel. Every
+/// adapter holds only path data (connections are opened per call), so this bound is always satisfied.
+pub trait Adapter: Send + Sync {
     fn harness(&self) -> Harness;
 
     /// The on-disk root this adapter reads from (already resolved against $HOME), if it exists.

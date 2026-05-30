@@ -64,33 +64,40 @@ impl Adapter for Gemini {
         let Some(root) = &self.root else {
             return Ok(vec![]);
         };
-        let mut out = Vec::new();
-        for entry in WalkDir::new(root).into_iter().filter_map(|e| e.ok()) {
-            if !entry.file_type().is_file() {
-                continue;
-            }
-            let name = entry.file_name().to_string_lossy();
-            let path = entry.path();
-
-            if name == "logs.json" {
-                if let Ok(text) = fs::read_to_string(path) {
-                    out.extend(refs_from_logs(&text, path));
-                }
-            } else if is_chat_recording(path) {
-                if let Ok(text) = fs::read_to_string(path) {
-                    if let Some(s) = parse_chat_recording(&text, Some(path.to_path_buf())) {
-                        out.push(session_ref(&s, path));
+        // Collect candidate file paths first (cheap walk), then read+parse in parallel. A single
+        // `logs.json` can expand into many sessions, so this is a flat-map.
+        let paths: Vec<_> = WalkDir::new(root)
+            .into_iter()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_type().is_file())
+            .map(|e| e.into_path())
+            .collect();
+        Ok(crate::par_flat_map(paths, |path| {
+            crate::discover_cache::cached_scan_many(&path, || {
+                let name = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                if name == "logs.json" {
+                    if let Ok(text) = fs::read_to_string(&path) {
+                        return refs_from_logs(&text, &path);
+                    }
+                } else if is_chat_recording(&path) {
+                    if let Ok(text) = fs::read_to_string(&path) {
+                        if let Some(s) = parse_chat_recording(&text, Some(path.clone())) {
+                            return vec![session_ref(&s, &path)];
+                        }
+                    }
+                } else if is_checkpoint(&name) {
+                    if let Ok(text) = fs::read_to_string(&path) {
+                        if let Some(s) = parse_checkpoint(&text, &name, Some(path.clone())) {
+                            return vec![session_ref(&s, &path)];
+                        }
                     }
                 }
-            } else if is_checkpoint(&name) {
-                if let Ok(text) = fs::read_to_string(path) {
-                    if let Some(s) = parse_checkpoint(&text, &name, Some(path.to_path_buf())) {
-                        out.push(session_ref(&s, path));
-                    }
-                }
-            }
-        }
-        Ok(out)
+                Vec::new()
+            })
+        }))
     }
 
     fn parse(&self, r: &SessionRef) -> Result<Session> {

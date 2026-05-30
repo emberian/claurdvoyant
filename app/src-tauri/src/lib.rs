@@ -151,6 +151,54 @@ fn ingest_zip_bytes(bytes: &[u8]) -> Result<String, String> {
     serde_json::to_string(&sessions).map_err(|e| format!("serializing sessions: {e}"))
 }
 
+/// List the machine's real on-disk sessions as lightweight metadata stubs (id/harness/cwd/title/
+/// counts/dates — no messages), newest-first, capped at `limit`. The web UI shows these in the main
+/// list and lazily fetches the full transcript via [`local_session`] when a row is opened. This is
+/// the native, HTTP-free path the desktop app uses instead of reaching `cvd` over the network (the
+/// webview's cross-origin fetch to `http://localhost` is unreliable).
+#[tauri::command]
+fn local_sessions(limit: Option<usize>) -> Result<String, String> {
+    let mut refs = cv_core::discover_all();
+    // Newest-first by updated_at (then created_at), missing dates sort last.
+    refs.sort_by(|a, b| {
+        let ka = a.updated_at.or(a.created_at);
+        let kb = b.updated_at.or(b.created_at);
+        kb.cmp(&ka)
+    });
+    if let Some(n) = limit {
+        refs.truncate(n);
+    }
+    // Emit the same field names the IR/serde shape uses, so the JS `normalizeSession` reads them.
+    let stubs: Vec<serde_json::Value> = refs
+        .iter()
+        .map(|r| {
+            serde_json::json!({
+                "id": r.id,
+                "harness": r.harness.as_str(),
+                "cwd": r.cwd.as_ref().map(|p| p.to_string_lossy()),
+                "title": r.title,
+                "created_at": r.created_at,
+                "updated_at": r.updated_at,
+                "message_count": r.message_count,
+            })
+        })
+        .collect();
+    serde_json::to_string(&stubs).map_err(|e| format!("serializing session stubs: {e}"))
+}
+
+/// Parse one on-disk session fully into IR and return it as JSON. `harness`/`id` come from a stub
+/// produced by [`local_sessions`]. This is the native equivalent of cvd's `/api/session/{h}/{id}`.
+#[tauri::command]
+fn local_session(harness: String, id: String) -> Result<String, String> {
+    let want = cv_core::Harness::parse(&harness)
+        .ok_or_else(|| format!("unknown harness {harness:?}"))?;
+    let (r, adapter) = cv_core::find(&id, Some(want))
+        .map_err(|e| format!("looking up session: {e:#}"))?
+        .ok_or_else(|| format!("no session {id:?} for harness {harness}"))?;
+    let session = adapter.parse(&r).map_err(|e| format!("parsing session: {e:#}"))?;
+    serde_json::to_string(&session).map_err(|e| format!("serializing session: {e}"))
+}
+
 /// Report whether an LLM provider is configured (so the UI can enable/disable distill/loom).
 #[derive(Serialize)]
 struct ProviderInfo {
@@ -399,7 +447,9 @@ pub fn run() {
             redact,
             generate,
             ingest_zip,
-            provider_info
+            provider_info,
+            local_sessions,
+            local_session
         ])
         .on_menu_event(handle_menu_event)
         .setup(|app| {

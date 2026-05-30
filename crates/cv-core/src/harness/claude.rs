@@ -46,25 +46,26 @@ impl Adapter for Claude {
         let Some(root) = &self.root else {
             return Ok(vec![]);
         };
-        let mut out = Vec::new();
         // Session files sit at projects/<encoded>/<sid>.jsonl (depth 2). Subagent transcripts live
-        // deeper (…/<sid>/subagents/…), which max_depth(2) naturally excludes.
-        for entry in WalkDir::new(root)
+        // deeper (…/<sid>/subagents/…), which max_depth(2) naturally excludes. Collect paths (cheap),
+        // then scan (read + parse) them in parallel.
+        let paths: Vec<_> = WalkDir::new(root)
             .min_depth(2)
             .max_depth(2)
             .into_iter()
             .filter_map(|e| e.ok())
-        {
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
-                continue;
-            }
-            match scan(path) {
-                Ok(r) => out.push(r),
-                Err(e) => eprintln!("cv: skipping {}: {e:#}", path.display()),
-            }
-        }
-        Ok(out)
+            .map(|e| e.into_path())
+            .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("jsonl"))
+            .collect();
+        Ok(crate::par_filter_map(paths, |path| {
+            crate::discover_cache::cached_scan(&path, || match scan(&path) {
+                Ok(r) => Some(r),
+                Err(e) => {
+                    eprintln!("cv: skipping {}: {e:#}", path.display());
+                    None
+                }
+            })
+        }))
     }
 
     fn parse(&self, r: &SessionRef) -> Result<Session> {

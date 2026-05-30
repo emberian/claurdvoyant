@@ -6,9 +6,8 @@
 //
 // Filters: free-text search (matches title/cwd/model/all message content),
 // harness multi-select, sort by recency / title / message count.
-import "./cv-harness-badge.js";
 import {
-  esc, fmtTime, sortTime, searchableText, sessionLabel, shortPath,
+  esc, fmtTime, sortTime, searchableText, sessionLabel, shortPath, msgCount, harnessBadge,
   HARNESS_LABELS,
 } from "./util.js";
 
@@ -61,7 +60,7 @@ class CvSessionList extends HTMLElement {
       recent: (a, b) => sortTime(b) - sortTime(a),
       oldest: (a, b) => sortTime(a) - sortTime(b),
       title: (a, b) => sessionLabel(a).localeCompare(sessionLabel(b)),
-      messages: (a, b) => (b.messages?.length || 0) - (a.messages?.length || 0),
+      messages: (a, b) => (msgCount(b) - msgCount(a)),
     }[this._sort] || ((a, b) => 0);
     return rows.slice().sort(cmp);
   }
@@ -107,16 +106,25 @@ class CvSessionList extends HTMLElement {
 
     // Wire events.
     const search = this.querySelector(".search");
-    search.addEventListener("input", () => { this._query = search.value; this._rerenderRows(); });
+    // Debounce: re-filtering scans every session's searchable text, so don't do it on every keystroke.
+    search.addEventListener("input", () => {
+      this._query = search.value;
+      clearTimeout(this._searchTimer);
+      this._searchTimer = setTimeout(() => this._rerenderRows(), 140);
+    });
     this.querySelector("select").addEventListener("change", (e) => {
       this._sort = e.target.value; this._rerenderRows();
     });
     this.querySelectorAll(".chip").forEach((btn) => {
       btn.addEventListener("click", () => {
         const h = btn.dataset.harness;
-        if (this._harnessFilter.has(h)) this._harnessFilter.delete(h);
+        const on = this._harnessFilter.has(h);
+        if (on) this._harnessFilter.delete(h);
         else this._harnessFilter.add(h);
-        this.render();
+        // Toggle just this chip + re-filter the rows — no full component rebuild.
+        btn.classList.toggle("on", !on);
+        btn.setAttribute("aria-pressed", String(!on));
+        this._rerenderRows();
       });
     });
     this._wireRows();
@@ -136,12 +144,12 @@ class CvSessionList extends HTMLElement {
     const id = s.id || "";
     const sel = id && id === this._selectedId ? " selected" : "";
     const when = fmtTime(s.updated_at || s.created_at);
-    const count = s.messages?.length || 0;
+    const count = msgCount(s);
     const cwd = s.cwd ? `<span class="row-cwd" title="${esc(s.cwd)}">${esc(shortPath(s.cwd))}</span>` : "";
     return `
       <li class="session-row${sel}" role="option" aria-selected="${!!sel}" data-id="${esc(id)}" tabindex="0">
         <div class="row-top">
-          <cv-harness-badge harness="${esc((s.harness || "").toLowerCase())}"></cv-harness-badge>
+          ${harnessBadge((s.harness || "").toLowerCase())}
           <span class="row-title">${esc(sessionLabel(s))}</span>
         </div>
         <div class="row-meta muted">
@@ -153,12 +161,20 @@ class CvSessionList extends HTMLElement {
   }
 
   _wireRows() {
-    this.querySelectorAll(".session-row").forEach((li) => {
-      const fire = () => this._selectById(li.dataset.id);
-      li.addEventListener("click", fire);
-      li.addEventListener("keydown", (e) => {
-        if (e.key === "Enter" || e.key === " ") { e.preventDefault(); fire(); }
-      });
+    // Event delegation: one listener on the <ul>, not two per row — so thousands of sessions don't
+    // mean thousands of listeners (and re-rendering rows doesn't leak old ones).
+    const ul = this.querySelector(".session-rows");
+    if (!ul || ul._delegated) return;
+    ul._delegated = true;
+    const rowId = (e) => e.target.closest(".session-row")?.dataset.id;
+    ul.addEventListener("click", (e) => {
+      const id = rowId(e);
+      if (id) this._selectById(id);
+    });
+    ul.addEventListener("keydown", (e) => {
+      if (e.key !== "Enter" && e.key !== " ") return;
+      const id = rowId(e);
+      if (id) { e.preventDefault(); this._selectById(id); }
     });
   }
 
@@ -190,11 +206,19 @@ class CvSessionList extends HTMLElement {
   }
 
   _updateSelection() {
-    this.querySelectorAll(".session-row").forEach((li) => {
-      const on = li.dataset.id === this._selectedId;
-      li.classList.toggle("selected", on);
-      li.setAttribute("aria-selected", String(on));
-    });
+    // Touch only the previously-selected row and the new one, not all N rows.
+    const prev = this.querySelector(".session-row.selected");
+    if (prev && prev.dataset.id !== this._selectedId) {
+      prev.classList.remove("selected");
+      prev.setAttribute("aria-selected", "false");
+    }
+    if (this._selectedId != null) {
+      const next = this.querySelector(`.session-row[data-id="${CSS.escape(this._selectedId)}"]`);
+      if (next) {
+        next.classList.add("selected");
+        next.setAttribute("aria-selected", "true");
+      }
+    }
   }
 }
 

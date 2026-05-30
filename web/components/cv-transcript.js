@@ -11,11 +11,6 @@ import {
 } from "./util.js";
 import { renderMarkdown, renderCodeBlock } from "../markdown.js";
 
-// Above this message count we lazily render: only a window of messages is in
-// the DOM at once, so a 12k-message session doesn't freeze the tab.
-const VIRTUALIZE_THRESHOLD = 200;
-const WINDOW_PAD = 6; // messages of overscan above/below the viewport
-
 class CvTranscript extends HTMLElement {
   constructor() {
     super();
@@ -27,7 +22,6 @@ class CvTranscript extends HTMLElement {
 
   set session(s) {
     this._session = s || null;
-    this._virtual = null;
     this.render();
   }
   get session() { return this._session; }
@@ -36,17 +30,7 @@ class CvTranscript extends HTMLElement {
 
   connectedCallback() { if (!this.childElementCount) this.render(); }
 
-  disconnectedCallback() { this._teardownVirtual(); }
-
-  _teardownVirtual() {
-    if (this._scrollHost && this._onScroll) this._scrollHost.removeEventListener("scroll", this._onScroll);
-    this._scrollHost = null;
-    this._onScroll = null;
-    this._virtual = null;
-  }
-
   render() {
-    this._teardownVirtual();
     const s = this._session;
     if (!s) {
       this.innerHTML = `<div class="transcript-empty muted">
@@ -55,18 +39,31 @@ class CvTranscript extends HTMLElement {
       return;
     }
 
+    // `content-visibility:auto` on `.turn` (CSS) makes the browser skip layout/paint for off-screen
+    // turns and remember each turn's real height once measured — native, correct virtualization. (The
+    // old hand-rolled sliding window mapped scroll through *estimated* heights, so one tall Gemini
+    // message threw off the math and left blank gaps on scroll.)
+    //
+    // Building the HTML is the only O(n) cost left (markdown per block), so for huge sessions (20k+
+    // messages exist) we render the first screenful synchronously, then append the rest in
+    // rAF-scheduled chunks — instant open, no freeze, and scrolling works as chunks fill in.
     const messages = s.messages || [];
-    if (messages.length > VIRTUALIZE_THRESHOLD) {
-      this._renderVirtual(s, messages);
-    } else {
-      this.innerHTML = `
-        ${this._headerHtml(s)}
-        <div class="turns">${messages.map((m, i) => this._messageHtml(m, i)).join("")}</div>
-      `;
-    }
-
+    this.innerHTML = `${this._headerHtml(s)}<div class="turns"></div>`;
     this._wireHeader(s);
-    this._wireBlocks(this);
+    const turns = this.querySelector(".turns");
+
+    const CHUNK = 250;
+    let i = 0;
+    const renderChunk = () => {
+      if (this._session !== s) return; // session changed mid-render — abandon this pass
+      const end = Math.min(messages.length, i + CHUNK);
+      let html = "";
+      for (; i < end; i++) html += this._messageHtml(messages[i], i);
+      turns.insertAdjacentHTML("beforeend", html);
+      this._wireBlocks(turns);
+      if (i < messages.length) requestAnimationFrame(renderChunk);
+    };
+    renderChunk(); // first chunk synchronously, so content is on screen immediately
   }
 
   // Header-level controls (export buttons) — wired once per render.
@@ -107,99 +104,6 @@ class CvTranscript extends HTMLElement {
         } catch { /* clipboard may be unavailable */ }
       });
     });
-  }
-
-  // ---- virtualization ----------------------------------------------------
-  // For very long transcripts we keep only a sliding window of messages in the
-  // DOM. Spacer rows reserve the remaining vertical space so the scrollbar and
-  // scroll position behave normally. Heights are estimated, then corrected with
-  // measured values as messages scroll through, so the spacers stay honest.
-
-  _renderVirtual(s, messages) {
-    this.innerHTML = `
-      ${this._headerHtml(s)}
-      <div class="virtual-note muted">⚡ Lazy-rendering ${messages.length.toLocaleString()} messages for performance.</div>
-      <div class="turns turns-virtual">
-        <div class="v-spacer v-top" style="height:0"></div>
-        <div class="v-window"></div>
-        <div class="v-spacer v-bottom" style="height:0"></div>
-      </div>`;
-
-    const window_ = this.querySelector(".v-window");
-    const topSpacer = this.querySelector(".v-top");
-    const botSpacer = this.querySelector(".v-bottom");
-
-    // Per-message estimated height; corrected as we measure rendered rows.
-    const est = 120;
-    const heights = new Array(messages.length).fill(est);
-
-    this._virtual = { messages, heights, est, window_, topSpacer, botSpacer, start: -1, end: -1 };
-
-    // Find the scroll container: the nearest ancestor that actually scrolls.
-    this._scrollHost = this._findScrollHost();
-    this._onScroll = () => this._syncWindow();
-    this._scrollHost.addEventListener("scroll", this._onScroll, { passive: true });
-    // Also respond to resize (layout changes window math).
-    this._syncWindow();
-    requestAnimationFrame(() => this._syncWindow());
-  }
-
-  _findScrollHost() {
-    let el = this.parentElement;
-    while (el && el !== document.body) {
-      const oy = getComputedStyle(el).overflowY;
-      if ((oy === "auto" || oy === "scroll") && el.scrollHeight > el.clientHeight + 4) return el;
-      el = el.parentElement;
-    }
-    return this.parentElement || document.scrollingElement || document.documentElement;
-  }
-
-  _syncWindow() {
-    const v = this._virtual;
-    if (!v) return;
-    const host = this._scrollHost;
-    const hostRect = host.getBoundingClientRect();
-    const turnsTop = this.querySelector(".turns-virtual").getBoundingClientRect().top;
-    // Offset of the turns container relative to the scroll content top.
-    const scrolled = host.scrollTop + (hostRect.top - turnsTop);
-    const viewTop = scrolled;
-    const viewBottom = scrolled + host.clientHeight;
-
-    // Walk cumulative heights to find the visible range.
-    let acc = 0, start = 0;
-    while (start < v.messages.length && acc + v.heights[start] < viewTop) { acc += v.heights[start]; start++; }
-    const topPad = acc;
-    let end = start;
-    while (end < v.messages.length && acc < viewBottom) { acc += v.heights[end]; end++; }
-
-    start = Math.max(0, start - WINDOW_PAD);
-    end = Math.min(v.messages.length, end + WINDOW_PAD);
-
-    if (start === v.start && end === v.end) return;
-    v.start = start; v.end = end;
-
-    // Reserve space above the first rendered message.
-    let above = 0; for (let i = 0; i < start; i++) above += v.heights[i];
-    let below = 0; for (let i = end; i < v.messages.length; i++) below += v.heights[i];
-    v.topSpacer.style.height = `${above}px`;
-    v.botSpacer.style.height = `${below}px`;
-
-    v.window_.innerHTML = v.messages.slice(start, end).map((m, j) => this._messageHtml(m, start + j)).join("");
-    this._wireBlocks(v.window_);
-
-    // Correct height estimates from the actually-rendered rows.
-    let corrected = false;
-    [...v.window_.children].forEach((node, j) => {
-      const h = node.offsetHeight;
-      const idx = start + j;
-      if (h && Math.abs(h - v.heights[idx]) > 2) { v.heights[idx] = h; corrected = true; }
-    });
-    if (corrected) {
-      let above2 = 0; for (let i = 0; i < start; i++) above2 += v.heights[i];
-      let below2 = 0; for (let i = end; i < v.messages.length; i++) below2 += v.heights[i];
-      v.topSpacer.style.height = `${above2}px`;
-      v.botSpacer.style.height = `${below2}px`;
-    }
   }
 
   _headerHtml(s) {

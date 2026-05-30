@@ -11,15 +11,20 @@
 // In a plain browser none of this exists, so every helper degrades to a no-op /
 // `false`, and callers fall back to the in-JS OpenRouter path.
 
-/** True when running inside the Tauri desktop shell. */
+/** True when running inside the Tauri desktop shell. `__TAURI_INTERNALS__` is the low-level bridge
+ *  that is ALWAYS present in the webview (even when `withGlobalTauri` is off and the high-level
+ *  `window.__TAURI__` object isn't injected), so it's the reliable presence signal. */
 export function isTauri() {
-  return typeof window !== "undefined" && !!window.__TAURI__;
+  return typeof window !== "undefined"
+    && !!(window.__TAURI_INTERNALS__ || window.__TAURI__);
 }
 
-/** The native `invoke` fn, or null in a browser. */
+/** The native `invoke` fn, or null in a browser. Prefer the high-level API, but fall back to the
+ *  always-present internals bridge so native commands work regardless of `withGlobalTauri`. */
 function invokeFn() {
   return window.__TAURI__?.core?.invoke
     ?? window.__TAURI__?.invoke // older Tauri exposed it at the root
+    ?? window.__TAURI_INTERNALS__?.invoke // low-level bridge, always injected
     ?? null;
 }
 

@@ -16,11 +16,15 @@ thiserror.workspace = true
 walkdir.workspace = true
 percent-encoding.workspace = true
 rusqlite = { workspace = true, optional = true }
+rayon = { workspace = true, optional = true }
 dirs.workspace = true
 uuid.workspace = true
 
 [features]
-default = ["sqlite"]
+default = ["sqlite", "parallel"]
 # `sqlite` pulls in rusqlite (native C SQLite) for the Hermes adapter and the FTS index.
 # Disable it (e.g. `--no-default-features`) to compile cv-core for wasm32.
 sqlite = ["dep:rusqlite"]
+# `parallel` fans discovery across adapters/files with rayon. Off for wasm32 (no threads); the code
+# has a sequential fallback so behavior is identical, just slower.
+parallel = ["dep:rayon"]

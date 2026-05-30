@@ -5,7 +5,7 @@
 // Totals, per-harness counts, message counts, top cwds, date range, token
 // sums. Charts are hand-rolled CSS bars + a tiny inline SVG activity sparkline.
 // No chart library.
-import { esc, fmtTime, sortTime, shortPath, sumTokens, HARNESS_LABELS } from "./util.js";
+import { esc, fmtTime, sortTime, shortPath, sumTokens, msgCount, HARNESS_LABELS } from "./util.js";
 
 class CvStats extends HTMLElement {
   constructor() {
@@ -20,36 +20,47 @@ class CvStats extends HTMLElement {
 
   _compute() {
     const sessions = this._sessions;
-    let messages = 0, tokIn = 0, tokOut = 0, tokCache = 0;
+    // `messages` uses msgCount so it counts metadata-only stubs (which carry message_count) too.
+    // Role/block breakdowns and token sums need the actual message tree, so they're tallied only over
+    // *hydrated* sessions and disclosed as such — never silently zero.
+    let messages = 0, hydrated = 0, tokIn = 0, tokOut = 0, tokCache = 0;
     const perHarness = new Map();
     const perRole = new Map();
     const cwds = new Map();
+    const projects = new Map();
     const times = [];
     const blockKinds = new Map();
 
     for (const s of sessions) {
       const h = (s.harness || "?").toLowerCase();
       perHarness.set(h, (perHarness.get(h) || 0) + 1);
-      if (s.cwd) cwds.set(s.cwd, (cwds.get(s.cwd) || 0) + 1);
+      if (s.cwd) {
+        cwds.set(s.cwd, (cwds.get(s.cwd) || 0) + 1);
+        projects.set(s.cwd, true);
+      }
       const t = sortTime(s);
       if (t > 0) times.push(t);
-      const tk = sumTokens(s);
-      tokIn += tk.input; tokOut += tk.output; tokCache += tk.cacheRead;
-      for (const m of s.messages || []) {
-        messages++;
-        const r = (m.role || "?").toLowerCase();
-        perRole.set(r, (perRole.get(r) || 0) + 1);
-        for (const b of m.content || []) {
-          const k = b?.kind || "?";
-          blockKinds.set(k, (blockKinds.get(k) || 0) + 1);
+      messages += msgCount(s);
+      const msgs = s.messages || [];
+      if (msgs.length) {
+        hydrated++;
+        const tk = sumTokens(s);
+        tokIn += tk.input; tokOut += tk.output; tokCache += tk.cacheRead;
+        for (const m of msgs) {
+          const r = (m.role || "?").toLowerCase();
+          perRole.set(r, (perRole.get(r) || 0) + 1);
+          for (const b of m.content || []) {
+            const k = b?.kind || "?";
+            blockKinds.set(k, (blockKinds.get(k) || 0) + 1);
+          }
         }
       }
     }
 
     times.sort((a, b) => a - b);
     return {
-      sessions: sessions.length, messages, tokIn, tokOut, tokCache,
-      perHarness, perRole, blockKinds,
+      sessions: sessions.length, messages, hydrated, tokIn, tokOut, tokCache,
+      perHarness, perRole, blockKinds, projects: projects.size,
       cwds: [...cwds.entries()].sort((a, b) => b[1] - a[1]).slice(0, 6),
       range: times.length ? [times[0], times[times.length - 1]] : null,
       times,
@@ -64,19 +75,29 @@ class CvStats extends HTMLElement {
     const c = this._compute();
 
     const cards = [
-      ["Sessions", c.sessions],
+      ["Sessions", c.sessions.toLocaleString()],
       ["Messages", c.messages.toLocaleString()],
+      ["Projects", c.projects.toLocaleString()],
       ["Harnesses", c.perHarness.size],
       ["Input tokens", c.tokIn ? c.tokIn.toLocaleString() : "—"],
       ["Output tokens", c.tokOut ? c.tokOut.toLocaleString() : "—"],
-      ["Cached tokens", c.tokCache ? c.tokCache.toLocaleString() : "—"],
     ].map(([k, v]) => `<div class="stat-card"><div class="stat-num">${esc(String(v))}</div><div class="stat-label muted">${esc(k)}</div></div>`).join("");
 
+    // Honest disclosure: message-level charts only reflect sessions whose transcript is loaded.
+    const unhydrated = c.sessions - c.hydrated;
+    const note = unhydrated > 0
+      ? `<div class="stat-note muted">Role, block &amp; token breakdowns reflect the ${c.hydrated.toLocaleString()} opened session${c.hydrated === 1 ? "" : "s"} — open more to enrich them. (${unhydrated.toLocaleString()} not yet loaded.)</div>`
+      : "";
+
+    const needsHydration = (map, label) =>
+      map.size ? this._barsHtml(map, ...label) : `<p class="muted">${c.hydrated ? "none" : "open a session to populate"}</p>`;
+
     this.innerHTML = `
-      <div class="view-head"><h2>Stats</h2>
+      <div class="view-head"><h2>📊 Stats</h2>
         <span class="muted">${c.range ? `${esc(fmtTime(new Date(c.range[0]).toISOString()))} → ${esc(fmtTime(new Date(c.range[1]).toISOString()))}` : "no timestamps"}</span>
       </div>
       <div class="stat-grid">${cards}</div>
+      ${note}
       <div class="stat-cols">
         <section class="stat-block">
           <h3>Sessions per harness</h3>
@@ -84,11 +105,11 @@ class CvStats extends HTMLElement {
         </section>
         <section class="stat-block">
           <h3>Messages by role</h3>
-          ${this._barsHtml(c.perRole, (k) => k, () => "var(--accent)")}
+          ${needsHydration(c.perRole, [(k) => k, () => "var(--accent)"])}
         </section>
         <section class="stat-block">
           <h3>Block kinds</h3>
-          ${this._barsHtml(c.blockKinds, (k) => k, () => "var(--h-codex)")}
+          ${needsHydration(c.blockKinds, [(k) => k, () => "var(--h-codex)"])}
         </section>
         <section class="stat-block">
           <h3>Top working directories</h3>

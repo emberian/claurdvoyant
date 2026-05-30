@@ -52,7 +52,9 @@ export function searchableText(session) {
           break;
         case "tool_use":
           if (b.name) parts.push(b.name);
-          if (b.input != null) parts.push(pretty(b.input));
+          // Only index string args, not a full JSON.stringify of the input — serializing every
+          // tool input across every message was a per-keystroke hot spot for big sessions.
+          if (typeof b.input === "string") parts.push(b.input);
           break;
         case "tool_result":
           if (b.content) parts.push(b.content);
@@ -88,6 +90,19 @@ export function truncate(s, max) {
   s = String(s ?? "");
   if (s.length <= max) return s;
   return s.slice(0, Math.max(0, max - 1)) + "…";
+}
+
+/** Message count that works for hydrated sessions and metadata-only stubs (cvd `/api/sessions`). */
+export function msgCount(session) {
+  return session.messages?.length || session.message_count || 0;
+}
+
+/** Harness pill as a plain HTML string — same markup/styling as <cv-harness-badge> but with NO
+ *  custom-element upgrade, so lists of thousands of rows render fast. */
+export function harnessBadge(harness) {
+  const h = (harness || "").toLowerCase();
+  const label = HARNESS_LABELS[h] || h || "?";
+  return `<span class="cv-badge" data-harness="${esc(h)}" title="harness: ${esc(label)}">${esc(label)}</span>`;
 }
 
 /** A nicer display label for a filesystem path: keep the tail. */
@@ -243,6 +258,9 @@ export function normalizeSession(s) {
     git: s.git,
     extra: s.extra,
     source_path: pick(s, "source_path", "sourcePath"),
+    // Metadata-only "stub" sessions (e.g. from cvd's /api/sessions) carry a count but no messages
+    // yet; keep it so the list can show the real length before the transcript is hydrated.
+    message_count: pick(s, "message_count", "messageCount"),
     messages: Array.isArray(s.messages) ? s.messages.map(normMessage) : [],
   };
 }

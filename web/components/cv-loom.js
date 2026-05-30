@@ -19,6 +19,7 @@
 // API: loom.sessions = Session[]   (setter)
 import "./cv-transcript.js";
 import "./cv-harness-badge.js";
+import "./cv-session-picker.js";
 import {
   esc, sessionLabel, ROLE_LABELS, toOpenSession, toMarkdown,
   downloadFile, slug, randomId,
@@ -28,6 +29,7 @@ import {
   MODEL_PRESETS, DEFAULT_MODEL,
 } from "../openrouter.js";
 import { canInvokeNative, nativeGenerate } from "../tauri.js";
+import { hydrateSession, isStub } from "./hydrate.js";
 
 class CvLoom extends HTMLElement {
   constructor() {
@@ -36,6 +38,8 @@ class CvLoom extends HTMLElement {
     this._sourceId = null;
     this._title = "Spliced session";
     this._dragUid = null;
+    this._hydratedSrc = new Map(); // id -> full session (with messages)
+    this._pendingSrc = new Set();
 
     // Branch tree. Each branch is a named variant holding its own lane:
     //   { id, name, lane: [{ uid, message, from, harness }], composedId }
@@ -83,7 +87,26 @@ class CvLoom extends HTMLElement {
 
   disconnectedCallback() { this._abort?.abort(); }
 
-  _source() { return this._sessions.find((s) => (s.id || "") === this._sourceId) || null; }
+  // Prefer the hydrated (full) source if we have it; otherwise the stub from the pool.
+  _source() {
+    return this._hydratedSrc.get(this._sourceId) || this._sessions.find((s) => (s.id || "") === this._sourceId) || null;
+  }
+
+  // Pull the full transcript for the current source, then refresh the source pane. No-op if ready.
+  _ensureSourceHydrated() {
+    const id = this._sourceId;
+    const s = this._sessions.find((x) => (x.id || "") === id);
+    if (!s || this._hydratedSrc.has(id) || this._pendingSrc.has(id) || !isStub(s)) return;
+    this._pendingSrc.add(id);
+    hydrateSession(s)
+      .then((full) => {
+        this._hydratedSrc.set(id, full);
+        this._pendingSrc.delete(id);
+        const srcT = this.querySelector(".loom-transcript");
+        if (srcT && this._sourceId === id) srcT.session = full;
+      })
+      .catch(() => { this._pendingSrc.delete(id); });
+  }
 
   _composed() {
     const b = this._branch();
@@ -101,9 +124,6 @@ class CvLoom extends HTMLElement {
       this.innerHTML = `<div class="view-empty muted"><p>Load sessions, then splice their messages here.</p></div>`;
       return;
     }
-    const srcOpts = this._sessions.map((s) =>
-      `<option value="${esc(s.id || "")}"${(s.id || "") === this._sourceId ? " selected" : ""}>${esc(sessionLabel(s))}</option>`).join("");
-
     this.innerHTML = `
       <div class="view-head">
         <h2>✨ Loom</h2>
@@ -116,7 +136,7 @@ class CvLoom extends HTMLElement {
         <section class="loom-source">
           <div class="loom-pane-head">
             <strong>Source</strong>
-            <select class="loom-source-pick" aria-label="Source session">${srcOpts}</select>
+            <cv-session-picker class="loom-source-pick" aria-label="Source session"></cv-session-picker>
           </div>
           <div class="loom-source-body">
             <cv-transcript class="loom-transcript"></cv-transcript>
@@ -156,11 +176,18 @@ class CvLoom extends HTMLElement {
     // Preview transcript.
     this._renderPreview();
 
-    // Wire controls.
-    this.querySelector(".loom-source-pick").addEventListener("change", (e) => {
-      this._sourceId = e.target.value;
+    // Source picker (searchable, not a 2000-option <select>).
+    const pick = this.querySelector(".loom-source-pick");
+    pick.sessions = this._sessions;
+    pick.value = this._sourceId;
+    pick.placeholder = "Pick a source session…";
+    pick.addEventListener("pick", (e) => {
+      this._sourceId = e.detail.id;
       this.querySelector(".loom-transcript").session = this._source();
+      this._ensureSourceHydrated();
     });
+    // Pull the current source's full transcript if it's still a stub.
+    this._ensureSourceHydrated();
     this.querySelector(".loom-title").addEventListener("input", (e) => {
       this._title = e.target.value;
       this._renderPreview();
