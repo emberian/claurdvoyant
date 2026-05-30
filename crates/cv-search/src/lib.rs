@@ -92,10 +92,17 @@ pub fn semantic_search(
     semantic::semantic_search(&path, query, k)
 }
 
-/// Build a `(id, harness, cwd, title, body)` corpus by discovering + parsing every session.
+/// Stream the `(id, harness, cwd, title, body)` corpus by discovering + parsing every session,
+/// invoking `f` once per session and **dropping the parsed `Session` + `Doc` immediately after**.
+///
+/// Peak memory is O(one session), NOT O(corpus). The previous `build_corpus() -> Vec<Doc>` held
+/// every session's searchable body in a single `Vec` (~35 GB on a real machine) and the semantic
+/// path then `.clone()`d them all again — which ballooned `cv` to ~65 GB RSS and got it OOM-killed
+/// (taking down the terminal-sibling process). Both indexers now consume this streaming driver, so
+/// they still see exactly the same searchable text but never hold the whole corpus at once.
 /// Shared by both indexers so they see exactly the same searchable text.
-pub(crate) fn build_corpus() -> Vec<Doc> {
-    let mut out = Vec::new();
+pub(crate) fn stream_corpus(mut f: impl FnMut(Doc) -> Result<()>) -> Result<usize> {
+    let mut n = 0usize;
     for r in cv_core::discover_all() {
         let Some(adapter) = cv_core::harness::for_harness(r.harness) else {
             continue;
@@ -107,7 +114,7 @@ pub(crate) fn build_corpus() -> Vec<Doc> {
                 continue;
             }
         };
-        out.push(Doc {
+        let doc = Doc {
             id: r.id.clone(),
             harness: r.harness.as_str().to_string(),
             cwd: r.cwd.as_ref().map(|p| p.display().to_string()),
@@ -115,9 +122,12 @@ pub(crate) fn build_corpus() -> Vec<Doc> {
             created_at: r.created_at.map(|t| t.timestamp()),
             updated_at: r.updated_at.map(|t| t.timestamp()),
             body: session.searchable_text(),
-        });
+        };
+        drop(session); // free the parsed transcript before handing the doc downstream
+        f(doc)?;
+        n += 1;
     }
-    out
+    Ok(n)
 }
 
 /// One indexable document distilled from a parsed [`cv_core::Session`].
