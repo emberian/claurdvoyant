@@ -117,6 +117,7 @@ pub fn parse_str(id: &str, text: &str, is_jsonl: bool, source_path: Option<PathB
         git: None,
         messages: Vec::new(),
         source_path,
+        extra: serde_json::Map::new(),
     };
 
     if is_jsonl {
@@ -443,6 +444,7 @@ fn handle_item(
                     text,
                     signature: None,
                     encrypted,
+                    redacted: false,
                 });
                 out.push(m);
             }
@@ -493,12 +495,16 @@ fn handle_item(
         "function_call_output" | "custom_tool_call_output" => {
             let call_id = str_field("call_id");
             let (content, images) = coerce_output(p.get("output"));
+            let is_error = output_is_error(p.get("output"));
             let mut m = Message::new(Role::Tool);
             m.timestamp = ts;
             m.content.push(Block::ToolResult {
                 tool_use_id: call_id,
                 content,
-                is_error: output_is_error(p.get("output")),
+                is_error,
+                tool_name: None,
+                status: Some(if is_error { "error" } else { "completed" }.into()),
+                details: None,
             });
             // Structured outputs can return image content items alongside text.
             m.content.extend(images);
@@ -534,6 +540,9 @@ fn handle_item(
                 tool_use_id: call_id,
                 content,
                 is_error: false,
+                tool_name: Some("tool_search".into()),
+                status: None,
+                details: None,
             });
             out.push(m);
         }
@@ -958,7 +967,7 @@ mod tests {
             _ => unreachable!(),
         }
         match first_block(&s, |b| matches!(b, Block::ToolResult { .. })) {
-            Block::ToolResult { tool_use_id, content, is_error } => {
+            Block::ToolResult { tool_use_id, content, is_error, .. } => {
                 assert_eq!(tool_use_id, "c1");
                 assert_eq!(content, "boom");
                 assert!(is_error);

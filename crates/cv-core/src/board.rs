@@ -286,6 +286,305 @@ pub fn channels() -> Result<Vec<String>> {
     channels_in_dir(&board_dir())
 }
 
+// ───────────────────────────── coordination primitives ─────────────────────────────
+//
+// The fns below are *conventions on top of the existing storage*: they are ordinary board
+// messages with agreed-upon `kind`s and tags, plus (for claims) one sibling JSON file guarded by
+// the very same per-channel lock. Nothing here introduces a new lock or a new race — every write
+// reuses [`post_to_dir`]'s O_APPEND atomicity, and the claims file is only ever touched while
+// holding [`ChannelLock`].
+
+/// Tag prefix carrying the id a `reply`/`ack` refers to: `reply-to:<request_id>`.
+const REPLY_TO_TAG: &str = "reply-to:";
+
+/// Build the `reply-to:<id>` tag.
+fn reply_to_tag(id: &str) -> String {
+    format!("{REPLY_TO_TAG}{id}")
+}
+
+/// Post a `kind="request"` message — a question/ask others can [`reply`] to. See [`request_to_dir`].
+pub fn request(channel: &str, from: &str, body: &str) -> Result<BoardMessage> {
+    request_to_dir(&board_dir(), channel, from, body)
+}
+
+/// Core of [`request`], parameterized on the board directory.
+///
+/// A request is just a normal message with `kind="request"`; its `id` is the correlation key that
+/// replies carry. Collect answers with [`replies_to_dir`].
+pub fn request_to_dir(dir: &Path, channel: &str, from: &str, body: &str) -> Result<BoardMessage> {
+    post_to_dir(dir, channel, from, body, Some("request"), vec![], None)
+}
+
+/// Post a `kind="reply"` answering `in_reply_to`. See [`reply_to_dir`].
+pub fn reply(
+    channel: &str,
+    from: &str,
+    in_reply_to: &str,
+    body: &str,
+) -> Result<BoardMessage> {
+    reply_to_dir(&board_dir(), channel, from, in_reply_to, body)
+}
+
+/// Core of [`reply`], parameterized on the board directory.
+///
+/// The reply records the request id in **both** `session_ref` (the structured slot) and a
+/// `reply-to:<id>` tag (so it survives tag-only filtering); [`replies_to_dir`] matches either.
+pub fn reply_to_dir(
+    dir: &Path,
+    channel: &str,
+    from: &str,
+    in_reply_to: &str,
+    body: &str,
+) -> Result<BoardMessage> {
+    post_to_dir(
+        dir,
+        channel,
+        from,
+        body,
+        Some("reply"),
+        vec![reply_to_tag(in_reply_to)],
+        Some(in_reply_to.to_string()),
+    )
+}
+
+/// Collect all replies to `request_id` on `channel` (default board dir). See [`replies_to_dir`].
+pub fn replies(channel: &str, request_id: &str) -> Result<Vec<BoardMessage>> {
+    replies_to_dir(&board_dir(), channel, request_id)
+}
+
+/// Core of [`replies`], parameterized on the board directory.
+///
+/// Returns `kind="reply"` messages whose `session_ref` is `request_id` *or* which carry the
+/// `reply-to:<request_id>` tag, in chronological order.
+pub fn replies_to_dir(
+    dir: &Path,
+    channel: &str,
+    request_id: &str,
+) -> Result<Vec<BoardMessage>> {
+    let want_tag = reply_to_tag(request_id);
+    let mut msgs = read_from_dir(dir, channel, None, 0)?;
+    msgs.retain(|m| {
+        m.kind == "reply"
+            && (m.session_ref.as_deref() == Some(request_id) || m.tags.iter().any(|t| *t == want_tag))
+    });
+    Ok(msgs)
+}
+
+/// Acknowledge a message id with a tiny `kind="ack"` note. See [`ack_to_dir`].
+pub fn ack(channel: &str, from: &str, msg_id: &str) -> Result<BoardMessage> {
+    ack_to_dir(&board_dir(), channel, from, msg_id)
+}
+
+/// Core of [`ack`], parameterized on the board directory.
+///
+/// An ack is a `kind="ack"` message tagged `reply-to:<msg_id>` (and carrying it in `session_ref`),
+/// so the same correlation machinery used for replies finds it. Body is left empty.
+pub fn ack_to_dir(dir: &Path, channel: &str, from: &str, msg_id: &str) -> Result<BoardMessage> {
+    post_to_dir(
+        dir,
+        channel,
+        from,
+        "",
+        Some("ack"),
+        vec![reply_to_tag(msg_id)],
+        Some(msg_id.to_string()),
+    )
+}
+
+// ───────────────────────────── presence / heartbeat ─────────────────────────────
+
+/// Post a `kind="presence"` heartbeat for `from` on `channel`. See [`heartbeat_to_dir`].
+pub fn heartbeat(channel: &str, from: &str) -> Result<BoardMessage> {
+    heartbeat_to_dir(&board_dir(), channel, from)
+}
+
+/// Core of [`heartbeat`], parameterized on the board directory.
+///
+/// Just a `kind="presence"` message; its `ts` is the heartbeat time. [`who_in_dir`] reads recent
+/// ones back. Heartbeats are ordinary append-only lines (no cleanup); callers poll [`who`].
+pub fn heartbeat_to_dir(dir: &Path, channel: &str, from: &str) -> Result<BoardMessage> {
+    post_to_dir(dir, channel, from, "", Some("presence"), vec![], None)
+}
+
+/// List agents that heartbeat on `channel` within the last `within` (default board dir).
+pub fn who(channel: &str, within: Duration) -> Result<Vec<String>> {
+    who_in_dir(&board_dir(), channel, within)
+}
+
+/// Core of [`who`], parameterized on the board directory.
+///
+/// Returns the distinct `from` of every `kind="presence"` message newer than `now - within`,
+/// sorted. An agent with no recent heartbeat simply isn't listed.
+pub fn who_in_dir(dir: &Path, channel: &str, within: Duration) -> Result<Vec<String>> {
+    let cutoff = Utc::now()
+        - chrono::Duration::from_std(within).unwrap_or_else(|_| chrono::Duration::zero());
+    let msgs = read_from_dir(dir, channel, None, 0)?;
+    let mut seen: Vec<String> = msgs
+        .into_iter()
+        .filter(|m| m.kind == "presence" && m.ts >= cutoff)
+        .map(|m| m.from)
+        .collect();
+    seen.sort();
+    seen.dedup();
+    Ok(seen)
+}
+
+// ───────────────────────────── claim / lease ─────────────────────────────
+//
+// A soft distributed lock so two agents don't grab the same task `key`. Claims live in a sibling
+// `<channel>.claims.json` (a small map `key -> {owner, expires_at}`), and *every* mutation of that
+// file happens under the existing per-channel [`ChannelLock`] using a read-modify-write. Because
+// the lock serializes the whole compare-and-set, the "is there a live claim?" check and the
+// "record my claim" write are one atomic step across threads *and* processes — so exactly one
+// claimer can win a free (or expired) key. Expired claims are stealable; releasing removes the
+// entry. We reuse the lock the board already uses for appends, so a claim and a post never race.
+
+/// One record in a channel's claims file.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct ClaimRecord {
+    /// The task key being claimed (caller-defined, e.g. a file path or task id).
+    key: String,
+    /// Who holds the claim.
+    owner: String,
+    /// When the claim lapses; after this instant any other agent may steal `key`.
+    expires_at: DateTime<Utc>,
+}
+
+/// A held claim. Carries enough to [`release`] it. Cloneable but releasing twice is harmless.
+#[derive(Clone, Debug)]
+pub struct Lease {
+    dir: PathBuf,
+    channel: String,
+    /// The claimed key.
+    pub key: String,
+    /// The owner that holds it.
+    pub owner: String,
+    /// When the claim expires (unless released/renewed first).
+    pub expires_at: DateTime<Utc>,
+}
+
+/// Path to a channel's sibling claims file.
+fn claims_path(dir: &Path, channel: &str) -> PathBuf {
+    dir.join(format!("{}.claims.json", slug(channel)))
+}
+
+/// Load the claims map (key → record) for a channel. Missing/garbage file → empty map.
+fn load_claims(dir: &Path, channel: &str) -> Vec<ClaimRecord> {
+    let path = claims_path(dir, channel);
+    match fs::read_to_string(&path) {
+        Ok(s) => serde_json::from_str(&s).unwrap_or_default(),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// Atomically persist the claims map: write to a temp sibling then rename over the target so a
+/// reader never sees a half-written file. Caller MUST hold the channel lock.
+fn store_claims(dir: &Path, channel: &str, claims: &[ClaimRecord]) -> Result<()> {
+    let path = claims_path(dir, channel);
+    let tmp = path.with_extension("json.tmp");
+    let body = serde_json::to_string(claims).context("serializing claims")?;
+    fs::write(&tmp, body).with_context(|| format!("writing {}", tmp.display()))?;
+    fs::rename(&tmp, &path).with_context(|| format!("renaming into {}", path.display()))?;
+    Ok(())
+}
+
+/// Try to claim `key` on `channel` for `from`, holding it for `ttl`. See [`claim_in_dir`].
+pub fn claim(channel: &str, from: &str, key: &str, ttl: Duration) -> Result<Option<Lease>> {
+    claim_in_dir(&board_dir(), channel, from, key, ttl)
+}
+
+/// Core of [`claim`], parameterized on the board directory.
+///
+/// Under the per-channel lock: load claims, drop any that have expired, and check whether `key` is
+/// still held by *someone else*. If so, return `Ok(None)`. Otherwise record `{key, from, now+ttl}`
+/// (overwriting our own prior/expired entry), persist, and return the [`Lease`]. The whole
+/// load→check→write is serialized by [`ChannelLock`], so only one of N concurrent claimers wins.
+/// Also emits a `kind="claim"` board event for the activity feed (best-effort, inside the lock).
+pub fn claim_in_dir(
+    dir: &Path,
+    channel: &str,
+    from: &str,
+    key: &str,
+    ttl: Duration,
+) -> Result<Option<Lease>> {
+    fs::create_dir_all(dir).with_context(|| format!("creating board dir {}", dir.display()))?;
+    let _lock = ChannelLock::acquire(lock_path(dir, channel))?;
+
+    let now = Utc::now();
+    let mut claims = load_claims(dir, channel);
+    // Drop expired entries so they don't linger and so a stale claim is stealable.
+    claims.retain(|c| c.expires_at > now);
+
+    if let Some(existing) = claims.iter().find(|c| c.key == key) {
+        if existing.owner != from {
+            // A live claim by someone else — caller loses the race.
+            return Ok(None);
+        }
+        // We already hold it: fall through to renew (refresh the expiry).
+    }
+
+    let expires_at = now
+        + chrono::Duration::from_std(ttl).unwrap_or_else(|_| chrono::Duration::zero());
+    claims.retain(|c| c.key != key); // remove our own prior entry, if any
+    claims.push(ClaimRecord {
+        key: key.to_string(),
+        owner: from.to_string(),
+        expires_at,
+    });
+    store_claims(dir, channel, &claims)?;
+
+    // No board-feed event here on purpose: we hold the channel lock and `post_to_dir` re-acquires
+    // the *same* lockfile, which would deadlock. Callers who want a visible "claim" event can
+    // `post` one after this returns (the lock is already released by then).
+
+    Ok(Some(Lease {
+        dir: dir.to_path_buf(),
+        channel: channel.to_string(),
+        key: key.to_string(),
+        owner: from.to_string(),
+        expires_at,
+    }))
+}
+
+/// Release a held [`Lease`], freeing its key for others. Idempotent.
+///
+/// Under the channel lock, removes the claim for `lease.key` **only if we still own it** (so we
+/// never yank a claim another agent legitimately stole after ours expired).
+pub fn release(lease: &Lease) -> Result<()> {
+    let _lock = ChannelLock::acquire(lock_path(&lease.dir, &lease.channel))?;
+    let mut claims = load_claims(&lease.dir, &lease.channel);
+    let before = claims.len();
+    claims.retain(|c| !(c.key == lease.key && c.owner == lease.owner));
+    if claims.len() != before {
+        store_claims(&lease.dir, &lease.channel, &claims)?;
+    }
+    Ok(())
+}
+
+/// List the currently-active (un-expired) claims on `channel` (default board dir).
+pub fn active_claims(channel: &str) -> Result<Vec<(String, String, DateTime<Utc>)>> {
+    active_claims_in_dir(&board_dir(), channel)
+}
+
+/// Core of [`active_claims`], parameterized on the board directory.
+///
+/// Returns `(key, owner, expires_at)` for every claim not yet expired, sorted by key. Reads under
+/// the channel lock so it never observes a half-written claims file.
+pub fn active_claims_in_dir(
+    dir: &Path,
+    channel: &str,
+) -> Result<Vec<(String, String, DateTime<Utc>)>> {
+    let _lock = ChannelLock::acquire(lock_path(dir, channel))?;
+    let now = Utc::now();
+    let mut out: Vec<_> = load_claims(dir, channel)
+        .into_iter()
+        .filter(|c| c.expires_at > now)
+        .map(|c| (c.key, c.owner, c.expires_at))
+        .collect();
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(out)
+}
+
 /// Core of [`channels`], parameterized on the board directory. Missing dir → empty list.
 pub fn channels_in_dir(dir: &Path) -> Result<Vec<String>> {
     let rd = match fs::read_dir(dir) {
@@ -488,6 +787,187 @@ mod tests {
         assert_eq!(ids.len(), n_threads * per_thread);
         // Lock should be released; lockfile gone.
         assert!(!lock_path(&dir, "race").exists());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    // ───────────────────────── request / reply / ack ─────────────────────────
+
+    #[test]
+    fn request_reply_round_trip() {
+        let dir = tmp_board();
+        let req = request_to_dir(&dir, "ch", "alice", "what's the build status?").unwrap();
+        assert_eq!(req.kind, "request");
+
+        let r1 = reply_to_dir(&dir, "ch", "bob", &req.id, "green").unwrap();
+        let r2 = reply_to_dir(&dir, "ch", "carol", &req.id, "still green").unwrap();
+        assert_eq!(r1.kind, "reply");
+        assert_eq!(r1.session_ref.as_deref(), Some(req.id.as_str()));
+        assert!(r1.tags.iter().any(|t| t == &reply_to_tag(&req.id)));
+
+        // A reply to a *different* request must not be collected.
+        let other = request_to_dir(&dir, "ch", "alice", "unrelated").unwrap();
+        reply_to_dir(&dir, "ch", "dave", &other.id, "nope").unwrap();
+
+        let got = replies_to_dir(&dir, "ch", &req.id).unwrap();
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].id, r1.id);
+        assert_eq!(got[0].body, "green");
+        assert_eq!(got[1].id, r2.id);
+        assert_eq!(got[1].from, "carol");
+
+        // Unknown request id -> no replies.
+        assert!(replies_to_dir(&dir, "ch", "missing").unwrap().is_empty());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn replies_matches_tag_even_without_session_ref() {
+        let dir = tmp_board();
+        let req = request_to_dir(&dir, "ch", "alice", "q").unwrap();
+        // Hand-craft a reply that carries only the tag (no session_ref) to prove tag-matching.
+        post_to_dir(
+            &dir,
+            "ch",
+            "bob",
+            "tagged answer",
+            Some("reply"),
+            vec![reply_to_tag(&req.id)],
+            None,
+        )
+        .unwrap();
+        let got = replies_to_dir(&dir, "ch", &req.id).unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].body, "tagged answer");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn ack_is_correlated_to_target() {
+        let dir = tmp_board();
+        let m = post_to_dir(&dir, "ch", "alice", "deploy done", None, vec![], None).unwrap();
+        let a = ack_to_dir(&dir, "ch", "bob", &m.id).unwrap();
+        assert_eq!(a.kind, "ack");
+        assert_eq!(a.session_ref.as_deref(), Some(m.id.as_str()));
+        assert!(a.tags.iter().any(|t| t == &reply_to_tag(&m.id)));
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    // ───────────────────────── presence / heartbeat ─────────────────────────
+
+    #[test]
+    fn who_lists_recent_heartbeaters() {
+        let dir = tmp_board();
+        heartbeat_to_dir(&dir, "ch", "alice").unwrap();
+        heartbeat_to_dir(&dir, "ch", "bob").unwrap();
+        heartbeat_to_dir(&dir, "ch", "alice").unwrap(); // dup -> deduped
+
+        let now = who_in_dir(&dir, "ch", Duration::from_secs(60)).unwrap();
+        assert_eq!(now, vec!["alice".to_string(), "bob".to_string()]);
+
+        // A zero window excludes everyone (no heartbeat is `>= now`).
+        let none = who_in_dir(&dir, "ch", Duration::from_millis(0)).unwrap();
+        std::thread::sleep(Duration::from_millis(2));
+        let none2 = who_in_dir(&dir, "ch", Duration::from_millis(0)).unwrap();
+        assert!(none.is_empty() || none2.is_empty());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    // ───────────────────────── claim / lease ─────────────────────────
+
+    #[test]
+    fn claim_blocks_second_claimer_until_release() {
+        let dir = tmp_board();
+        let lease = claim_in_dir(&dir, "ch", "alice", "task-1", Duration::from_secs(60))
+            .unwrap()
+            .expect("alice should win the free key");
+        assert_eq!(lease.owner, "alice");
+        assert_eq!(lease.key, "task-1");
+
+        // A different key is independent and grantable.
+        assert!(claim_in_dir(&dir, "ch", "bob", "task-2", Duration::from_secs(60))
+            .unwrap()
+            .is_some());
+
+        // bob cannot take task-1 while alice's live claim stands.
+        assert!(claim_in_dir(&dir, "ch", "bob", "task-1", Duration::from_secs(60))
+            .unwrap()
+            .is_none());
+
+        // alice re-claiming her own key just renews (still Some).
+        assert!(claim_in_dir(&dir, "ch", "alice", "task-1", Duration::from_secs(60))
+            .unwrap()
+            .is_some());
+
+        // active_claims reflects both holders.
+        let active = active_claims_in_dir(&dir, "ch").unwrap();
+        assert_eq!(active.len(), 2);
+        assert_eq!(active[0].0, "task-1");
+        assert_eq!(active[0].1, "alice");
+        assert_eq!(active[1].0, "task-2");
+
+        // After alice releases, bob can take task-1.
+        release(&lease).unwrap();
+        let bob = claim_in_dir(&dir, "ch", "bob", "task-1", Duration::from_secs(60)).unwrap();
+        assert!(bob.is_some());
+        assert_eq!(bob.unwrap().owner, "bob");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn expired_claim_is_stealable() {
+        let dir = tmp_board();
+        // Tiny ttl so it lapses almost immediately.
+        let lease = claim_in_dir(&dir, "ch", "alice", "k", Duration::from_millis(20))
+            .unwrap()
+            .unwrap();
+        // Immediately, bob is blocked.
+        assert!(claim_in_dir(&dir, "ch", "bob", "k", Duration::from_secs(60))
+            .unwrap()
+            .is_none());
+        // Wait past the ttl; now bob can steal it.
+        std::thread::sleep(Duration::from_millis(40));
+        let stolen = claim_in_dir(&dir, "ch", "bob", "k", Duration::from_secs(60)).unwrap();
+        assert!(stolen.is_some());
+        assert_eq!(stolen.unwrap().owner, "bob");
+
+        // alice releasing her now-superseded lease must NOT yank bob's claim.
+        release(&lease).unwrap();
+        let active = active_claims_in_dir(&dir, "ch").unwrap();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].1, "bob");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn concurrent_claim_has_exactly_one_winner() {
+        let dir = tmp_board();
+        let n = 16;
+        let winners = std::sync::atomic::AtomicUsize::new(0);
+        std::thread::scope(|s| {
+            for t in 0..n {
+                let dir = dir.clone();
+                let winners = &winners;
+                s.spawn(move || {
+                    if claim_in_dir(
+                        &dir,
+                        "ch",
+                        &format!("agent-{t}"),
+                        "the-one-key",
+                        Duration::from_secs(60),
+                    )
+                    .unwrap()
+                    .is_some()
+                    {
+                        winners.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    }
+                });
+            }
+        });
+        // Exactly one of the N racing claimers may own the key.
+        assert_eq!(winners.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let active = active_claims_in_dir(&dir, "ch").unwrap();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].0, "the-one-key");
         fs::remove_dir_all(&dir).ok();
     }
 }

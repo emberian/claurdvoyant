@@ -137,6 +137,7 @@ impl Adapter for OpenCode {
             git: None,
             messages: Vec::new(),
             source_path: Some(r.path.clone()),
+            extra: serde_json::Map::new(),
         };
 
         // collect & order messages by created time
@@ -247,6 +248,7 @@ fn build_messages(mv: &Value, parts: &[Value]) -> Vec<Message> {
                             text: t.to_string(),
                             signature,
                             encrypted: None,
+                            redacted: false,
                         });
                     }
                 }
@@ -335,21 +337,24 @@ fn tool_blocks(part: &Value) -> (Block, Option<Block>) {
     let name = part.get("tool").and_then(Value::as_str).unwrap_or("").to_string();
     let status = part.pointer("/state/status").and_then(Value::as_str).unwrap_or("");
 
+    let tool_name = (!name.is_empty()).then(|| name.clone());
+    let status_field = (!status.is_empty()).then(|| status.to_string());
     let use_block = Block::ToolUse {
         id: call_id.clone(),
         name,
         input: part.pointer("/state/input").cloned().unwrap_or(Value::Null),
     };
 
-    // A completed tool carries `output`; an error tool carries `error`. Title/metadata enrich
-    // the result text but the IR ToolResult has no field for them, so they ride in… nowhere
-    // visible — we fold the human title in front of the output to keep it searchable.
+    // A completed tool carries `output`; an error tool carries `error`.
     let result = match status {
         "completed" | "running" | "pending" => {
             part.pointer("/state/output").map(|out| Block::ToolResult {
                 tool_use_id: call_id.clone(),
                 content: coerce_text(out),
                 is_error: false,
+                tool_name: tool_name.clone(),
+                status: status_field.clone(),
+                details: None,
             })
         }
         "error" => {
@@ -362,6 +367,9 @@ fn tool_blocks(part: &Value) -> (Block, Option<Block>) {
                 tool_use_id: call_id.clone(),
                 content,
                 is_error: true,
+                tool_name: tool_name.clone(),
+                status: status_field.clone(),
+                details: None,
             })
         }
         // Unknown status but an output is present — still surface it.
@@ -369,15 +377,18 @@ fn tool_blocks(part: &Value) -> (Block, Option<Block>) {
             tool_use_id: call_id.clone(),
             content: coerce_text(out),
             is_error: false,
+            tool_name: tool_name.clone(),
+            status: status_field.clone(),
+            details: None,
         }),
     };
 
     (use_block, result)
 }
 
-/// Map a `file` part to a block. Only genuine images become `Block::Image`; everything else
-/// (text files, directories via `@path`, symbol/resource refs) is a *reference*, not an image —
-/// we surface it as text and keep the structured part in… the text. (IR has no File block yet.)
+/// Map a `file` part to a block. Genuine images become `Block::Image`; everything else
+/// (text files, directories via `@path`, symbol/resource refs) becomes a first-class
+/// `Block::File` reference.
 fn file_block(part: &Value) -> Block {
     let mime = part.get("mime").and_then(Value::as_str).unwrap_or("");
     if mime.starts_with("image/") {
@@ -386,13 +397,16 @@ fn file_block(part: &Value) -> Block {
             data_ref: part.get("url").and_then(Value::as_str).map(str::to_string),
         }
     } else {
-        let label = part
-            .get("filename")
-            .or_else(|| part.get("url"))
+        // `source.path` is the workspace-relative path when present; `filename`/`url` are fallbacks.
+        let path = part
+            .pointer("/source/path")
+            .or_else(|| part.get("filename"))
             .and_then(Value::as_str)
-            .unwrap_or("file");
-        Block::Text {
-            text: format!("[file: {label}]"),
+            .map(str::to_string);
+        Block::File {
+            mime: (!mime.is_empty()).then(|| mime.to_string()),
+            path,
+            source: part.get("url").and_then(Value::as_str).map(str::to_string),
         }
     }
 }
@@ -534,10 +548,12 @@ mod tests {
         // tool result became its own Tool message
         assert_eq!(out[1].role, Role::Tool);
         match &out[1].content[0] {
-            Block::ToolResult { content, is_error, tool_use_id } => {
+            Block::ToolResult { content, is_error, tool_use_id, tool_name, status, .. } => {
                 assert_eq!(content, "a\nb");
                 assert!(!is_error);
                 assert_eq!(tool_use_id, "c1");
+                assert_eq!(tool_name.as_deref(), Some("bash"));
+                assert_eq!(status.as_deref(), Some("completed"));
             }
             b => panic!("expected tool result, got {b:?}"),
         }
@@ -571,10 +587,10 @@ mod tests {
         let m = &out[0];
         // image -> Image block
         assert!(matches!(&m.content[0], Block::Image { media_type, .. } if media_type.as_deref()==Some("image/png")));
-        // text file -> textual reference, NOT an image
-        assert!(matches!(&m.content[1], Block::Text { text } if text.contains("Makefile")));
-        // directory -> textual reference, NOT an image
-        assert!(matches!(&m.content[2], Block::Text { text } if text.contains("tools/")));
+        // text file -> File reference, NOT an image
+        assert!(matches!(&m.content[1], Block::File { path, .. } if path.as_deref()==Some("Makefile")));
+        // directory -> File reference, NOT an image
+        assert!(matches!(&m.content[2], Block::File { source, .. } if source.as_deref().unwrap_or("").contains("tools/")));
     }
 
     #[test]

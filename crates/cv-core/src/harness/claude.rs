@@ -94,6 +94,7 @@ pub fn parse_str(id: &str, text: &str, source_path: Option<PathBuf>) -> Session 
         git: None,
         messages: Vec::new(),
         source_path,
+        extra: serde_json::Map::new(),
     };
 
     for line in text.lines() {
@@ -423,6 +424,7 @@ fn parse_block(item: &Value) -> Option<Block> {
                 .and_then(Value::as_str)
                 .map(str::to_string),
             encrypted: None,
+            redacted: false,
         }),
         // Encrypted reasoning the API returns when thinking can't be shown in the clear. The plaintext
         // is intentionally absent; stash the opaque blob in `encrypted` so it's not silently lost.
@@ -433,6 +435,7 @@ fn parse_block(item: &Value) -> Option<Block> {
                 .get("data")
                 .and_then(Value::as_str)
                 .map(str::to_string),
+            redacted: true,
         }),
         "tool_use" => Some(Block::ToolUse {
             id: item.get("id").and_then(Value::as_str).unwrap_or("").to_string(),
@@ -451,6 +454,9 @@ fn parse_block(item: &Value) -> Option<Block> {
                 .to_string(),
             content: coerce_text(item.get("content")),
             is_error: item.get("is_error").and_then(Value::as_bool).unwrap_or(false),
+            tool_name: None,
+            status: None,
+            details: None,
         }),
         "image" => {
             let source = item.get("source");
@@ -478,19 +484,29 @@ fn parse_block(item: &Value) -> Option<Block> {
                 data_ref,
             })
         }
-        // Some user turns embed a `document` block (PDF/text attachments); surface its title as text.
+        // Some user turns embed a `document` block (PDF/text attachments); surface it as a File.
         "document" => {
-            let title = item
+            let source = item.get("source");
+            let mime = source
+                .and_then(|s| s.get("media_type"))
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            let path = item
                 .get("title")
                 .and_then(Value::as_str)
-                .or_else(|| {
-                    item.get("source")
-                        .and_then(|s| s.get("media_type"))
-                        .and_then(Value::as_str)
-                })
-                .unwrap_or("document");
-            Some(Block::Text {
-                text: format!("[document: {title}]"),
+                .map(str::to_string);
+            let data = source.and_then(|s| match s.get("type").and_then(Value::as_str) {
+                Some("url") => s.get("url").and_then(Value::as_str).map(str::to_string),
+                Some("file") => s
+                    .get("file_id")
+                    .and_then(Value::as_str)
+                    .map(|id| format!("file:{id}")),
+                _ => None,
+            });
+            Some(Block::File {
+                mime,
+                path,
+                source: data,
             })
         }
         _ => None,
@@ -553,7 +569,7 @@ mod tests {
         let kinds: Vec<_> = asst.content.iter().collect();
         assert!(matches!(kinds[0], Block::Thinking { signature: Some(sig), .. } if sig == "SIGREDACTED=="));
         assert!(
-            matches!(kinds[1], Block::Thinking { text, encrypted: Some(e), signature: None } if text.is_empty() && e == "ENCREDACTED==")
+            matches!(kinds[1], Block::Thinking { text, encrypted: Some(e), signature: None, .. } if text.is_empty() && e == "ENCREDACTED==")
         );
         assert!(matches!(kinds[2], Block::Text { .. }));
         assert!(matches!(kinds[3], Block::ToolUse { name, .. } if name == "Edit"));
@@ -572,7 +588,7 @@ mod tests {
         // image + document.
         let media = &s.messages[3];
         assert!(matches!(&media.content[0], Block::Image { media_type: Some(m), data_ref: Some(r) } if m == "image/png" && r == "base64:inline"));
-        assert!(matches!(&media.content[1], Block::Text { text } if text.contains("document")));
+        assert!(matches!(&media.content[1], Block::File { mime: Some(m), path: Some(p), .. } if m == "application/pdf" && p == "spec.pdf"));
     }
 
     #[test]

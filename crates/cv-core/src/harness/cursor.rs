@@ -369,6 +369,7 @@ fn parse_global(conn: &Connection, r: &SessionRef) -> Result<Session> {
         git: None,
         messages: Vec::new(),
         source_path: Some(r.path.clone()),
+        extra: serde_json::Map::new(),
     };
     // Note: the composer's `unifiedMode` (chat/agent/edit) has no home on the IR Session (no
     // free-form Session.extra). Each bubble's own `unifiedMode` is preserved in Message.extra
@@ -450,6 +451,7 @@ fn bubble_to_message(b: &Value) -> Option<Message> {
                 text,
                 signature,
                 encrypted: None,
+                redacted: false,
             });
         }
     }
@@ -531,6 +533,7 @@ fn push_tool_former(m: &mut Message, tf: &Value) {
         })
         .or_else(|| tf.get("params").cloned())
         .unwrap_or(Value::Null);
+    let tool_name = name.clone();
     m.content.push(Block::ToolUse {
         id: id.clone(),
         name,
@@ -560,6 +563,9 @@ fn push_tool_former(m: &mut Message, tf: &Value) {
             tool_use_id: id,
             content,
             is_error,
+            tool_name: Some(tool_name),
+            status: (!status.is_empty()).then(|| status.to_string()),
+            details: None,
         });
     }
 }
@@ -675,6 +681,7 @@ fn parse_legacy(conn: &Connection, r: &SessionRef, tab_id: &str) -> Result<Sessi
         git: None,
         messages: Vec::new(),
         source_path: Some(r.path.clone()),
+        extra: serde_json::Map::new(),
     };
     if let Some(bubbles) = tab.get("bubbles").and_then(Value::as_array) {
         for b in bubbles {
@@ -792,7 +799,7 @@ mod tests {
         assert_eq!(name, "run_terminal_cmd");
         assert_eq!(tid, "t1");
         assert_eq!(input.get("command").and_then(Value::as_str), Some("cargo test"));
-        assert!(a.content.iter().any(|b| matches!(b, Block::ToolResult { tool_use_id, content, is_error }
+        assert!(a.content.iter().any(|b| matches!(b, Block::ToolResult { tool_use_id, content, is_error, .. }
             if tool_use_id == "t1" && content.contains("ok") && !is_error)));
         // usage mapped
         assert_eq!(a.usage.as_ref().unwrap().input_tokens, Some(10));

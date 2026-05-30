@@ -50,8 +50,18 @@ fn render_block_md(b: &Block, out: &mut String) {
                 truncate(content, 4000)
             ));
         }
+        Block::File { path, source, .. } => {
+            out.push_str(&format!("_[file: {}]_\n\n", file_label(path, source)));
+        }
         Block::Image { .. } => out.push_str("_[image]_\n\n"),
     }
+}
+
+fn file_label(path: &Option<String>, source: &Option<String>) -> String {
+    path.as_deref()
+        .or(source.as_deref())
+        .unwrap_or("?")
+        .to_string()
 }
 
 /// Compact plain-text rendering (terminal `show`).
@@ -79,6 +89,9 @@ pub fn to_plain(s: &Session, block_limit: usize) -> String {
                     if *is_error { " error" } else { "" },
                     truncate(content, block_limit)
                 )),
+                Block::File { path, source, .. } => {
+                    out.push_str(&format!("[file: {}]\n", file_label(path, source)))
+                }
                 Block::Image { .. } => out.push_str("[image]\n"),
             }
         }

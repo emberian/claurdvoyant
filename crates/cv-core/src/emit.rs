@@ -234,6 +234,10 @@ fn claude_assistant_blocks(content: &[Block]) -> Vec<Value> {
             })),
             // Tool results don't belong on an assistant line; skip (emitted on the Tool turn).
             Block::ToolResult { .. } => {}
+            Block::File { path, source, .. } => {
+                let label = path.as_deref().or(source.as_deref()).unwrap_or("?");
+                out.push(json!({ "type": "text", "text": format!("[file: {label}]") }));
+            }
             Block::Image { media_type, .. } => out.push(json!({
                 "type": "image",
                 "source": { "media_type": media_type },
@@ -253,6 +257,7 @@ fn claude_tool_result_blocks(content: &[Block]) -> Vec<Value> {
             tool_use_id,
             content,
             is_error,
+            ..
         } = b
         {
             out.push(json!({
@@ -368,6 +373,17 @@ fn emit_codex(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<E
                                     "call_id": id,
                                     "name": name,
                                     "arguments": args,
+                                }),
+                            ));
+                        }
+                        Block::File { path, source, .. } => {
+                            let label =
+                                path.as_deref().or(source.as_deref()).unwrap_or("?");
+                            lines.push(codex_event_msg(
+                                &ts,
+                                json!({
+                                    "type": "agent_message",
+                                    "message": format!("[file: {label}]"),
                                 }),
                             ));
                         }
@@ -734,6 +750,17 @@ fn emit_opencode(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Resul
                     }
                     write_part(Value::Object(p))?;
                 }
+                Block::File { mime, path, source } => {
+                    let mut p = Map::new();
+                    p.insert("type".into(), json!("file"));
+                    if let Some(mt) = mime {
+                        p.insert("mime".into(), json!(mt));
+                    }
+                    if let Some(url) = source.as_deref().or(path.as_deref()) {
+                        p.insert("url".into(), json!(url));
+                    }
+                    write_part(Value::Object(p))?;
+                }
                 Block::ToolResult { .. } => {}
             }
         }
@@ -931,6 +958,10 @@ fn openclaw_content_blocks(content: &[Block]) -> Value {
                 }
                 out.push(Value::Object(m));
             }
+            Block::File { path, source, .. } => {
+                let label = path.as_deref().or(source.as_deref()).unwrap_or("?");
+                out.push(json!({ "type": "text", "text": format!("[file: {label}]") }));
+            }
             Block::ToolResult { .. } => {}
         }
     }
@@ -944,9 +975,16 @@ fn openclaw_tool_result(content: &[Block]) -> (String, String, bool, Option<Stri
             tool_use_id,
             content,
             is_error,
+            tool_name,
+            ..
         } = b
         {
-            return (tool_use_id.clone(), content.clone(), *is_error, None);
+            return (
+                tool_use_id.clone(),
+                content.clone(),
+                *is_error,
+                tool_name.clone(),
+            );
         }
     }
     (String::new(), String::new(), false, None)
@@ -995,6 +1033,7 @@ fn emit_gemini(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<
                     tool_use_id,
                     content,
                     is_error,
+                    ..
                 } = b
                 {
                     tool_results.insert(tool_use_id.clone(), (content.clone(), *is_error));
@@ -1123,6 +1162,16 @@ fn gemini_parts(content: &[Block]) -> Value {
                     inline.insert("mimeType".into(), json!(mt));
                 }
                 out.push(json!({ "inlineData": Value::Object(inline) }));
+            }
+            Block::File { mime, path, source } => {
+                let mut fd = Map::new();
+                if let Some(mt) = mime {
+                    fd.insert("mimeType".into(), json!(mt));
+                }
+                if let Some(uri) = source.as_deref().or(path.as_deref()) {
+                    fd.insert("fileUri".into(), json!(uri));
+                }
+                out.push(json!({ "fileData": Value::Object(fd) }));
             }
             // Tool use/result handled out of band.
             Block::ToolUse { .. } | Block::ToolResult { .. } => {}
@@ -1389,6 +1438,7 @@ mod tests {
             text: "I should run ls".into(),
             signature: None,
             encrypted: None,
+            redacted: false,
         });
         asst.content.push(Block::Text {
             text: "Sure, listing now.".into(),
@@ -1404,6 +1454,9 @@ mod tests {
             tool_use_id: "call_1".into(),
             content: "file_a.txt\nfile_b.txt".into(),
             is_error: false,
+            tool_name: None,
+            status: None,
+            details: None,
         });
 
         Session {
@@ -1421,6 +1474,7 @@ mod tests {
             }),
             messages: vec![sys, user, asst, tool],
             source_path: None,
+            extra: serde_json::Map::new(),
         }
     }
 

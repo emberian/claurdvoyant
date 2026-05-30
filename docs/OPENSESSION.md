@@ -1,6 +1,6 @@
 # 🧬 OpenSession — an interchange format for agent sessions
 
-*Status: draft 0.1 · a claurdvoyant proposal · feedback very welcome*
+*Status: draft 0.2 · a claurdvoyant proposal · feedback very welcome*
 
 Every coding-agent harness records its conversations, and **every single one invented its own format**:
 Claude threads by UUID, Codex emits an event stream (twice — once for the UI, once for the model),
@@ -31,11 +31,11 @@ first. claurdvoyant's in-memory IR is the reference implementation, and `cv expo
 8. **Be tolerant on the way in.** Real transcripts have corrupt lines, missing fields, and multiple historical
    format versions. A parser that rejects a session because one line is malformed is worse than useless.
 
-## The schema (v0.1)
+## The schema (v0.2)
 
 ```jsonc
 {
-  "openSession": "0.1",            // format version
+  "openSession": "0.2",            // format version
   "harness": "claude",             // origin: claude|codex|grok|opencode|gemini|hermes|openclaw|...
   "id": "da9174f4-…",              // session id (native if possible)
   "cwd": "/Users/ember/pug/x",     // METADATA, not identity — freely rewritable
@@ -44,6 +44,7 @@ first. claurdvoyant's in-memory IR is the reference implementation, and `cv expo
   "createdAt": "2026-05-29T21:…Z", // ISO-8601 (optional)
   "updatedAt": "2026-05-29T22:…Z",
   "git": { "branch": "main", "commit": "…", "remote": "…" },   // optional
+  "extra": { },                    // session-level harness-specific passthrough (optional)
   "messages": [
     {
       "id": "uuid",                // optional
@@ -54,10 +55,12 @@ first. claurdvoyant's in-memory IR is the reference implementation, and `cv expo
       "usage": { "inputTokens": 0, "outputTokens": 0,
                  "cacheReadTokens": 0, "cacheCreationTokens": 0 },   // optional
       "content": [                 // ordered, typed blocks
-        { "kind": "thinking", "text": "…", "signature": "…", "encrypted": "…" },
+        { "kind": "thinking", "text": "…", "signature": "…", "encrypted": "…", "redacted": false },
         { "kind": "text", "text": "…" },
         { "kind": "toolUse", "id": "call_1", "name": "Bash", "input": { "command": "ls" } },
-        { "kind": "toolResult", "toolUseId": "call_1", "content": "…", "isError": false },
+        { "kind": "toolResult", "toolUseId": "call_1", "content": "…", "isError": false,
+          "toolName": "Bash", "status": "completed", "details": { } },
+        { "kind": "file", "mime": "application/pdf", "path": "spec.pdf", "source": "file:///…" },
         { "kind": "image", "mediaType": "image/png", "dataRef": "…" }
       ],
       "extra": { }                 // harness-specific passthrough (optional)
@@ -71,12 +74,15 @@ first. claurdvoyant's in-memory IR is the reference implementation, and `cv expo
 | `kind` | meaning | key fields |
 |---|---|---|
 | `text` | plain prose | `text` |
-| `thinking` | reasoning / chain-of-thought | `text`, `signature?`, `encrypted?` (opaque blob) |
+| `thinking` | reasoning / chain-of-thought | `text`, `signature?`, `encrypted?` (opaque blob), `redacted?` (provider-redacted flag) |
 | `toolUse` | a tool/function invocation | `id`, `name`, `input` (arbitrary JSON) |
-| `toolResult` | the result of one | `toolUseId`, `content`, `isError` |
+| `toolResult` | the result of one | `toolUseId`, `content`, `isError`, `toolName?`, `status?`, `details?` (structured) |
+| `file` | a file/dir/resource attachment (never inlined bytes) | `mime?`, `path?`, `source?` (uri/ref) |
 | `image` | an image reference (never inlined bytes) | `mediaType?`, `dataRef?` |
 
 New block kinds are additive; consumers MUST ignore kinds they don't recognize (forward-compatibility).
+v0.2 added the `file` kind, the `toolResult` `toolName`/`status`/`details` fields, the `thinking` `redacted`
+flag, and a session-level `extra` bag — all additive over v0.1.
 
 ## What's deliberately *not* in v0.1
 

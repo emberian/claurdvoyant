@@ -221,6 +221,7 @@ fn parse_conn(conn: &Connection, r: &SessionRef) -> Result<Session> {
         git: None,
         messages: Vec::new(),
         source_path: Some(r.path.clone()),
+        extra: serde_json::Map::new(),
     };
 
     // Walk the compression/branch lineage root→tip so a compressed-and-continued conversation
@@ -478,6 +479,7 @@ impl MsgRow {
                 text: reasoning_text,
                 signature: None,
                 encrypted,
+                redacted: false,
             });
         }
 
@@ -487,6 +489,9 @@ impl MsgRow {
                 tool_use_id: self.tool_call_id.unwrap_or_default(),
                 content: self.content.unwrap_or_default(),
                 is_error: false,
+                tool_name: self.tool_name.clone(),
+                status: None,
+                details: None,
             });
             // attach tool name for context if present
             if let Some(name) = self.tool_name {

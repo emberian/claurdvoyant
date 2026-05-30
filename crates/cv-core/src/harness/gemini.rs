@@ -251,6 +251,7 @@ fn parse_logs_str(text: &str, source_path: Option<PathBuf>) -> Vec<Session> {
             git: None,
             messages: Vec::new(),
             source_path: source_path.clone(),
+            extra: serde_json::Map::new(),
         };
         for e in items {
             let role = match e.get("type").and_then(Value::as_str) {
@@ -456,6 +457,7 @@ fn record_to_session(
                                 text,
                                 signature: None,
                                 encrypted: None,
+                                redacted: false,
                             });
                         }
                     }
@@ -480,9 +482,8 @@ fn record_to_session(
                             name: name.to_string(),
                             input,
                         });
-                        let is_error = c
-                            .get("status")
-                            .and_then(Value::as_str)
+                        let status = c.get("status").and_then(Value::as_str);
+                        let is_error = status
                             .map(|s| s.eq_ignore_ascii_case("error"))
                             .unwrap_or(false);
                         let content = tool_result_text(c.get("result"))
@@ -497,6 +498,9 @@ fn record_to_session(
                                 tool_use_id: call_id,
                                 content,
                                 is_error,
+                                tool_name: Some(name.to_string()),
+                                status: status.map(str::to_string),
+                                details: None,
                             });
                         }
                     }
@@ -552,6 +556,7 @@ fn record_to_session(
         git: None,
         messages,
         source_path,
+        extra: serde_json::Map::new(),
     }
 }
 
@@ -614,6 +619,9 @@ fn push_part(out: &mut Vec<Block>, part: &Value) {
             tool_use_id: id,
             content,
             is_error: false,
+            tool_name: Some(name.to_string()),
+            status: None,
+            details: None,
         });
         return;
     }
@@ -621,6 +629,14 @@ fn push_part(out: &mut Vec<Block>, part: &Value) {
         out.push(Block::Image {
             media_type: inline.get("mimeType").and_then(Value::as_str).map(str::to_string),
             data_ref: None, // we don't inline base64 bytes into the IR
+        });
+        return;
+    }
+    if let Some(fd) = obj.get("fileData").and_then(Value::as_object) {
+        out.push(Block::File {
+            mime: fd.get("mimeType").and_then(Value::as_str).map(str::to_string),
+            path: None,
+            source: fd.get("fileUri").and_then(Value::as_str).map(str::to_string),
         });
         return;
     }
@@ -634,6 +650,7 @@ fn push_part(out: &mut Vec<Block>, part: &Value) {
                 text: text.to_string(),
                 signature: None,
                 encrypted: None,
+                redacted: false,
             });
         } else {
             out.push(Block::Text { text: text.to_string() });
@@ -763,6 +780,7 @@ fn parse_checkpoint(text: &str, file_name: &str, source_path: Option<PathBuf>) -
         git: None,
         messages,
         source_path,
+        extra: serde_json::Map::new(),
     })
 }
 

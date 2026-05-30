@@ -968,6 +968,10 @@ fn print_message(m: &Message) {
                 if *is_error { " error" } else { "" },
                 truncate(content, 200)
             ),
+            Block::File { path, source, .. } => println!(
+                "[file: {}]",
+                path.as_deref().or(source.as_deref()).unwrap_or("?")
+            ),
             Block::Image { .. } => println!("[image]"),
         }
     }
@@ -1014,6 +1018,12 @@ fn to_markdown(s: &Session) -> String {
                         "**↩ result{}**\n\n```\n{}\n```\n\n",
                         if *is_error { " (error)" } else { "" },
                         truncate(content, 4000)
+                    ));
+                }
+                Block::File { path, source, .. } => {
+                    out.push_str(&format!(
+                        "_[file: {}]_\n\n",
+                        path.as_deref().or(source.as_deref()).unwrap_or("?")
                     ));
                 }
                 Block::Image { .. } => out.push_str("_[image]_\n\n"),

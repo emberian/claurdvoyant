@@ -141,6 +141,7 @@ fn parse_text(text: &str, r: &SessionRef) -> Session {
         git: None,
         messages: Vec::new(),
         source_path: Some(r.path.clone()),
+        extra: serde_json::Map::new(),
     };
     let mut header_version: Option<i64> = None;
 
@@ -357,6 +358,9 @@ fn parse_tool_result(m: &mut Message, msg: &Value) {
         tool_use_id,
         content: coerce_content_text(msg.get("content")),
         is_error: msg.get("isError").and_then(Value::as_bool).unwrap_or(false),
+        tool_name: msg.get("toolName").and_then(Value::as_str).map(str::to_string),
+        status: None,
+        details: msg.get("details").filter(|d| !d.is_null()).cloned(),
     });
     // Image parts in a tool result aren't captured by the text coercion above; surface them.
     if let Some(Value::Array(items)) = msg.get("content") {
@@ -516,6 +520,10 @@ fn content_block(item: &Value) -> Option<Block> {
                 .and_then(Value::as_bool)
                 .filter(|&r| r)
                 .map(|_| "redacted".to_string()),
+            redacted: item
+                .get("redacted")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
         }),
         "toolCall" => Some(Block::ToolUse {
             id: item.get("id").and_then(Value::as_str).unwrap_or("").to_string(),
@@ -635,6 +643,7 @@ mod tests {
                 Block::ToolUse { .. } => "toolcall",
                 Block::ToolResult { .. } => "toolresult",
                 Block::Image { .. } => "image",
+                Block::File { .. } => "file",
             })
             .collect();
         assert_eq!(kinds, ["thinking", "text", "toolcall"]);
@@ -662,10 +671,11 @@ mod tests {
         let tr = &s.messages[2];
         assert_eq!(tr.role, Role::Tool);
         match &tr.content[0] {
-            Block::ToolResult { tool_use_id, content, is_error } => {
+            Block::ToolResult { tool_use_id, content, is_error, tool_name, .. } => {
                 assert_eq!(tool_use_id, "call_1");
                 assert_eq!(content, "file contents");
                 assert!(!is_error);
+                assert_eq!(tool_name.as_deref(), Some("read_file"));
             }
             _ => panic!("expected tool result"),
         }

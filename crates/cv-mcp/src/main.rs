@@ -435,6 +435,12 @@ fn message_text(m: &cv_core::Message) -> String {
                 out.push_str(&input.to_string());
                 out.push('\n');
             }
+            Block::File { path, source, .. } => {
+                if let Some(p) = path.as_deref().or(source.as_deref()) {
+                    out.push_str(p);
+                    out.push('\n');
+                }
+            }
             Block::Image { .. } => {}
         }
     }

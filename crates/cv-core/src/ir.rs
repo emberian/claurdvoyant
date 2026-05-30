@@ -101,6 +101,9 @@ pub struct Session {
     /// Where this session was read from on disk.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_path: Option<PathBuf>,
+    /// Session-level metadata that doesn't have a first-class home yet.
+    #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
+    pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
 impl Session {
@@ -144,6 +147,12 @@ impl Session {
                     Block::ToolResult { content, .. } => {
                         out.push_str(content);
                         out.push('\n');
+                    }
+                    Block::File { path, source, .. } => {
+                        if let Some(p) = path.as_deref().or(source.as_deref()) {
+                            out.push_str(p);
+                            out.push('\n');
+                        }
                     }
                     Block::Image { .. } => {}
                 }
@@ -237,6 +246,9 @@ pub enum Block {
         signature: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         encrypted: Option<String>,
+        /// Whether the provider redacted this reasoning content.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        redacted: bool,
     },
     /// A tool/function invocation by the assistant.
     ToolUse {
@@ -250,6 +262,15 @@ pub enum Block {
         content: String,
         #[serde(default)]
         is_error: bool,
+        /// Name of the tool this result is for, when the adapter knows it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tool_name: Option<String>,
+        /// Adapter-computed status string (e.g. "completed", "error", "running").
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        status: Option<String>,
+        /// Structured extra details about the result.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        details: Option<serde_json::Value>,
     },
     Image {
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -257,6 +278,15 @@ pub enum Block {
         /// Path or opaque reference; we don't inline image bytes into the IR.
         #[serde(skip_serializing_if = "Option::is_none")]
         data_ref: Option<String>,
+    },
+    /// A first-class file/dir/resource attachment.
+    File {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        mime: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        path: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        source: Option<String>,
     },
 }
 

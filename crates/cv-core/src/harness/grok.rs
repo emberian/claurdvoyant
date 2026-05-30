@@ -118,6 +118,7 @@ impl Adapter for Grok {
             git: grok_git(&summary),
             messages: Vec::new(),
             source_path: Some(dir.clone()),
+            extra: serde_json::Map::new(),
         };
 
         // Sidecar enrichment: tool_call / tool_call_update entries from the ACP update stream.
@@ -244,12 +245,18 @@ fn chat_message(v: &Value, enrich: &HashMap<String, ToolEnrich>) -> Option<Messa
             .unwrap_or_default()
             .to_string();
         let content = coerce_content(v.get("content"));
-        let is_error = enrich.get(&tool_use_id).map(|e| e.is_error()).unwrap_or(false);
+        let e = enrich.get(&tool_use_id);
+        let is_error = e.map(|e| e.is_error()).unwrap_or(false);
+        let status = e.and_then(|e| e.status.clone());
+        let tool_name = e.and_then(|e| e.title.clone());
         let mut m = Message::new(Role::Tool);
         m.content.push(Block::ToolResult {
             tool_use_id,
             content,
             is_error,
+            tool_name,
+            status,
+            details: None,
         });
         return Some(m);
     }
@@ -278,6 +285,7 @@ fn chat_message(v: &Value, enrich: &HashMap<String, ToolEnrich>) -> Option<Messa
                 text,
                 signature: None,
                 encrypted,
+                redacted: false,
             });
         }
     }
@@ -524,6 +532,7 @@ mod tests {
                 tool_use_id,
                 content,
                 is_error,
+                ..
             } => {
                 assert_eq!(tool_use_id, "call-1");
                 assert_eq!(content, "file contents");
