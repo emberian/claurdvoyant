@@ -10,6 +10,12 @@
 
 *parse anything · search by meaning · resume anywhere · let your agents read each other's minds*
 
+<br>
+
+<img src="docs/screenshot-timeline.png" alt="claurdvoyant timeline — a GitHub-style activity heatmap of every agent session across every harness, with a constellation feed below" width="840">
+
+<sub>the desktop app reading 2,245 real local sessions across 8 harnesses — heatmap, harness legend, and a live feed</sub>
+
 </div>
 
 ---
@@ -73,16 +79,28 @@ cv scry
 - **🔮 Recall** — semantic "have I solved this before?" — as a `cv recall` command *and* an MCP tool that hands a running agent the relevant past span.
 - **🔒 Redact** — `cv redact <id>` scrubs secrets/PII so a transcript is safe to share.
 - **📣 Coordination board** — agents post status, hand off work, and grab tasks with a **distributed lock** (`board_claim`) so a fleet never duplicates effort. `await_omen` blocks until a session matches a regex.
-- **🌐 Web app + 🖥️ Tauri desktop app** — drop a harness zip in the browser (WASM, nothing uploaded): viewer, timeline, compare, stats, a visual **loom composer** (with OpenRouter generation), and a live **fleet dashboard**. The `app/` Tauri build bundles it all natively.
+- **🖥️ Desktop app + 🌐 web viewer** — the Tauri app reads **all your local sessions natively** (zero setup) and lays the corpus out beautifully:
+  - a **Projects** lens — every repo, every agent that touched it, over time;
+  - a GitHub-style **activity heatmap** timeline (a constellation of your working days);
+  - side-by-side **Compare**, a **Stats** dashboard, a visual **loom composer** (OpenRouter *or* free local LM Studio generation), and a live **fleet dashboard**;
+  - **sub-agent trees** — a Claude Task session's children, nested and lazy-loaded inline, each labeled with its task prompt.
+
+  The browser build is zero-install — drop a harness zip, nothing uploaded (all WASM).
 - **🔌 Harness integrations** — plug claurdvoyant into the agents' own hooks/MCP/plugins ([`integrations/`](integrations/)): SessionEnd → archive + distill, SessionStart → recall, events → the board.
 
 ## 🛠️ Install
 
+**Prebuilt binaries** for macOS / Linux / Windows (arm64 · x64 · x86) ship on every release — grab the latest from **[Releases](https://github.com/emberian/claurdvoyant/releases/latest)** (`cv` · `cv-mcp` · `cvd` · `cv-tui` · `cv-search`), or one-line it:
+
 ```sh
-cargo build --release          # → target/release/{cv, cv-mcp, cvd, cv-search}
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/emberian/claurdvoyant/releases/latest/download/cv-installer.sh | sh
 ```
 
-(Prebuilt binaries for macOS/Linux/Windows × arm64/x64/x86 ship on each release via `dist`.)
+Or from source:
+
+```sh
+cargo build --release          # → target/release/{cv, cv-mcp, cvd, cv-tui, cv-search}
+```
 
 ## 🧠 Let agents read each other's minds (MCP)
 
