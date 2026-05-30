@@ -1,0 +1,14 @@
+[
+  {
+    "sessionId": "11111111-1111-1111-1111-111111111111",
+    "title": "Refactor the parser",
+    "dateCreated": "1700000000000",
+    "workspaceDirectory": "/Users/me/proj"
+  },
+  {
+    "sessionId": "22222222-2222-2222-2222-222222222222",
+    "title": "Stale index entry (no file)",
+    "dateCreated": "1700000500000",
+    "workspaceDirectory": "/Users/me/other"
+  }
+]

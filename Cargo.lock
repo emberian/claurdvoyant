@@ -412,6 +412,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "cv-llm"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "cv-core",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "cv-mcp"
 version = "0.1.0"
 dependencies = [

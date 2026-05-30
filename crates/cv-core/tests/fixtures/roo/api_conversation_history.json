@@ -1,0 +1,24 @@
+[
+  {
+    "role": "user",
+    "content": [
+      {
+        "type": "text",
+        "text": "<task>\nAdd a unit test\n</task>\n<environment_details>\n# Current Working Directory (/home/dev/app) Files\nsrc/lib.rs\n</environment_details>"
+      }
+    ]
+  },
+  {
+    "role": "assistant",
+    "content": [
+      { "type": "text", "text": "I'll add a test." },
+      { "type": "tool_use", "id": "toolu_9", "name": "write_to_file", "input": { "path": "src/lib.rs" } }
+    ]
+  },
+  {
+    "role": "user",
+    "content": [
+      { "type": "tool_result", "tool_use_id": "toolu_9", "content": "File written.", "is_error": false }
+    ]
+  }
+]

@@ -14,6 +14,7 @@ pub mod index;
 pub mod ingest;
 pub mod ir;
 pub mod loom;
+pub mod redact;
 pub mod render;
 pub mod watch;
 

@@ -1,0 +1,32 @@
+[
+  {
+    "role": "user",
+    "content": [
+      {
+        "type": "text",
+        "text": "<task>\nFix the parser bug\n</task>\n<environment_details>\n# Current Working Directory (/Users/me/proj) Files\nsrc/main.rs\nCargo.toml\n</environment_details>"
+      }
+    ]
+  },
+  {
+    "role": "assistant",
+    "content": [
+      { "type": "thinking", "thinking": "Let me read the file first.", "signature": "SIG==" },
+      { "type": "text", "text": "I'll read the file." },
+      { "type": "tool_use", "id": "toolu_1", "name": "read_file", "input": { "path": "src/main.rs" } }
+    ]
+  },
+  {
+    "role": "user",
+    "content": [
+      {
+        "type": "tool_result",
+        "tool_use_id": "toolu_1",
+        "content": [
+          { "type": "text", "text": "fn main() {\n    println!(\"hi\");\n}\n" }
+        ],
+        "is_error": false
+      }
+    ]
+  }
+]
