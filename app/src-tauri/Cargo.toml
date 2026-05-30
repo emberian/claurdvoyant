@@ -9,7 +9,7 @@
 [package]
 name = "claurdvoyant-app"
 description = "claurdvoyant desktop app — Tauri v2 shell around the web UI + native cv-core/cv-llm power."
-version = "0.1.0"
+version = "0.9.8"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["ember"]
