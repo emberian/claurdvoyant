@@ -88,6 +88,10 @@ cv scry
   The browser build is zero-install — drop a harness zip, nothing uploaded (all WASM).
 - **🔌 Harness integrations** — plug claurdvoyant into the agents' own hooks/MCP/plugins ([`integrations/`](integrations/)): SessionEnd → archive + distill, SessionStart → recall, events → the board.
 
+## 📖 Manual
+
+Full docs — every CLI command, the MCP tools, the daemon's HTTP API, the app, cross-harness conversion, and the harness table — live in the **[user manual](https://claurdvoyant.lunar.town/manual/)** (mdBook, also under `manual/`).
+
 ## 🛠️ Install
 
 **Prebuilt binaries** for macOS / Linux / Windows (arm64 · x64 · x86) ship on every release — grab the latest from **[Releases](https://github.com/emberian/claurdvoyant/releases/latest)** (`cv` · `cv-mcp` · `cvd` · `cv-tui` · `cv-search`), or one-line it:

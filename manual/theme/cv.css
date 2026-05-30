@@ -1,0 +1,3 @@
+:root { --links: #9a78f0; }
+.menu-title::before { content: "🔮 "; }
+h1, h2 { letter-spacing: -0.01em; }

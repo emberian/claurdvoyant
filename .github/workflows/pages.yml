@@ -55,6 +55,19 @@ jobs:
             echo "crates/cv-web not present yet; skipping WASM build (site will run in demo mode)."
           fi
 
+      # Build the mdBook user manual and nest it under the site at /manual/.
+      - name: Install mdBook
+        uses: peaceiris/actions-mdbook@v2
+        with:
+          mdbook-version: '0.5.2'
+
+      - name: Build the manual
+        run: |
+          mdbook build manual
+          rm -rf web/manual
+          mkdir -p web/manual
+          cp -r manual/book/. web/manual/
+
       - name: Configure Pages
         uses: actions/configure-pages@v5
 

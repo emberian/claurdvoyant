@@ -6,3 +6,7 @@
 # build artifacts in ANY crate (root + nested, e.g. the Tauri app)
 **/target/
 app/src-tauri/gen/
+
+# mdBook generated output (built in CI)
+/manual/book/
+/web/manual/

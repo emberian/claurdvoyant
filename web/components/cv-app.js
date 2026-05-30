@@ -222,7 +222,8 @@ class CvApp extends HTMLElement {
         <div class="header-actions">
           <button type="button" class="icon-btn help-btn" title="Keyboard shortcuts (?)" aria-label="Keyboard shortcuts">?</button>
           <button type="button" class="icon-btn theme-toggle" title="Toggle theme — dark / light / auto (t)" aria-label="Toggle theme">◐</button>
-          <a class="repo-link" href="https://github.com/" target="_blank" rel="noopener" title="Project repository">source</a>
+          <a class="repo-link" href="https://claurdvoyant.lunar.town/manual/" target="_blank" rel="noopener" title="User manual">manual</a>
+          <a class="repo-link" href="https://github.com/emberian/claurdvoyant" target="_blank" rel="noopener" title="Project repository">source</a>
         </div>
       </header>
 
@@ -449,7 +450,7 @@ class CvApp extends HTMLElement {
       overlay.setAttribute("aria-modal", "true");
       overlay.setAttribute("aria-label", "Keyboard shortcuts");
       const rows = [
-        ["1 – 7", "Switch view (Sessions, Timeline, Compare, …)"],
+        ["1 – 8", "Switch view (Sessions, Projects, Timeline, …)"],
         ["/", "Focus session search"],
         ["j / k  ·  ↓ / ↑", "Move selection in the session list"],
         ["Enter", "Open the focused session"],
