@@ -28,3 +28,50 @@ export async function hydrateSession(stub) {
   full._stub = false;
   return full;
 }
+
+const enc = encodeURIComponent;
+
+/** The sub-agents a session spawned (Claude Code Task sub-agents), as metadata-only stubs. Empty on
+ *  any error or for harnesses without sub-agents. */
+export async function getSubagents(session) {
+  if (!session || !session.harness || !session.id) return [];
+  try {
+    let raw;
+    if (canInvokeNative()) {
+      raw = JSON.parse(await invoke("local_subagents", { harness: session.harness, id: session.id }));
+    } else {
+      const resp = await fetch(`${CVD_BASE}/api/session/${enc(session.harness)}/${enc(session.id)}/subagents`, {
+        headers: { Accept: "application/json" },
+      });
+      if (!resp.ok) return [];
+      raw = await resp.json();
+    }
+    if (!Array.isArray(raw)) return [];
+    return raw.map((s) => {
+      const n = normalizeSession(s);
+      n._stub = true;
+      n._parentId = session.id;
+      n._parentHarness = session.harness;
+      return n;
+    });
+  } catch {
+    return [];
+  }
+}
+
+/** Full transcript of one sub-agent, loaded relative to its parent. */
+export async function getSubagent(parentHarness, parentId, agentId) {
+  let raw;
+  if (canInvokeNative()) {
+    raw = JSON.parse(await invoke("local_subagent", { harness: parentHarness, parent: parentId, agent: agentId }));
+  } else {
+    const resp = await fetch(`${CVD_BASE}/api/session/${enc(parentHarness)}/${enc(parentId)}/subagent/${enc(agentId)}`, {
+      headers: { Accept: "application/json" },
+    });
+    if (!resp.ok) throw new Error(`cvd ${resp.status}`);
+    raw = await resp.json();
+  }
+  const full = normalizeSession(raw);
+  full._stub = false;
+  return full;
+}

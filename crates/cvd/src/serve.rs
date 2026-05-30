@@ -85,6 +85,10 @@ fn route(segments: &[String], query: &str) -> (u16, Value) {
 
         ["api", "session", harness, id] => session(harness, id),
 
+        ["api", "session", harness, id, "subagents"] => subagents(harness, id),
+
+        ["api", "session", harness, parent, "subagent", agent] => subagent(harness, parent, agent),
+
         ["api", "board", channel] => board(channel, query),
 
         ["api", "claims", channel] => claims(channel),
@@ -170,6 +174,61 @@ fn session(harness: &str, id: &str) -> (u16, Value) {
             Err(e) => err(500, &format!("parse failed: {e:#}")),
         },
         Ok(None) => err(404, "session not found"),
+        Err(e) => err(500, &e.to_string()),
+    }
+}
+
+/// `GET /api/session/{harness}/{id}/subagents` — lightweight refs for the sub-agents this session
+/// spawned (e.g. Claude Code Task sub-agents), newest first. Empty array if none.
+fn subagents(harness: &str, id: &str) -> (u16, Value) {
+    let h = match Harness::parse(harness) {
+        Some(h) => h,
+        None => return err(400, &format!("unknown harness {harness:?}")),
+    };
+    match cv_core::find(id, Some(h)) {
+        Ok(Some((r, _))) => {
+            let out: Vec<Value> = cv_core::subagents_of(&r)
+                .iter()
+                .map(|s| {
+                    json!({
+                        "id": s.id,
+                        "harness": s.harness.as_str(),
+                        "cwd": s.cwd.as_ref().map(|c| c.to_string_lossy()),
+                        "title": s.title,
+                        "updated_at": s.updated_at,
+                        "created_at": s.created_at,
+                        "message_count": s.message_count,
+                    })
+                })
+                .collect();
+            ok(json!(out))
+        }
+        Ok(None) => err(404, "session not found"),
+        Err(e) => err(500, &e.to_string()),
+    }
+}
+
+/// `GET /api/session/{harness}/{parent}/subagent/{agent}` — the full parsed transcript of one
+/// sub-agent (sub-agents aren't in the main pool, so they're loaded relative to their parent).
+fn subagent(harness: &str, parent: &str, agent: &str) -> (u16, Value) {
+    let h = match Harness::parse(harness) {
+        Some(h) => h,
+        None => return err(400, &format!("unknown harness {harness:?}")),
+    };
+    match cv_core::find(parent, Some(h)) {
+        Ok(Some((r, adapter))) => {
+            match cv_core::subagents_of(&r).into_iter().find(|s| s.id == agent) {
+                Some(sr) => match adapter.parse(&sr) {
+                    Ok(session) => match serde_json::to_value(&session) {
+                        Ok(v) => ok(v),
+                        Err(e) => err(500, &e.to_string()),
+                    },
+                    Err(e) => err(500, &format!("parse failed: {e:#}")),
+                },
+                None => err(404, "subagent not found"),
+            }
+        }
+        Ok(None) => err(404, "parent session not found"),
         Err(e) => err(500, &e.to_string()),
     }
 }

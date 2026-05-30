@@ -199,6 +199,49 @@ fn local_session(harness: String, id: String) -> Result<String, String> {
     serde_json::to_string(&session).map_err(|e| format!("serializing session: {e}"))
 }
 
+/// Lightweight refs for the sub-agents a session spawned (Claude Code Task sub-agents), newest
+/// first — the native equivalent of cvd's `/api/session/{h}/{id}/subagents`.
+#[tauri::command]
+fn local_subagents(harness: String, id: String) -> Result<String, String> {
+    let want = cv_core::Harness::parse(&harness)
+        .ok_or_else(|| format!("unknown harness {harness:?}"))?;
+    let (r, _) = cv_core::find(&id, Some(want))
+        .map_err(|e| format!("looking up session: {e:#}"))?
+        .ok_or_else(|| format!("no session {id:?} for harness {harness}"))?;
+    let stubs: Vec<serde_json::Value> = cv_core::subagents_of(&r)
+        .iter()
+        .map(|s| {
+            serde_json::json!({
+                "id": s.id,
+                "harness": s.harness.as_str(),
+                "cwd": s.cwd.as_ref().map(|c| c.to_string_lossy()),
+                "title": s.title,
+                "created_at": s.created_at,
+                "updated_at": s.updated_at,
+                "message_count": s.message_count,
+            })
+        })
+        .collect();
+    serde_json::to_string(&stubs).map_err(|e| format!("serializing subagents: {e}"))
+}
+
+/// Full parsed transcript of one sub-agent, loaded relative to its parent (sub-agents aren't in the
+/// main pool). Native equivalent of cvd's `/api/session/{h}/{parent}/subagent/{agent}`.
+#[tauri::command]
+fn local_subagent(harness: String, parent: String, agent: String) -> Result<String, String> {
+    let want = cv_core::Harness::parse(&harness)
+        .ok_or_else(|| format!("unknown harness {harness:?}"))?;
+    let (r, adapter) = cv_core::find(&parent, Some(want))
+        .map_err(|e| format!("looking up parent: {e:#}"))?
+        .ok_or_else(|| format!("no parent session {parent:?}"))?;
+    let sr = cv_core::subagents_of(&r)
+        .into_iter()
+        .find(|s| s.id == agent)
+        .ok_or_else(|| format!("subagent {agent:?} not found under {parent}"))?;
+    let session = adapter.parse(&sr).map_err(|e| format!("parsing subagent: {e:#}"))?;
+    serde_json::to_string(&session).map_err(|e| format!("serializing subagent: {e}"))
+}
+
 /// Report whether an LLM provider is configured (so the UI can enable/disable distill/loom).
 #[derive(Serialize)]
 struct ProviderInfo {
@@ -449,7 +492,9 @@ pub fn run() {
             ingest_zip,
             provider_info,
             local_sessions,
-            local_session
+            local_session,
+            local_subagents,
+            local_subagent
         ])
         .on_menu_event(handle_menu_event)
         .setup(|app| {

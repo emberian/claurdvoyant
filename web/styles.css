@@ -409,6 +409,38 @@ pre code { background: none; padding: 0; }
 
 .tool-out { max-height: 420px; }
 
+/* ---------- Sub-agent tree (Claude Task sub-agents, nested in the transcript) ---------- */
+.sub-panel {
+  margin: 4px 20px 10px; border-radius: 11px; overflow: hidden;
+  border: 1px solid color-mix(in srgb, var(--accent) 28%, var(--border));
+  background: color-mix(in srgb, var(--accent) 5%, var(--bg-elev));
+}
+.sub-panel-head {
+  display: flex; align-items: center; gap: 7px; width: 100%;
+  padding: 9px 13px; background: none; border: 0; color: var(--fg);
+  font: inherit; font-size: 13px; cursor: pointer; text-align: left;
+}
+.sub-panel-head:hover { background: color-mix(in srgb, var(--accent) 9%, transparent); }
+.sub-fork { color: var(--accent); font-size: 14px; text-shadow: 0 0 8px color-mix(in srgb, var(--accent) 60%, transparent); }
+.sub-caret { margin-left: auto; color: var(--fg-muted); font-size: 11px; }
+.sub-list { display: flex; flex-direction: column; gap: 2px; padding: 2px 6px 8px; }
+.sub-row-head { display: flex; align-items: center; gap: 9px; padding: 7px 9px; border-radius: 8px; cursor: pointer; }
+.sub-row-head:hover { background: var(--bg-sunk); }
+.sub-dot {
+  width: 8px; height: 8px; border-radius: 50%; flex: none; margin-left: 4px;
+  background: var(--accent); box-shadow: 0 0 7px -1px var(--accent);
+}
+.sub-row-title { font-weight: 550; font-size: 13px; font-family: var(--mono); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sub-row.open .sub-row-title { font-family: var(--sans); color: var(--accent); }
+.sub-row-meta { margin-left: auto; flex: none; font-size: 11px; white-space: nowrap; }
+.sub-row-caret { flex: none; color: var(--fg-muted); font-size: 11px; }
+.sub-row-body {
+  margin: 0 0 8px 18px; border-left: 2px solid color-mix(in srgb, var(--accent) 40%, var(--border));
+}
+.sub-row-body cv-transcript { display: block; }
+.sub-row-body .turns { padding: 8px 14px 14px; gap: 12px; }
+.sub-loading { padding: 12px 14px; font-size: 12.5px; }
+
 /* Thinking (collapsible) */
 .thinking {
   background: var(--thinking-bg);

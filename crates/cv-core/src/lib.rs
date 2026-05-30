@@ -98,6 +98,15 @@ where
     }
 }
 
+/// The sub-agent sessions a given session spawned (lazily; not part of the main pool — there can be
+/// thousands). Currently Claude Code's Task sub-agents; other harnesses return empty for now.
+pub fn subagents_of(r: &SessionRef) -> Vec<SessionRef> {
+    match r.harness {
+        Harness::Claude => harness::claude::subagent_refs(&r.path),
+        _ => Vec::new(),
+    }
+}
+
 /// Find a single session by id (optionally constrained to one harness), returning its ref + adapter.
 ///
 /// An exact id match always wins and returns immediately. Otherwise the id is treated as a prefix:

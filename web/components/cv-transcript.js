@@ -6,10 +6,11 @@
 // block, tool_result (with error styling), and images as labeled placeholders.
 import "./cv-harness-badge.js";
 import {
-  esc, pretty, fmtTime, sessionLabel, shortPath, sumTokens,
+  esc, pretty, fmtTime, sessionLabel, shortPath, sumTokens, msgCount,
   toOpenSession, toMarkdown, downloadFile, slug, ROLE_LABELS, HARNESS_LABELS,
 } from "./util.js";
 import { renderMarkdown, renderCodeBlock } from "../markdown.js";
+import { getSubagents, getSubagent } from "./hydrate.js";
 
 class CvTranscript extends HTMLElement {
   constructor() {
@@ -64,6 +65,88 @@ class CvTranscript extends HTMLElement {
       if (i < messages.length) requestAnimationFrame(renderChunk);
     };
     renderChunk(); // first chunk synchronously, so content is on screen immediately
+
+    this._mountSubagents(s);
+  }
+
+  // ---- sub-agent tree -----------------------------------------------------
+  // If this session spawned sub-agents (Claude Code Task), show a collapsible tree below the header;
+  // each child lazily loads its full transcript inline (recursively rendered by a nested transcript).
+  async _mountSubagents(session) {
+    if (!session || session._isSubagent) return; // sub-agents don't spawn their own
+    const subs = await getSubagents(session);
+    if (this._session !== session || !subs.length) return; // changed / none
+    this._subs = subs;
+    const panel = document.createElement("div");
+    panel.className = "sub-panel";
+    panel.innerHTML = `
+      <button type="button" class="sub-panel-head" aria-expanded="false">
+        <span class="sub-fork" aria-hidden="true">⑂</span>
+        <b>${subs.length}</b> sub-agent${subs.length === 1 ? "" : "s"} spawned
+        <span class="sub-caret" aria-hidden="true">▸</span>
+      </button>
+      <div class="sub-list" hidden>${subs.map((s, i) => this._subRowHtml(s, i)).join("")}</div>`;
+    const header = this.querySelector(".transcript-header");
+    if (header) header.insertAdjacentElement("afterend", panel);
+    else this.insertAdjacentElement("afterbegin", panel);
+
+    const list = panel.querySelector(".sub-list");
+    panel.querySelector(".sub-panel-head").addEventListener("click", (e) => {
+      const open = list.hasAttribute("hidden");
+      list.toggleAttribute("hidden", !open);
+      e.currentTarget.setAttribute("aria-expanded", String(open));
+      e.currentTarget.querySelector(".sub-caret").textContent = open ? "▾" : "▸";
+    });
+    list.addEventListener("click", (e) => {
+      const row = e.target.closest(".sub-row");
+      if (row) this._toggleSub(row);
+    });
+  }
+
+  _subRowHtml(s, i) {
+    const when = fmtTime(s.updated_at || s.created_at);
+    const n = msgCount(s);
+    return `
+      <div class="sub-row" data-idx="${i}">
+        <div class="sub-row-head">
+          <span class="sub-dot" aria-hidden="true"></span>
+          <span class="sub-row-title">${esc(s.id || `sub-agent ${i + 1}`)}</span>
+          <span class="sub-row-meta muted">${n} msg${n === 1 ? "" : "s"} · ${esc(when)}</span>
+          <span class="sub-row-caret" aria-hidden="true">▸</span>
+        </div>
+        <div class="sub-row-body" hidden></div>
+      </div>`;
+  }
+
+  async _toggleSub(row) {
+    const body = row.querySelector(".sub-row-body");
+    const caret = row.querySelector(".sub-row-caret");
+    if (!body.hasAttribute("hidden")) {
+      body.setAttribute("hidden", "");
+      caret.textContent = "▸";
+      row.classList.remove("open");
+      return;
+    }
+    body.removeAttribute("hidden");
+    caret.textContent = "▾";
+    row.classList.add("open");
+    if (body.dataset.loaded) return;
+    body.dataset.loaded = "1";
+    body.innerHTML = `<div class="muted sub-loading">Loading sub-agent…</div>`;
+    const stub = this._subs[+row.dataset.idx];
+    try {
+      const full = await getSubagent(stub._parentHarness, stub._parentId, stub.id);
+      full._isSubagent = true; // so the nested transcript doesn't re-query sub-agents
+      body.innerHTML = "";
+      const nested = document.createElement("cv-transcript");
+      body.appendChild(nested);
+      nested.session = full;
+      // Relabel the row with the task prompt (its first user message) now that we have it.
+      const label = sessionLabel(full);
+      if (label && label !== "(untitled)") row.querySelector(".sub-row-title").textContent = label;
+    } catch (e) {
+      body.innerHTML = `<div class="muted">Couldn't load this sub-agent (${esc(String(e?.message || e))}).</div>`;
+    }
   }
 
   // Header-level controls (export buttons) — wired once per render.

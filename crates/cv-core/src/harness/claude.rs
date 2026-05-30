@@ -165,6 +165,30 @@ pub fn parse_str(id: &str, text: &str, source_path: Option<PathBuf>) -> Session 
     session
 }
 
+/// Sub-agent transcripts spawned by `parent_path`'s session (Claude Code's Task tool). They live at
+/// `<projects>/<encoded>/<sid>/subagents/<agent>.jsonl` — a sibling `subagents/` dir next to the
+/// parent's `<sid>.jsonl`. Returned as lightweight refs (newest first), scanned in parallel.
+pub fn subagent_refs(parent_path: &std::path::Path) -> Vec<SessionRef> {
+    let Some(stem) = parent_path.file_stem().and_then(|s| s.to_str()) else {
+        return vec![];
+    };
+    let Some(dir) = parent_path.parent().map(|d| d.join(stem).join("subagents")) else {
+        return vec![];
+    };
+    let mut paths: Vec<PathBuf> = Vec::new();
+    if let Ok(rd) = fs::read_dir(&dir) {
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.extension().and_then(|x| x.to_str()) == Some("jsonl") {
+                paths.push(p);
+            }
+        }
+    }
+    let mut refs = crate::par_filter_map(paths, |p| scan(&p).ok());
+    refs.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+    refs
+}
+
 /// Cheap metadata-only scan for `discover`.
 fn scan(path: &std::path::Path) -> Result<SessionRef> {
     let id = path
