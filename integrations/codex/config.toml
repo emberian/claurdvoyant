@@ -1,0 +1,26 @@
+# claurdvoyant × Codex CLI — MCP server registration.
+#
+# Merge this block into ~/.codex/config.toml. Codex registers stdio MCP servers under
+# [mcp_servers.<name>] with `command` / `args` / optional `env` / `enabled`.
+# Confirmed against the live ~/.codex/config.toml on this machine (e.g.
+# [mcp_servers.playwright], [mcp_servers.anna-mcp]) and codex-rs config handling.
+#
+# Replace the command path with your built cv-mcp binary. This lets a running Codex
+# agent call recall / search_sessions / project_sessions / read_session / board_* —
+# i.e. read OTHER agents' sessions across harnesses.
+
+[mcp_servers.claurdvoyant]
+command = "/path/to/target/release/cv-mcp"
+args = []
+enabled = true
+
+# Optional: Codex also fires a `notify` program after each completed turn with a JSON
+# payload like {"type":"agent-turn-complete", ...} as the final argv. You can point it
+# at a tiny wrapper that runs `cvd sync` (see ./notify-cvd.sh). Codex appends the JSON
+# payload as one extra argument; the wrapper ignores it.
+#
+#   notify = ["/path/to/integrations/codex/notify-cvd.sh"]
+#
+# If you already use `notify` for desktop notifications, keep your existing value —
+# notify only supports a single program. Prefer the lifecycle hooks (hooks.json) for
+# archiving instead, since those compose.

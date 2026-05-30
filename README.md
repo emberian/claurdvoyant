@@ -49,23 +49,32 @@ cv scry
 - 📣 **A coordination board** (`cv board` + MCP): agents post status and hand off work to each other. With the daemon mirroring activity, it's a live feed across your whole **cloud fleet**.
 - 🌐 **A zero-install web viewer**: drag a zip of any harness folder into your browser and explore it. Nothing uploaded, all WASM.
 
-## 🪐 Harnesses
+## 🪐 17 harnesses, one IR
 
-| | Harness | Parse | Convert *to* |
-|---|---|:--:|:--:|
-| ✅ | **Claude Code** | ✅ | ✅ |
-| ✅ | **Codex CLI** | ✅ | ✅ |
-| ✅ | **Grok CLI** | ✅ | ✅ |
-| ✅ | **OpenCode** | ✅ | ✅ |
-| ✅ | **Gemini / Antigravity** | ✅ | ✅ |
-| ✅ | **Hermes** (Nous) | ✅ | ✅ |
-| ✅ | **OpenClaw** | ✅ | ✅ |
-| ✅ | **Cursor** | ✅ | — |
-| 🔒 | **Claude / ChatGPT desktop apps** | detected¹ | — |
+| | Harness | Parse | Convert *to* | | | Harness | Parse | Convert *to* |
+|---|---|:--:|:--:|---|---|---|:--:|:--:|
+| ✅ | **Claude Code** | ✅ | ✅ | | ✅ | **Cursor** | ✅ | — |
+| ✅ | **Codex CLI** | ✅ | ✅ | | ✅ | **Kimi CLI** | ✅ | — |
+| ✅ | **Grok CLI** | ✅ | ✅ | | ✅ | **Qwen Code** | ✅ | — |
+| ✅ | **OpenCode** | ✅ | ✅ | | ✅ | **LM Studio** | ✅ | — |
+| ✅ | **Gemini / Antigravity** | ✅ | ✅ | | ✅ | **Cline** | ✅ | — |
+| ✅ | **Hermes** (Nous) | ✅ | ✅ | | ✅ | **Roo Code** | ✅ | — |
+| ✅ | **OpenClaw** | ✅ | ✅ | | ✅ | **Continue** | ✅ | — |
+| 🔒 | **Claude / ChatGPT apps** | detected¹ | — | | ✅ | **Goose** (Block) | ✅ | — |
 
 <sub>¹ The Claude app keeps transcripts server-side; the ChatGPT app keeps them locally but encrypted at rest. We detect the install and document exactly why neither is readable — see [`docs/FORMATS.md`](docs/FORMATS.md).</sub>
 
-**Conversion is N-way**: any ✅ source → any ✅ target, mediated by one unified IR. Every format reverse-engineered in [`docs/FORMATS.md`](docs/FORMATS.md). Bringing your own? → [`ADDING_HARNESS.md`](ADDING_HARNESS.md) 💛
+**Conversion is N-way** among the 7 emit-capable harnesses: any → any, mediated by one unified IR. Every format reverse-engineered in [`docs/FORMATS.md`](docs/FORMATS.md). Bringing your own? → [`ADDING_HARNESS.md`](ADDING_HARNESS.md) 💛
+
+## ✨ More than a viewer
+
+- **🧵 Splice & loom** — compose a new session from spans of others (`cv splice A:0-12 B:6-`), or *fork-and-graft* a branch and **generate** its continuation with an LLM (`cv loom … --generate`). Works via OpenRouter / Anthropic / **LM Studio (free, local, offline)**. Loom agent transcripts like a [Janus loom](https://generative.ink/posts/loom-interface-to-the-multiverse/), across any harness.
+- **🧠 Distill** — `cv distill <id>` turns a session into a durable `MEMORY.md` digest (decisions, gotchas, where things live). Your archive *compounds* instead of rotting.
+- **🔮 Recall** — semantic "have I solved this before?" — as a `cv recall` command *and* an MCP tool that hands a running agent the relevant past span.
+- **🔒 Redact** — `cv redact <id>` scrubs secrets/PII so a transcript is safe to share.
+- **📣 Coordination board** — agents post status, hand off work, and grab tasks with a **distributed lock** (`board_claim`) so a fleet never duplicates effort. `await_omen` blocks until a session matches a regex.
+- **🌐 Web app + 🖥️ Tauri desktop app** — drop a harness zip in the browser (WASM, nothing uploaded): viewer, timeline, compare, stats, a visual **loom composer** (with OpenRouter generation), and a live **fleet dashboard**. The `app/` Tauri build bundles it all natively.
+- **🔌 Harness integrations** — plug claurdvoyant into the agents' own hooks/MCP/plugins ([`integrations/`](integrations/)): SessionEnd → archive + distill, SessionStart → recall, events → the board.
 
 ## 🛠️ Install
 
@@ -81,7 +90,7 @@ cargo build --release          # → target/release/{cv, cv-mcp, cvd, cv-search}
 claude mcp add claurdvoyant -- /path/to/target/release/cv-mcp
 ```
 
-Tools: `list_sessions` · `search_sessions` · `read_session` · `project_sessions` · **`await_omen`** (block until a session matches a regex) · `board_*` (post/read/await on the coordination board).
+18 tools, incl: `list_sessions` · `search_sessions` · `read_session` · `project_sessions` · **`recall`** (semantic "where was this solved before") · **`await_omen`** (block until a session matches a regex) · `board_post/read/await` + `board_claim/release/who` (coordination + distributed locks).
 
 ## 📡 Archive your whole fleet (`cvd`)
 
@@ -96,19 +105,19 @@ After staring into seven different transcript formats, we wrote down the one the
 
 ## 🏗️ Under the hood
 
-One IR (`Session → Message → Block{Text|Thinking|ToolUse|ToolResult|Image}`), one `Adapter` per harness (`discover` + `parse` + `emit`), and a handful of small crates on top: **`cv`** (CLI) · **`cv-mcp`** (MCP) · **`cvd`** (daemon) · **`cv-search`** (tantivy FTS + `model2vec` semantic) · **`cv-web`** (WASM).
+One IR (`Session → Message → Block{Text|Thinking|ToolUse|ToolResult|File|Image}`), one `Adapter` per harness (`discover` + `parse` + `emit`), plus `loom` / `redact` / `board` / `watch` / `ingest` modules — and small crates on top: **`cv`** (CLI) · **`cv-mcp`** (MCP) · **`cvd`** (daemon + `serve`) · **`cv-search`** (tantivy + `model2vec`) · **`cv-llm`** (distill/generate) · **`cv-web`** (WASM) · **`app/`** (Tauri desktop).
 
 ```
-parse(any harness) → 🔮 unified IR → search · convert · port · archive · view · stream · coordinate
+parse(any harness) → 🔮 unified IR → search · convert · port · loom · distill · archive · coordinate · view
 ```
 
 ## 🧪 Status
 
-Built in a couple of (gleeful) sessions, much of it by a swarm of agents working disjoint files. ✨ Young and honest:
+Built in a wild few sessions, much of it by a swarm of agents working disjoint files. ✨ Honest about the edges:
 
-- Conversion **emits** to all 7 core harnesses; Cursor + desktop apps are parse-only and landing now.
-- The search index trades disk for speed (full content; compression is on the list).
-- Gemini's protobuf `.pb` is opaque; some sidecar tool-call streams aren't merged yet.
+- **17 harnesses parse**; the 7 core ones also **emit** (N-way conversion). The newer 8 (Cursor, Kimi, Qwen, LM Studio, Cline, Roo, Continue, Goose) are parse-only for now.
+- **Robustness:** 2000+ real sessions parse with **0 panics**; parsers are fuzz-tested against hostile input.
+- The full-text index trades disk for speed; Gemini's protobuf `.pb` is opaque; a few sidecar tool-call streams aren't merged yet.
 - Historical format variants are an explicit goal — see [`ADDING_HARNESS.md`](ADDING_HARNESS.md), and **please send your own harness logs** (we can only test what we can see).
 
 PRs and weird old transcripts deeply welcome. 💜

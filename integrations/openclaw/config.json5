@@ -1,0 +1,16 @@
+{
+  // claurdvoyant MCP server for OpenClaw.
+  //
+  // OpenClaw consumes external MCP servers under `mcp.servers.<name>` (stdio entries use
+  // `command` + `args`). Confirmed in docs/gateway/configuration-reference.md ("## MCP",
+  // `mcp.servers`). Merge this into your OpenClaw gateway config (or use
+  // `openclaw mcp set claurdvoyant ...`). Replace the command path with your cv-mcp binary.
+  mcp: {
+    servers: {
+      claurdvoyant: {
+        command: "/path/to/target/release/cv-mcp",
+        args: [],
+      },
+    },
+  },
+}

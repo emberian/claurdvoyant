@@ -2,3 +2,7 @@
 /web/pkg
 .DS_Store
 **/*.rs.bk
+
+# build artifacts in ANY crate (root + nested, e.g. the Tauri app)
+**/target/
+app/src-tauri/gen/

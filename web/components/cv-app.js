@@ -8,6 +8,7 @@
 //   compare    — side-by-side message diff (<cv-compare>)
 //   stats      — dashboard (<cv-stats>)
 //   loom       — splice/loom composer (<cv-loom>)
+//   fleet      — live cvd serve dashboard (<cv-fleet>)
 //   opensession— the OpenSession standard (<cv-opensession>)
 import "./cv-session-list.js";
 import "./cv-transcript.js";
@@ -15,6 +16,7 @@ import "./cv-timeline.js";
 import "./cv-compare.js";
 import "./cv-stats.js";
 import "./cv-loom.js";
+import "./cv-fleet.js";
 import "./cv-opensession.js";
 import { esc, normalizeSessions, randomId } from "./util.js";
 
@@ -24,6 +26,7 @@ const VIEWS = [
   ["compare", "Compare", "🔍"],
   ["stats", "Stats", "📊"],
   ["loom", "Loom", "✨"],
+  ["fleet", "Fleet", "📡"],
   ["opensession", "OpenSession", "🧬"],
 ];
 
@@ -149,6 +152,7 @@ class CvApp extends HTMLElement {
       case "compare": host.innerHTML = `<cv-compare></cv-compare>`; break;
       case "stats": host.innerHTML = `<cv-stats></cv-stats>`; break;
       case "loom": host.innerHTML = `<cv-loom></cv-loom>`; break;
+      case "fleet": host.innerHTML = `<cv-fleet></cv-fleet>`; break;
       case "opensession": host.innerHTML = `<cv-opensession></cv-opensession>`; break;
     }
     this._refreshViews();

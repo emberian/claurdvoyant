@@ -1,0 +1,31 @@
+{
+  "//": "claurdvoyant lifecycle hooks for Gemini CLI, bundled inside the extension. Gemini loads extension hooks from hooks/hooks.json (see docs/extensions/reference.md -> Hooks). SessionStart MUST emit ONLY a JSON object on stdout: {\"hookSpecificOutput\": {\"additionalContext\": \"...\"}} (docs/hooks/reference.md). The wrapper scripts handle that. Matchers for lifecycle events are exact strings; \"*\" matches all.",
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "name": "claurdvoyant-recall",
+            "type": "command",
+            "command": "$GEMINI_PROJECT_DIR/.gemini/extensions/cv-claurdvoyant/hooks/session-start.sh",
+            "timeout": 8000
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "name": "claurdvoyant-archive",
+            "type": "command",
+            "command": "$GEMINI_PROJECT_DIR/.gemini/extensions/cv-claurdvoyant/hooks/session-end.sh",
+            "timeout": 15000
+          }
+        ]
+      }
+    ]
+  }
+}

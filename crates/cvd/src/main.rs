@@ -5,6 +5,7 @@
 //! cv-core's live-watch engine.
 
 mod archive;
+mod serve;
 
 use anyhow::Result;
 use archive::{pretty_cwd, ref_cwd, Archive, StoreOutcome};
@@ -45,6 +46,15 @@ enum Command {
         #[arg(long)]
         cwd: Option<String>,
     },
+    /// Serve fleet state as JSON over HTTP for a live browser dashboard.
+    Serve {
+        /// Port to listen on.
+        #[arg(long, default_value_t = 7777)]
+        port: u16,
+        /// Host/interface to bind.
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
+    },
     /// List what's in the archive.
     Ls,
     /// Print the archive location.
@@ -62,6 +72,7 @@ fn main() -> Result<()> {
             harness,
             cwd,
         } => cmd_watch(&archive, interval, harness, cwd),
+        Command::Serve { port, host } => serve::run(&host, port),
         Command::Ls => cmd_ls(&archive),
         Command::Path => {
             println!("{}", archive.home().display());

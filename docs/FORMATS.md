@@ -115,6 +115,58 @@ decouples them via a unified IR.
   history is local as one **encrypted** file per conversation (`conversations-v3-<acct>/<uuid>.data`); the key is
   app-held (not in a readable Keychain item). We detect the install + count convos but cannot decrypt.
 
+## Kimi CLI (MoonshotAI) — `$KIMI_SHARE_DIR` or `~/.kimi`
+
+- Sessions at `sessions/<md5(cwd)>/<uuid>/context.jsonl` (modern dir form) or `sessions/<md5(cwd)>/<uuid>.jsonl`
+  (legacy flat). Project-dir name is `md5(cwd_utf8).hexdigest()` (or `<kaos>_<md5>` for non-local KAOS); cwd is
+  recovered from `~/.kimi/kimi.json` `work_dirs[]`. `context.jsonl` roles `_system_prompt`/`user`/`assistant`/
+  `tool` (+ skippable `_checkpoint`/`_usage`); content is a bare string or a list of `type`-tagged Parts
+  (`text`/`think`/`image_url`/…); tool calls carry a JSON-string `arguments`. A `wire.jsonl` sidecar
+  (`protocol_version` 1.x) enriches tool results + token usage. `state.json` → title; `context_N.jsonl` are
+  compaction segments. Read-only.
+
+## Qwen Code — `~/.qwen/`
+
+- A **gemini-cli fork**: byte-identical format under `~/.qwen/tmp/<projectHash>/{logs.json, chats/session-*.json|jsonl,
+  checkpoint-*.json}`. The adapter delegates to the Gemini parser and re-tags `Harness::Qwen`. (Path delta only.)
+
+## LM Studio — `~/.lmstudio/conversations/<ms-epoch>.conversation.json`
+
+- Plaintext JSON, one file per chat (filename stem = id = `createdAt` ms). No cwd (chat app). `messages[]` =
+  `{versions:[…], currentlySelected}` (every regenerated variant kept; read the selected one). `singleStep` (user)
+  content parts `text`/`file`; `multiStep` (assistant) `steps[]` of `contentBlock` (`style.type=="thinking"` →
+  reasoning; `genInfo` → model + tokens). No first-class tool calls (gpt-oss inline `<|channel|>` markers kept as
+  text). Attachments are references; bytes under `~/.lmstudio/.internal/files/`.
+
+## Cline — VS Code extension (`<globalStorage>/saoudrizwan.claude-dev/`)
+
+- Tasks at `<globalStorage>/saoudrizwan.claude-dev/tasks/<taskId>/` (also `~/.cline/tasks/`): `api_conversation_history.json`
+  (a JSON **array of raw Anthropic Messages-API objects** — maps ~1:1 onto the Claude block model), `ui_messages.json`
+  (UI events, timestamp enrichment), `task_metadata.json`. globalStorage roots: `<Editor>/User/globalStorage/` for
+  `<Editor>` ∈ {Code, Code - Insiders, Cursor, VSCodium}. `<taskId>` ms-epoch → `created_at`. cwd from the first user
+  msg's `<environment_details>`. A `user` turn of only `tool_result` blocks → a Tool turn.
+
+## Roo Code — a Cline fork (`<globalStorage>/rooveterinaryinc.roo-cline|roo-code/`)
+
+- Identical per-task layout/schema to Cline, different extension namespace (+ `~/.roo/tasks/`). Reuses the Cline parser,
+  tagged `Harness::Roo`.
+
+## Continue (continue.dev) — `~/.continue/sessions/` (`$CONTINUE_GLOBAL_DIR` overrides)
+
+- Index `sessions.json` (`[{sessionId, title, dateCreated, workspaceDirectory}]`) + per-session `<id>.json`
+  (`{sessionId, title, workspaceDirectory, history:[item]}`). Each item's `message` is OpenAI-shaped (role
+  user/assistant/system/tool; content string or `[{type:text}/{type:imageUrl}]`; assistant `toolCalls[]`;
+  `role:"tool"` + `toolCallId`). `contextItems[]` → File refs. cwd = `workspaceDirectory`.
+
+## Goose (Block) — modern SQLite + legacy `.jsonl`
+
+- Data dir: Linux `~/.local/share/goose/sessions/`; macOS `~/Library/Application Support/Block.block.goose/sessions/`;
+  Windows `%APPDATA%\Block\Block\goose\data\sessions\` (`$GOOSE_PATH_ROOT`/`$XDG_DATA_HOME` override). Modern:
+  `sessions.db` (`sessions(working_dir→cwd, description→title, provider_name+model_config_json→model, …)` +
+  `messages(role[user|assistant], content_json, …)`; open READ-ONLY, PRAGMA-probe columns). `content_json` = array of
+  MCP-style `MessageContent` (`text`/`thinking`/`toolRequest`/`toolResponse`/…); tool results ride on `user` msgs →
+  reclassified to Tool. Legacy: per-session `<name>.jsonl` (header line + one message per line).
+
 ---
 
 ## Prior art (don't reinvent; do unify)

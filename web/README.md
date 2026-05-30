@@ -40,11 +40,71 @@ A tab bar (`<cv-app>`) switches between views, all reading from the merged pool:
   histogram. Hand-rolled CSS bars + inline SVG — no chart library.
 - **✨ Loom** (`<cv-loom>`) — the headline. A three-pane composer: pick a source
   session, click **＋ loom** on any message to collect it, then reorder (▲ ▼ or
-  drag), remove (✕), or **fork from here** (⑂, drop everything after). A live
-  preview renders the composition as you build it. **Download** it as an
-  OpenSession `.json` or Markdown — pure client-side.
+  drag), remove (✕), or **fork from here** (⑂). A live preview renders the
+  composition as you build it. **Download** it as an OpenSession `.json` or
+  Markdown — pure client-side. Now it also *looms*: see **Generation & branches**
+  below.
+- **📡 Fleet** (`<cv-fleet>`) — a live dashboard over a running `cvd serve` HTTP
+  API. See **Fleet dashboard** below.
 - **🧬 OpenSession** (`<cv-opensession>`) — the OpenSession standard, featured
   in-app. Also available as a standalone page at **`openSession.html`**.
+
+## ⚡ Loom: generation & branches
+
+The loom no longer only *rearranges* messages — with an OpenRouter API key it
+**generates** continuations, so you can fork a transcript and grow alternate
+futures with a model.
+
+- **⚙ generation** (top-right of the loom) opens a settings panel: paste an
+  **OpenRouter API key** and pick a **model** (free-text, with presets like
+  `anthropic/claude-3.5-sonnet`, `openai/gpt-4o-mini`). The key is stored in
+  `localStorage` on your device only and is sent **only** to
+  `https://openrouter.ai/api/v1/chat/completions` over HTTPS (Bearer auth) —
+  nothing else ever sees it.
+- **⚡ generate continuation** converts the current composition to OpenRouter
+  chat format (IR roles → `user`/`assistant`/`system`; `tool` → user context;
+  text/thinking/tool blocks flattened to text) and **appends** the model's reply
+  as a new IR `assistant` message in the lane. The reply **streams** in
+  (`fetch` + `ReadableStream` over SSE) when the provider supports it, with a
+  **stop** button; otherwise it awaits the full response.
+- **Branches.** A branch bar holds multiple named variants, each with its own
+  lane. **＋ branch** duplicates the active branch; **⑂** on any lane message
+  forks a *sibling branch* from that prefix. Switch branches, generate divergent
+  continuations, and compare them side-by-side in the **🔍 Compare** view (export
+  each branch to OpenSession `.json` and drop them back in).
+- Errors (bad key `401/403`, no credits `402`, rate limit `429`, …) surface
+  inline and never block the UI; the key always stays client-side.
+
+Implementation: `components/cv-loom.js` plus the dependency-free helper
+`openrouter.js` (credential storage, IR→chat conversion, streaming request).
+
+## 📡 Fleet dashboard
+
+`<cv-fleet>` connects to a running **`cvd serve`** HTTP API and live-displays the
+fleet by **polling every ~2s** (CORS is enabled server-side, so cross-origin
+`fetch` from this static page works). Enter a **base URL** (default
+`http://localhost:7777`) and a **channel** (default `fleet`, i.e. the `#fleet`
+activity channel the daemon mirrors into).
+
+It renders, all auto-refreshing with a **pause** toggle:
+
+- an **active-agents** strip — present agents from `/api/who/<channel>`
+  (recent heartbeats), harness-colored;
+- a **claims table** — the distributed locks from `/api/claims/<channel>`
+  (`key → owner → expires`), with soon/expired highlighting;
+- a **#channel board feed** — messages from `/api/board/<channel>`
+  (`{id,channel,from,ts,kind,body,tags,session_ref}`), newest first, colored by
+  `kind` (`status`/`event`/`request`/`reply`/`presence`/`claim`);
+- a **recent-sessions** activity feed — `/api/sessions?limit=N` (IR `Session[]`),
+  harness-badged.
+
+Polled endpoints: `/api/health`, `/api/sessions?limit=`, `/api/channels`,
+`/api/board/<channel>`, `/api/claims/<channel>`, `/api/who/<channel>`.
+
+If the API is unreachable it shows a friendly **"start `cvd serve`"** hint and
+lets you **load a static board export** (`.json`: an array of `BoardMessage`s, or
+an object `{ board?, claims?, who?, sessions?, channels?, channel? }`) to explore
+the layout offline.
 
 ## Components
 
@@ -64,8 +124,12 @@ All are plain native custom elements (no framework, no build step), in `componen
   a session-total. Has per-session **Markdown / OpenSession-JSON export** buttons,
   and an optional `pickMode` (used by the loom).
 - **`<cv-timeline>`**, **`<cv-compare>`**, **`<cv-stats>`**, **`<cv-loom>`**,
-  **`<cv-opensession>`** — the views above.
+  **`<cv-fleet>`**, **`<cv-opensession>`** — the views above.
 - **`<cv-harness-badge>`** — a small per-harness colored pill.
+
+`openrouter.js` is a dependency-free OpenRouter client used by the loom (key
+storage in `localStorage`, IR→chat conversion, and a streaming
+`chat/completions` request).
 
 `components/util.js` holds shared helpers: HTML escaping, time formatting, search
 indexing, **normalization** (`normalizeSessions`, accepts both shapes),
@@ -127,6 +191,27 @@ wasm-pack build crates/cv-web --target web --out-dir ../../web/pkg --no-default-
 (run from the repo root). Then reload and drop one or more `.zip` / `.json` files.
 
 > A plain `file://` open won't work — ES module imports require an HTTP origin.
+
+### Demo the loom generation
+
+1. Open the **✨ Loom** tab and click **＋ loom** on a few source messages.
+2. Click **⚙ generation**, paste an OpenRouter API key, pick a model.
+3. Click **⚡ generate continuation** — the model's reply streams in as a new
+   assistant turn. Use **⑂** on a message to fork a sibling **branch**, switch to
+   it, and generate a divergent continuation. Compare branches in **🔍 Compare**.
+
+### Demo the fleet dashboard
+
+Run the daemon's HTTP API alongside the static site:
+
+```sh
+cvd serve --addr 127.0.0.1:7777   # CORS-enabled
+```
+
+Open the **📡 Fleet** tab (base URL `http://localhost:7777`, channel `fleet`).
+The active-agents strip, claims table, board feed, and recent-sessions feed
+refresh every ~2s; use **⏸ pause** to freeze. No server? The offline panel lets
+you load a static board `.json` to explore the layout.
 
 ## Deployment
 

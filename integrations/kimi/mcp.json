@@ -1,0 +1,10 @@
+{
+  "//": "claurdvoyant MCP server for Kimi CLI. Either run the `kimi mcp add` command in the README (recommended), or merge this `mcpServers` entry into ~/.kimi/mcp.json. Shape confirmed in kimi-cli docs/en/configuration/data-locations.md (mcp.json -> mcpServers). Replace the command path with your built cv-mcp binary.",
+  "mcpServers": {
+    "claurdvoyant": {
+      "transport": "stdio",
+      "command": "/path/to/target/release/cv-mcp",
+      "args": []
+    }
+  }
+}

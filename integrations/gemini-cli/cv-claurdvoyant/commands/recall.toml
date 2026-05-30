@@ -1,0 +1,16 @@
+description = "Recall prior cross-harness work relevant to the current task (via claurdvoyant)"
+
+prompt = """
+Use the claurdvoyant MCP server to find prior work — across every harness and every
+past session — relevant to: {{args}}
+
+1. Call the `recall` tool with the query above (k=5). It semantically searches the whole
+   cross-harness corpus and returns the most relevant message spans. Summarize what was
+   already tried / decided / learned.
+2. If `recall` returns nothing useful, fall back to `search_sessions` with the same query.
+3. Call `project_sessions` with the current working directory to surface what happened in
+   THIS project before.
+
+Then give a tight briefing: relevant prior context, dead ends already hit, decisions
+already made — citing the session ids you pulled from.
+"""

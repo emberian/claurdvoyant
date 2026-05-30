@@ -1,0 +1,27 @@
+{
+  "//": "claurdvoyant <-> Codex lifecycle hooks. Place at ~/.codex/hooks.json. Codex implements a Claude-Code-compatible hooks system: each event (SessionStart, Stop, ...) maps to an array of { hooks: [ { type: 'command', command: '<shell>' } ] }. The hook command receives a JSON payload on stdin whose fields include cwd, session_id, hook_event_name (Stop also adds last_assistant_message, turn_id). Confirmed against codex-rs/core/tests/suite/hooks.rs and codex-rs/hooks/schema/generated/{session-start,stop}.command.input.schema.json. Replace /path/to/... with your built binaries.",
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "CWD=\"$(jq -r '.cwd // empty')\"; /path/to/cv ls --cwd \"${CWD:-$PWD}\" --limit 8; /path/to/cv board read fleet --limit 5",
+            "statusMessage": "claurdvoyant: surfacing prior sessions + fleet board"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "CWD=\"$(jq -r '.cwd // empty')\"; /path/to/cvd sync >/dev/null 2>&1 || true; /path/to/cv board post fleet \"codex finished in ${CWD:-$PWD}\" --from codex --kind status >/dev/null 2>&1 || true",
+            "statusMessage": "claurdvoyant: archiving + posting to fleet board"
+          }
+        ]
+      }
+    ]
+  }
+}

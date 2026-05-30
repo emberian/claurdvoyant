@@ -174,6 +174,50 @@ enum Cmd {
         /// Rehome the composed session to this working directory.
         #[arg(long)]
         cwd: Option<PathBuf>,
+        /// Generate a continuation of the composed session via an LLM and append it (the loom's
+        /// generative step). Uses OPENROUTER/ANTHROPIC keys or LMSTUDIO_API_BASE for free local gen.
+        #[arg(long)]
+        generate: bool,
+        /// Model for --generate (provider-specific; defaults to the provider's default).
+        #[arg(long = "gen-model")]
+        gen_model: Option<String>,
+    },
+    /// Distill a session into durable memory (decisions, gotchas, where things live) via an LLM.
+    Distill {
+        id: String,
+        #[arg(long)]
+        harness: Option<String>,
+        /// Model id (provider-specific; defaults to the provider's cheap/fast model).
+        #[arg(long)]
+        model: Option<String>,
+        /// Frame the distillation as whole-project memory (may span more than one session).
+        #[arg(long)]
+        project: bool,
+        /// Write the digest to this file instead of stdout.
+        #[arg(long)]
+        out: Option<PathBuf>,
+        /// With --out, append under a dated header instead of overwriting (build a MEMORY.md).
+        #[arg(long)]
+        append: bool,
+    },
+    /// Semantic recall across the corpus: the most relevant past spans for a query (CLI recall).
+    Recall {
+        query: String,
+        #[arg(short = 'k', default_value_t = 5)]
+        k: usize,
+        #[arg(long)]
+        harness: Option<String>,
+    },
+    /// Scrub secrets/PII from a session and export it (safe to share).
+    Redact {
+        id: String,
+        #[arg(long)]
+        harness: Option<String>,
+        #[arg(long, default_value = "md")]
+        format: String,
+        /// Also print redaction counts per class to stderr.
+        #[arg(long)]
+        stats: bool,
     },
     /// Loom graft: take base[..N], then graft other[M..] into one new branched session.
     Loom {
@@ -195,6 +239,12 @@ enum Cmd {
         /// Rehome the grafted session to this working directory.
         #[arg(long)]
         cwd: Option<PathBuf>,
+        /// Generate a continuation of the grafted branch via an LLM and append it.
+        #[arg(long)]
+        generate: bool,
+        /// Model for --generate.
+        #[arg(long = "gen-model")]
+        gen_model: Option<String>,
     },
 }
 
@@ -309,11 +359,207 @@ fn main() -> Result<()> {
         Cmd::Board { action } => cmd_board(action),
         Cmd::Timeline { harness, cwd, limit } => cmd_timeline(harness, cwd, limit),
         Cmd::Diff { a, b, harness } => cmd_diff(&a, &b, harness),
-        Cmd::Splice { specs, to, out, export, cwd } => cmd_splice(&specs, to, out, export, cwd),
-        Cmd::Loom { base, at, graft, from, to, out, export, cwd } => {
-            cmd_loom(&base, at, &graft, from, to, out, export, cwd)
+        Cmd::Splice { specs, to, out, export, cwd, generate, gen_model } => cmd_splice(&specs, to, out, export, cwd, generate, gen_model),
+        Cmd::Distill { id, harness, model, project, out, append } => {
+            cmd_distill(&id, harness, model, project, out, append)
+        }
+        Cmd::Recall { query, k, harness } => cmd_recall(&query, k, harness),
+        Cmd::Redact { id, harness, format, stats } => cmd_redact(&id, harness, &format, stats),
+        Cmd::Loom { base, at, graft, from, to, out, export, cwd, generate, gen_model } => {
+            cmd_loom(&base, at, &graft, from, to, out, export, cwd, generate, gen_model)
         }
     }
+}
+
+// ---------- distill / recall / redact ----------
+
+fn cmd_distill(
+    id: &str,
+    harness: Option<String>,
+    model: Option<String>,
+    project: bool,
+    out: Option<PathBuf>,
+    append: bool,
+) -> Result<()> {
+    let want = parse_harness(&harness)?;
+    let (r, adapter) =
+        cv_core::find(id, want)?.with_context(|| format!("no session matching {id:?}"))?;
+    let session = adapter.parse(&r)?;
+
+    match cv_llm::available_provider() {
+        None => {
+            eprintln!(
+                "no LLM provider configured. Set one of:\n  \
+                 OPENROUTER_API_KEY=…   (OpenRouter; preferred)\n  \
+                 ANTHROPIC_API_KEY=…    (Anthropic)\n  \
+                 LMSTUDIO_API_BASE=local  (a free local LM Studio server at localhost:1234)"
+            );
+            std::process::exit(1);
+        }
+        Some(p) => eprintln!("✦ distilling via {p}…"),
+    }
+
+    let opts = cv_llm::DistillOptions { model, project };
+    let digest = cv_llm::distill(&session, &opts).context("distillation failed")?;
+
+    match out {
+        None => print!("{digest}"),
+        Some(path) => {
+            if append {
+                use std::io::Write;
+                let date = session
+                    .updated_at
+                    .or(session.created_at)
+                    .map(|d| d.format("%Y-%m-%d").to_string())
+                    .unwrap_or_else(|| "----------".into());
+                let header = format!("\n\n## {} ({})\n", session.label(), date);
+                let mut f = fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&path)
+                    .with_context(|| format!("opening {} for append", path.display()))?;
+                f.write_all(header.as_bytes())?;
+                f.write_all(digest.as_bytes())?;
+                if !digest.ends_with('\n') {
+                    f.write_all(b"\n")?;
+                }
+                eprintln!("✦ appended distillation → {}", path.display());
+            } else {
+                fs::write(&path, &digest)
+                    .with_context(|| format!("writing {}", path.display()))?;
+                eprintln!("✦ wrote distillation → {}", path.display());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn cmd_recall(query: &str, k: usize, harness: Option<String>) -> Result<()> {
+    let want = parse_harness(&harness)?;
+    let k = k.max(1);
+    // Over-fetch when filtering by harness so we can still fill `k`.
+    let fetch = if want.is_some() { (k * 4).max(20) } else { k };
+
+    let (mut hits, mode) = match cv_search::semantic_search(None, query, fetch) {
+        Ok(h) => (h, "semantic"),
+        Err(e) => {
+            eprintln!(
+                "(semantic search unavailable: {e:#}; falling back to keyword mode — run \
+                 `cv index --semantic` for semantic recall)"
+            );
+            (cv_search::text_search(None, query, fetch)?, "keyword")
+        }
+    };
+
+    if let Some(h) = want {
+        let w = h.as_str();
+        hits.retain(|hit| hit.harness == w);
+    }
+    hits.truncate(k);
+
+    if hits.is_empty() {
+        println!("no recall matches for {query:?} ({mode})");
+        return Ok(());
+    }
+
+    for hit in &hits {
+        let cwd = hit
+            .cwd
+            .as_deref()
+            .map(|c| home_rel(Path::new(c)))
+            .unwrap_or_else(|| "(no cwd)".into());
+        println!(
+            "{:8}  {:8}  {:>6.3}  {}  ·  {}",
+            hit.harness,
+            short_id(&hit.id),
+            hit.score,
+            truncate(&hit.title.clone().unwrap_or_default(), 50),
+            truncate(&cwd, 40),
+        );
+        let excerpt = recall_excerpt(hit, query);
+        for line in excerpt.lines() {
+            println!("      {line}");
+        }
+    }
+    Ok(())
+}
+
+/// Best excerpt for a recall hit: prefer the stored snippet; otherwise load the session and render
+/// a compact ~3-message window around the best textual match of `query`.
+fn recall_excerpt(hit: &cv_search::Hit, query: &str) -> String {
+    if !hit.snippet.trim().is_empty() {
+        return truncate(&hit.snippet, 200);
+    }
+    let h = Harness::parse(&hit.harness);
+    let Some((sref, adapter)) = cv_core::find(&hit.id, h).ok().flatten() else {
+        return String::new();
+    };
+    let Ok(session) = adapter.parse(&sref) else {
+        return String::new();
+    };
+    if session.messages.is_empty() {
+        return String::new();
+    }
+    // Pick the message best matching the query (most query words present), with a small window.
+    let needle = query.to_lowercase();
+    let words: Vec<&str> = needle.split_whitespace().filter(|w| w.len() > 2).collect();
+    let mut best = 0usize;
+    let mut best_score = -1i64;
+    for (i, m) in session.messages.iter().enumerate() {
+        let t = m.text().unwrap_or_default().to_lowercase();
+        if t.trim().is_empty() {
+            continue;
+        }
+        let score = words.iter().filter(|w| t.contains(**w)).count() as i64
+            + if t.contains(&needle) { 5 } else { 0 };
+        if score > best_score {
+            best_score = score;
+            best = i;
+        }
+    }
+    let lo = best.saturating_sub(1);
+    let hi = (best + 2).min(session.messages.len());
+    let mut out = String::new();
+    for m in &session.messages[lo..hi] {
+        if let Some(t) = m.text() {
+            if !t.trim().is_empty() {
+                out.push_str(cv_core::render::role_label(m.role));
+                out.push_str(": ");
+                out.push_str(&truncate(&t, 100));
+                out.push('\n');
+            }
+        }
+    }
+    out.trim_end().to_string()
+}
+
+fn cmd_redact(id: &str, harness: Option<String>, format: &str, stats: bool) -> Result<()> {
+    let want = parse_harness(&harness)?;
+    let (r, adapter) =
+        cv_core::find(id, want)?.with_context(|| format!("no session matching {id:?}"))?;
+    let session = adapter.parse(&r)?;
+
+    let (redacted, st) = cv_core::redact::redact_with(&session, &Default::default());
+
+    match format {
+        "json" => println!("{}", serde_json::to_string_pretty(&redacted)?),
+        "md" | "markdown" => print!("{}", cv_core::render::to_markdown(&redacted)),
+        other => bail!("unknown format {other:?} (use md or json)"),
+    }
+
+    if stats {
+        eprintln!(
+            "✦ redacted {} item(s): {} api_key, {} private_key, {} jwt, {} email, {} blob, {} assignment",
+            st.total(),
+            st.api_keys,
+            st.private_keys,
+            st.jwts,
+            st.emails,
+            st.blobs,
+            st.assignments,
+        );
+    }
+    Ok(())
 }
 
 fn cmd_board(action: BoardCmd) -> Result<()> {
@@ -1290,12 +1536,15 @@ fn parse_splice_spec(spec: &str) -> Result<SpliceSpec> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cmd_splice(
     specs: &[String],
     to: Option<String>,
     out: Option<PathBuf>,
     export: Option<String>,
     cwd: Option<PathBuf>,
+    generate: bool,
+    gen_model: Option<String>,
 ) -> Result<()> {
     let parsed: Vec<SpliceSpec> = specs.iter().map(|s| parse_splice_spec(s)).collect::<Result<_>>()?;
 
@@ -1324,7 +1573,7 @@ fn cmd_splice(
     };
 
     let spliced = cv_core::loom::splice(&spans, None, to_h);
-    finish_composed(spliced, to_h, to.is_some(), out, export, cwd)
+    finish_composed(spliced, to_h, to.is_some(), out, export, cwd, generate, gen_model)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1337,6 +1586,8 @@ fn cmd_loom(
     out: Option<PathBuf>,
     export: Option<String>,
     cwd: Option<PathBuf>,
+    generate: bool,
+    gen_model: Option<String>,
 ) -> Result<()> {
     let (rb, ab) = cv_core::find(base, None)?.with_context(|| format!("no session matching {base:?}"))?;
     let (rg, ag) = cv_core::find(graft, None)?.with_context(|| format!("no session matching {graft:?}"))?;
@@ -1352,11 +1603,12 @@ fn cmd_loom(
     // Re-stamp the harness if --to overrode it (graft used base.harness).
     let mut grafted = grafted;
     grafted.harness = to_h;
-    finish_composed(grafted, to_h, to.is_some(), out, export, cwd)
+    finish_composed(grafted, to_h, to.is_some(), out, export, cwd, generate, gen_model)
 }
 
 /// Shared tail for splice/loom: emit to a harness when `--to`/`--out` is in play, otherwise print a
 /// summary and (with `--export md|json`) the composed session to stdout.
+#[allow(clippy::too_many_arguments)]
 fn finish_composed(
     mut session: Session,
     to_h: Harness,
@@ -1364,7 +1616,28 @@ fn finish_composed(
     out: Option<PathBuf>,
     export: Option<String>,
     cwd: Option<PathBuf>,
+    generate: bool,
+    gen_model: Option<String>,
 ) -> Result<()> {
+    // The generative half of looming: grow the composed branch with an LLM-generated continuation.
+    if generate {
+        match cv_llm::available_provider() {
+            Some(prov) => eprintln!("✦ looming a continuation via {prov}…"),
+            None => bail!(
+                "--generate needs an LLM provider: set OPENROUTER_API_KEY, ANTHROPIC_API_KEY, or \
+                 LMSTUDIO_API_BASE=local (free local LM Studio)"
+            ),
+        }
+        let text = cv_llm::generate(
+            &session,
+            &cv_llm::GenerateOptions { model: gen_model, ..Default::default() },
+        )?;
+        let mut m = Message::new(Role::Assistant);
+        m.content.push(Block::Text { text });
+        session.messages.push(m);
+        eprintln!("  ↳ grew the branch by 1 generated turn ({} msg total)", session.messages.len());
+    }
+
     // Emit path: an explicit --to or an --out directory means "materialize this for a harness".
     if explicit_to || out.is_some() {
         if let Some(dir) = &cwd {

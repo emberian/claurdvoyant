@@ -1,0 +1,40 @@
+# Standalone cargo workspace for the claurdvoyant Tauri v2 desktop app.
+#
+# This deliberately declares its OWN `[workspace]` so it is EXCLUDED from the main
+# claurdvoyant workspace at the repo root — building/CI of the main crates can't be
+# affected by (and isn't affected by) this app, and vice-versa. The app depends on the
+# main crates by relative path (`../../crates/...`).
+[workspace]
+
+[package]
+name = "claurdvoyant-app"
+description = "claurdvoyant desktop app — Tauri v2 shell around the web UI + native cv-core/cv-llm power."
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+authors = ["ember"]
+
+# The Tauri runtime lives in lib.rs (so mobile targets can reuse it); main.rs is a thin wrapper.
+[lib]
+name = "claurdvoyant_app_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-shell = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+
+# The native power: pull in the workspace crates by relative path so the desktop app can
+# call distill/redact/generate without shipping API keys into JS.
+cv-core = { path = "../../crates/cv-core" }
+cv-llm = { path = "../../crates/cv-llm" }
+cv-search = { path = "../../crates/cv-search" }
+
+[profile.release]
+opt-level = 3
+lto = "thin"

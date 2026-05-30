@@ -24,6 +24,9 @@
 //! - `read_session(id, harness?, format="markdown"|"json")` — the full transcript.
 //! - `project_sessions(cwd, limit=20)` — sessions whose recorded cwd contains the given path; the
 //!   headline "what happened in THIS project before / what are sibling agents doing here" tool.
+//! - `recall(query, k=5, harness?)` — "have I/another agent solved this before?" Semantic search
+//!   over the whole corpus (via `cv-search`) that returns the most relevant message *spans*, not
+//!   just metadata. Needs `cv index --semantic`; degrades to keyword search otherwise.
 
 use anyhow::Context as _;
 use cv_core::watch::{Filter, Watcher};
@@ -145,7 +148,9 @@ fn initialize_result() -> Value {
         },
         "instructions": "claurdvoyant lets you read OTHER agents' sessions across harnesses and time. \
 Use project_sessions(cwd) to see what happened (or is happening) in the current project, \
-search_sessions(query) to find a past conversation by content, and read_session(id) to read a full transcript."
+search_sessions(query) to find a past conversation by content, and read_session(id) to read a full transcript. \
+Use recall(query) — the 'find where this was solved before' tool — to semantically search the whole \
+cross-harness corpus and pull back the most relevant message spans mid-task."
     })
 }
 
@@ -200,6 +205,19 @@ fn tool_list() -> Value {
                     "limit": { "type": "number", "description": "Max results (default 20)." }
                 },
                 "required": ["cwd"]
+            }
+        },
+        {
+            "name": "recall",
+            "description": "\"Have I (or another agent) solved/seen this before?\" Semantically searches the WHOLE cross-harness session corpus and returns the most relevant message SPANS (a short excerpt of the messages around the best match), not just session metadata — so you can pull past context into a running task. Tries meaning-based search first and falls back to keyword search. For best results run `cv index --semantic` to build the embedding store; without it, recall degrades to keyword (full-text) search.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string", "description": "What you're trying to do / the problem to find prior work on." },
+                    "k": { "type": "number", "description": "Max sessions to return (default 5)." },
+                    "harness": { "type": "string", "description": "Restrict results to one harness: claude, codex, grok, opencode, gemini." }
+                },
+                "required": ["query"]
             }
         },
         {
@@ -414,6 +432,7 @@ fn call_tool(name: &str, args: &Value) -> anyhow::Result<String> {
         "search_sessions" => search_sessions(args),
         "read_session" => read_session(args),
         "project_sessions" => project_sessions(args),
+        "recall" => recall(args),
         "await_omen" => await_omen(args),
         "board_post" => board_post(args),
         "board_read" => board_read(args),
@@ -900,6 +919,143 @@ fn read_session(args: &Value) -> anyhow::Result<String> {
         "json" => Ok(serde_json::to_string_pretty(&session)?),
         "markdown" | "" => Ok(cv_core::render::to_markdown(&session)),
         other => anyhow::bail!("unknown format {other:?} (expected 'markdown' or 'json')"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// recall — semantic "have I solved this before?" across the whole corpus
+// ---------------------------------------------------------------------------
+
+/// Semantic recall: find the most relevant past sessions for `query` and return, for each, a short
+/// rendered SPAN of the messages around the best textual match — so a running agent can pull prior
+/// context mid-task. Tries `cv_search::semantic_search` first; on any error (e.g. no embedding store
+/// built) falls back to `cv_search::text_search`. Optionally filtered to one harness.
+fn recall(args: &Value) -> anyhow::Result<String> {
+    let query = arg_str(args, "query")
+        .ok_or_else(|| anyhow::anyhow!("missing required argument: query"))?;
+    let k = arg_usize(args, "k", 5).max(1);
+    let harness = parse_harness(args)?;
+
+    // We may filter by harness *after* searching, so over-fetch a bit to still fill `k`.
+    let fetch = if harness.is_some() { (k * 4).max(20) } else { k };
+
+    let (mut hits, mode) = match cv_search::semantic_search(None, query, fetch) {
+        Ok(h) => (h, "semantic"),
+        Err(e) => {
+            eprintln!("cv-mcp: recall semantic search unavailable ({e:#}); falling back to text search");
+            match cv_search::text_search(None, query, fetch) {
+                Ok(h) => (h, "text"),
+                Err(e2) => {
+                    anyhow::bail!("recall failed: semantic ({e:#}) and text ({e2:#}) search both unavailable")
+                }
+            }
+        }
+    };
+
+    if let Some(h) = harness {
+        let want = h.as_str();
+        hits.retain(|hit| hit.harness == want);
+    }
+    hits.truncate(k);
+
+    // Keep the whole response compact: cap total bytes of rendered spans across all hits.
+    const TOTAL_SPAN_BUDGET: usize = 8_000;
+    let per_hit_budget = (TOTAL_SPAN_BUDGET / k).max(400);
+
+    let out: Vec<Value> = hits
+        .iter()
+        .map(|hit| {
+            let span = extract_span(&hit.id, &hit.harness, query, per_hit_budget)
+                .unwrap_or_default();
+            json!({
+                "id": hit.id,
+                "harness": hit.harness,
+                "cwd": hit.cwd,
+                "title": hit.title,
+                "score": hit.score,
+                "why": hit.snippet,
+                "span": span,
+            })
+        })
+        .collect();
+
+    Ok(serde_json::to_string_pretty(&json!({
+        "mode": mode,
+        "query": query,
+        "results": out,
+    }))?)
+}
+
+/// Load a session and render a short excerpt of the messages around the best textual match of
+/// `query`, capped at ~`budget` bytes. Returns an empty string if the session can't be loaded.
+fn extract_span(id: &str, harness: &str, query: &str, budget: usize) -> Option<String> {
+    let h = Harness::parse(harness);
+    let (sref, adapter) = cv_core::find(id, h).ok().flatten()?;
+    let session = adapter.parse(&sref).ok()?;
+    if session.messages.is_empty() {
+        return None;
+    }
+
+    let needle = query.to_lowercase();
+    // Find the message whose combined text best matches the query (most query *words* present,
+    // tie-broken by an exact substring hit). Falls back to the first message.
+    let words: Vec<&str> = needle.split_whitespace().filter(|w| w.len() > 2).collect();
+    let mut best_idx = 0usize;
+    let mut best_score = -1i64;
+    for (i, m) in session.messages.iter().enumerate() {
+        let text = message_text(m).to_lowercase();
+        if text.trim().is_empty() {
+            continue;
+        }
+        let mut score = 0i64;
+        if text.contains(&needle) {
+            score += 100;
+        }
+        for w in &words {
+            if text.contains(w) {
+                score += 1;
+            }
+        }
+        if score > best_score {
+            best_score = score;
+            best_idx = i;
+        }
+    }
+
+    // Take a small window of messages around the best match (one before, the match, one after).
+    let lo = best_idx.saturating_sub(1);
+    let hi = (best_idx + 2).min(session.messages.len());
+
+    let mut out = String::new();
+    for m in &session.messages[lo..hi] {
+        let role = cv_core::render::role_label(m.role);
+        let body = message_text(m);
+        let body = body.trim();
+        if body.is_empty() {
+            continue;
+        }
+        let remaining = budget.saturating_sub(out.len());
+        if remaining < 40 {
+            out.push('…');
+            break;
+        }
+        out.push_str(role);
+        out.push_str(": ");
+        if body.len() > remaining {
+            let end = floor_char_boundary(body, remaining);
+            out.push_str(&body[..end]);
+            out.push('…');
+        } else {
+            out.push_str(body);
+        }
+        out.push_str("\n\n");
+    }
+
+    let trimmed = out.trim_end();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
     }
 }
 
