@@ -222,7 +222,7 @@ class CvApp extends HTMLElement {
         <div class="header-actions">
           <button type="button" class="icon-btn help-btn" title="Keyboard shortcuts (?)" aria-label="Keyboard shortcuts">?</button>
           <button type="button" class="icon-btn theme-toggle" title="Toggle theme — dark / light / auto (t)" aria-label="Toggle theme">◐</button>
-          <a class="repo-link" href="https://claurdvoyant.lunar.town/manual/" target="_blank" rel="noopener" title="User manual">manual</a>
+          <a class="repo-link" href="https://emberian.github.io/claurdvoyant/manual/" target="_blank" rel="noopener" title="User manual">manual</a>
           <a class="repo-link" href="https://github.com/emberian/claurdvoyant" target="_blank" rel="noopener" title="Project repository">source</a>
         </div>
       </header>
