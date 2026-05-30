@@ -789,7 +789,11 @@ cv-session-picker { position: relative; display: inline-flex; min-width: 0; }
 .cmp-heads { position: sticky; top: 0; z-index: 1; background: var(--bg); padding: 8px 0; margin-bottom: 6px; border-bottom: 1px solid var(--border); }
 .cmp-col-head { display: flex; align-items: center; gap: 8px; padding: 0 10px; }
 .cmp-col-title { font-weight: 650; font-size: 14px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.cmp-row { align-items: stretch; }
+.cmp-row {
+  align-items: stretch;
+  /* Virtualize: a comparison of two big sessions can be thousands of rows. */
+  content-visibility: auto; contain-intrinsic-size: auto 96px;
+}
 .cmp-cell { padding: 6px; min-width: 0; }
 .cmp-gutter { display: flex; align-items: center; justify-content: center; color: var(--fg-muted); font-family: var(--mono); }
 .cmp-msg { border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px; background: var(--bg-elev); height: 100%; }
