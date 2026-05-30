@@ -45,7 +45,7 @@ use super::Adapter;
 use crate::ir::*;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
-use serde_json::{Map, Value};
+use serde_json::{json, Map, Value};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -89,8 +89,12 @@ impl Adapter for Cline {
         parse_task_dir(&r.path, &r.id, Harness::Cline)
     }
 
+    fn emit(&self, session: &Session, out_dir: &Path) -> Result<crate::harness::EmitResult> {
+        emit(session, out_dir, &crate::emit::EmitOptions::default())
+    }
+
     fn can_emit(&self) -> bool {
-        false
+        true
     }
 }
 
@@ -460,6 +464,233 @@ fn content_plain_text(content: Option<&Value>) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// Emitting (Cline / Roo are conversion targets)
+// ---------------------------------------------------------------------------
+
+/// Emit `session` into Cline's per-task layout under `out_dir`:
+///
+/// ```text
+/// <out_dir>/tasks/<taskId>/
+///   api_conversation_history.json   # JSON array of Anthropic message objects (the transcript)
+///   ui_messages.json                # minimal UI event log (created/updated timestamps)
+///   task_metadata.json              # {cwd, files_in_context[], model_usage[]} hints
+/// ```
+///
+/// This is the faithful inverse of [`parse_history_str`]: every IR [`Block`] maps back to the
+/// Anthropic content block the parser expects (`text`, `thinking`, `tool_use`, `tool_result`,
+/// `image`). A [`Role::Tool`] turn is written as a `user` message whose content is *only*
+/// `tool_result` blocks, which the parser reclassifies back to [`Role::Tool`].
+///
+/// `<taskId>` comes from `opts.new_id`; otherwise it's a millisecond-epoch string derived from the
+/// session's created/updated time (the parser turns the taskId back into `created_at`). The cwd
+/// (`opts.new_cwd`, else `session.cwd`) is threaded into the first user turn's
+/// `<environment_details>` block (where the parser extracts it from) and into `task_metadata.json`.
+pub fn emit(
+    session: &Session,
+    out_dir: &Path,
+    opts: &crate::emit::EmitOptions,
+) -> Result<crate::harness::EmitResult> {
+    emit_with_harness(session, out_dir, opts, Harness::Cline)
+}
+
+/// Shared emit core, parameterized by `harness` so `roo.rs` can reuse it with `Harness::Roo`.
+///
+/// The on-disk per-task format is byte-for-byte identical for Cline and Roo (the harness only
+/// differs at parse time / in which storage root it lives under), so `harness` is accepted for API
+/// symmetry and resume-hint flavor but doesn't change the emitted bytes.
+pub fn emit_with_harness(
+    session: &Session,
+    out_dir: &Path,
+    opts: &crate::emit::EmitOptions,
+    harness: Harness,
+) -> Result<crate::harness::EmitResult> {
+    let _ = harness;
+    // taskId: an explicit override, else a ms-epoch string the parser can turn back into created_at.
+    let created = session.created_at.or(session.updated_at).unwrap_or_else(Utc::now);
+    let new_id = opts.new_id.clone().unwrap_or_else(|| created.timestamp_millis().to_string());
+
+    let cwd = opts.new_cwd.clone().or_else(|| session.cwd.clone());
+    let cwd_str = cwd.as_ref().map(|p| p.to_string_lossy().to_string());
+
+    let task_dir = out_dir.join("tasks").join(&new_id);
+    fs::create_dir_all(&task_dir)
+        .with_context(|| format!("creating {}", task_dir.display()))?;
+
+    // ── api_conversation_history.json ──
+    let mut history: Vec<Value> = Vec::new();
+    let mut first_user_seen = false;
+    for msg in &session.messages {
+        match msg.role {
+            Role::User => {
+                // Thread the cwd through the first user turn's <environment_details>, mirroring
+                // where the parser reads it back from.
+                let inject = if !first_user_seen {
+                    first_user_seen = true;
+                    cwd_str.as_deref()
+                } else {
+                    None
+                };
+                let mut blocks = emit_blocks(&msg.content);
+                if let Some(cwd) = inject {
+                    // Prepend a <task> title block (when we have one) so titles round-trip, then
+                    // append the environment_details so cwd extraction finds it.
+                    if let Some(title) = &session.title {
+                        blocks.insert(0, json!({ "type": "text", "text": format!("<task>{title}</task>") }));
+                    }
+                    blocks.push(json!({
+                        "type": "text",
+                        "text": format!(
+                            "<environment_details>\n# Current Working Directory ({cwd}) Files\n</environment_details>"
+                        ),
+                    }));
+                }
+                history.push(json!({ "role": "user", "content": Value::Array(blocks) }));
+            }
+            Role::Assistant => {
+                history.push(json!({
+                    "role": "assistant",
+                    "content": Value::Array(emit_blocks(&msg.content)),
+                }));
+            }
+            Role::Tool => {
+                // A tool turn is a `user` message of only tool_result blocks; the parser
+                // reclassifies it back to Role::Tool.
+                history.push(json!({
+                    "role": "user",
+                    "content": Value::Array(emit_tool_result_blocks(&msg.content)),
+                }));
+            }
+            Role::System => {
+                history.push(json!({
+                    "role": "system",
+                    "content": Value::Array(emit_blocks(&msg.content)),
+                }));
+            }
+        }
+    }
+    let history_path = task_dir.join("api_conversation_history.json");
+    fs::write(&history_path, serde_json::to_string_pretty(&Value::Array(history))?)
+        .with_context(|| format!("writing {}", history_path.display()))?;
+
+    // ── task_metadata.json (cwd + model hints; sidecar the parser falls back to for cwd) ──
+    let mut meta = Map::new();
+    if let Some(c) = &cwd_str {
+        meta.insert("cwd".into(), json!(c));
+    }
+    meta.insert("files_in_context".into(), json!([]));
+    if let Some(model) = &session.model {
+        meta.insert("model_usage".into(), json!([{ "model_id": model }]));
+    }
+    let meta_path = task_dir.join("task_metadata.json");
+    fs::write(&meta_path, serde_json::to_string_pretty(&Value::Object(meta))?)
+        .with_context(|| format!("writing {}", meta_path.display()))?;
+
+    // ── ui_messages.json (minimal event log carrying created/updated timestamps) ──
+    let created_ms = created.timestamp_millis();
+    let updated_ms = session
+        .updated_at
+        .or(session.created_at)
+        .unwrap_or(created)
+        .timestamp_millis();
+    let mut ui: Vec<Value> = Vec::new();
+    if let Some(title) = &session.title {
+        ui.push(json!({ "ts": created_ms, "type": "say", "say": "task", "text": title }));
+    } else {
+        ui.push(json!({ "ts": created_ms, "type": "say", "say": "task", "text": "" }));
+    }
+    if updated_ms != created_ms {
+        ui.push(json!({ "ts": updated_ms, "type": "say", "say": "completion_result", "text": "" }));
+    }
+    let ui_path = task_dir.join("ui_messages.json");
+    fs::write(&ui_path, serde_json::to_string_pretty(&Value::Array(ui))?)
+        .with_context(|| format!("writing {}", ui_path.display()))?;
+
+    let resume = match &cwd {
+        Some(c) => format!("open {} in Cline (task {new_id}, cwd {})", task_dir.display(), c.display()),
+        None => format!("open {} in Cline (task {new_id})", task_dir.display()),
+    };
+    Ok(crate::harness::EmitResult {
+        path: task_dir,
+        new_id,
+        resume_hint: Some(resume),
+    })
+}
+
+/// Map IR blocks → Anthropic content blocks, exactly as [`parse_block`] reads them. Tool results
+/// are skipped here (they live on their own [`Role::Tool`] turn via [`emit_tool_result_blocks`]).
+fn emit_blocks(content: &[Block]) -> Vec<Value> {
+    let mut out = Vec::new();
+    for b in content {
+        match b {
+            Block::Text { text } => out.push(json!({ "type": "text", "text": text })),
+            Block::Thinking { text, signature, encrypted, redacted } => {
+                if *redacted {
+                    let mut m = Map::new();
+                    m.insert("type".into(), json!("redacted_thinking"));
+                    if let Some(enc) = encrypted {
+                        m.insert("data".into(), json!(enc));
+                    }
+                    out.push(Value::Object(m));
+                } else {
+                    let mut m = Map::new();
+                    m.insert("type".into(), json!("thinking"));
+                    m.insert("thinking".into(), json!(text));
+                    if let Some(sig) = signature {
+                        m.insert("signature".into(), json!(sig));
+                    }
+                    out.push(Value::Object(m));
+                }
+            }
+            Block::ToolUse { id, name, input } => out.push(json!({
+                "type": "tool_use",
+                "id": id,
+                "name": name,
+                "input": input,
+            })),
+            Block::Image { media_type, data_ref } => {
+                let mut source = Map::new();
+                if let Some(mt) = media_type {
+                    source.insert("media_type".into(), json!(mt));
+                }
+                match data_ref.as_deref() {
+                    Some("base64:inline") | None => {
+                        source.insert("type".into(), json!("base64"));
+                    }
+                    Some(r) => {
+                        source.insert("type".into(), json!("url"));
+                        source.insert("url".into(), json!(r));
+                    }
+                }
+                out.push(json!({ "type": "image", "source": Value::Object(source) }));
+            }
+            Block::File { path, source, .. } => {
+                let label = path.as_deref().or(source.as_deref()).unwrap_or("?");
+                out.push(json!({ "type": "text", "text": format!("[file: {label}]") }));
+            }
+            // Tool results don't belong on a non-Tool turn; emitted separately.
+            Block::ToolResult { .. } => {}
+        }
+    }
+    out
+}
+
+/// Map a [`Role::Tool`] turn's blocks → `tool_result` content blocks the parser pairs by id.
+fn emit_tool_result_blocks(content: &[Block]) -> Vec<Value> {
+    let mut out = Vec::new();
+    for b in content {
+        if let Block::ToolResult { tool_use_id, content, is_error, .. } = b {
+            out.push(json!({
+                "type": "tool_result",
+                "tool_use_id": tool_use_id,
+                "content": content,
+                "is_error": is_error,
+            }));
+        }
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
 // cwd / title / timestamp helpers
 // ---------------------------------------------------------------------------
 
@@ -690,6 +921,106 @@ mod tests {
         assert!(parse_history_str("x", "{}", Harness::Cline, None)
             .messages
             .is_empty());
+    }
+
+    #[test]
+    fn emit_round_trips_through_parser() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+
+        // Build a small Session: user, assistant (text + tool_use), tool result.
+        let mut session = Session {
+            id: "src".to_string(),
+            harness: Harness::Cline,
+            cwd: Some(PathBuf::from("/Users/me/proj")),
+            title: Some("Fix the parser bug".to_string()),
+            created_at: DateTime::<Utc>::from_timestamp_millis(1717000000000),
+            updated_at: DateTime::<Utc>::from_timestamp_millis(1717000005000),
+            model: Some("claude-x".to_string()),
+            git: None,
+            messages: Vec::new(),
+            source_path: None,
+            extra: Map::new(),
+        };
+
+        let mut user = Message::new(Role::User);
+        user.content = vec![Block::Text { text: "please fix it".to_string() }];
+        session.messages.push(user);
+
+        let mut asst = Message::new(Role::Assistant);
+        asst.content = vec![
+            Block::Text { text: "on it".to_string() },
+            Block::ToolUse {
+                id: "toolu_1".to_string(),
+                name: "read_file".to_string(),
+                input: json!({ "path": "a.rs" }),
+            },
+        ];
+        session.messages.push(asst);
+
+        let mut tool = Message::new(Role::Tool);
+        tool.content = vec![Block::ToolResult {
+            tool_use_id: "toolu_1".to_string(),
+            content: "fn main() {}".to_string(),
+            is_error: false,
+            tool_name: None,
+            status: None,
+            details: None,
+        }];
+        session.messages.push(tool);
+
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let out_dir = std::env::temp_dir().join(format!(
+            "cv-cline-emit-{}-{}",
+            std::process::id(),
+            n
+        ));
+
+        let cline = Cline::new();
+        let res = cline.emit(&session, &out_dir).expect("emit");
+        assert_eq!(res.path, out_dir.join("tasks").join(&res.new_id));
+
+        // Re-parse via this adapter's parse path.
+        let r = SessionRef {
+            id: res.new_id.clone(),
+            harness: Harness::Cline,
+            path: res.path.clone(),
+            cwd: None,
+            title: None,
+            created_at: None,
+            updated_at: None,
+            message_count: 0,
+        };
+        let parsed = cline.parse(&r).expect("re-parse");
+
+        // Roles survive: user, assistant, tool.
+        assert_eq!(parsed.messages.len(), 3);
+        assert_eq!(parsed.messages[0].role, Role::User);
+        assert_eq!(parsed.messages[1].role, Role::Assistant);
+        assert_eq!(parsed.messages[2].role, Role::Tool);
+
+        // cwd + title threaded through the first user turn / metadata.
+        assert_eq!(parsed.cwd.as_deref(), Some(std::path::Path::new("/Users/me/proj")));
+        assert_eq!(parsed.title.as_deref(), Some("Fix the parser bug"));
+
+        // Assistant text + tool_use blocks survive.
+        assert!(matches!(&parsed.messages[1].content[0], Block::Text { text } if text == "on it"));
+        assert!(matches!(
+            &parsed.messages[1].content[1],
+            Block::ToolUse { id, name, .. } if id == "toolu_1" && name == "read_file"
+        ));
+
+        // Tool result survives with id + content.
+        match &parsed.messages[2].content[0] {
+            Block::ToolResult { tool_use_id, content, is_error, .. } => {
+                assert_eq!(tool_use_id, "toolu_1");
+                assert!(content.contains("fn main"));
+                assert!(!is_error);
+            }
+            o => panic!("expected tool_result, got {o:?}"),
+        }
+
+        let _ = std::fs::remove_dir_all(&out_dir);
     }
 
     #[test]

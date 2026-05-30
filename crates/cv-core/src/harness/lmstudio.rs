@@ -35,10 +35,11 @@
 //!   missing `~/.lmstudio` dir yields an empty discover (never a panic).
 
 use super::Adapter;
+use super::EmitResult;
 use crate::ir::*;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
-use serde_json::Value;
+use serde_json::{json, Map, Value};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -64,6 +65,14 @@ impl Default for LmStudio {
 impl Adapter for LmStudio {
     fn harness(&self) -> Harness {
         Harness::LmStudio
+    }
+
+    fn can_emit(&self) -> bool {
+        true
+    }
+
+    fn emit(&self, session: &Session, out_dir: &Path) -> Result<EmitResult> {
+        emit(session, out_dir, &crate::emit::EmitOptions::default())
     }
 
     fn storage_root(&self) -> Option<PathBuf> {
@@ -140,6 +149,258 @@ impl Adapter for LmStudio {
             extra,
         })
     }
+}
+
+// ------------------------------------------------------------------------------------------------
+// Emit (port-a-sesh target): the faithful inverse of `parse`.
+// ------------------------------------------------------------------------------------------------
+
+/// Emit `session` into LM Studio's native format: a single
+/// `<out_dir>/conversations/<ms-epoch>.conversation.json` file. The filename stem is the chat id
+/// (also `createdAt`, ms-epoch), exactly as the parser expects.
+///
+/// This is the inverse of [`parse`]. Each IR [`Message`] becomes one `messages[]` turn wrapped in
+/// `{versions:[<version>], currentlySelected:0}`:
+/// - **User/System** → a `singleStep` version with `content` parts (`text` / `file`).
+/// - **Assistant** → a `multiStep` version whose `steps[]` are `contentBlock`s: text → a plain
+///   block, [`Block::Thinking`] → a block tagged `style.type=="thinking"` (the form the parser reads
+///   back as reasoning), and tool calls/results are flattened to readable text blocks (LM Studio has
+///   no first-class tool structures on disk, so we don't try to fabricate any). Model + usage ride
+///   on the first content step's `genInfo`, and a `stepIdentifier` carries the step timestamp.
+///
+/// LM Studio is a chat app with no working directory, so `opts.new_cwd` / `session.cwd` are not
+/// written into the file; we surface the chosen cwd only in the resume hint.
+pub fn emit(
+    session: &Session,
+    out_dir: &Path,
+    opts: &crate::emit::EmitOptions,
+) -> Result<EmitResult> {
+    let created = session
+        .created_at
+        .or(session.updated_at)
+        .unwrap_or_else(Utc::now);
+    let created_ms = created.timestamp_millis();
+
+    // The id (filename stem) is the ms-epoch createdAt unless explicitly overridden.
+    let new_id = opts
+        .new_id
+        .clone()
+        .unwrap_or_else(|| created_ms.to_string());
+
+    let conv_dir = out_dir.join("conversations");
+    fs::create_dir_all(&conv_dir)
+        .with_context(|| format!("creating {}", conv_dir.display()))?;
+    let file_path = conv_dir.join(format!("{new_id}.conversation.json"));
+
+    let mut messages: Vec<Value> = Vec::new();
+    for msg in &session.messages {
+        if let Some(version) = emit_version(session, msg, created) {
+            messages.push(json!({
+                "versions": [version],
+                "currentlySelected": 0,
+            }));
+        }
+    }
+
+    let mut root = Map::new();
+    let title = session
+        .title
+        .clone()
+        .or_else(|| session.first_user_text())
+        .map(|t| crate::ir::truncate(&t, 80))
+        .unwrap_or_else(|| "Untitled".to_string());
+    root.insert("name".into(), json!(title));
+    root.insert("createdAt".into(), json!(created_ms));
+    root.insert("messages".into(), Value::Array(messages));
+    root.insert("tokenCount".into(), json!(0));
+    root.insert("pinned".into(), json!(false));
+
+    // Preserve any system prompt the source carried in `extra` (parse stashes it there).
+    if let Some(sp) = session.extra.get("systemPrompt").and_then(Value::as_str) {
+        root.insert("systemPrompt".into(), json!(sp));
+    }
+
+    fs::write(&file_path, serde_json::to_string_pretty(&Value::Object(root))?)
+        .with_context(|| format!("writing {}", file_path.display()))?;
+
+    Ok(EmitResult {
+        path: file_path,
+        new_id,
+        resume_hint: Some("open the chat in LM Studio".to_string()),
+    })
+}
+
+/// Build the single `version` object for one IR message turn (the parser only reads the
+/// `currentlySelected` version, so we emit exactly one). Returns `None` for empty turns.
+fn emit_version(session: &Session, msg: &Message, fallback: DateTime<Utc>) -> Option<Value> {
+    match msg.role {
+        Role::Assistant => {
+            let steps = emit_assistant_steps(session, msg, fallback);
+            if steps.is_empty() {
+                return None;
+            }
+            Some(json!({
+                "type": "multiStep",
+                "role": "assistant",
+                "steps": steps,
+            }))
+        }
+        // User, System, and Tool turns all become a single-step turn with content parts.
+        role => {
+            let content = emit_content_parts(&msg.content);
+            if content.is_empty() {
+                return None;
+            }
+            let role_str = match role {
+                Role::System => "system",
+                _ => "user", // Tool results have no native shape; carry them on a user turn.
+            };
+            Some(json!({
+                "type": "singleStep",
+                "role": role_str,
+                "content": content,
+            }))
+        }
+    }
+}
+
+/// Map an assistant message's blocks into LM Studio `steps[]` (`contentBlock`s). Model + usage ride
+/// on the first step's `genInfo`; the `stepIdentifier` prefix carries the step timestamp.
+fn emit_assistant_steps(session: &Session, msg: &Message, fallback: DateTime<Utc>) -> Vec<Value> {
+    let ts = msg.timestamp.unwrap_or(fallback);
+    let step_id = format!("{}-0.{}", ts.timestamp_millis(), "0000000000000000");
+    let model = msg.model.as_ref().or(session.model.as_ref());
+
+    let mut steps: Vec<Value> = Vec::new();
+    let mut attached_gen = false;
+
+    let mut push_block = |content: Value, thinking: bool, steps: &mut Vec<Value>| {
+        let mut step = Map::new();
+        step.insert("type".into(), json!("contentBlock"));
+        step.insert("role".into(), json!("assistant"));
+        step.insert("content".into(), content);
+        step.insert("stepIdentifier".into(), json!(step_id));
+        if thinking {
+            step.insert("style".into(), json!({ "type": "thinking" }));
+        }
+        // Attach model + usage to the first content block, mirroring how the parser reads them.
+        if !attached_gen {
+            let mut gen = Map::new();
+            if let Some(m) = model {
+                gen.insert("indexedModelIdentifier".into(), json!(m));
+            }
+            if let Some(u) = &msg.usage {
+                let mut stats = Map::new();
+                if let Some(i) = u.input_tokens {
+                    stats.insert("promptTokensCount".into(), json!(i));
+                }
+                if let Some(o) = u.output_tokens {
+                    stats.insert("predictedTokensCount".into(), json!(o));
+                }
+                if !stats.is_empty() {
+                    gen.insert("stats".into(), Value::Object(stats));
+                }
+            }
+            if !gen.is_empty() {
+                step.insert("genInfo".into(), Value::Object(gen));
+                attached_gen = true;
+            }
+        }
+        steps.push(Value::Object(step));
+    };
+
+    for b in &msg.content {
+        match b {
+            Block::Text { text } => {
+                push_block(text_parts(text), false, &mut steps);
+            }
+            Block::Thinking { text, .. } => {
+                if !text.is_empty() {
+                    push_block(text_parts(text), true, &mut steps);
+                }
+            }
+            Block::ToolUse { name, input, .. } => {
+                // No native tool structure: render a readable, self-describing text block. The
+                // parser reads it back as text (round-trips as content, not as a ToolUse).
+                let args = serde_json::to_string(input).unwrap_or_else(|_| "{}".to_string());
+                push_block(text_parts(&format!("[tool call: {name} {args}]")), false, &mut steps);
+            }
+            Block::ToolResult { content, .. } => {
+                push_block(text_parts(&format!("[tool result: {content}]")), false, &mut steps);
+            }
+            Block::File { .. } | Block::Image { .. } => {
+                if let Some(part) = emit_file_part(b) {
+                    push_block(Value::Array(vec![part]), false, &mut steps);
+                }
+            }
+        }
+    }
+    steps
+}
+
+/// Map a (user/system/tool) message's blocks into a `content[]` parts array (`text` / `file`).
+fn emit_content_parts(blocks: &[Block]) -> Vec<Value> {
+    let mut out = Vec::new();
+    for b in blocks {
+        match b {
+            Block::Text { text } => out.push(json!({ "type": "text", "text": text })),
+            // Reasoning is unusual on a user turn, but keep the text rather than drop it.
+            Block::Thinking { text, .. } if !text.is_empty() => {
+                out.push(json!({ "type": "text", "text": text }))
+            }
+            Block::ToolResult { content, .. } => {
+                out.push(json!({ "type": "text", "text": format!("[tool result: {content}]") }))
+            }
+            Block::ToolUse { name, input, .. } => {
+                let args = serde_json::to_string(input).unwrap_or_else(|_| "{}".to_string());
+                out.push(json!({ "type": "text", "text": format!("[tool call: {name} {args}]") }))
+            }
+            Block::File { .. } | Block::Image { .. } => {
+                if let Some(part) = emit_file_part(b) {
+                    out.push(part);
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// A `content[]` array holding a single `text` part.
+fn text_parts(text: &str) -> Value {
+    json!([{ "type": "text", "text": text }])
+}
+
+/// Map a [`Block::File`] / [`Block::Image`] into LM Studio's `{type:"file", ...}` part (a reference,
+/// matching how the parser reads `identifier`/`fileIdentifier`, `name`, `fileType`).
+fn emit_file_part(b: &Block) -> Option<Value> {
+    let mut part = Map::new();
+    part.insert("type".into(), json!("file"));
+    match b {
+        Block::Image { media_type, data_ref } => {
+            part.insert("fileType".into(), json!("image"));
+            if let Some(r) = data_ref {
+                part.insert("identifier".into(), json!(r));
+                part.insert("name".into(), json!(r));
+            }
+            if let Some(mt) = media_type {
+                part.insert("mimeType".into(), json!(mt));
+            }
+        }
+        Block::File { mime, path, source } => {
+            if let Some(mt) = mime {
+                part.insert("fileType".into(), json!(mt));
+            }
+            if let Some(s) = source {
+                part.insert("identifier".into(), json!(s));
+            }
+            if let Some(p) = path {
+                part.insert("name".into(), json!(p));
+            }
+        }
+        _ => return None,
+    }
+    Some(Value::Object(part))
 }
 
 /// Files we treat as conversations: `*.conversation.json` (the real format) and, defensively, any
@@ -558,6 +819,87 @@ mod tests {
         let ts = step_id_ts("1754425094719-0.022738884687463323").unwrap();
         assert_eq!(ts.timestamp_millis(), 1754425094719);
         assert!(step_id_ts("garbage").is_none());
+    }
+
+    #[test]
+    fn emit_round_trips_through_parse() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+
+        // Build a small session: a user turn and an assistant turn with thinking + text.
+        let mut user = Message::new(Role::User);
+        user.content.push(Block::Text {
+            text: "Hello there".to_string(),
+        });
+        let mut assistant = Message::new(Role::Assistant);
+        assistant.model = Some("openai/gpt-oss-120b".to_string());
+        assistant.content.push(Block::Thinking {
+            text: "the user said hi".to_string(),
+            signature: None,
+            encrypted: None,
+            redacted: false,
+        });
+        assistant.content.push(Block::Text {
+            text: "Hi! How can I help?".to_string(),
+        });
+        assistant.usage = Some(Usage {
+            input_tokens: Some(12),
+            output_tokens: Some(34),
+            cache_read_tokens: None,
+            cache_creation_tokens: None,
+        });
+
+        let session = Session {
+            id: "orig".to_string(),
+            harness: Harness::LmStudio,
+            cwd: None,
+            title: Some("Greeting".to_string()),
+            created_at: DateTime::from_timestamp_millis(1_754_425_094_719),
+            updated_at: None,
+            model: Some("openai/gpt-oss-120b".to_string()),
+            git: None,
+            messages: vec![user, assistant],
+            source_path: None,
+            extra: serde_json::Map::new(),
+        };
+
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let out_dir = std::env::temp_dir().join(format!(
+            "cv-lmstudio-emit-{}-{}",
+            std::process::id(),
+            n
+        ));
+        let _ = fs::remove_dir_all(&out_dir);
+
+        let result =
+            emit(&session, &out_dir, &crate::emit::EmitOptions::default()).unwrap();
+        assert!(result.path.exists(), "emitted file exists");
+
+        // Re-parse the emitted file with this adapter.
+        let r = scan(&result.path).unwrap().unwrap();
+        let parsed = LmStudio { root: None }.parse(&r).unwrap();
+
+        assert_eq!(parsed.messages.len(), 2, "both turns survive");
+        assert_eq!(parsed.messages[0].role, Role::User);
+        assert_eq!(parsed.messages[1].role, Role::Assistant);
+        assert_eq!(
+            parsed.messages[0].text().as_deref(),
+            Some("Hello there"),
+            "first user text survives"
+        );
+
+        let a = &parsed.messages[1];
+        assert!(
+            matches!(a.content[0], Block::Thinking { .. }),
+            "thinking block round-trips via style.type==thinking"
+        );
+        assert_eq!(a.text().as_deref(), Some("Hi! How can I help?"));
+        assert_eq!(a.model.as_deref(), Some("openai/gpt-oss-120b"));
+        let usage = a.usage.as_ref().expect("usage round-trips");
+        assert_eq!(usage.input_tokens, Some(12));
+        assert_eq!(usage.output_tokens, Some(34));
+
+        let _ = fs::remove_dir_all(&out_dir);
     }
 
     #[test]

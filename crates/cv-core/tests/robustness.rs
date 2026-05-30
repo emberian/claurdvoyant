@@ -447,27 +447,52 @@ fn round_trip_all_supported_targets() {
         let parsed = emit_and_reparse(target)
             .unwrap_or_else(|| panic!("{target}: emitted session was not discoverable"));
 
-        // Core invariant: user/assistant text + tool names survive the round trip.
-        assert_eq!(
-            user_texts(&parsed),
-            vec!["list the files please"],
-            "{target}: user text did not survive round-trip"
+        // Two faithful-format quirks among the newer targets:
+        //  - LM Studio has no tool structures on disk → tool turns flatten to text (lossy on tools);
+        //  - Cline/Roo embed cwd + a `<task>` title inside the first user message's text (that's how
+        //    those harnesses really store it), so the user text comes back wrapped, not bare;
+        //  - Continue/LM Studio have no thinking part, so a thinking block flattens into the
+        //    assistant's text.
+        // For these we assert the core text is present rather than byte-exact.
+        let wraps_text = matches!(
+            target,
+            Harness::LmStudio | Harness::Cline | Harness::Roo | Harness::Continue
         );
-        assert_eq!(
-            assistant_texts(&parsed),
-            vec!["Sure, listing now."],
-            "{target}: assistant text did not survive round-trip"
-        );
+        let flattens_tools = matches!(target, Harness::LmStudio);
 
-        // Tool names must survive for every supported target. Grok used to be an exception
-        // (`emit_grok` wrote plain-text chat_history and dropped tool turns), but emit now writes
-        // assistant `tool_calls[]` + `tool_result` lines that the Grok parser reads back, so tool
-        // calls round-trip there too.
-        assert_eq!(
-            tool_names(&parsed),
-            vec!["run_shell"],
-            "{target}: tool name did not survive round-trip"
-        );
+        if wraps_text {
+            assert!(
+                user_texts(&parsed).iter().any(|t| t.contains("list the files please")),
+                "{target}: user text did not survive round-trip (got {:?})",
+                user_texts(&parsed)
+            );
+            assert!(
+                assistant_texts(&parsed).iter().any(|t| t.contains("Sure, listing now.")),
+                "{target}: assistant text did not survive round-trip (got {:?})",
+                assistant_texts(&parsed)
+            );
+        } else {
+            // Core invariant: user/assistant text survives the round trip exactly.
+            assert_eq!(
+                user_texts(&parsed),
+                vec!["list the files please"],
+                "{target}: user text did not survive round-trip"
+            );
+            assert_eq!(
+                assistant_texts(&parsed),
+                vec!["Sure, listing now."],
+                "{target}: assistant text did not survive round-trip"
+            );
+        }
+
+        // Tool names survive for every target except the ones that flatten tools to text.
+        if !flattens_tools {
+            assert_eq!(
+                tool_names(&parsed),
+                vec!["run_shell"],
+                "{target}: tool name did not survive round-trip"
+            );
+        }
 
         checked.push(target.to_string());
     }

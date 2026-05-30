@@ -34,7 +34,7 @@ use super::Adapter;
 use crate::ir::*;
 use anyhow::Result;
 use chrono::{DateTime, Utc};
-use serde_json::Value;
+use serde_json::{Map, Value, json};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -162,8 +162,249 @@ impl Adapter for Continue {
     }
 
     fn can_emit(&self) -> bool {
-        false
+        true
     }
+
+    fn emit(&self, session: &Session, out_dir: &Path) -> Result<super::EmitResult> {
+        emit(session, out_dir, &crate::emit::EmitOptions::default())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Emit (IR -> Continue native layout)
+// ---------------------------------------------------------------------------
+
+/// Emit `session` into Continue's native layout under `out_dir` (the `sessions` directory):
+///   `out_dir/<sessionId>.json`     — the transcript `{sessionId, title, workspaceDirectory, history}`
+///   `out_dir/sessions.json`        — the index array (merged: our entry added/updated)
+///
+/// This is the faithful inverse of [`Continue::parse`] / [`Continue::discover`]:
+/// - Each IR [`Message`] becomes one `history` item `{message, contextItems}`.
+/// - `message` is the OpenAI-ish `ChatMessage` (`role`, string-or-array `content`, assistant
+///   `toolCalls[]` with `arguments` as a JSON-encoded *string*, `role:"tool"` + `toolCallId`).
+/// - `Block::File`/`Block::Image` on a turn become `contextItems[]` (so the parser's
+///   `context_item_to_block` recovers them as `File` blocks); inline images also go in `content`.
+///
+/// The parser backfills `cwd`/`title` from the transcript itself, so writing the index is for
+/// `discover()` fidelity, not correctness; we still write it.
+pub fn emit(
+    session: &Session,
+    out_dir: &Path,
+    opts: &crate::emit::EmitOptions,
+) -> Result<super::EmitResult> {
+    use anyhow::Context;
+
+    let new_id = opts
+        .new_id
+        .clone()
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let cwd = opts.new_cwd.clone().or_else(|| session.cwd.clone());
+    let cwd_str = cwd
+        .as_ref()
+        .map(|p| p.to_string_lossy().to_string())
+        .filter(|s| !s.is_empty());
+
+    fs::create_dir_all(out_dir).with_context(|| format!("creating {}", out_dir.display()))?;
+
+    // ── transcript: <sessionId>.json ──
+    let title = session
+        .title
+        .clone()
+        .or_else(|| session.first_user_text())
+        .map(|t| crate::ir::truncate(&t, 80));
+
+    let mut history: Vec<Value> = Vec::new();
+    for msg in &session.messages {
+        history.push(history_item(msg, session.model.as_deref()));
+    }
+
+    let mut transcript = Map::new();
+    transcript.insert("sessionId".into(), json!(new_id));
+    if let Some(t) = &title {
+        transcript.insert("title".into(), json!(t));
+    }
+    if let Some(c) = &cwd_str {
+        transcript.insert("workspaceDirectory".into(), json!(c));
+    }
+    transcript.insert("history".into(), Value::Array(history));
+
+    let file_path = out_dir.join(format!("{new_id}.json"));
+    fs::write(
+        &file_path,
+        serde_json::to_string_pretty(&Value::Object(transcript))?,
+    )
+    .with_context(|| format!("writing {}", file_path.display()))?;
+
+    // ── index: sessions.json (merge-or-create) ──
+    let index_path = out_dir.join("sessions.json");
+    let mut entries: Vec<Value> = fs::read_to_string(&index_path)
+        .ok()
+        .and_then(|t| serde_json::from_str::<Value>(&t).ok())
+        .and_then(|v| v.as_array().cloned())
+        .unwrap_or_default();
+    // Drop any stale entry for this id, then append a fresh one.
+    entries.retain(|e| e.get("sessionId").and_then(Value::as_str) != Some(new_id.as_str()));
+    let created = session
+        .created_at
+        .or(session.updated_at)
+        .unwrap_or_else(chrono::Utc::now);
+    let mut entry = Map::new();
+    entry.insert("sessionId".into(), json!(new_id));
+    if let Some(t) = &title {
+        entry.insert("title".into(), json!(t));
+    }
+    // `dateCreated` is a string holding millisecond epoch (the older-build shape, which the parser
+    // accepts alongside ISO).
+    entry.insert(
+        "dateCreated".into(),
+        json!(created.timestamp_millis().to_string()),
+    );
+    if let Some(c) = &cwd_str {
+        entry.insert("workspaceDirectory".into(), json!(c));
+    }
+    entries.push(Value::Object(entry));
+    fs::write(
+        &index_path,
+        serde_json::to_string_pretty(&Value::Array(entries))?,
+    )
+    .with_context(|| format!("writing {}", index_path.display()))?;
+
+    Ok(super::EmitResult {
+        path: file_path,
+        new_id,
+        resume_hint: None,
+    })
+}
+
+/// Build one `history` item (`{message, contextItems}`) from an IR message.
+fn history_item(msg: &Message, session_model: Option<&str>) -> Value {
+    let role_str = match msg.role {
+        Role::System => "system",
+        Role::Assistant => "assistant",
+        Role::Tool => "tool",
+        Role::User => "user",
+    };
+
+    let mut message = Map::new();
+    message.insert("role".into(), json!(role_str));
+
+    let mut context_items: Vec<Value> = Vec::new();
+
+    match msg.role {
+        Role::Tool => {
+            // A tool result: Continue stores output in `content`, keyed by `toolCallId`.
+            let (tool_use_id, content) = tool_result_of(&msg.content);
+            message.insert("toolCallId".into(), json!(tool_use_id));
+            message.insert("content".into(), json!(content));
+        }
+        _ => {
+            // content: array of text/image parts (the array shape the parser handles).
+            let mut parts: Vec<Value> = Vec::new();
+            let mut tool_calls: Vec<Value> = Vec::new();
+            for b in &msg.content {
+                match b {
+                    Block::Text { text } => {
+                        parts.push(json!({ "type": "text", "text": text }));
+                    }
+                    Block::Thinking { text, .. } => {
+                        // Continue's ChatMessage has no thinking part; preserve as text so it's
+                        // searchable and survives a round-trip as content.
+                        if !text.is_empty() {
+                            parts.push(json!({ "type": "text", "text": text }));
+                        }
+                    }
+                    Block::Image { data_ref, .. } => {
+                        if let Some(url) = data_ref {
+                            parts.push(json!({
+                                "type": "imageUrl",
+                                "imageUrl": { "url": url },
+                            }));
+                        }
+                    }
+                    Block::ToolUse { id, name, input } => {
+                        tool_calls.push(json!({
+                            "id": id,
+                            "type": "function",
+                            "function": {
+                                "name": name,
+                                // `arguments` is a JSON-encoded *string*.
+                                "arguments": serde_json::to_string(input)
+                                    .unwrap_or_else(|_| "{}".to_string()),
+                            },
+                        }));
+                    }
+                    Block::File { path, source, mime } => {
+                        context_items.push(file_context_item(path, source, mime));
+                    }
+                    Block::ToolResult { .. } => {}
+                }
+            }
+            message.insert("content".into(), Value::Array(parts));
+            if msg.role == Role::Assistant && !tool_calls.is_empty() {
+                message.insert("toolCalls".into(), Value::Array(tool_calls));
+            }
+        }
+    }
+
+    let mut item = Map::new();
+    item.insert("message".into(), Value::Object(message));
+    item.insert("contextItems".into(), Value::Array(context_items));
+    // Carry the model so the parser can backfill it (assistant turns).
+    if msg.role == Role::Assistant {
+        if let Some(model) = msg.model.as_deref().or(session_model) {
+            item.insert(
+                "promptLogs".into(),
+                json!([{ "modelTitle": model }]),
+            );
+        }
+    }
+    Value::Object(item)
+}
+
+/// Map a `Block::File` to a Continue `contextItem` (`{name, description, uri:{type, value}}`) that
+/// the parser's `context_item_to_block` round-trips back into a `File` block.
+fn file_context_item(path: &Option<String>, source: &Option<String>, mime: &Option<String>) -> Value {
+    let mut ci = Map::new();
+    match (path, source) {
+        (Some(p), _) => {
+            ci.insert("name".into(), json!(file_name_of(p)));
+            ci.insert("description".into(), json!(p));
+            ci.insert("uri".into(), json!({ "type": "file", "value": p }));
+        }
+        (None, Some(s)) => {
+            ci.insert("name".into(), json!(s));
+            ci.insert("description".into(), json!(s));
+            ci.insert("uri".into(), json!({ "type": "url", "value": s }));
+        }
+        (None, None) => {
+            ci.insert("name".into(), json!("file"));
+        }
+    }
+    if let Some(m) = mime {
+        ci.insert("content".into(), json!(""));
+        ci.insert("mime".into(), json!(m));
+    }
+    Value::Object(ci)
+}
+
+/// Basename of a path-ish string, for a `contextItem` name.
+fn file_name_of(p: &str) -> String {
+    p.rsplit(['/', '\\']).next().unwrap_or(p).to_string()
+}
+
+/// Pull `(toolCallId, content)` from a Tool turn's first ToolResult block.
+fn tool_result_of(content: &[Block]) -> (String, String) {
+    for b in content {
+        if let Block::ToolResult {
+            tool_use_id,
+            content,
+            ..
+        } = b
+        {
+            return (tool_use_id.clone(), content.clone());
+        }
+    }
+    (String::new(), String::new())
 }
 
 // ---------------------------------------------------------------------------
@@ -674,6 +915,108 @@ mod tests {
             .messages
             .iter()
             .any(|m| m.content.iter().any(|b| matches!(b, Block::File { .. }))));
+    }
+
+    #[test]
+    fn emit_round_trips() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "cv-continue-emit-{}-{}",
+            std::process::id(),
+            n
+        ));
+        let _ = fs::remove_dir_all(&dir);
+
+        // Build a small session: user, assistant w/ a tool call, a tool result.
+        let mut session = Session {
+            id: "src".into(),
+            harness: Harness::Continue,
+            cwd: Some(PathBuf::from("/Users/me/proj")),
+            title: Some("Roundtrip".into()),
+            created_at: None,
+            updated_at: None,
+            model: Some("gpt-4o".into()),
+            git: None,
+            messages: Vec::new(),
+            source_path: None,
+            extra: serde_json::Map::new(),
+        };
+
+        let mut user = Message::new(Role::User);
+        user.content.push(Block::Text {
+            text: "please read a.rs".into(),
+        });
+        session.messages.push(user);
+
+        let mut asst = Message::new(Role::Assistant);
+        asst.content.push(Block::Text {
+            text: "on it".into(),
+        });
+        asst.content.push(Block::ToolUse {
+            id: "call_1".into(),
+            name: "read_file".into(),
+            input: json!({ "path": "a.rs" }),
+        });
+        session.messages.push(asst);
+
+        let mut tool = Message::new(Role::Tool);
+        tool.content.push(Block::ToolResult {
+            tool_use_id: "call_1".into(),
+            content: "fn main() {}".into(),
+            is_error: false,
+            tool_name: None,
+            status: None,
+            details: None,
+        });
+        session.messages.push(tool);
+
+        let opts = crate::emit::EmitOptions {
+            new_id: Some("emit-test-id".into()),
+            new_cwd: None,
+        };
+        let res = emit(&session, &dir, &opts).unwrap();
+        assert_eq!(res.new_id, "emit-test-id");
+        assert!(res.path.exists());
+
+        // Re-parse via this adapter.
+        let r = SessionRef {
+            id: res.new_id.clone(),
+            harness: Harness::Continue,
+            path: res.path.clone(),
+            cwd: None,
+            title: None,
+            created_at: None,
+            updated_at: None,
+            message_count: 0,
+        };
+        let parsed = Continue { sessions: None }.parse(&r).unwrap();
+
+        assert_eq!(parsed.cwd.as_deref(), Some(Path::new("/Users/me/proj")));
+        assert_eq!(parsed.messages.len(), 3);
+        assert_eq!(parsed.messages[0].role, Role::User);
+        assert_eq!(parsed.messages[0].text().as_deref(), Some("please read a.rs"));
+        assert_eq!(parsed.messages[1].role, Role::Assistant);
+        assert!(parsed.messages[1]
+            .content
+            .iter()
+            .any(|b| matches!(b, Block::ToolUse { name, .. } if name == "read_file")));
+        assert_eq!(parsed.messages[2].role, Role::Tool);
+        assert!(parsed.messages[2].content.iter().any(|b| matches!(
+            b,
+            Block::ToolResult { tool_use_id, content, .. }
+                if tool_use_id == "call_1" && content == "fn main() {}"
+        )));
+
+        // The index should also discover it.
+        let adapter = Continue {
+            sessions: Some(dir.clone()),
+        };
+        let refs = adapter.discover().unwrap();
+        assert!(refs.iter().any(|r| r.id == "emit-test-id"));
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

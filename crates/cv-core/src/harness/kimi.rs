@@ -205,8 +205,280 @@ impl Adapter for Kimi {
     }
 
     fn can_emit(&self) -> bool {
-        false
+        true
     }
+
+    fn emit(&self, session: &Session, out_dir: &Path) -> Result<crate::harness::EmitResult> {
+        emit(session, out_dir, &crate::emit::EmitOptions::default())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// IR → Kimi native format (emitter; faithful inverse of `parse`)
+// ---------------------------------------------------------------------------
+
+/// Emit `session` into Kimi's native modern (dir-form) layout under `out_dir`:
+///   `out_dir/sessions/<hash>/<id>/context.jsonl`  (the transcript)
+///   `out_dir/sessions/<hash>/<id>/wire.jsonl`     (timestamp + token-usage sidecar)
+///
+/// `<hash>` is `md5(cwd_utf8)` (the local-KAOS project-dir name kimi-cli uses); when there is no
+/// cwd we fall back to `md5("")`. `<id>` is `opts.new_id` or a fresh uuid.
+///
+/// The transcript records are the exact shapes [`context_message`] parses back:
+/// - `{"role":"_system_prompt","content": <text>}` for System turns,
+/// - `{"role":"user","content": <bare string | [Part]>}` for User turns,
+/// - `{"role":"assistant","content":[Part],"tool_calls":[…]}` for Assistant turns
+///   (`tool_calls[].function.arguments` is a JSON-encoded *string*),
+/// - `{"role":"tool","content": <text>,"tool_call_id": <id>}` for Tool turns.
+///
+/// Parts are `type`-tagged (`text`/`think`/`image_url`/`audio_url`/`video_url`). The `wire.jsonl`
+/// sidecar carries a `metadata` header, one `StatusUpdate` per assistant turn (token usage +
+/// `message_id`), one `ToolResult` per tool turn, and per-turn timestamps.
+pub fn emit(
+    session: &Session,
+    out_dir: &Path,
+    opts: &crate::emit::EmitOptions,
+) -> Result<crate::harness::EmitResult> {
+    let new_id = opts
+        .new_id
+        .clone()
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let cwd = opts.new_cwd.clone().or_else(|| session.cwd.clone());
+    let cwd_str = cwd
+        .as_ref()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let hash = md5_hex(cwd_str.as_bytes());
+
+    let session_dir = out_dir.join("sessions").join(&hash).join(&new_id);
+    fs::create_dir_all(&session_dir)
+        .map_err(|e| anyhow::anyhow!("creating {}: {e}", session_dir.display()))?;
+
+    // Base timestamp for any turn lacking its own.
+    let base_ts = session
+        .created_at
+        .or(session.updated_at)
+        .unwrap_or_else(Utc::now);
+
+    // ── context.jsonl (the transcript) ──
+    let mut ctx_lines: Vec<Value> = Vec::new();
+    // ── wire.jsonl (sidecar) ── header first, then per-turn enrichment events.
+    let mut wire_lines: Vec<Value> = Vec::new();
+    wire_lines.push(serde_json::json!({
+        "type": "metadata",
+        "protocol_version": "1.9",
+    }));
+
+    for msg in &session.messages {
+        let ts = msg.timestamp.unwrap_or(base_ts);
+        let epoch = dt_to_epoch(ts);
+        match msg.role {
+            Role::System => {
+                let text = coerce_message_text(msg);
+                ctx_lines.push(serde_json::json!({
+                    "role": "_system_prompt",
+                    "content": text,
+                }));
+                wire_lines.push(wire_event(epoch, "TurnBegin", serde_json::json!({})));
+            }
+            Role::User => {
+                ctx_lines.push(serde_json::json!({
+                    "role": "user",
+                    "content": user_content(&msg.content),
+                }));
+                wire_lines.push(wire_event(epoch, "TurnBegin", serde_json::json!({})));
+            }
+            Role::Assistant => {
+                let mut rec = serde_json::Map::new();
+                rec.insert("role".into(), Value::String("assistant".into()));
+                rec.insert("content".into(), Value::Array(content_parts(&msg.content)));
+                let calls = tool_calls(&msg.content);
+                if !calls.is_empty() {
+                    rec.insert("tool_calls".into(), Value::Array(calls));
+                }
+                ctx_lines.push(Value::Object(rec));
+
+                // StatusUpdate: usage + message_id ride here (attach_status_updates zips these
+                // positionally onto assistant turns).
+                let mut payload = serde_json::Map::new();
+                if let Some(u) = &msg.usage {
+                    payload.insert("token_usage".into(), usage_to_wire(u));
+                }
+                if let Some(id) = &msg.id {
+                    payload.insert("message_id".into(), Value::String(id.clone()));
+                }
+                wire_lines.push(wire_event(epoch, "ContentPart", serde_json::json!({})));
+                wire_lines.push(wire_event(epoch, "StatusUpdate", Value::Object(payload)));
+            }
+            Role::Tool => {
+                for b in &msg.content {
+                    if let Block::ToolResult {
+                        tool_use_id,
+                        content,
+                        is_error,
+                        details,
+                        ..
+                    } = b
+                    {
+                        ctx_lines.push(serde_json::json!({
+                            "role": "tool",
+                            "tool_call_id": tool_use_id,
+                            "content": content,
+                        }));
+                        // Richer ToolResult in wire (return_value{is_error,output,extras}).
+                        let mut rv = serde_json::Map::new();
+                        rv.insert("is_error".into(), Value::Bool(*is_error));
+                        rv.insert("output".into(), Value::String(content.clone()));
+                        if let Some(d) = details {
+                            rv.insert("extras".into(), d.clone());
+                        }
+                        let payload = serde_json::json!({
+                            "tool_call_id": tool_use_id,
+                            "return_value": Value::Object(rv),
+                        });
+                        wire_lines.push(wire_event(epoch, "ToolCall", serde_json::json!({})));
+                        wire_lines.push(wire_event(epoch, "ToolResult", payload));
+                    }
+                }
+            }
+        }
+    }
+
+    let ctx_path = session_dir.join("context.jsonl");
+    write_jsonl(&ctx_path, &ctx_lines)?;
+    let wire_path = session_dir.join("wire.jsonl");
+    write_jsonl(&wire_path, &wire_lines)?;
+
+    let resume = match &cwd {
+        Some(c) => format!("kimi --resume {new_id}  (run from {})", c.display()),
+        None => format!("kimi --resume {new_id}"),
+    };
+    Ok(crate::harness::EmitResult {
+        path: session_dir,
+        new_id,
+        resume_hint: Some(resume),
+    })
+}
+
+/// User `content`: a bare string for a single text block (matching how kimi-cli stores single-part
+/// user turns, and exactly what `push_parts` round-trips), else a `[Part]` array.
+fn user_content(content: &[Block]) -> Value {
+    if let [Block::Text { text }] = content {
+        return Value::String(text.clone());
+    }
+    Value::Array(content_parts(content))
+}
+
+/// Map IR blocks → Kimi `type`-tagged Parts (the inverse of `part_to_block`). Tool-use blocks are
+/// emitted via `tool_calls[]`, not here, so they're skipped.
+fn content_parts(content: &[Block]) -> Vec<Value> {
+    let mut out = Vec::new();
+    for b in content {
+        match b {
+            Block::Text { text } => out.push(serde_json::json!({ "type": "text", "text": text })),
+            Block::Thinking { text, encrypted, .. } => {
+                let mut p = serde_json::Map::new();
+                p.insert("type".into(), Value::String("think".into()));
+                p.insert("think".into(), Value::String(text.clone()));
+                if let Some(enc) = encrypted {
+                    p.insert("encrypted".into(), Value::String(enc.clone()));
+                }
+                out.push(Value::Object(p));
+            }
+            Block::Image { data_ref, .. } => {
+                out.push(serde_json::json!({
+                    "type": "image_url",
+                    "image_url": { "url": data_ref, "id": Value::Null },
+                }));
+            }
+            Block::File { source, .. } => {
+                // kimi nests audio/video media URLs under a type-named key; default to audio_url.
+                out.push(serde_json::json!({
+                    "type": "audio_url",
+                    "audio_url": { "url": source, "id": Value::Null },
+                }));
+            }
+            // Tool calls go in tool_calls[]; tool results are their own `tool` records.
+            Block::ToolUse { .. } | Block::ToolResult { .. } => {}
+        }
+    }
+    out
+}
+
+/// Assistant ToolUse blocks → `tool_calls[]` (`arguments` is a JSON-encoded *string*, as the parser
+/// expects and `parse_arguments` decodes).
+fn tool_calls(content: &[Block]) -> Vec<Value> {
+    content
+        .iter()
+        .filter_map(|b| match b {
+            Block::ToolUse { id, name, input } => Some(serde_json::json!({
+                "type": "function",
+                "id": id,
+                "function": {
+                    "name": name,
+                    "arguments": serde_json::to_string(input)
+                        .unwrap_or_else(|_| "{}".to_string()),
+                },
+            })),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Flatten a message's text/thinking blocks to plain text, for `_system_prompt` content.
+fn coerce_message_text(msg: &Message) -> String {
+    let mut parts = Vec::new();
+    for b in &msg.content {
+        match b {
+            Block::Text { text } | Block::Thinking { text, .. } => parts.push(text.clone()),
+            _ => {}
+        }
+    }
+    parts.join("\n")
+}
+
+/// One `wire.jsonl` event line: a top-level `timestamp` (read by `wire_time_bounds` and, for the
+/// turn-boundary types `TurnBegin`/`ContentPart`/`ToolCall`, by `attach_timestamps`) wrapping a
+/// `{type, payload}` message (mined by `read_wire_enrichment` for `StatusUpdate`/`ToolResult`).
+fn wire_event(epoch: f64, mty: &str, payload: Value) -> Value {
+    serde_json::json!({
+        "timestamp": epoch,
+        "message": { "type": mty, "payload": payload },
+    })
+}
+
+/// IR usage → wire `token_usage` (inverse of `wire_usage`).
+fn usage_to_wire(u: &Usage) -> Value {
+    let mut m = serde_json::Map::new();
+    if let Some(v) = u.input_tokens {
+        m.insert("input_other".into(), Value::Number(v.into()));
+    }
+    if let Some(v) = u.output_tokens {
+        m.insert("output".into(), Value::Number(v.into()));
+    }
+    if let Some(v) = u.cache_read_tokens {
+        m.insert("input_cache_read".into(), Value::Number(v.into()));
+    }
+    if let Some(v) = u.cache_creation_tokens {
+        m.insert("input_cache_creation".into(), Value::Number(v.into()));
+    }
+    Value::Object(m)
+}
+
+/// `DateTime<Utc>` → epoch-seconds float (inverse of `epoch_to_dt`).
+fn dt_to_epoch(t: DateTime<Utc>) -> f64 {
+    t.timestamp_nanos_opt().unwrap_or(0) as f64 / 1e9
+}
+
+/// Write one JSON object per line (newline-terminated), like emit.rs's `write_jsonl`.
+fn write_jsonl(path: &Path, lines: &[Value]) -> Result<()> {
+    let mut buf = String::new();
+    for v in lines {
+        buf.push_str(&serde_json::to_string(v)?);
+        buf.push('\n');
+    }
+    fs::write(path, buf).map_err(|e| anyhow::anyhow!("writing {}: {e}", path.display()))?;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1008,6 +1280,133 @@ mod tests {
         let s = Kimi { sessions: None, root: None }.parse(&r).unwrap();
         assert!(s.messages.iter().any(|m| m.role == Role::User));
         assert!(s.messages.iter().any(|m| m.role == Role::Assistant));
+    }
+
+    /// A unique temp dir for emit round-trip tests (no external tempfile crate).
+    fn emit_temp_dir() -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let d = std::env::temp_dir().join(format!(
+            "cv-kimi-emit-{}-{}",
+            std::process::id(),
+            n
+        ));
+        fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn emit_round_trips_through_parse() {
+        // Build a small session: system + user + assistant(think+text+tool_use) + tool result.
+        let mut sys = Message::new(Role::System);
+        sys.content.push(Block::Text { text: "You are Kimi.".into() });
+
+        let mut user = Message::new(Role::User);
+        user.content.push(Block::Text { text: "list files".into() });
+
+        let mut asst = Message::new(Role::Assistant);
+        asst.id = Some("chatcmpl-xyz".into());
+        asst.usage = Some(Usage {
+            input_tokens: Some(10),
+            output_tokens: Some(42),
+            cache_read_tokens: None,
+            cache_creation_tokens: None,
+        });
+        asst.content.push(Block::Thinking {
+            text: "let me think".into(),
+            signature: Some("BLOB".into()),
+            encrypted: Some("BLOB".into()),
+            redacted: false,
+        });
+        asst.content.push(Block::Text { text: "Running ls.".into() });
+        asst.content.push(Block::ToolUse {
+            id: "tool_1".into(),
+            name: "Shell".into(),
+            input: serde_json::json!({ "command": "ls" }),
+        });
+
+        let mut tool = Message::new(Role::Tool);
+        tool.content.push(Block::ToolResult {
+            tool_use_id: "tool_1".into(),
+            content: "README.md\nsrc".into(),
+            is_error: false,
+            tool_name: None,
+            status: Some("completed".into()),
+            details: None,
+        });
+
+        let session = Session {
+            id: "orig".into(),
+            harness: Harness::Kimi,
+            cwd: Some(PathBuf::from("/proj")),
+            title: Some("demo".into()),
+            created_at: Some(DateTime::<Utc>::from_timestamp(1_700_000_000, 0).unwrap()),
+            updated_at: None,
+            model: None,
+            git: None,
+            messages: vec![sys, user, asst, tool],
+            source_path: None,
+            extra: serde_json::Map::new(),
+        };
+
+        let out = emit_temp_dir();
+        let res = emit(&session, &out, &crate::emit::EmitOptions::default()).unwrap();
+        // emit writes the session dir; both transcript + sidecar must exist.
+        assert!(res.path.join("context.jsonl").exists());
+        assert!(res.path.join("wire.jsonl").exists());
+
+        // Re-parse with THIS adapter (path is the session dir, id is the new id).
+        let r = SessionRef {
+            id: res.new_id.clone(),
+            harness: Harness::Kimi,
+            path: res.path.clone(),
+            cwd: Some(PathBuf::from("/proj")),
+            title: None,
+            created_at: None,
+            updated_at: None,
+            message_count: 0,
+        };
+        let parsed = Kimi { sessions: None, root: None }.parse(&r).unwrap();
+
+        // Message count + roles round-trip.
+        assert_eq!(parsed.messages.len(), 4);
+        let roles: Vec<Role> = parsed.messages.iter().map(|m| m.role).collect();
+        assert_eq!(
+            roles,
+            vec![Role::System, Role::User, Role::Assistant, Role::Tool]
+        );
+
+        // First text (system prompt) round-trips.
+        assert_eq!(parsed.messages[0].text().as_deref(), Some("You are Kimi."));
+        assert_eq!(parsed.messages[1].text().as_deref(), Some("list files"));
+
+        // Assistant: thinking + text + tool_use survive; usage + message_id come back via wire.
+        let a = &parsed.messages[2];
+        assert!(a.content.iter().any(|b| matches!(b, Block::Thinking { text, .. } if text == "let me think")));
+        assert!(a.content.iter().any(|b| matches!(b, Block::Text { text } if text == "Running ls.")));
+        match a.content.iter().find(|b| matches!(b, Block::ToolUse { .. })).unwrap() {
+            Block::ToolUse { id, name, input } => {
+                assert_eq!(id, "tool_1");
+                assert_eq!(name, "Shell");
+                assert_eq!(input["command"], "ls");
+            }
+            _ => unreachable!(),
+        }
+        assert_eq!(a.usage.as_ref().and_then(|u| u.output_tokens), Some(42));
+        assert_eq!(a.id.as_deref(), Some("chatcmpl-xyz"));
+
+        // Tool result round-trips (content from context, enriched by wire).
+        match parsed.messages[3].content.first().unwrap() {
+            Block::ToolResult { tool_use_id, content, is_error, .. } => {
+                assert_eq!(tool_use_id, "tool_1");
+                assert!(content.contains("README.md"));
+                assert!(!is_error);
+            }
+            _ => unreachable!(),
+        }
+
+        let _ = fs::remove_dir_all(&out);
     }
 
     /// Write `name`→`contents` into a fresh temp dir, return the dir.

@@ -50,7 +50,15 @@ pub fn emit(
         Harness::Hermes => {
             anyhow::bail!("emit to hermes requires the `sqlite` feature")
         }
-        // Parse-only harnesses (Cursor, desktop apps, …) aren't conversion targets.
+        // Emitters living in their own adapter modules.
+        Harness::Kimi => crate::harness::kimi::emit(session, out_dir, opts),
+        Harness::LmStudio => crate::harness::lmstudio::emit(session, out_dir, opts),
+        Harness::Cline => crate::harness::cline::emit(session, out_dir, opts),
+        Harness::Roo => crate::harness::roo::emit(session, out_dir, opts),
+        Harness::Continue => crate::harness::continuedev::emit(session, out_dir, opts),
+        // Qwen Code stores the same ConversationRecord shape Gemini does, so it reuses that emitter.
+        Harness::Qwen => emit_gemini(session, out_dir, opts),
+        // Parse-only harnesses (Cursor, Goose, desktop apps, …) aren't conversion targets.
         other => anyhow::bail!("emit to {other} is not supported yet"),
     }
 }
@@ -105,6 +113,20 @@ fn reparse_emitted(target: Harness, result: &EmitResult) -> Result<Session> {
         Harness::OpenCode => reparse_opencode(result),
         #[cfg(feature = "sqlite")]
         Harness::Hermes => reparse_hermes(result),
+        // The emitters whose output is parseable directly from the EmitResult path.
+        Harness::Kimi => crate::harness::kimi::Kimi::new()
+            .parse(&sref(result.new_id.clone(), result.path.clone())),
+        Harness::LmStudio => crate::harness::lmstudio::LmStudio::new()
+            .parse(&sref(result.new_id.clone(), result.path.clone())),
+        Harness::Cline => crate::harness::cline::Cline::new()
+            .parse(&sref(result.new_id.clone(), result.path.clone())),
+        Harness::Roo => crate::harness::roo::Roo::new()
+            .parse(&sref(result.new_id.clone(), result.path.clone())),
+        Harness::Continue => crate::harness::continuedev::Continue::new()
+            .parse(&sref(result.new_id.clone(), result.path.clone())),
+        // Qwen reuses Gemini's emitter (same record shape) but its own parser.
+        Harness::Qwen => crate::harness::qwen::Qwen::new()
+            .parse(&sref(result.new_id.clone(), result.path.clone())),
         other => anyhow::bail!("re-parse for {other} not supported"),
     }
 }
@@ -287,6 +309,12 @@ pub fn supported_targets() -> &'static [Harness] {
         Harness::Gemini,
         #[cfg(feature = "sqlite")]
         Harness::Hermes,
+        Harness::Kimi,
+        Harness::LmStudio,
+        Harness::Cline,
+        Harness::Roo,
+        Harness::Continue,
+        Harness::Qwen,
     ]
 }
 
