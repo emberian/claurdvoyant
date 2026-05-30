@@ -10,14 +10,16 @@ ci = "github"
 # The installers to generate for each app
 installers = ["shell", "powershell"]
 # Target platforms to build apps for (Rust target-triple syntax)
-# macOS arm64/x64, Linux arm64/x64/x86, Windows arm64/x64/x86
+# macOS arm64/x64, Linux arm64/x64/x86, Windows x64/x86.
+# NOTE: aarch64-pc-windows-msvc is intentionally omitted — `ring` (the C crypto lib behind rustls)
+# fails to cross-compile to Windows-ARM64 via cargo-xwin (clang rejects the `/imsvc` MSVC include
+# flag in GNU mode). All other 7 targets build clean. Re-add if/when the toolchain is fixed.
 targets = [
     "aarch64-apple-darwin",
     "x86_64-apple-darwin",
     "aarch64-unknown-linux-gnu",
     "x86_64-unknown-linux-gnu",
     "i686-unknown-linux-gnu",
-    "aarch64-pc-windows-msvc",
     "x86_64-pc-windows-msvc",
     "i686-pc-windows-msvc",
 ]
