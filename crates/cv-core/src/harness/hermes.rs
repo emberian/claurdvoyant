@@ -53,7 +53,12 @@ const OPTIONAL_MSG_COLS: &[&str] = &[
 ];
 
 pub struct Hermes {
-    db: Option<PathBuf>,
+    /// Every Hermes `state.db` we can read: the top-level `<home>/state.db` PLUS one per
+    /// `<home>/profiles/*/state.db`. Hermes stores most sessions under the *active* profile (e.g.
+    /// `profiles/hermes-x/state.db`), so a single top-level DB only sees a small slice. Each DB is
+    /// opened independently per call (read-only) — `SessionRef.path` carries which DB a ref came
+    /// from, so cross-profile session-id collisions never alias.
+    dbs: Vec<PathBuf>,
 }
 
 impl Hermes {
@@ -62,18 +67,34 @@ impl Hermes {
         let home = std::env::var_os("HERMES_HOME")
             .map(PathBuf::from)
             .or_else(|| dirs::home_dir().map(|h| h.join(".hermes")));
-        let db = home.map(|h| h.join("state.db")).filter(|p| p.exists());
-        Hermes { db }
+        let mut dbs = Vec::new();
+        if let Some(home) = home {
+            // Top-level DB (legacy / no-profile installs).
+            let top = home.join("state.db");
+            if top.exists() {
+                dbs.push(top);
+            }
+            // Every `profiles/<name>/state.db` — depth-1 read_dir, so pre-update
+            // `state-snapshots/**/state.db` are naturally skipped (never recurse).
+            if let Ok(rd) = std::fs::read_dir(home.join("profiles")) {
+                for e in rd.flatten() {
+                    let p = e.path().join("state.db");
+                    if p.exists() {
+                        dbs.push(p); // hermes-x, hermes-google, …
+                    }
+                }
+            }
+        }
+        Hermes { dbs }
     }
 
-    fn open(&self) -> Result<Connection> {
-        let db = self.db.as_ref().context("hermes state.db not found")?;
+    fn open_path(path: &PathBuf) -> Result<Connection> {
         // Read-only so we never touch the user's live DB / take a write lock.
         let conn = Connection::open_with_flags(
-            db,
+            path,
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )
-        .with_context(|| format!("opening {}", db.display()))?;
+        .with_context(|| format!("opening {}", path.display()))?;
         Ok(conn)
     }
 }
@@ -90,20 +111,31 @@ impl Adapter for Hermes {
     }
 
     fn storage_root(&self) -> Option<PathBuf> {
-        self.db.clone()
+        self.dbs.first().cloned()
     }
 
     fn discover(&self) -> Result<Vec<SessionRef>> {
-        if self.db.is_none() {
-            return Ok(vec![]);
+        // Iterate every DB (top-level + each profile), opening each read-only, and concatenate the
+        // per-DB discovery. Each `SessionRef` carries its own `path`, so refs from different
+        // profiles stay disambiguated even when their internal session ids collide. A single
+        // unreadable DB (e.g. permission-denied) is skipped rather than failing the whole scan.
+        let mut out = Vec::new();
+        for db in &self.dbs {
+            let conn = match Self::open_path(db) {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+            if let Ok(refs) = discover_conn(&conn, db) {
+                out.extend(refs);
+            }
         }
-        let conn = self.open()?;
-        let path = self.db.clone().unwrap();
-        discover_conn(&conn, &path)
+        Ok(out)
     }
 
     fn parse(&self, r: &SessionRef) -> Result<Session> {
-        let conn = self.open()?;
+        // Route by the ref's own DB path (set at discovery time), NOT a single self.db — this is
+        // what lets one Hermes adapter span many profile DBs without id collisions.
+        let conn = Self::open_path(&r.path)?;
         parse_conn(&conn, r)
     }
 
@@ -967,6 +999,66 @@ mod tests {
         let refs = discover_conn(&conn, &PathBuf::from(":memory:")).unwrap();
         assert_eq!(refs.len(), 1);
         assert_eq!(refs[0].id, "s1");
+    }
+
+    /// Branch-don't-fork: the adapter must discover sessions in BOTH the top-level `state.db` AND
+    /// every `profiles/<name>/state.db`. Regression guard for the bug where `Hermes::new()` bound a
+    /// single `<home>/state.db` and left the active profile's sessions (2782 on the real install)
+    /// invisible. Synthesizes a minimal `~/.hermes`-shaped tree under a temp `HERMES_HOME`.
+    #[test]
+    fn discovers_top_level_and_profile_dbs() {
+        // Mutating process env (HERMES_HOME) is not thread-safe; serialize against the other
+        // env-touching tests in this binary.
+        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = ENV_LOCK.lock().unwrap();
+
+        let home = std::env::temp_dir().join(format!("cv-hermes-profiles-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(home.join("profiles/hermes-x")).unwrap();
+        // A pre-update snapshot dir at a DEEPER level must NOT be picked up (depth-1 read_dir only).
+        std::fs::create_dir_all(home.join("profiles/state-snapshots/old")).unwrap();
+
+        // helper: create a state.db with one named session.
+        let mk_db = |path: &std::path::Path, sid: &str| {
+            let conn = Connection::open(path).unwrap();
+            conn.execute_batch(SCHEMA_V14).unwrap();
+            conn.execute(
+                "INSERT INTO sessions (id, source, model, started_at, message_count, title) \
+                 VALUES (?1,'cli','nous/hermes-4',1000.0,1,?2)",
+                rusqlite::params![sid, sid],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO messages (session_id, role, content, timestamp) VALUES (?1,'user','hi',1001.0)",
+                [sid],
+            )
+            .unwrap();
+        };
+        mk_db(&home.join("state.db"), "top-session");
+        mk_db(&home.join("profiles/hermes-x/state.db"), "profile-session");
+        // A snapshot DB deeper than depth-1 — must stay hidden.
+        mk_db(&home.join("profiles/state-snapshots/old/state.db"), "snapshot-session");
+
+        // Point the adapter at our synthetic home and discover.
+        std::env::set_var("HERMES_HOME", &home);
+        let hermes = Hermes::new();
+        // Two readable DBs: top-level + the one profile (snapshot is depth-2, skipped).
+        assert_eq!(hermes.dbs.len(), 2, "should bind top-level + profile DB only");
+        let refs = hermes.discover().unwrap();
+        std::env::remove_var("HERMES_HOME");
+
+        let ids: HashSet<&str> = refs.iter().map(|r| r.id.as_str()).collect();
+        assert!(ids.contains("top-session"), "top-level session must be discovered");
+        assert!(ids.contains("profile-session"), "profile session must be discovered (the bug)");
+        assert!(!ids.contains("snapshot-session"), "depth-2 snapshot DB must NOT be discovered");
+
+        // parse() must route by the ref's own DB path, so the profile session parses from its DB.
+        let pref = refs.iter().find(|r| r.id == "profile-session").unwrap();
+        let s = hermes.parse(pref).unwrap();
+        assert_eq!(s.messages.len(), 1);
+        assert_eq!(s.messages[0].text().as_deref(), Some("hi"));
+
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]
