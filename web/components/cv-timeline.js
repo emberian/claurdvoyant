@@ -252,8 +252,8 @@ class CvTimeline extends HTMLElement {
     const time = t ? new Date(t).toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" }) : "";
     const count = msgCount(s);
     return `
-      <div class="tl-node" data-id="${esc(s.id || "")}" tabindex="0" role="button" title="Open ${esc(sessionLabel(s))}">
-        <span class="tl-dot" style="background: var(--h-${esc(h)}, var(--fg-muted))"></span>
+      <div class="tl-node" style="--c: var(--h-${esc(h)}, var(--fg-muted))" data-id="${esc(s.id || "")}" tabindex="0" role="button" title="Open ${esc(sessionLabel(s))}">
+        <span class="tl-dot"></span>
         <span class="tl-time muted">${esc(time)}</span>
         ${harnessBadge(h)}
         <span class="tl-title">${esc(sessionLabel(s))}</span>

@@ -255,14 +255,17 @@ const STYLES = `
 .os-page { max-width: 860px; margin: 0 auto; padding: 8px 4px 56px; }
 
 /* ---- hero ------------------------------------------------------------- */
-.os-hero { position: relative; text-align: center; padding: 28px 16px 22px; overflow: hidden; }
+.os-hero { position: relative; text-align: center; padding: 24px 16px 20px; }
 .os-hero-glow {
-  position: absolute; inset: -40% 0 auto 0; height: 280px; pointer-events: none;
-  background: radial-gradient(60% 100% at 50% 0%,
-    color-mix(in srgb, var(--accent) 28%, transparent), transparent 70%);
-  filter: blur(6px); z-index: 0;
+  position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%);
+  width: min(560px, 90%); height: 300px; pointer-events: none; z-index: 0;
+  background: radial-gradient(closest-side,
+    color-mix(in srgb, var(--accent) 30%, transparent), transparent);
+  filter: blur(12px);
 }
-.os-hero > * { position: relative; z-index: 1; }
+/* Everything EXCEPT the glow sits above it in normal flow — the glow must stay absolute (this rule
+   was overriding its position:absolute, so its 300px height was shoving the content down). */
+.os-hero > *:not(.os-hero-glow) { position: relative; z-index: 1; }
 .os-emoji { font-size: 44px; line-height: 1; filter: drop-shadow(0 2px 10px color-mix(in srgb, var(--accent) 45%, transparent)); }
 .os-hero h2 {
   margin: 10px 0 4px; font-size: 34px; letter-spacing: -0.5px;
@@ -351,7 +354,7 @@ const STYLES = `
 }
 .os-card {
   position: relative; text-align: left; cursor: pointer; font: inherit; color: inherit;
-  display: grid; grid-template-columns: auto 1fr auto; grid-template-rows: auto 0fr;
+  display: grid; grid-template-columns: auto 1fr auto; grid-template-rows: auto auto;
   column-gap: 11px; align-items: start;
   padding: 14px 14px 14px 13px; border-radius: var(--radius);
   border: 1px solid var(--border); background: var(--bg-elev);
@@ -372,9 +375,11 @@ const STYLES = `
 .os-card-body {
   grid-row: 2; grid-column: 2 / 4; min-height: 0; overflow: hidden;
   color: var(--fg-muted); font-size: 13.5px; line-height: 1.55;
+  /* Collapsed by default; expand reveals the reasoning. max-height is reliable cross-browser
+     (0fr grid rows don't collapse intrinsic-height content in WebKit). */
+  max-height: 0; opacity: 0;
 }
-.os-card[aria-expanded="true"] { grid-template-rows: auto 1fr; }
-.os-card[aria-expanded="true"] .os-card-body { margin-top: 9px; }
+.os-card[aria-expanded="true"] .os-card-body { max-height: 22em; opacity: 1; margin-top: 9px; }
 .os-card[aria-expanded="true"] .os-card-chevron { transform: rotate(180deg); }
 .os-card[aria-expanded="true"] {
   border-color: color-mix(in srgb, var(--accent) 45%, var(--border));
@@ -386,7 +391,8 @@ const STYLES = `
 .os-card:hover::before { opacity: .9; }
 .os-card:focus-visible { outline: 2px solid color-mix(in srgb, var(--accent) 60%, transparent); outline-offset: 2px; }
 @media (prefers-reduced-motion: no-preference) {
-  .os-card { transition: border-color .18s, box-shadow .25s, grid-template-rows .28s ease; }
+  .os-card { transition: border-color .18s, box-shadow .25s; }
+  .os-card-body { transition: max-height .3s ease, opacity .22s ease, margin-top .2s ease; }
   .os-card-chevron { transition: transform .25s ease; }
   .os-card::before { transition: opacity .2s, box-shadow .25s; }
   .os-pill { transition: transform .15s; }
