@@ -6,17 +6,23 @@
 // block, tool_result (with error styling), and images as labeled placeholders.
 import "./cv-harness-badge.js";
 import {
-  esc, pretty, fmtTime, sessionLabel, shortPath, ROLE_LABELS, HARNESS_LABELS,
+  esc, pretty, fmtTime, sessionLabel, shortPath, sumTokens,
+  toOpenSession, toMarkdown, downloadFile, slug, ROLE_LABELS, HARNESS_LABELS,
 } from "./util.js";
 
 class CvTranscript extends HTMLElement {
   constructor() {
     super();
     this._session = null;
+    // When true, render a "+" affordance on each message so a host (the loom)
+    // can collect messages. Hidden by default.
+    this._pickMode = false;
   }
 
   set session(s) { this._session = s || null; this.render(); }
   get session() { return this._session; }
+
+  set pickMode(v) { this._pickMode = !!v; this.render(); }
 
   connectedCallback() { if (!this.childElementCount) this.render(); }
 
@@ -31,8 +37,28 @@ class CvTranscript extends HTMLElement {
 
     this.innerHTML = `
       ${this._headerHtml(s)}
-      <div class="turns">${(s.messages || []).map((m) => this._messageHtml(m)).join("")}</div>
+      <div class="turns">${(s.messages || []).map((m, i) => this._messageHtml(m, i)).join("")}</div>
     `;
+
+    // Export menu.
+    this.querySelector("[data-export-json]")?.addEventListener("click", () => {
+      downloadFile(`${slug(sessionLabel(s))}.opensession.json`,
+        JSON.stringify(toOpenSession(s), null, 2), "application/json");
+    });
+    this.querySelector("[data-export-md]")?.addEventListener("click", () => {
+      downloadFile(`${slug(sessionLabel(s))}.md`, toMarkdown(s), "text/markdown");
+    });
+
+    // Pick buttons (loom collection) — emit a bubbling event the host handles.
+    this.querySelectorAll("[data-pick]").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        const idx = Number(btn.dataset.pick);
+        const m = (s.messages || [])[idx];
+        if (m) this.dispatchEvent(new CustomEvent("pick-message", {
+          detail: { session: s, message: m, index: idx }, bubbles: true,
+        }));
+      });
+    });
 
     // Toggle thinking blocks.
     this.querySelectorAll(".thinking > summary").forEach((sum) => {
@@ -62,6 +88,8 @@ class CvTranscript extends HTMLElement {
     if (s.git?.commit) meta.push(`<span class="kv"><span class="k">commit</span>${esc(String(s.git.commit).slice(0, 8))}</span>`);
     const when = fmtTime(s.updated_at || s.created_at);
     if (when) meta.push(`<span class="kv"><span class="k">updated</span>${esc(when)}</span>`);
+    const tok = sumTokens(s);
+    if (tok.total) meta.push(`<span class="kv" title="total token usage"><span class="k">tokens</span>${tok.input.toLocaleString()}↓ ${tok.output.toLocaleString()}↑</span>`);
     if (s.id) meta.push(`<span class="kv"><span class="k">id</span>${esc(s.id)}</span>`);
 
     return `
@@ -69,19 +97,26 @@ class CvTranscript extends HTMLElement {
         <div class="th-title">
           <cv-harness-badge harness="${esc(h)}"></cv-harness-badge>
           <h2>${esc(sessionLabel(s))}</h2>
+          <div class="th-actions">
+            <button type="button" class="mini-btn" data-export-md title="Download as Markdown">⬇ .md</button>
+            <button type="button" class="mini-btn" data-export-json title="Download as OpenSession JSON">⬇ .json</button>
+          </div>
         </div>
         <div class="th-meta">${meta.join("")}</div>
         ${s.source_path ? `<div class="th-source muted" title="${esc(s.source_path)}">${esc(s.source_path)}</div>` : ""}
       </header>`;
   }
 
-  _messageHtml(m) {
+  _messageHtml(m, idx) {
     const role = (m.role || "").toLowerCase();
     const roleLabel = ROLE_LABELS[role] || role || "?";
     const when = fmtTime(m.timestamp);
     const usage = this._usageHtml(m.usage);
     const model = m.model ? `<span class="turn-model">${esc(m.model)}</span>` : "";
     const blocks = (m.content || []).map((b) => this._blockHtml(b)).join("");
+    const pick = this._pickMode
+      ? `<button type="button" class="pick-btn" data-pick="${idx}" title="Add this message to the loom">＋ loom</button>`
+      : "";
     return `
       <article class="turn turn-${esc(role)}">
         <div class="turn-head">
@@ -89,6 +124,7 @@ class CvTranscript extends HTMLElement {
           ${model}
           ${when ? `<span class="turn-when muted">${esc(when)}</span>` : ""}
           ${usage}
+          ${pick}
         </div>
         <div class="turn-body">${blocks || '<div class="muted block-empty">(empty)</div>'}</div>
       </article>`;
@@ -109,36 +145,68 @@ class CvTranscript extends HTMLElement {
       case "text":
         return `<div class="block block-text">${this._renderText(b.text || "")}</div>`;
 
-      case "thinking":
+      case "thinking": {
+        const tag = b.redacted ? " (redacted)" : b.encrypted ? " (encrypted)" : "";
+        const body = b.text
+          ? this._renderText(b.text)
+          : b.redacted ? '<span class="opaque-blob">[redacted reasoning]</span>'
+          : b.encrypted ? '<span class="opaque-blob">[encrypted reasoning blob]</span>'
+          : "";
         return `
           <details class="block thinking">
-            <summary>Thinking${b.encrypted ? " (encrypted)" : ""}</summary>
-            <div class="thinking-body">${this._renderText(b.text || (b.encrypted ? "[encrypted reasoning blob]" : ""))}</div>
+            <summary>💭 Thinking${tag}</summary>
+            <div class="thinking-body">${body}${b.signature ? `<div class="sig muted" title="signature">sig: ${esc(String(b.signature).slice(0, 24))}…</div>` : ""}</div>
           </details>`;
+      }
 
       case "tool_use": {
         const input = b.input == null ? "" : pretty(b.input);
-        return `
-          <div class="block tool-use">
-            <div class="block-label">
-              <span class="tool-glyph">⚙</span> tool_use
-              <span class="tool-name">${esc(b.name || "?")}</span>
-              <button type="button" class="copy-btn" data-copy aria-label="Copy input">copy</button>
-            </div>
-            <pre><code>${esc(input)}</code></pre>
+        const big = input.length > 600;
+        const pre = `<pre><code>${esc(input)}</code></pre>`;
+        const label = `
+          <div class="block-label">
+            <span class="tool-glyph">⚙</span> tool_use
+            <span class="tool-name">${esc(b.name || "?")}</span>
+            <button type="button" class="copy-btn" data-copy aria-label="Copy input">copy</button>
           </div>`;
+        return big
+          ? `<details class="block tool-use"><summary class="tool-summary">⚙ <span class="tool-name">${esc(b.name || "?")}</span> <span class="muted">tool_use · ${input.length} chars</span></summary>${pre}</details>`
+          : `<div class="block tool-use">${label}${pre}</div>`;
       }
 
       case "tool_result": {
         const err = b.is_error ? " is-error" : "";
+        const content = String(b.content ?? "");
+        const status = b.status ? `<span class="tool-status">${esc(b.status)}</span>` : "";
+        const tname = b.tool_name ? `<span class="tool-name">${esc(b.tool_name)}</span>` : "";
+        const details = b.details != null
+          ? `<details class="tool-details"><summary class="muted">details</summary><pre><code>${esc(pretty(b.details))}</code></pre></details>`
+          : "";
+        const big = content.length > 600;
+        const pre = `<pre><code>${esc(content)}</code></pre>`;
+        const label = `
+          <div class="block-label">
+            <span class="tool-glyph">${b.is_error ? "✖" : "↳"}</span>
+            tool_result${b.is_error ? " (error)" : ""} ${tname} ${status}
+            <button type="button" class="copy-btn" data-copy aria-label="Copy result">copy</button>
+          </div>`;
+        return big
+          ? `<details class="block tool-result${err}"><summary class="tool-summary">${b.is_error ? "✖" : "↳"} <span class="muted">tool_result${b.is_error ? " (error)" : ""} · ${content.length} chars</span> ${status}</summary>${pre}${details}</details>`
+          : `<div class="block tool-result${err}">${label}${pre}${details}</div>`;
+      }
+
+      case "file": {
+        const path = b.path || b.source || "";
+        const mime = b.mime ? esc(b.mime) : "file";
         return `
-          <div class="block tool-result${err}">
-            <div class="block-label">
-              <span class="tool-glyph">${b.is_error ? "✖" : "↳"}</span>
-              tool_result${b.is_error ? " (error)" : ""}
-              <button type="button" class="copy-btn" data-copy aria-label="Copy result">copy</button>
+          <div class="block file">
+            <div class="file-card">
+              <span class="file-glyph">📄</span>
+              <div class="file-meta">
+                <div class="file-path" title="${esc(path)}">${esc(shortPath(path, 4) || "(file)")}</div>
+                <div class="file-type muted">${mime}${b.source && b.source !== path ? ` · ${esc(b.source)}` : ""}</div>
+              </div>
             </div>
-            <pre><code>${esc(b.content || "")}</code></pre>
           </div>`;
       }
 
@@ -158,7 +226,7 @@ class CvTranscript extends HTMLElement {
       }
 
       default:
-        return `<div class="block muted">[unknown block: ${esc(b?.kind ?? "null")}]</div>`;
+        return `<div class="block unknown-block muted">[${esc(b?.kind ?? "null")} block]${b && Object.keys(b).length > 1 ? `<details><summary class="muted">raw</summary><pre><code>${esc(pretty(b))}</code></pre></details>` : ""}</div>`;
     }
   }
 

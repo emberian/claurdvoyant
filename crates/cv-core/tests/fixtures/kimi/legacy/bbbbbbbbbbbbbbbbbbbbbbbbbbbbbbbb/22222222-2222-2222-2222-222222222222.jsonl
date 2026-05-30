@@ -1,0 +1,2 @@
+{"role": "user", "content": "hi there"}
+{"role": "assistant", "content": [{"type": "text", "text": "Hello! How can I help?"}]}

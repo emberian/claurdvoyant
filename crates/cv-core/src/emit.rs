@@ -11,7 +11,7 @@
 //! point; `cv-core::lib` re-exports it and the `cv` CLI calls it.
 
 use crate::harness::EmitResult;
-use crate::ir::{Block, GitInfo, Harness, Role, Session};
+use crate::ir::{Block, GitInfo, Harness, Role, Session, SessionRef};
 use anyhow::{Context, Result};
 use chrono::{DateTime, SecondsFormat, Utc};
 use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
@@ -53,6 +53,227 @@ pub fn emit(
         // Parse-only harnesses (Cursor, desktop apps, …) aren't conversion targets.
         other => anyhow::bail!("emit to {other} is not supported yet"),
     }
+}
+
+/// Emit `session` into `target`, then re-parse the written output with `target`'s own adapter and
+/// diff it against the input IR. Returns the [`EmitResult`] plus a list of human-readable
+/// lossy-conversion warnings (empty when the round-trip is clean). The CLI prints these so a user
+/// porting a session knows what (if anything) didn't survive.
+///
+/// This never changes what `emit` writes — it's a read-back verification pass on top of it.
+pub fn emit_verified(
+    session: &Session,
+    target: Harness,
+    out_dir: &Path,
+    opts: &EmitOptions,
+) -> Result<(EmitResult, Vec<String>)> {
+    let result = emit(session, target, out_dir, opts)?;
+    let warnings = match reparse_emitted(target, &result) {
+        Ok(reparsed) => diff_lossy(session, &reparsed),
+        Err(e) => vec![format!("could not verify round-trip ({e:#})")],
+    };
+    Ok((result, warnings))
+}
+
+/// Re-parse a just-emitted session back into the IR using `target`'s adapter, so we can diff it
+/// against the source. Mirrors how each adapter's `parse` keys off a [`SessionRef`].
+fn reparse_emitted(target: Harness, result: &EmitResult) -> Result<Session> {
+    use crate::harness::Adapter;
+    let sref = |id: String, path: PathBuf| SessionRef {
+        id,
+        harness: target,
+        path,
+        cwd: None,
+        title: None,
+        created_at: None,
+        updated_at: None,
+        message_count: 0,
+    };
+    match target {
+        Harness::Claude => {
+            let id = result.new_id.clone();
+            crate::harness::claude::Claude::new().parse(&sref(id, result.path.clone()))
+        }
+        Harness::Codex => crate::harness::codex::Codex::new()
+            .parse(&sref(String::new(), result.path.clone())),
+        Harness::Grok => crate::harness::grok::Grok::new()
+            .parse(&sref(result.new_id.clone(), result.path.clone())),
+        Harness::OpenClaw => crate::harness::openclaw::OpenClaw::new()
+            .parse(&sref(result.new_id.clone(), result.path.clone())),
+        Harness::Gemini => crate::harness::gemini::Gemini::new()
+            .parse(&sref(result.new_id.clone(), result.path.clone())),
+        Harness::OpenCode => reparse_opencode(result),
+        #[cfg(feature = "sqlite")]
+        Harness::Hermes => reparse_hermes(result),
+        other => anyhow::bail!("re-parse for {other} not supported"),
+    }
+}
+
+/// OpenCode resolves message/part dirs relative to `$HOME/.local/share/opencode/storage`; the emit
+/// target dir is that storage root. Point HOME at its grandparent-of-grandparent so `discover()`
+/// finds the session. Serialized against other HOME mutators in this crate's tests.
+fn reparse_opencode(result: &EmitResult) -> Result<Session> {
+    use crate::harness::Adapter;
+    let _guard = HOME_ENV_LOCK.lock().unwrap();
+    // result.path is .../storage/session/<projectID>/<id>.json — walk up to the synthetic HOME.
+    let storage = result
+        .path
+        .ancestors()
+        .find(|p| p.file_name().map(|n| n == "storage").unwrap_or(false))
+        .context("locating opencode storage root for re-parse")?;
+    let home = storage
+        .parent()
+        .and_then(|p| p.parent())
+        .and_then(|p| p.parent())
+        .context("locating opencode synthetic HOME for re-parse")?
+        .to_path_buf();
+    let prev = std::env::var_os("HOME");
+    unsafe {
+        std::env::set_var("HOME", &home);
+    }
+    let oc = crate::harness::opencode::OpenCode::new();
+    let parsed = oc.discover().ok().and_then(|refs| {
+        refs.into_iter()
+            .find(|r| r.id == result.new_id)
+            .and_then(|r| oc.parse(&r).ok())
+    });
+    unsafe {
+        match prev {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+    }
+    parsed.context("re-discovering emitted opencode session")
+}
+
+/// Hermes parses from `$HERMES_HOME/state.db`; point it at the emitted db's directory.
+#[cfg(feature = "sqlite")]
+fn reparse_hermes(result: &EmitResult) -> Result<Session> {
+    use crate::harness::Adapter;
+    let _guard = HOME_ENV_LOCK.lock().unwrap();
+    let home = result
+        .path
+        .parent()
+        .context("locating hermes state.db dir for re-parse")?
+        .to_path_buf();
+    let prev = std::env::var_os("HERMES_HOME");
+    unsafe {
+        std::env::set_var("HERMES_HOME", &home);
+    }
+    let h = crate::harness::hermes::Hermes::new();
+    let parsed = h.discover().ok().and_then(|refs| {
+        refs.into_iter()
+            .find(|r| r.id == result.new_id)
+            .and_then(|r| h.parse(&r).ok())
+    });
+    unsafe {
+        match prev {
+            Some(p) => std::env::set_var("HERMES_HOME", p),
+            None => std::env::remove_var("HERMES_HOME"),
+        }
+    }
+    parsed.context("re-discovering emitted hermes session")
+}
+
+/// Serializes HOME / HERMES_HOME env mutation during verification re-parse (process-global state).
+static HOME_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Count notable content features of a session, for before/after lossiness comparison.
+struct ContentStats {
+    tool_uses: usize,
+    tool_results: usize,
+    images: usize,
+    /// Thinking blocks carrying real summary/raw text (not just an encrypted blob).
+    thinking_with_text: usize,
+    /// Thinking blocks carrying only an encrypted blob (text empty).
+    thinking_encrypted_only: usize,
+    system_turns: usize,
+}
+
+fn content_stats(session: &Session) -> ContentStats {
+    let mut s = ContentStats {
+        tool_uses: 0,
+        tool_results: 0,
+        images: 0,
+        thinking_with_text: 0,
+        thinking_encrypted_only: 0,
+        system_turns: 0,
+    };
+    for m in &session.messages {
+        if m.role == Role::System {
+            s.system_turns += 1;
+        }
+        for b in &m.content {
+            match b {
+                Block::ToolUse { .. } => s.tool_uses += 1,
+                Block::ToolResult { .. } => s.tool_results += 1,
+                Block::Image { .. } => s.images += 1,
+                Block::Thinking { text, .. } => {
+                    if text.trim().is_empty() {
+                        s.thinking_encrypted_only += 1;
+                    } else {
+                        s.thinking_with_text += 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    s
+}
+
+/// Human-readable lossy-conversion warnings: what the source IR had that didn't survive the
+/// emit→re-parse round-trip. An empty Vec means a clean round-trip (modulo fields the target can't
+/// represent, which we don't flag because they're inherent to the format).
+fn diff_lossy(input: &Session, reparsed: &Session) -> Vec<String> {
+    let before = content_stats(input);
+    let after = content_stats(reparsed);
+    let mut warnings = Vec::new();
+
+    if after.tool_uses < before.tool_uses {
+        let n = before.tool_uses - after.tool_uses;
+        warnings.push(format!(
+            "dropped {n} tool call{}",
+            if n == 1 { "" } else { "s" }
+        ));
+    }
+    if after.tool_results < before.tool_results {
+        let n = before.tool_results - after.tool_results;
+        warnings.push(format!(
+            "dropped {n} tool result{}",
+            if n == 1 { "" } else { "s" }
+        ));
+    }
+    if after.images < before.images {
+        let n = before.images - after.images;
+        warnings.push(format!(
+            "{n} image{} dropped or reduced to a placeholder",
+            if n == 1 { "" } else { "s" }
+        ));
+    }
+    // Reasoning text that didn't come back, or came back only as an encrypted/summary blob.
+    if after.thinking_with_text < before.thinking_with_text {
+        let lost = before.thinking_with_text - after.thinking_with_text;
+        if after.thinking_encrypted_only > before.thinking_encrypted_only {
+            warnings.push(format!(
+                "{lost} reasoning block{} preserved as encrypted/summary only (raw text not stored)",
+                if lost == 1 { "" } else { "s" }
+            ));
+        } else {
+            warnings.push(format!(
+                "dropped {lost} reasoning block{}",
+                if lost == 1 { "" } else { "s" }
+            ));
+        }
+    }
+    if after.system_turns < before.system_turns {
+        let n = before.system_turns - after.system_turns;
+        warnings.push(format!(
+            "dropped {n} system turn{} (target has no standalone system message)",
+            if n == 1 { "" } else { "s" }
+        ));
+    }
+    warnings
 }
 
 /// Which targets [`emit`] can currently write.
@@ -304,6 +525,7 @@ fn emit_codex(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<E
     if let Some(c) = &cwd {
         meta.insert("cwd".into(), json!(c.to_string_lossy()));
     }
+    meta.insert("source".into(), json!("cli"));
     meta.insert("originator".into(), json!("claurdvoyant"));
     meta.insert("cli_version".into(), json!(env!("CARGO_PKG_VERSION")));
     if let Some(model) = &session.model {
@@ -354,9 +576,22 @@ fn emit_codex(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<E
                         Block::Thinking { text, encrypted, .. } => {
                             let mut p = Map::new();
                             p.insert("type".into(), json!("reasoning"));
+                            // The IR's Thinking text is the raw chain-of-thought (the parser
+                            // prefers `content` over `summary`); preserve it as raw `content` so
+                            // re-parsing recovers it verbatim. A distinct summary, if the source
+                            // adapter stashed one in `extra.reasoning_summary`, rides in `summary`.
+                            p.insert(
+                                "content".into(),
+                                json!([{ "type": "reasoning_text", "text": text }]),
+                            );
+                            let summary = msg
+                                .extra
+                                .get("reasoning_summary")
+                                .and_then(Value::as_str)
+                                .unwrap_or(text);
                             p.insert(
                                 "summary".into(),
-                                json!([{ "type": "summary_text", "text": text }]),
+                                json!([{ "type": "summary_text", "text": summary }]),
                             );
                             if let Some(enc) = encrypted {
                                 p.insert("encrypted_content".into(), json!(enc));
@@ -549,10 +784,43 @@ fn emit_grok(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<Em
                         break;
                     }
                 }
+                // Emit assistant tool calls. The Grok parser reads `tool_calls[]` with
+                // `arguments` as a JSON-encoded *string*, so re-encode the structured input.
+                let calls: Vec<Value> = msg
+                    .content
+                    .iter()
+                    .filter_map(|b| match b {
+                        Block::ToolUse { id, name, input } => Some(json!({
+                            "id": id,
+                            "name": name,
+                            "arguments": serde_json::to_string(input)
+                                .unwrap_or_else(|_| "{}".to_string()),
+                        })),
+                        _ => None,
+                    })
+                    .collect();
+                if !calls.is_empty() {
+                    line.insert("tool_calls".into(), Value::Array(calls));
+                }
                 lines.push(Value::Object(line));
             }
-            // Grok's chat_history doesn't model tool turns; best-effort drops them.
-            Role::Tool => {}
+            // Tool turns map to `tool_result` lines (the parser turns these back into Role::Tool).
+            Role::Tool => {
+                for b in &msg.content {
+                    if let Block::ToolResult {
+                        tool_use_id,
+                        content,
+                        ..
+                    } = b
+                    {
+                        lines.push(json!({
+                            "type": "tool_result",
+                            "tool_call_id": tool_use_id,
+                            "content": content,
+                        }));
+                    }
+                }
+            }
         }
     }
     let chat_path = session_dir.join("chat_history.jsonl");
@@ -1248,6 +1516,57 @@ fn emit_hermes(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<
     )
     .context("creating hermes schema")?;
 
+    // FTS5 virtual tables + sync triggers, mirroring hermes_state.py's FTS_SQL / FTS_TRIGRAM_SQL.
+    // Without these, a port into a *fresh* state.db is invisible to Hermes's search (which queries
+    // `messages_fts`). The unicode61 table is part of bundled FTS5 and always available; the trigram
+    // tokenizer is too in modern SQLite, but we still guard it so emit succeeds on any build that
+    // lacks it. Created BEFORE inserting rows so the AFTER INSERT triggers populate the index.
+    conn.execute_batch(
+        "CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(content);
+         CREATE TRIGGER IF NOT EXISTS messages_fts_insert AFTER INSERT ON messages BEGIN
+             INSERT INTO messages_fts(rowid, content) VALUES (
+                 new.id,
+                 COALESCE(new.content, '') || ' ' || COALESCE(new.tool_name, '') || ' ' || COALESCE(new.tool_calls, '')
+             );
+         END;
+         CREATE TRIGGER IF NOT EXISTS messages_fts_delete AFTER DELETE ON messages BEGIN
+             DELETE FROM messages_fts WHERE rowid = old.id;
+         END;
+         CREATE TRIGGER IF NOT EXISTS messages_fts_update AFTER UPDATE ON messages BEGIN
+             DELETE FROM messages_fts WHERE rowid = old.id;
+             INSERT INTO messages_fts(rowid, content) VALUES (
+                 new.id,
+                 COALESCE(new.content, '') || ' ' || COALESCE(new.tool_name, '') || ' ' || COALESCE(new.tool_calls, '')
+             );
+         END;",
+    )
+    .context("creating hermes messages_fts (FTS5)")?;
+
+    // Trigram table for CJK/substring search. Guarded: if the trigram tokenizer isn't compiled in,
+    // skip it (and its triggers) rather than failing the whole emit. The unicode61 table above is
+    // enough for Hermes to find ASCII content; the trigram index is a CJK nicety.
+    let trigram_sql =
+        "CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts_trigram USING fts5(content, tokenize='trigram');
+         CREATE TRIGGER IF NOT EXISTS messages_fts_trigram_insert AFTER INSERT ON messages BEGIN
+             INSERT INTO messages_fts_trigram(rowid, content) VALUES (
+                 new.id,
+                 COALESCE(new.content, '') || ' ' || COALESCE(new.tool_name, '') || ' ' || COALESCE(new.tool_calls, '')
+             );
+         END;
+         CREATE TRIGGER IF NOT EXISTS messages_fts_trigram_delete AFTER DELETE ON messages BEGIN
+             DELETE FROM messages_fts_trigram WHERE rowid = old.id;
+         END;
+         CREATE TRIGGER IF NOT EXISTS messages_fts_trigram_update AFTER UPDATE ON messages BEGIN
+             DELETE FROM messages_fts_trigram WHERE rowid = old.id;
+             INSERT INTO messages_fts_trigram(rowid, content) VALUES (
+                 new.id,
+                 COALESCE(new.content, '') || ' ' || COALESCE(new.tool_name, '') || ' ' || COALESCE(new.tool_calls, '')
+             );
+         END;";
+    if let Err(e) = conn.execute_batch(trigram_sql) {
+        eprintln!("cv: hermes trigram FTS unavailable, skipping ({e}); unicode61 FTS still active");
+    }
+
     let started = session
         .created_at
         .or(session.updated_at)
@@ -1627,12 +1946,38 @@ mod tests {
         assert_eq!(parsed.cwd, Some(PathBuf::from("/Users/test/project")));
         assert_eq!(texts(&parsed, Role::User), vec!["list the files please"]);
         assert_eq!(texts(&parsed, Role::Assistant), vec!["Sure, listing now."]);
-        assert_eq!(parsed.git.and_then(|g| g.branch), Some("main".to_string()));
+        assert_eq!(parsed.git.clone().and_then(|g| g.branch), Some("main".to_string()));
         // Thinking/reasoning survives on the assistant turn.
         assert!(parsed.messages.iter().any(|m| m
             .content
             .iter()
             .any(|b| matches!(b, Block::Thinking { .. }))));
+        // Tool calls now SURVIVE (previously emit dropped all tool turns).
+        assert_eq!(tool_names(&parsed), vec!["run_shell"]);
+        // And the assistant tool call's arguments round-trip.
+        let tool_use_input = parsed.messages.iter().find_map(|m| {
+            m.content.iter().find_map(|b| match b {
+                Block::ToolUse { input, .. } => Some(input.clone()),
+                _ => None,
+            })
+        });
+        assert_eq!(
+            tool_use_input.as_ref().and_then(|v| v.get("cmd")).and_then(|v| v.as_str()),
+            Some("ls")
+        );
+        // The tool RESULT survives as a Role::Tool message with its content intact.
+        let tool_results: Vec<_> = parsed
+            .messages
+            .iter()
+            .filter(|m| m.role == Role::Tool)
+            .collect();
+        assert_eq!(tool_results.len(), 1);
+        if let Block::ToolResult { content, tool_use_id, .. } = &tool_results[0].content[0] {
+            assert_eq!(content, "file_a.txt\nfile_b.txt");
+            assert_eq!(tool_use_id, "call_1");
+        } else {
+            panic!("expected tool result");
+        }
     }
 
     #[test]
@@ -1838,5 +2183,132 @@ mod tests {
             .content
             .iter()
             .any(|b| matches!(b, Block::Thinking { .. }))));
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn hermes_emit_creates_fts_and_is_searchable() {
+        use rusqlite::{Connection, OpenFlags};
+
+        let s = sample_session(Harness::Hermes);
+        let out = temp_dir();
+        let res = emit(&s, Harness::Hermes, &out, &EmitOptions::default()).unwrap();
+        let db = res.path.clone();
+        assert_eq!(db.file_name().unwrap(), "state.db");
+
+        let conn = Connection::open_with_flags(&db, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+
+        // The FTS virtual tables must exist (a fresh port is invisible to Hermes search without them).
+        let table_exists = |name: &str| -> bool {
+            conn.query_row(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1",
+                [name],
+                |_| Ok(()),
+            )
+            .is_ok()
+        };
+        assert!(table_exists("messages_fts"), "messages_fts must exist");
+        // trigram is guarded; assert it exists when the tokenizer is available (it is in bundled FTS5).
+        assert!(
+            table_exists("messages_fts_trigram"),
+            "messages_fts_trigram should exist with bundled FTS5"
+        );
+
+        // The triggers must have populated the index: an FTS MATCH finds an emitted message.
+        let cnt: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM messages_fts WHERE messages_fts MATCH 'files'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(cnt >= 1, "FTS query for 'files' should match the emitted user message");
+
+        // And the trigram index covers a substring of the assistant text.
+        let cnt_t: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM messages_fts_trigram WHERE messages_fts_trigram MATCH 'listing'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(cnt_t >= 1, "trigram FTS should find 'listing' substring");
+    }
+
+    /// A session whose only non-text payload is an image — a lossy target (Grok stores plain text
+    /// only) should report the image as dropped.
+    fn image_session() -> Session {
+        let mut user = Message::new(Role::User);
+        user.content.push(Block::Text { text: "look at this".into() });
+        user.content.push(Block::Image {
+            media_type: Some("image/png".into()),
+            data_ref: Some("data:image/png;base64,AAAA".into()),
+        });
+        let mut asst = Message::new(Role::Assistant);
+        asst.content.push(Block::Text { text: "nice picture".into() });
+
+        Session {
+            id: "img-id".into(),
+            harness: Harness::Grok,
+            cwd: Some(PathBuf::from("/Users/test/project")),
+            title: Some("image session".into()),
+            created_at: Some(Utc::now()),
+            updated_at: Some(Utc::now()),
+            model: Some("test-model".into()),
+            git: None,
+            messages: vec![user, asst],
+            source_path: None,
+            extra: serde_json::Map::new(),
+        }
+    }
+
+    #[test]
+    fn emit_verified_reports_lossy_grok() {
+        // An image-bearing session ported to Grok (plain-text chat_history) should warn that the
+        // image was dropped — the canonical lossy case.
+        let img = image_session();
+        let out = temp_dir();
+        let (_res, warnings) =
+            emit_verified(&img, Harness::Grok, &out, &EmitOptions::default()).unwrap();
+        assert!(
+            warnings.iter().any(|w| w.contains("image")),
+            "expected an image-dropped warning, got: {warnings:?}"
+        );
+
+        // A tools+text+system+reasoning Grok session now round-trips cleanly (post tool-emit fix):
+        // Grok keeps system turns, tool calls, tool results, and reasoning.
+        let clean = sample_session(Harness::Grok);
+        let out2 = temp_dir();
+        let (_r2, w2) =
+            emit_verified(&clean, Harness::Grok, &out2, &EmitOptions::default()).unwrap();
+        assert!(w2.is_empty(), "expected clean Grok round-trip, got: {w2:?}");
+    }
+
+    #[test]
+    fn emit_verified_clean_for_openclaw() {
+        // OpenClaw represents text, thinking, tool calls/results, system turns — a clean round-trip.
+        let s = sample_session(Harness::OpenClaw);
+        let out = temp_dir();
+        let (_res, warnings) =
+            emit_verified(&s, Harness::OpenClaw, &out, &EmitOptions::default()).unwrap();
+        // No tool/image/reasoning loss; OpenClaw keeps system turns and the title.
+        assert!(
+            warnings.is_empty(),
+            "expected a clean round-trip for OpenClaw, got: {warnings:?}"
+        );
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn emit_verified_clean_for_hermes() {
+        // Hermes keeps tools, reasoning, system turns, and title — should round-trip cleanly.
+        let s = sample_session(Harness::Hermes);
+        let out = temp_dir();
+        let (_res, warnings) =
+            emit_verified(&s, Harness::Hermes, &out, &EmitOptions::default()).unwrap();
+        assert!(
+            warnings.is_empty(),
+            "expected a clean round-trip for Hermes, got: {warnings:?}"
+        );
     }
 }

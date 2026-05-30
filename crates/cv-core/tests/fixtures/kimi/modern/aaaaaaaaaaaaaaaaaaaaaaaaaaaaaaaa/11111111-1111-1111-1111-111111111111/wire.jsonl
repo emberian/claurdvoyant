@@ -1,0 +1,8 @@
+{"type": "metadata", "protocol_version": "1.2"}
+{"timestamp": 1770483188.871613, "message": {"type": "TurnBegin", "payload": {"user_input": [{"type": "text", "text": "list the files in this directory"}]}}}
+{"timestamp": 1770483189.0, "message": {"type": "StepBegin", "payload": {"n": 1}}}
+{"timestamp": 1770483190.0, "message": {"type": "ContentPart", "payload": {"type": "text", "text": "I'll list the files."}}}
+{"timestamp": 1770483191.0, "message": {"type": "ToolCall", "payload": {"type": "function", "id": "tool_abc", "function": {"name": "Shell", "arguments": "{\"command\": \"ls\"}"}, "extras": null}}}
+{"timestamp": 1770483192.0, "message": {"type": "StatusUpdate", "payload": {"context_usage": 0.02, "token_usage": {"input_other": 100, "output": 42, "input_cache_read": 50, "input_cache_creation": 0}, "message_id": "chatcmpl-abc"}}}
+{"timestamp": 1770483193.0, "message": {"type": "ToolResult", "payload": {"tool_call_id": "tool_abc", "return_value": {"is_error": false, "output": "README.md\nsrc\nCargo.toml", "message": "Command executed successfully.", "display": [], "extras": {"exit_code": 0}}}}}
+{"timestamp": 1770483194.0, "message": {"type": "TurnEnd", "payload": {}}}

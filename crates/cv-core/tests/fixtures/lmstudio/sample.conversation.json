@@ -1,0 +1,93 @@
+{
+  "name": "Hello there",
+  "pinned": false,
+  "createdAt": 1754425038609,
+  "preset": "",
+  "tokenCount": 46,
+  "systemPrompt": "",
+  "messages": [
+    {
+      "versions": [
+        {
+          "type": "singleStep",
+          "role": "user",
+          "content": [
+            {
+              "type": "text",
+              "text": "Hello there"
+            }
+          ]
+        }
+      ],
+      "currentlySelected": 0
+    },
+    {
+      "versions": [
+        {
+          "type": "multiStep",
+          "role": "assistant",
+          "steps": [
+            {
+              "type": "contentBlock",
+              "stepIdentifier": "1754425094719-0.022738884687463323",
+              "style": {
+                "type": "thinking",
+                "ended": true,
+                "title": "Thought for 0.34 seconds"
+              },
+              "prefix": "",
+              "suffix": "</think>",
+              "content": [
+                {
+                  "type": "text",
+                  "text": "the user said hi"
+                }
+              ],
+              "defaultShouldIncludeInContext": true,
+              "shouldIncludeInContext": true
+            },
+            {
+              "type": "contentBlock",
+              "stepIdentifier": "1754425095001-0.91",
+              "content": [
+                {
+                  "type": "text",
+                  "text": "Hi! How can I help?"
+                }
+              ],
+              "defaultShouldIncludeInContext": true,
+              "shouldIncludeInContext": true,
+              "genInfo": {
+                "indexedModelIdentifier": "openai/gpt-oss-120b",
+                "identifier": "openai/gpt-oss-120b",
+                "stats": {
+                  "stopReason": "eosFound",
+                  "tokensPerSecond": 12.95,
+                  "promptTokensCount": 12,
+                  "predictedTokensCount": 34,
+                  "totalTokensCount": 46
+                }
+              }
+            },
+            {
+              "type": "debugInfoBlock",
+              "stepIdentifier": "1754425095100-0.5",
+              "debugInfo": "Conversation naming technique: 'hardcoded'"
+            }
+          ]
+        }
+      ],
+      "currentlySelected": 0
+    }
+  ],
+  "usePerChatPredictionConfig": false,
+  "perChatPredictionConfig": { "fields": [] },
+  "clientInput": "",
+  "clientInputFiles": [],
+  "userFilesSizeBytes": 0,
+  "notes": [],
+  "plugins": [],
+  "pluginConfigs": {},
+  "disabledPluginTools": [],
+  "looseFiles": []
+}

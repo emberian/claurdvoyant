@@ -140,6 +140,62 @@ enum Cmd {
         #[command(subcommand)]
         action: BoardCmd,
     },
+    /// Unified chronological feed across all harnesses (oldest → newest).
+    Timeline {
+        #[arg(long)]
+        harness: Option<String>,
+        /// Only sessions whose cwd contains this substring.
+        #[arg(long)]
+        cwd: Option<String>,
+        #[arg(long, default_value_t = 60)]
+        limit: usize,
+    },
+    /// Compare two sessions message-by-message (great for loom branches).
+    Diff {
+        a: String,
+        b: String,
+        #[arg(long)]
+        harness: Option<String>,
+    },
+    /// Compose a new session from spans of existing ones (`<id>:<start>-<end>`).
+    Splice {
+        /// One or more specs: `<id>:<start>-<end>`, `<id>:<start>-`, or `<id>` (whole session).
+        #[arg(required = true)]
+        specs: Vec<String>,
+        /// Target harness for the composed session (defaults to the first spec's harness).
+        #[arg(long)]
+        to: Option<String>,
+        /// Write under this directory instead of the target's real storage root.
+        #[arg(long)]
+        out: Option<PathBuf>,
+        /// Print the composed session instead of emitting it: md or json.
+        #[arg(long)]
+        export: Option<String>,
+        /// Rehome the composed session to this working directory.
+        #[arg(long)]
+        cwd: Option<PathBuf>,
+    },
+    /// Loom graft: take base[..N], then graft other[M..] into one new branched session.
+    Loom {
+        base: String,
+        #[arg(long)]
+        at: usize,
+        #[arg(long)]
+        graft: String,
+        #[arg(long)]
+        from: usize,
+        /// Target harness for the grafted session (defaults to the base's harness).
+        #[arg(long)]
+        to: Option<String>,
+        #[arg(long)]
+        out: Option<PathBuf>,
+        /// Print the grafted session instead of emitting it: md or json.
+        #[arg(long)]
+        export: Option<String>,
+        /// Rehome the grafted session to this working directory.
+        #[arg(long)]
+        cwd: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -179,6 +235,61 @@ enum BoardCmd {
         #[arg(long, default_value_t = 2.0)]
         interval: f64,
     },
+    /// Post a question others can `reply` to; prints the request id (the correlation key).
+    Request {
+        channel: String,
+        body: String,
+        #[arg(long, default_value = "cv")]
+        from: String,
+    },
+    /// Answer a request by its id.
+    Reply {
+        channel: String,
+        /// The request (or message) id this answers.
+        in_reply_to: String,
+        body: String,
+        #[arg(long, default_value = "cv")]
+        from: String,
+    },
+    /// Collect all replies to a request id.
+    Replies {
+        channel: String,
+        request_id: String,
+    },
+    /// Try to claim a task `key` (a soft lease). Exits non-zero on contention.
+    Claim {
+        channel: String,
+        key: String,
+        #[arg(long, default_value = "cv")]
+        from: String,
+        /// Lease duration in seconds.
+        #[arg(long = "ttl-secs", default_value_t = 300)]
+        ttl_secs: u64,
+    },
+    /// Release a held claim on `key`.
+    Release {
+        channel: String,
+        key: String,
+        #[arg(long, default_value = "cv")]
+        from: String,
+    },
+    /// List the currently-active (un-expired) claims on a channel.
+    Claims {
+        channel: String,
+    },
+    /// List agents that heartbeat on a channel recently (also posts your own heartbeat).
+    Who {
+        channel: String,
+        #[arg(long = "within-secs", default_value_t = 60)]
+        within_secs: u64,
+    },
+    /// Acknowledge a message id with a tiny ack note.
+    Ack {
+        channel: String,
+        message_id: String,
+        #[arg(long, default_value = "cv")]
+        from: String,
+    },
 }
 
 fn main() -> Result<()> {
@@ -196,6 +307,12 @@ fn main() -> Result<()> {
         Cmd::Resume { id, harness, launch } => cmd_resume(&id, harness, launch),
         Cmd::Tree { id, harness } => cmd_tree(&id, harness),
         Cmd::Board { action } => cmd_board(action),
+        Cmd::Timeline { harness, cwd, limit } => cmd_timeline(harness, cwd, limit),
+        Cmd::Diff { a, b, harness } => cmd_diff(&a, &b, harness),
+        Cmd::Splice { specs, to, out, export, cwd } => cmd_splice(&specs, to, out, export, cwd),
+        Cmd::Loom { base, at, graft, from, to, out, export, cwd } => {
+            cmd_loom(&base, at, &graft, from, to, out, export, cwd)
+        }
     }
 }
 
@@ -240,6 +357,88 @@ fn cmd_board(action: BoardCmd) -> Result<()> {
                 }
                 std::thread::sleep(Duration::from_secs_f64(interval.max(0.25)));
             }
+        }
+        BoardCmd::Request { channel, body, from } => {
+            let m = board::request(&channel, &from, &body)?;
+            println!("✦ requested {} on #{}", short_id(&m.id), channel);
+            println!("  ↳ reply with: cv board reply {channel} {} <body>", m.id);
+        }
+        BoardCmd::Reply { channel, in_reply_to, body, from } => {
+            let m = board::reply(&channel, &from, &in_reply_to, &body)?;
+            println!("✦ replied {} to {} on #{}", short_id(&m.id), short_id(&in_reply_to), channel);
+        }
+        BoardCmd::Replies { channel, request_id } => {
+            let msgs = board::replies(&channel, &request_id)?;
+            for m in &msgs {
+                print_board_msg(m);
+            }
+            if msgs.is_empty() {
+                println!("(no replies to {} on #{channel})", short_id(&request_id));
+            }
+        }
+        BoardCmd::Claim { channel, key, from, ttl_secs } => {
+            let lease = board::claim(&channel, &from, &key, Duration::from_secs(ttl_secs))?;
+            match lease {
+                Some(l) => {
+                    println!(
+                        "GRANTED  {key} → {} (expires {})",
+                        l.owner,
+                        l.expires_at.format("%Y-%m-%d %H:%M:%S")
+                    );
+                }
+                None => {
+                    let holder = board::active_claims(&channel)?
+                        .into_iter()
+                        .find(|(k, _, _)| *k == key)
+                        .map(|(_, owner, _)| owner)
+                        .unwrap_or_else(|| "someone".into());
+                    println!("CONTENDED  {key} is held by {holder}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        BoardCmd::Release { channel, key, from } => {
+            // We can only `release` a real `Lease` (its dir/channel fields are private). Re-claim
+            // the key as `from` — if we own it (or it's free), claim renews and hands us back a
+            // releasable lease; then drop it. If another agent holds it, there's nothing of ours
+            // to release.
+            match board::claim(&channel, &from, &key, Duration::from_secs(1))? {
+                Some(lease) => {
+                    board::release(&lease)?;
+                    println!("✦ released {key} on #{channel}");
+                }
+                None => {
+                    println!("(claim {key} on #{channel} is held by another agent — nothing to release)");
+                }
+            }
+        }
+        BoardCmd::Claims { channel } => {
+            let claims = board::active_claims(&channel)?;
+            for (key, owner, expires) in &claims {
+                println!(
+                    "{key:30}  {owner:16}  expires {}",
+                    expires.format("%Y-%m-%d %H:%M:%S")
+                );
+            }
+            if claims.is_empty() {
+                println!("(no active claims on #{channel})");
+            }
+        }
+        BoardCmd::Who { channel, within_secs } => {
+            // Record our own presence first, then list recent heartbeaters.
+            board::heartbeat(&channel, "cv")?;
+            let agents = board::who(&channel, Duration::from_secs(within_secs))?;
+            for a in &agents {
+                println!("{a}");
+            }
+            if agents.is_empty() {
+                println!("(nobody seen on #{channel} in the last {within_secs}s)");
+            }
+        }
+        BoardCmd::Ack { channel, message_id, from } => {
+            let m = board::ack(&channel, &from, &message_id)?;
+            println!("✦ acked {} on #{channel}", short_id(&message_id));
+            let _ = m;
         }
     }
     Ok(())
@@ -387,9 +586,11 @@ fn resume_command(h: Harness, id: &str) -> (String, Vec<String>) {
         Harness::Gemini => ("gemini".into(), vec!["--resume".into(), id.into()]),
         Harness::Hermes => ("hermes".into(), vec!["resume".into(), id.into()]),
         Harness::OpenClaw => ("openclaw".into(), vec!["--resume".into(), id.into()]),
-        // Desktop/IDE apps and others have no documented CLI resume — emit a best-effort hint.
-        Harness::Cursor | Harness::ClaudeApp | Harness::ChatGptApp => (
-            format!("# no CLI resume for {h}; open the app and find session"),
+        Harness::Kimi => ("kimi".into(), vec!["--resume".into(), id.into()]),
+        Harness::Qwen => ("qwen".into(), vec!["--resume".into(), id.into()]),
+        // Desktop/IDE apps (and any future harness) have no documented CLI resume.
+        _ => (
+            format!("# no CLI resume for {h}; open the app and find the session"),
             vec![id.into()],
         ),
     }
@@ -944,6 +1145,263 @@ fn cmd_scry(
             }
         }
     });
+}
+
+// ---------- timeline ----------
+
+/// A unified chronological feed across all harnesses (oldest → newest, like a feed). Grouped by day.
+fn cmd_timeline(harness: Option<String>, cwd: Option<String>, limit: usize) -> Result<()> {
+    let want = parse_harness(&harness)?;
+    let mut refs: Vec<SessionRef> = cv_core::discover_all()
+        .into_iter()
+        .filter(|r| want.map_or(true, |h| r.harness == h))
+        .filter(|r| match &cwd {
+            None => true,
+            Some(c) => r
+                .cwd
+                .as_ref()
+                .map(|p| p.to_string_lossy().contains(c))
+                .unwrap_or(false),
+        })
+        .collect();
+
+    // Sort ascending by updated_at (falling back to created_at), so the feed reads oldest → newest.
+    let key = |r: &SessionRef| r.updated_at.or(r.created_at);
+    refs.sort_by(|a, b| key(a).cmp(&key(b)));
+
+    let total = refs.len();
+    // A feed shows the *most recent* window; keep the last `limit` rows but still oldest → newest.
+    let shown = if total > limit { &refs[total - limit..] } else { &refs[..] };
+    if total > limit {
+        println!("… {} older (use --limit)\n", total - limit);
+    }
+
+    let mut last_day: Option<String> = None;
+    for r in shown {
+        let when = key(r);
+        let day = when
+            .map(|d| d.format("%Y-%m-%d").to_string())
+            .unwrap_or_else(|| "----------".into());
+        if last_day.as_deref() != Some(day.as_str()) {
+            println!("── {day} ──");
+            last_day = Some(day.clone());
+        }
+        let time = when
+            .map(|d| d.format("%H:%M").to_string())
+            .unwrap_or_else(|| "--:--".into());
+        let title = r
+            .title
+            .clone()
+            .map(|t| truncate(&t, 50))
+            .unwrap_or_else(|| dim_cwd(r.cwd.as_deref()));
+        println!(
+            "  {}  {:8}  {:8}  {:24}  {}",
+            time,
+            r.harness.as_str(),
+            short_id(&r.id),
+            truncate(&dim_cwd(r.cwd.as_deref()), 24),
+            title,
+        );
+    }
+    println!("\n{total} session(s)");
+    Ok(())
+}
+
+// ---------- diff ----------
+
+/// Compare two sessions message-by-message: a shared prefix (`=`) then a divergence marked
+/// `<` (only in A) / `>` (only in B). Comparison is on role + `Message::text()`.
+fn cmd_diff(a: &str, b: &str, harness: Option<String>) -> Result<()> {
+    let want = parse_harness(&harness)?;
+    let (ra, aa) = cv_core::find(a, want)?.with_context(|| format!("no session matching {a:?}"))?;
+    let (rb, ab) = cv_core::find(b, want)?.with_context(|| format!("no session matching {b:?}"))?;
+    let sa = aa.parse(&ra)?;
+    let sb = ab.parse(&rb)?;
+
+    println!("A {:8} {:8}  {} msg", sa.harness.as_str(), short_id(&sa.id), sa.messages.len());
+    println!("B {:8} {:8}  {} msg", sb.harness.as_str(), short_id(&sb.id), sb.messages.len());
+    println!();
+
+    let key = |m: &Message| (m.role, m.text().unwrap_or_default());
+    let na = sa.messages.len();
+    let nb = sb.messages.len();
+
+    // Shared prefix: matching role+text from the top.
+    let mut shared = 0;
+    while shared < na && shared < nb && key(&sa.messages[shared]) == key(&sb.messages[shared]) {
+        println!("= {}", diff_line(&sa.messages[shared]));
+        shared += 1;
+    }
+    // After divergence, list A's remainder then B's remainder.
+    for m in &sa.messages[shared..] {
+        println!("< {}", diff_line(m));
+    }
+    for m in &sb.messages[shared..] {
+        println!("> {}", diff_line(m));
+    }
+
+    println!(
+        "\n{shared} shared, {} only-in-A, {} only-in-B",
+        na - shared,
+        nb - shared
+    );
+    Ok(())
+}
+
+/// One-line `role: text-preview` for a diff row.
+fn diff_line(m: &Message) -> String {
+    let role = cv_core::render::role_label(m.role);
+    let text = m.text().unwrap_or_default();
+    format!("{role:9} {}", truncate(&text, 80))
+}
+
+// ---------- splice / loom ----------
+
+/// A parsed splice spec: which session, and a `[start, end)` window (end None → through the last).
+struct SpliceSpec {
+    id: String,
+    start: usize,
+    end: Option<usize>,
+}
+
+/// Parse `<id>:<start>-<end>` | `<id>:<start>-` | `<id>` into a [`SpliceSpec`].
+fn parse_splice_spec(spec: &str) -> Result<SpliceSpec> {
+    match spec.split_once(':') {
+        None => Ok(SpliceSpec { id: spec.to_string(), start: 0, end: None }),
+        Some((id, range)) => {
+            let (s, e) = range
+                .split_once('-')
+                .with_context(|| format!("bad spec {spec:?}: range must be <start>-<end> or <start>-"))?;
+            let start: usize = s
+                .trim()
+                .parse()
+                .with_context(|| format!("bad spec {spec:?}: start must be a number"))?;
+            let end = if e.trim().is_empty() {
+                None
+            } else {
+                Some(
+                    e.trim()
+                        .parse()
+                        .with_context(|| format!("bad spec {spec:?}: end must be a number"))?,
+                )
+            };
+            Ok(SpliceSpec { id: id.to_string(), start, end })
+        }
+    }
+}
+
+fn cmd_splice(
+    specs: &[String],
+    to: Option<String>,
+    out: Option<PathBuf>,
+    export: Option<String>,
+    cwd: Option<PathBuf>,
+) -> Result<()> {
+    let parsed: Vec<SpliceSpec> = specs.iter().map(|s| parse_splice_spec(s)).collect::<Result<_>>()?;
+
+    // Resolve + parse each spec's session FIRST, keeping the owners alive in a Vec so the spans can
+    // borrow them. We pair each parsed session with the (start, end) it'll select.
+    let mut owned: Vec<(Session, usize, Option<usize>)> = Vec::with_capacity(parsed.len());
+    for sp in &parsed {
+        let (r, adapter) =
+            cv_core::find(&sp.id, None)?.with_context(|| format!("no session matching {:?}", sp.id))?;
+        let session = adapter.parse(&r)?;
+        owned.push((session, sp.start, sp.end));
+    }
+
+    let spans: Vec<cv_core::loom::Span<'_>> = owned
+        .iter()
+        .map(|(s, start, end)| cv_core::loom::Span { source: s, start: *start, end: *end })
+        .collect();
+
+    // Target harness: --to, else the first spec's source harness.
+    let to_h = match &to {
+        Some(s) => Harness::parse(s).with_context(|| format!("unknown target harness: {s}"))?,
+        None => owned
+            .first()
+            .map(|(s, _, _)| s.harness)
+            .context("splice needs at least one session")?,
+    };
+
+    let spliced = cv_core::loom::splice(&spans, None, to_h);
+    finish_composed(spliced, to_h, to.is_some(), out, export, cwd)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cmd_loom(
+    base: &str,
+    at: usize,
+    graft: &str,
+    from: usize,
+    to: Option<String>,
+    out: Option<PathBuf>,
+    export: Option<String>,
+    cwd: Option<PathBuf>,
+) -> Result<()> {
+    let (rb, ab) = cv_core::find(base, None)?.with_context(|| format!("no session matching {base:?}"))?;
+    let (rg, ag) = cv_core::find(graft, None)?.with_context(|| format!("no session matching {graft:?}"))?;
+    let base_s = ab.parse(&rb)?;
+    let graft_s = ag.parse(&rg)?;
+
+    let grafted = cv_core::loom::graft(&base_s, at, &graft_s, from, None);
+    // Default target harness is the base's (graft() already used it); honor --to if given.
+    let to_h = match &to {
+        Some(s) => Harness::parse(s).with_context(|| format!("unknown target harness: {s}"))?,
+        None => base_s.harness,
+    };
+    // Re-stamp the harness if --to overrode it (graft used base.harness).
+    let mut grafted = grafted;
+    grafted.harness = to_h;
+    finish_composed(grafted, to_h, to.is_some(), out, export, cwd)
+}
+
+/// Shared tail for splice/loom: emit to a harness when `--to`/`--out` is in play, otherwise print a
+/// summary and (with `--export md|json`) the composed session to stdout.
+fn finish_composed(
+    mut session: Session,
+    to_h: Harness,
+    explicit_to: bool,
+    out: Option<PathBuf>,
+    export: Option<String>,
+    cwd: Option<PathBuf>,
+) -> Result<()> {
+    // Emit path: an explicit --to or an --out directory means "materialize this for a harness".
+    if explicit_to || out.is_some() {
+        if let Some(dir) = &cwd {
+            session.cwd = Some(dir.clone());
+        }
+        return emit_session(&session, to_h, out, EmitOptions { new_cwd: cwd, new_id: None });
+    }
+
+    // Otherwise: print a summary, and with --export, dump the composed session to stdout.
+    println!(
+        "✦ composed {} ({}) · {} msg",
+        short_id(&session.id),
+        session.harness.as_str(),
+        session.messages.len()
+    );
+    if let Some(prov) = session.extra.get("loom") {
+        if let Some(arr) = prov.as_array() {
+            for p in arr {
+                println!(
+                    "  ↳ {} {}[{}..{}]",
+                    p.get("harness").and_then(|v| v.as_str()).unwrap_or("?"),
+                    p.get("source_id").and_then(|v| v.as_str()).map(short_id).unwrap_or_default(),
+                    p.get("start").and_then(|v| v.as_u64()).unwrap_or(0),
+                    p.get("end").and_then(|v| v.as_u64()).unwrap_or(0),
+                );
+            }
+        }
+    }
+    match export.as_deref() {
+        None => {
+            println!("\n(use --export md|json to print it, or --to <harness> [--out <dir>] to emit it)");
+        }
+        Some("json") => println!("{}", serde_json::to_string_pretty(&session)?),
+        Some("md") | Some("markdown") => print!("{}", cv_core::render::to_markdown(&session)),
+        Some(other) => bail!("unknown export format {other:?} (use md or json)"),
+    }
+    Ok(())
 }
 
 // ---------- rendering helpers ----------

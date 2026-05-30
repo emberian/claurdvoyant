@@ -26,10 +26,24 @@ pub enum Harness {
     ClaudeApp,
     /// The ChatGPT desktop app (macOS/Windows).
     ChatGptApp,
+    /// Kimi CLI (MoonshotAI), `~/.kimi`.
+    Kimi,
+    /// Qwen Code CLI (a gemini-cli fork), `~/.qwen`.
+    Qwen,
+    /// LM Studio desktop app, `~/.lmstudio`.
+    LmStudio,
+    /// Cline (VS Code extension), per-task Anthropic-format JSON.
+    Cline,
+    /// Roo Code (a Cline fork).
+    Roo,
+    /// Continue (VS Code/JetBrains), `~/.continue/sessions`.
+    Continue,
+    /// Goose (Block), `~/.local/share/goose/sessions`.
+    Goose,
 }
 
 impl Harness {
-    pub const ALL: [Harness; 10] = [
+    pub const ALL: [Harness; 17] = [
         Harness::Claude,
         Harness::Codex,
         Harness::Grok,
@@ -40,6 +54,13 @@ impl Harness {
         Harness::Cursor,
         Harness::ClaudeApp,
         Harness::ChatGptApp,
+        Harness::Kimi,
+        Harness::Qwen,
+        Harness::LmStudio,
+        Harness::Cline,
+        Harness::Roo,
+        Harness::Continue,
+        Harness::Goose,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -54,6 +75,13 @@ impl Harness {
             Harness::Cursor => "cursor",
             Harness::ClaudeApp => "claude-app",
             Harness::ChatGptApp => "chatgpt-app",
+            Harness::Kimi => "kimi",
+            Harness::Qwen => "qwen",
+            Harness::LmStudio => "lmstudio",
+            Harness::Cline => "cline",
+            Harness::Roo => "roo",
+            Harness::Continue => "continue",
+            Harness::Goose => "goose",
         }
     }
 
@@ -69,6 +97,13 @@ impl Harness {
             "cursor" => Harness::Cursor,
             "claude-app" | "claude-desktop" | "claudeapp" => Harness::ClaudeApp,
             "chatgpt-app" | "chatgpt" | "chatgpt-desktop" | "openai-app" => Harness::ChatGptApp,
+            "kimi" | "kimi-cli" => Harness::Kimi,
+            "qwen" | "qwen-code" => Harness::Qwen,
+            "lmstudio" | "lm-studio" => Harness::LmStudio,
+            "cline" => Harness::Cline,
+            "roo" | "roo-code" | "roocode" => Harness::Roo,
+            "continue" | "continuedev" => Harness::Continue,
+            "goose" => Harness::Goose,
             _ => return None,
         })
     }

@@ -1,0 +1,6 @@
+{"role": "_system_prompt", "content": "You are Kimi Code CLI."}
+{"role": "_checkpoint", "id": 0}
+{"role": "user", "content": "list the files in this directory"}
+{"role": "_usage", "token_count": 1234}
+{"role": "assistant", "content": [{"type": "think", "think": "I should list the files.", "encrypted": "ENC"}, {"type": "text", "text": "I'll list the files."}], "tool_calls": [{"type": "function", "id": "tool_abc", "function": {"name": "Shell", "arguments": "{\"command\": \"ls\"}"}}]}
+{"role": "tool", "content": [{"type": "text", "text": "<system>Command executed successfully.</system>"}, {"type": "text", "text": "stale-context-text"}], "tool_call_id": "tool_abc"}

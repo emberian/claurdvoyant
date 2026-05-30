@@ -13,6 +13,7 @@ pub mod harness;
 pub mod index;
 pub mod ingest;
 pub mod ir;
+pub mod loom;
 pub mod render;
 pub mod watch;
 

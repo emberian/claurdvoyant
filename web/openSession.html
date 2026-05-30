@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="en" data-theme="auto">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>OpenSession — an interchange format for agent sessions</title>
+  <meta name="description" content="OpenSession: the format coding-agent harnesses would have agreed on if they'd talked first. A claurdvoyant proposal." />
+  <link rel="stylesheet" href="./styles.css" />
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E%F0%9F%A7%AC%3C/text%3E%3C/svg%3E" />
+  <style>
+    body { padding: 0 16px; }
+    .os-wrap { max-width: 900px; margin: 0 auto; }
+    .os-nav { display: flex; align-items: center; justify-content: space-between; padding: 18px 4px 4px; }
+    .os-nav a { color: var(--fg-muted); text-decoration: none; font-size: 13px; border-bottom: 1px dotted var(--border-strong); }
+    .os-nav a:hover { color: var(--fg); }
+  </style>
+</head>
+<body>
+  <div class="os-wrap">
+    <nav class="os-nav">
+      <a href="./index.html">← back to claurdvoyant</a>
+      <button type="button" class="theme-toggle" title="Toggle light / dark" aria-label="Toggle theme">◐</button>
+    </nav>
+    <cv-opensession></cv-opensession>
+  </div>
+
+  <script type="module">
+    import "./components/cv-opensession.js";
+    // Lightweight theme toggle mirroring the main app.
+    const root = document.documentElement;
+    const stored = localStorage.getItem("cv-theme");
+    if (stored) root.setAttribute("data-theme", stored);
+    document.querySelector(".theme-toggle")?.addEventListener("click", () => {
+      const cur = root.getAttribute("data-theme");
+      const next = cur === "dark" ? "light" : cur === "light" ? "auto" : "dark";
+      root.setAttribute("data-theme", next);
+      localStorage.setItem("cv-theme", next);
+    });
+  </script>
+</body>
+</html>

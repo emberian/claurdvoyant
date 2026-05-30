@@ -131,9 +131,57 @@ export const SAMPLE_SESSIONS = [
       {
         role: "assistant",
         content: [
+          { kind: "thinking", encrypted: "AQEBxR3k…opaque…", text: "" },
           { kind: "text", text: "The sidebar is overflowing its container — the flex child needs `min-width: 0` so it can shrink below its content size." }
         ]
       }
+    ]
+  },
+  {
+    id: "claude-loom-branch-a",
+    harness: "claude",
+    cwd: "/Users/ember/pug/claurdvoyant",
+    title: "Wire up the WASM ingest contract (branch A)",
+    created_at: "2026-05-28T17:12:04Z",
+    updated_at: "2026-05-28T17:30:00Z",
+    model: "claude-opus-4-8",
+    git: { branch: "loom-a", commit: "a1b2c3d" },
+    messages: [
+      { id: "m1", role: "user", timestamp: "2026-05-28T17:12:04Z",
+        content: [{ kind: "text", text: "Can you read the IR and tell me what `ingest_zip` should return? I want the web UI to match exactly." }] },
+      { id: "mb2", parent_id: "m1", role: "assistant", timestamp: "2026-05-28T17:20:00Z", model: "claude-opus-4-8",
+        content: [
+          { kind: "text", text: "Branch A: let's just trust the docs — it returns a JSON string of Session[]. Shipping." },
+          { kind: "file", mime: "text/x-rust", path: "crates/cv-web/src/lib.rs", source: "diff" }
+        ] }
+    ]
+  },
+  {
+    // An OpenSession-format (camelCase) session, to exercise the JSON loader /
+    // normalizer. Dropping a .json shaped like this loads directly — no wasm.
+    openSession: "0.1",
+    harness: "openSession",
+    id: "open-demo-42",
+    cwd: "/Users/ember/lab/opensession",
+    title: "OpenSession round-trip demo",
+    model: "gpt-5-codex",
+    createdAt: "2026-05-29T10:00:00Z",
+    updatedAt: "2026-05-29T10:08:00Z",
+    git: { branch: "main", commit: "deadbeef", remote: "git@github.com:ember/open.git" },
+    messages: [
+      { id: "o1", role: "user", timestamp: "2026-05-29T10:00:00Z",
+        content: [{ kind: "text", text: "Prove the camelCase OpenSession shape loads and renders." }] },
+      { id: "o2", parentId: "o1", role: "assistant", timestamp: "2026-05-29T10:01:00Z", model: "gpt-5-codex",
+        usage: { inputTokens: 900, outputTokens: 120, cacheReadTokens: 4000 },
+        content: [
+          { kind: "thinking", redacted: true },
+          { kind: "text", text: "Here's a tool call using the OpenSession `toolUse` kind:" },
+          { kind: "toolUse", id: "c1", name: "Bash", input: { command: "cargo test --workspace" } }
+        ] },
+      { id: "o3", parentId: "o2", role: "tool", timestamp: "2026-05-29T10:02:00Z",
+        content: [{ kind: "toolResult", toolUseId: "c1", toolName: "Bash", status: "ok", isError: false,
+          content: "running 128 tests\n…\ntest result: ok. 128 passed; 0 failed",
+          details: { exitCode: 0, durationMs: 8421 } }] }
     ]
   }
 ];

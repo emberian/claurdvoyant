@@ -8,15 +8,23 @@ use std::path::{Path, PathBuf};
 pub mod chatgpt_app;
 pub mod claude;
 pub mod claude_app;
+pub mod cline;
 pub mod codex;
+pub mod continuedev;
 #[cfg(feature = "sqlite")]
 pub mod cursor;
+#[cfg(feature = "sqlite")]
+pub mod goose;
+pub mod roo;
 pub mod gemini;
 pub mod grok;
 #[cfg(feature = "sqlite")]
 pub mod hermes;
+pub mod kimi;
+pub mod lmstudio;
 pub mod opencode;
 pub mod openclaw;
+pub mod qwen;
 
 /// Result of emitting an IR session into a harness's native on-disk format.
 #[derive(Debug, Clone)]
@@ -65,11 +73,18 @@ pub fn all() -> Vec<Box<dyn Adapter>> {
         Box::new(openclaw::OpenClaw::new()),
         Box::new(claude_app::ClaudeApp::new()),
         Box::new(chatgpt_app::ChatGptApp::new()),
+        Box::new(kimi::Kimi::new()),
+        Box::new(qwen::Qwen::new()),
+        Box::new(lmstudio::LmStudio::new()),
+        Box::new(cline::Cline::new()),
+        Box::new(roo::Roo::new()),
+        Box::new(continuedev::Continue::new()),
     ];
     #[cfg(feature = "sqlite")]
     {
         adapters.push(Box::new(hermes::Hermes::new()));
         adapters.push(Box::new(cursor::Cursor::new()));
+        adapters.push(Box::new(goose::Goose::new()));
     }
     adapters
 }
