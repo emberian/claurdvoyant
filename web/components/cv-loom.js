@@ -27,6 +27,7 @@ import {
   generate, getKey, setKey, getModel, setModel, hasKey,
   MODEL_PRESETS, DEFAULT_MODEL,
 } from "../openrouter.js";
+import { canInvokeNative, nativeGenerate } from "../tauri.js";
 
 class CvLoom extends HTMLElement {
   constructor() {
@@ -50,12 +51,21 @@ class CvLoom extends HTMLElement {
 
   // ---- branch model ------------------------------------------------------
 
-  _newBranch(name, lane = []) {
-    const b = { id: randomId(), name: name || `branch ${this._branches.length + 1}`, lane, composedId: randomId() };
+  _newBranch(name, lane = [], opts = {}) {
+    const b = {
+      id: randomId(),
+      name: name || `branch ${this._branches.length + 1}`,
+      lane,
+      composedId: randomId(),
+      parent: opts.parent ?? null,   // parent branch id (null for roots)
+      forkAt: opts.forkAt ?? 0,      // # of messages shared with the parent
+    };
     this._branches.push(b);
     this._activeBranchId = b.id;
     return b;
   }
+
+  _children(id) { return this._branches.filter((b) => b.parent === id); }
   _branch() { return this._branches.find((b) => b.id === this._activeBranchId) || this._branches[0]; }
   get _lane() { return this._branch().lane; }
   set _lane(v) { this._branch().lane = v; }
@@ -238,30 +248,79 @@ class CvLoom extends HTMLElement {
 
   // ---- branch bar --------------------------------------------------------
 
+  // A real branch-tree visualization: roots and their forked descendants,
+  // indented by depth, with the fork point (shared message count) shown on each
+  // child. The active branch is highlighted; rows are keyboard-navigable.
   _branchBarHtml() {
-    const tabs = this._branches.map((b) => {
+    const order = this._branchTreeOrder();
+    const multi = this._branches.length > 1;
+    const rows = order.map(({ b, depth, isLast, ancestorsLast }) => {
       const on = b.id === this._activeBranchId;
+      // Build the ASCII-ish guide: vertical bars for open ancestors, an elbow.
+      let guide = "";
+      for (let d = 0; d < depth; d++) {
+        const lastAtThatDepth = ancestorsLast[d];
+        guide += `<span class="bt-rail">${d === depth - 1 ? (isLast ? "└" : "├") : (lastAtThatDepth ? " " : "│")}</span>`;
+      }
+      const fork = b.parent ? `<span class="bt-fork muted" title="forked after ${b.forkAt} message${b.forkAt === 1 ? "" : "s"}">⑂${b.forkAt}</span>` : "";
       return `
-        <button type="button" class="branch-tab${on ? " on" : ""}" data-branch="${esc(b.id)}" title="${esc(b.name)} · ${b.lane.length} msg">
+        <div class="branch-node${on ? " on" : ""}" data-branch="${esc(b.id)}" role="tab"
+          aria-selected="${on}" tabindex="${on ? 0 : -1}" title="${esc(b.name)} · ${b.lane.length} msg">
+          <span class="bt-guide" aria-hidden="true">${guide}</span>
+          <span class="bt-dot"></span>
           <span class="branch-name">${esc(b.name)}</span>
+          ${fork}
           <span class="branch-count muted">${b.lane.length}</span>
-          ${this._branches.length > 1 ? `<span class="branch-x" data-branch-del="${esc(b.id)}" title="Delete branch">✕</span>` : ""}
-        </button>`;
+          ${multi ? `<span class="branch-x" data-branch-del="${esc(b.id)}" role="button" tabindex="-1" title="Delete branch (children re-parent)">✕</span>` : ""}
+        </div>`;
     }).join("");
     return `
-      <div class="branch-bar" role="tablist" aria-label="Branches">
-        <span class="branch-bar-label muted">branches</span>
-        ${tabs}
-        <button type="button" class="mini-btn branch-add" data-branch-dup title="Duplicate the active branch into a new sibling">＋ branch</button>
+      <div class="branch-tree" role="tablist" aria-label="Branch tree">
+        <div class="branch-tree-head">
+          <span class="branch-bar-label muted">branch tree</span>
+          <button type="button" class="mini-btn branch-add" data-branch-dup title="Duplicate the active branch into a new child">＋ branch</button>
+        </div>
+        <div class="branch-rows">${rows}</div>
       </div>`;
   }
 
+  // Depth-first pre-order over the parent→child forest, carrying the data the
+  // guide rails need (whether each ancestor was the last child of its parent).
+  _branchTreeOrder() {
+    const out = [];
+    const visit = (b, depth, ancestorsLast) => {
+      const siblings = this._children(b.parent);
+      const isLast = siblings[siblings.length - 1]?.id === b.id;
+      out.push({ b, depth, isLast, ancestorsLast });
+      const kids = this._children(b.id);
+      kids.forEach((k) => visit(k, depth + 1, [...ancestorsLast, isLast]));
+    };
+    // Roots: parent is null, OR parent no longer exists (defensive).
+    const ids = new Set(this._branches.map((b) => b.id));
+    const roots = this._branches.filter((b) => !b.parent || !ids.has(b.parent));
+    roots.forEach((r) => visit(r, 0, []));
+    // Safety: include any branch not reached (shouldn't happen) as a root.
+    for (const b of this._branches) if (!out.some((o) => o.b.id === b.id)) out.push({ b, depth: 0, isLast: true, ancestorsLast: [] });
+    return out;
+  }
+
   _wireBranchBar() {
-    this.querySelectorAll("[data-branch]").forEach((b) =>
+    const rows = [...this.querySelectorAll(".branch-node")];
+    rows.forEach((b) => {
       b.addEventListener("click", (e) => {
         if (e.target.closest("[data-branch-del]")) return;
         this._activeBranchId = b.dataset.branch; this.render();
-      }));
+      });
+      b.addEventListener("keydown", (e) => {
+        if (e.key === "Enter" || e.key === " ") { e.preventDefault(); this._activeBranchId = b.dataset.branch; this.render(); return; }
+        if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+          e.preventDefault();
+          const i = rows.indexOf(b);
+          const next = rows[i + (e.key === "ArrowDown" ? 1 : -1)];
+          next?.focus();
+        }
+      });
+    });
     this.querySelectorAll("[data-branch-del]").forEach((x) =>
       x.addEventListener("click", (e) => {
         e.stopPropagation();
@@ -270,7 +329,7 @@ class CvLoom extends HTMLElement {
     this.querySelector("[data-branch-dup]")?.addEventListener("click", () => {
       const cur = this._branch();
       const lane = cur.lane.map((e) => ({ ...e, uid: randomId(), message: JSON.parse(JSON.stringify(e.message)) }));
-      this._newBranch(`${cur.name}′`, lane);
+      this._newBranch(`${cur.name}′`, lane, { parent: cur.id, forkAt: cur.lane.length });
       this.render();
     });
   }
@@ -279,8 +338,12 @@ class CvLoom extends HTMLElement {
     if (this._branches.length <= 1) return;
     const i = this._branches.findIndex((b) => b.id === id);
     if (i < 0) return;
+    const gone = this._branches[i];
+    // Re-parent any children onto the deleted branch's parent so the tree stays
+    // connected (no orphaned sub-trees).
+    for (const b of this._branches) if (b.parent === id) { b.parent = gone.parent; b.forkAt = Math.min(b.forkAt, gone.forkAt); }
     this._branches.splice(i, 1);
-    if (this._activeBranchId === id) this._activeBranchId = this._branches[Math.max(0, i - 1)].id;
+    if (this._activeBranchId === id) this._activeBranchId = (gone.parent && this._branches.find((b) => b.id === gone.parent)?.id) || this._branches[Math.max(0, i - 1)].id;
     this.render();
   }
 
@@ -288,16 +351,17 @@ class CvLoom extends HTMLElement {
 
   _genBarHtml() {
     const model = getModel();
-    const ready = hasKey();
+    const native = canInvokeNative();        // desktop: route through native commands, no key needed
+    const ready = native || hasKey();
     const busy = this._gen.busy;
     return `
       <div class="loom-gen">
         <button type="button" class="btn-gen" data-generate ${this._lane.length && !busy ? "" : "disabled"}
-          title="${ready ? "Send the composition to OpenRouter and append the reply" : "Set an API key in ⚙ generation first"}">
+          title="${ready ? (native ? "Generate via the desktop runtime (no API key needed)" : "Send the composition to OpenRouter and append the reply") : "Set an API key in ⚙ generation first"}">
           ${busy ? "⏳ generating…" : "⚡ generate continuation"}
         </button>
         ${busy ? `<button type="button" class="mini-btn" data-gen-stop>stop</button>` : ""}
-        <span class="gen-model muted" title="active model">${esc(model)}</span>
+        <span class="gen-model muted" title="active model">${native ? "🖥 native" : esc(model)}</span>
         ${!ready ? `<button type="button" class="gen-needkey" data-settings-open>add API key →</button>` : ""}
         ${this._gen.error ? `<div class="gen-error" role="alert">${esc(this._gen.error)}</div>` : ""}
       </div>`;
@@ -313,7 +377,8 @@ class CvLoom extends HTMLElement {
 
   async _generate() {
     if (this._gen.busy || !this._lane.length) return;
-    if (!hasKey()) { this._showSettings = true; this._gen.error = "Add an OpenRouter API key first."; this.render(); return; }
+    const native = canInvokeNative();
+    if (!native && !hasKey()) { this._showSettings = true; this._gen.error = "Add an OpenRouter API key first."; this.render(); return; }
 
     this._gen.busy = true;
     this._gen.error = "";
@@ -347,11 +412,10 @@ class CvLoom extends HTMLElement {
       const messages = this._lane
         .filter((e) => e.uid !== entry.uid) // send everything *before* the placeholder
         .map((e) => e.message);
-      const text = await generate({
-        messages,
-        signal: this._abort.signal,
-        onToken: (_chunk, full) => setText(full),
-      });
+      // Desktop: route through the native runtime (no API key). Browser: OpenRouter.
+      const text = native
+        ? await nativeGenerate({ messages, model: getModel(), onToken: (_chunk, full) => setText(full) })
+        : await generate({ messages, signal: this._abort.signal, onToken: (_chunk, full) => setText(full) });
       setText(text);
       if (!text.trim()) {
         // Empty reply — drop the placeholder so we don't leave a blank turn.
@@ -448,9 +512,10 @@ class CvLoom extends HTMLElement {
     list.querySelectorAll("[data-branchfork]").forEach((b) => b.addEventListener("click", () => {
       const i = this._idx(b.dataset.branchfork);
       if (i < 0) return;
+      const cur = this._branch();
       const prefix = this._lane.slice(0, i + 1).map((e) => ({ ...e, uid: randomId(), message: JSON.parse(JSON.stringify(e.message)) }));
-      const base = this._branch().name.replace(/′+$/, "");
-      this._newBranch(`${base}·fork`, prefix);
+      const base = cur.name.replace(/′+$/, "");
+      this._newBranch(`${base}·fork`, prefix, { parent: cur.id, forkAt: i + 1 });
       this.render();
     }));
 

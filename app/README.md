@@ -3,7 +3,8 @@
 A single clickable cross-platform desktop application that wraps claurdvoyant:
 the existing **static web UI** (session viewer, timeline, compare, stats, OpenSession,
 splice/loom composer, fleet dashboard) plus **native Rust backend power** (distill,
-redact, generative loom) and an auto-launched local fleet API.
+redact, generative loom, **native zip ingest**), a **native application menu**,
+**persisted window state**, and an auto-launched local fleet API.
 
 ## Layout
 
@@ -15,7 +16,7 @@ app/
     ├── build.rs         ← tauri-build codegen
     ├── tauri.conf.json  ← v2 config; identifier `town.lunar.claurdvoyant`
     ├── capabilities/
-    │   └── default.json ← grants core + shell:allow-open to the main window
+    │   └── default.json ← grants core + shell:allow-open + dialog:default to the main window
     ├── icons/           ← app icon set (crystal-ball theme)
     └── src/
         ├── main.rs      ← thin binary entry point
@@ -43,11 +44,46 @@ Rust means LLM API keys live in the desktop *process* env, never in JS:
 | `distill`       | `{ sessionJson: string }`                     | Markdown digest (`string`)      | `cv_llm::distill`      |
 | `redact`        | `{ sessionJson: string }`                     | redacted Session as JSON string | `cv_core::redact`      |
 | `generate`      | `{ sessionJson: string, model?: string }`     | next assistant turn (`string`)  | `cv_llm::generate`     |
+| `ingest_zip`    | `{ path: string }`                            | `Session[]` as a JSON string    | `cv_core::ingest::ingest_files` |
 | `provider_info` | `{}`                                          | `{ provider, available }`       | `cv_llm::available_provider` |
 
 `distill`/`generate` need a provider in the environment — see [LLM providers](#llm-providers).
-`redact` is pure and offline (no key needed). All take/return the **same Session IR JSON**
-the web UI already speaks (`serde_json` round-trip of `cv_core::Session`).
+`redact` and `ingest_zip` are pure and offline (no key needed). All take/return the **same
+Session IR JSON** the web UI already speaks (`serde_json` round-trip of `cv_core::Session`).
+
+`ingest_zip` reads a `.zip` from disk, unzips it **in-memory** (the `zip` crate, deflate only),
+and runs the same `cv_core::ingest::ingest_files` the browser's WASM path uses — so native
+file-open works **without** the WASM module. It returns the `Session[]` array as a JSON string,
+the exact shape the web UI's WASM `ingest_zip` produces.
+
+## Native application menu
+
+The app installs a native [`Menu`](https://docs.rs/tauri/2/tauri/menu/) in `setup` (handled in
+`on_menu_event`):
+
+- **File → Open zip…** (`Cmd/Ctrl+O`) — native file dialog (`tauri-plugin-dialog`) → in-memory
+  unzip + ingest → **emits the `cv://open-sessions` Tauri event** with the `Session[]` JSON
+  payload. The `web/` UI can `listen("cv://open-sessions", …)` to load the sessions without WASM.
+  Ingest/read errors surface in a native error dialog. The picker + ingest run off the main
+  thread so the event loop never blocks.
+- **File → Quit** — predefined quit item.
+- **View → Reload** (`Cmd/Ctrl+R`) reloads the webview, **Toggle DevTools** (`Cmd/Ctrl+Alt+I`;
+  the `tauri` `devtools` feature is enabled so this works in release bundles too),
+  **Toggle Fullscreen**, and **Toggle cvd serve** (start/stop the sidecar at runtime).
+- **Help → About claurdvoyant** (predefined, with name/version/description) and
+  **Open the web demo** (opens the public demo in the default browser via `shell:allow-open`).
+
+The native dialog is driven from **Rust** (`app.dialog().file()…`), so no JS-side permission is
+strictly required; `dialog:default` is still granted in `capabilities/default.json` for any
+future JS use.
+
+## Window state
+
+Window size/position (and maximized/fullscreen flags) persist across launches via the official
+[`tauri-plugin-window-state`](https://docs.rs/tauri-plugin-window-state) — registered as
+`tauri_plugin_window_state::Builder::new().build()`. It writes a small `.window-state.json` in
+the app config dir, restores on startup, and saves on close automatically. No manual save/restore
+code needed.
 
 ## cvd serve wiring
 
@@ -69,7 +105,8 @@ cargo build -p cvd            # from the repo root → target/debug/cvd
 ```
 
 If `cvd` can't be found, the app still runs; only the live fleet dashboard is unavailable
-(a clear note is logged to stderr).
+(a clear note is logged to stderr). You can also start/stop the sidecar at runtime from
+**View → Toggle cvd serve**. The child is always killed on app exit (`RunEvent::Exit`).
 
 > **Optional: make it a real sidecar for a self-contained bundle.** Build `cvd`
 > (`cargo build -p cvd --release`), copy it to `app/src-tauri/binaries/cvd-<target-triple>`
@@ -116,11 +153,14 @@ Requirements:
 
 ## Verified in this environment
 
-- `cargo build` in `app/src-tauri` **compiles cleanly** (Tauri v2 + system WebKit on macOS;
-  cv-core / cv-llm / cv-search all build via relative paths).
-- `cargo tauri info` validates `tauri.conf.json`, the shell plugin, and `frontendDist: ../../web`.
+- `cargo build` **and** `cargo build --release` in `app/src-tauri` **compile cleanly** — Tauri v2
+  (with the `devtools` feature) + system WebKit on macOS; the dialog, window-state, and shell
+  plugins; the `zip` crate; and cv-core / cv-llm / cv-search via relative paths. No warnings from
+  `claurdvoyant-app` itself.
 - The app is **excluded from the main repo workspace** (`cargo metadata` at the repo root does
   not list `claurdvoyant-app`).
 
-A full `cargo tauri build` bundle (.app/.dmg) was not produced here; run it on your machine
-with `tauri-cli` installed (it is — `tauri-cli 2.9.6`).
+A full `cargo tauri dev` / `cargo tauri build` bundle (.app/.dmg) needs a display and (for
+distribution) codesigning, so it was not produced here — run it on your machine with `tauri-cli`
+installed (`cargo install tauri-cli --version '^2'`). Getting it to **compile** with the menu,
+dialog, native ingest, and window-state is what's verified above.

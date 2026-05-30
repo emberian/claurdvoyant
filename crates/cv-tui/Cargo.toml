@@ -1,0 +1,21 @@
+[package]
+name = "cv-tui"
+description = "claurdvoyant TUI — a terminal browser for agent sessions (search, read, scry, board)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "cv-tui"
+path = "src/main.rs"
+
+[dependencies]
+cv-core = { path = "../cv-core" }
+cv-search = { path = "../cv-search" }
+anyhow.workspace = true
+chrono.workspace = true
+dirs.workspace = true
+ratatui = "0.29"
+crossterm = "0.28"

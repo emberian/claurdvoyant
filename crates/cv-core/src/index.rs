@@ -210,21 +210,35 @@ impl Index {
             .query_map(rusqlite::params![match_expr, limit], |row| {
                 let harness_s: String = row.get(1)?;
                 let updated_s: Option<String> = row.get(4)?;
-                Ok(IndexHit {
-                    id: row.get(0)?,
-                    harness: Harness::parse(&harness_s).unwrap_or(Harness::Claude),
-                    cwd: row.get(2)?,
-                    title: row.get(3)?,
-                    updated_at: updated_s
+                Ok((
+                    row.get::<_, String>(0)?,
+                    harness_s,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    updated_s
                         .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
                         .map(|d| d.with_timezone(&Utc)),
-                    snippet: row.get(5)?,
-                })
+                    row.get::<_, String>(5)?,
+                ))
             })
             .context("running search query")?;
         let mut hits = Vec::new();
         for r in rows {
-            hits.push(r.context("reading search row")?);
+            let (id, harness_s, cwd, title, updated_at, snippet) = r.context("reading search row")?;
+            // A row whose stored harness we no longer recognize is dropped, not relabeled — mislabeling
+            // it (e.g. as Claude) would corrupt `cv show`/resume, which dispatch on harness.
+            let Some(harness) = Harness::parse(&harness_s) else {
+                eprintln!("cv: index hit {id} has unknown harness {harness_s:?}; skipping");
+                continue;
+            };
+            hits.push(IndexHit {
+                id,
+                harness,
+                cwd,
+                title,
+                updated_at,
+                snippet,
+            });
         }
         Ok(hits)
     }

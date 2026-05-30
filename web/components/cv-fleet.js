@@ -65,7 +65,13 @@ class CvFleet extends HTMLElement {
     this._poll();
     this._timer = setInterval(() => { if (!this._paused) this._poll(); }, POLL_MS);
   }
-  _stop() { if (this._timer) { clearInterval(this._timer); this._timer = null; } }
+  _stop() {
+    if (this._timer) { clearInterval(this._timer); this._timer = null; }
+    // Abort any in-flight poll so its late resolution can't clobber the UI
+    // after we've torn down / reconnected.
+    if (this._ctrl) { try { this._ctrl.abort(); } catch { /* ignore */ } this._ctrl = null; }
+    this._inflight = false;
+  }
 
   async _fetchJson(path, signal) {
     const url = this._base.replace(/\/+$/, "") + path;
@@ -78,6 +84,7 @@ class CvFleet extends HTMLElement {
     if (this._inflight || this._staticMode) return;
     this._inflight = true;
     const ctrl = new AbortController();
+    this._ctrl = ctrl;
     const to = setTimeout(() => ctrl.abort(), POLL_MS + 1500);
     try {
       const health = await this._fetchJson("/api/health", ctrl.signal);
@@ -105,12 +112,19 @@ class CvFleet extends HTMLElement {
 
       this._lastUpdate = Date.now();
     } catch (err) {
+      // If this poll was superseded (reconnect/teardown aborted it), drop it
+      // silently — its late result must not clobber the current view.
+      if (this._ctrl !== ctrl) { clearTimeout(to); return; }
       this._state = "error";
       this._err = err?.name === "AbortError" ? "request timed out" : (err?.message || String(err));
     } finally {
       clearTimeout(to);
-      this._inflight = false;
-      this.render();
+      // Only the current poll clears the inflight flag and repaints.
+      if (this._ctrl === ctrl) {
+        this._inflight = false;
+        this._ctrl = null;
+        this.render();
+      }
     }
   }
 

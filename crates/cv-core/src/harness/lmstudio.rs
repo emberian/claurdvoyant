@@ -360,12 +360,18 @@ fn push_content_parts(content: Option<&Value>, m: &mut Message, as_thinking: boo
 
 fn push_text(m: &mut Message, text: String, as_thinking: bool) {
     if as_thinking {
+        // Explicit reasoning steps (`style.type=="thinking"`) stay a single Thinking block.
         m.content.push(Block::Thinking {
             text,
             signature: None,
             encrypted: None,
             redacted: false,
         });
+    } else if crate::harmony::looks_like_harmony(&text) {
+        // gpt-oss (common in LM Studio) embeds Harmony channel markers in plain assistant text:
+        // analysis → Thinking, commentary tool calls → ToolUse, final → Text. Decode them into
+        // first-class IR blocks instead of leaving the raw `<|channel|>…` markers in the text.
+        m.content.extend(crate::harmony::decode_content(&text));
     } else {
         m.content.push(Block::Text { text });
     }
@@ -552,5 +558,48 @@ mod tests {
         let ts = step_id_ts("1754425094719-0.022738884687463323").unwrap();
         assert_eq!(ts.timestamp_millis(), 1754425094719);
         assert!(step_id_ts("garbage").is_none());
+    }
+
+    #[test]
+    fn gpt_oss_harmony_text_decodes_into_blocks() {
+        // gpt-oss output stored by LM Studio as raw Harmony-framed assistant text should be decoded
+        // into Thinking + ToolUse + Text instead of a single text block full of `<|channel|>` markers.
+        let path = fixture("harmony.conversation.json");
+        if !path.exists() {
+            return; // fixture optional in minimal checkouts
+        }
+        let r = scan(&path).unwrap().unwrap();
+        let s = LmStudio { root: None }.parse(&r).unwrap();
+        assert_eq!(s.messages.len(), 2);
+
+        let a = &s.messages[1];
+        assert_eq!(a.role, Role::Assistant);
+        // No raw Harmony markers should survive in the decoded blocks.
+        assert_eq!(a.content.len(), 3, "thinking + tooluse + text");
+
+        match &a.content[0] {
+            Block::Thinking { text, .. } => {
+                assert!(text.contains("get_weather"));
+                assert!(!text.contains("<|channel|>"));
+            }
+            other => panic!("expected Thinking, got {other:?}"),
+        }
+        match &a.content[1] {
+            Block::ToolUse { name, input, .. } => {
+                assert_eq!(name, "get_weather");
+                assert_eq!(input["location"], "San Francisco, CA");
+            }
+            other => panic!("expected ToolUse, got {other:?}"),
+        }
+        match &a.content[2] {
+            Block::Text { text } => {
+                assert!(text.contains("sunny"));
+                assert!(!text.contains("<|"));
+            }
+            other => panic!("expected Text, got {other:?}"),
+        }
+        // Model + usage still parsed from genInfo.
+        assert_eq!(a.model.as_deref(), Some("openai/gpt-oss-120b"));
+        assert_eq!(a.usage.as_ref().unwrap().output_tokens, Some(68));
     }
 }

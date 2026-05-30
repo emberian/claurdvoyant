@@ -147,29 +147,56 @@ impl Archive {
         Ok(map.into_values().collect())
     }
 
-    /// Insert/replace an entry and atomically rewrite the deduped catalog.
+    /// Record an entry by **appending** one line — O(1) per archive instead of rewriting the whole
+    /// catalog every time (which made N archives O(N²)). `load_catalog` already dedups by key with
+    /// the newest `archived_at` winning, so superseded lines are harmless until we compact. When the
+    /// raw line count grows well past the number of unique entries, rewrite once to reclaim space.
     fn upsert_catalog(&self, entry: CatalogEntry) -> Result<()> {
-        let mut entries = self.load_catalog()?;
-        let key = entry.key();
-        entries.retain(|e| e.key() != key);
-        entries.push(entry);
-
-        if let Some(parent) = self.catalog_path().parent() {
+        let path = self.catalog_path();
+        if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)
                 .with_context(|| format!("creating {}", parent.display()))?;
         }
-        let tmp = self.catalog_path().with_extension("jsonl.tmp");
+        let line = serde_json::to_string(&entry)?;
+        {
+            let mut f = fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+                .with_context(|| format!("opening {} for append", path.display()))?;
+            writeln!(f, "{line}")?;
+            f.flush()?;
+        }
+        self.maybe_compact_catalog()?;
+        Ok(())
+    }
+
+    /// Rewrite the catalog to one line per unique entry, but only when the on-disk line count has
+    /// drifted far enough past the unique count to be worth the full rewrite (amortizes to O(1)).
+    fn maybe_compact_catalog(&self) -> Result<()> {
+        let path = self.catalog_path();
+        let raw = match fs::read_to_string(&path) {
+            Ok(s) => s,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+        };
+        let raw_lines = raw.lines().filter(|l| !l.trim().is_empty()).count();
+        let entries = self.load_catalog()?;
+        // Compact only once we're carrying ~2x dead weight (and past a small floor).
+        if raw_lines < 64 || raw_lines < entries.len() * 2 {
+            return Ok(());
+        }
+        let tmp = path.with_extension(format!("{}.jsonl.tmp", std::process::id()));
         {
             let mut f = fs::File::create(&tmp)
                 .with_context(|| format!("creating {}", tmp.display()))?;
             for e in &entries {
-                let line = serde_json::to_string(e)?;
-                writeln!(f, "{line}")?;
+                writeln!(f, "{}", serde_json::to_string(e)?)?;
             }
             f.flush()?;
         }
-        fs::rename(&tmp, self.catalog_path())
-            .with_context(|| format!("finalizing {}", self.catalog_path().display()))?;
+        fs::rename(&tmp, &path)
+            .with_context(|| format!("finalizing {}", path.display()))?;
         Ok(())
     }
 }

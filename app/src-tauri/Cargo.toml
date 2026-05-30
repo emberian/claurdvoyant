@@ -23,11 +23,19 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = [] }
+# `devtools`: keep the View → Toggle DevTools menu item working in release bundles too
+# (otherwise the open/close_devtools APIs are debug-only).
+tauri = { version = "2", features = ["devtools"] }
 tauri-plugin-shell = "2"
+tauri-plugin-dialog = "2"
+tauri-plugin-window-state = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"
+
+# Native in-memory zip ingestion (Open zip… menu item). No default features: we only
+# need stored/deflate reading, not the heavy optional codecs.
+zip = { version = "2", default-features = false, features = ["deflate"] }
 
 # The native power: pull in the workspace crates by relative path so the desktop app can
 # call distill/redact/generate without shipping API keys into JS.

@@ -19,6 +19,7 @@ import "./cv-loom.js";
 import "./cv-fleet.js";
 import "./cv-opensession.js";
 import { esc, normalizeSessions, randomId } from "./util.js";
+import { isTauri, listen } from "../tauri.js";
 
 const VIEWS = [
   ["sessions", "Sessions", "🗂"],
@@ -43,6 +44,13 @@ class CvApp extends HTMLElement {
   connectedCallback() {
     this.render();
     this._init();
+    this._wireKeyboard();
+    this._wireTauri();
+  }
+
+  disconnectedCallback() {
+    if (this._onKeydown) document.removeEventListener("keydown", this._onKeydown);
+    this._unlistenTauri?.();
   }
 
   async _init() {
@@ -60,11 +68,37 @@ class CvApp extends HTMLElement {
         this._sources = [{ name: "sample", count: this._sessions.length }];
         this._isSample = true;
         this._refreshViews();
-        this._setStatus("Showing the bundled sample dataset — drop one or more .zip / .json files to load your own.");
+        this._setStatus(isTauri()
+          ? "Showing the bundled sample — use File → Open in the desktop app, or drop .zip / .json files, to load your own."
+          : "Showing the bundled sample dataset — drop one or more .zip / .json files to load your own.");
       }
     } catch (e) {
       console.warn("[claurdvoyant] failed to load sample:", e);
     }
+  }
+
+  // ---- Tauri: native File→Open pushes sessions via the cv://open-sessions event
+  async _wireTauri() {
+    if (!isTauri()) return;
+    this._unlistenTauri = await listen("cv://open-sessions", (payload) => {
+      try {
+        const sessions = normalizeSessions(payload);
+        if (!sessions.length) { this._setStatus("File → Open: no sessions in that payload.", "warn"); return; }
+        if (this._isSample) { this._sessions = []; this._sources = []; this._isSample = false; }
+        this._sessions = this._mergePool(this._sessions, sessions);
+        this._sources.push({ name: "File → Open", count: sessions.length });
+        this._renderSources();
+        this._refreshViews();
+        if (this._list && this._sessions[0] && !this._list.selectedId) {
+          this._transcript.session = this._sessions[0];
+          this._list.selectedId = this._sessions[0].id;
+        }
+        this._setStatus(`Loaded ${sessions.length} session${sessions.length === 1 ? "" : "s"} from File → Open.`, "ok");
+      } catch (err) {
+        console.error("[claurdvoyant] cv://open-sessions failed:", err);
+        this._setStatus("Could not load the opened sessions.", "error");
+      }
+    });
   }
 
   render() {
@@ -78,7 +112,8 @@ class CvApp extends HTMLElement {
           </div>
         </div>
         <div class="header-actions">
-          <button type="button" class="theme-toggle" title="Toggle light / dark" aria-label="Toggle theme">◐</button>
+          <button type="button" class="icon-btn help-btn" title="Keyboard shortcuts (?)" aria-label="Keyboard shortcuts">?</button>
+          <button type="button" class="icon-btn theme-toggle" title="Toggle theme — dark / light / auto (t)" aria-label="Toggle theme">◐</button>
           <a class="repo-link" href="https://github.com/" target="_blank" rel="noopener" title="Project repository">source</a>
         </div>
       </header>
@@ -126,6 +161,7 @@ class CvApp extends HTMLElement {
 
     this._wireDropzone();
     this._wireTheme();
+    this.querySelector(".help-btn")?.addEventListener("click", () => this._toggleHelp());
     this._renderView();
     this._renderSources();
   }
@@ -234,6 +270,91 @@ class CvApp extends HTMLElement {
       root.setAttribute("data-theme", next);
       localStorage.setItem("cv-theme", next);
     });
+  }
+
+  // ---- keyboard shortcuts + help overlay --------------------------------
+
+  _wireKeyboard() {
+    this._onKeydown = (e) => {
+      // Don't hijack typing in inputs/textareas/contenteditable/selects.
+      const t = e.target;
+      const typing = t && (t.isContentEditable ||
+        /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName));
+
+      if (e.key === "Escape") {
+        if (this._helpOpen) { this._toggleHelp(false); e.preventDefault(); return; }
+        // In the narrow sessions layout, Esc returns to the list.
+        const layout = this._sessionsLayout;
+        if (this._view === "sessions" && layout?.classList.contains("show-transcript")) {
+          layout.classList.remove("show-transcript"); e.preventDefault(); return;
+        }
+        if (typing) t.blur();
+        return;
+      }
+
+      if (typing) return;
+      if (e.metaKey || e.ctrlKey || e.altKey) return;
+
+      // "?" (Shift+/) toggles help.
+      if (e.key === "?") { this._toggleHelp(); e.preventDefault(); return; }
+      // "/" focuses the session search (switching to sessions first).
+      if (e.key === "/") {
+        if (this._view !== "sessions") this._setView("sessions");
+        const search = this._list?.querySelector?.(".search");
+        if (search) { search.focus(); search.select?.(); e.preventDefault(); }
+        return;
+      }
+      // "t" cycles theme.
+      if (e.key === "t") { this.querySelector(".theme-toggle")?.click(); e.preventDefault(); return; }
+      // Number keys 1..N switch tabs.
+      if (/^[1-9]$/.test(e.key)) {
+        const idx = Number(e.key) - 1;
+        if (VIEWS[idx]) { this._setView(VIEWS[idx][0]); e.preventDefault(); }
+        return;
+      }
+      // j/k + arrows: move selection within the session list.
+      if (this._view === "sessions" && ["j", "k", "ArrowDown", "ArrowUp"].includes(e.key)) {
+        const dir = (e.key === "j" || e.key === "ArrowDown") ? 1 : -1;
+        if (this._list?.moveSelection?.(dir)) e.preventDefault();
+        return;
+      }
+    };
+    document.addEventListener("keydown", this._onKeydown);
+  }
+
+  _toggleHelp(force) {
+    this._helpOpen = force === undefined ? !this._helpOpen : !!force;
+    let overlay = this.querySelector(".help-overlay");
+    if (this._helpOpen && !overlay) {
+      overlay = document.createElement("div");
+      overlay.className = "help-overlay";
+      overlay.setAttribute("role", "dialog");
+      overlay.setAttribute("aria-modal", "true");
+      overlay.setAttribute("aria-label", "Keyboard shortcuts");
+      const rows = [
+        ["1 – 7", "Switch view (Sessions, Timeline, Compare, …)"],
+        ["/", "Focus session search"],
+        ["j / k  ·  ↓ / ↑", "Move selection in the session list"],
+        ["Enter", "Open the focused session"],
+        ["t", "Cycle theme (dark → light → auto)"],
+        ["Esc", "Close this help · back to the session list"],
+        ["?", "Toggle this help"],
+      ];
+      overlay.innerHTML = `
+        <div class="help-card">
+          <div class="help-head"><h2>Keyboard shortcuts</h2>
+            <button type="button" class="mini-btn help-close" aria-label="Close">esc ✕</button></div>
+          <table class="help-table">${rows.map(([k, d]) =>
+            `<tr><td class="help-key">${k.split(/\s+/).map((p) => /^[·–]$/.test(p) ? esc(p) : `<kbd>${esc(p)}</kbd>`).join(" ")}</td><td>${esc(d)}</td></tr>`).join("")}</table>
+          <p class="help-foot muted">claurdvoyant runs entirely in your browser — nothing is uploaded.</p>
+        </div>`;
+      overlay.addEventListener("click", (e) => { if (e.target === overlay) this._toggleHelp(false); });
+      overlay.querySelector(".help-close").addEventListener("click", () => this._toggleHelp(false));
+      this.appendChild(overlay);
+      overlay.querySelector(".help-close").focus();
+    } else if (!this._helpOpen && overlay) {
+      overlay.remove();
+    }
   }
 
   _wireDropzone() {

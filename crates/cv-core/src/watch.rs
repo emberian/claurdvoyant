@@ -93,11 +93,18 @@ impl Watcher {
     /// Record current state without emitting anything.
     fn prime(&mut self) {
         for r in self.discover() {
+            // The cheap discover `message_count` is NOT the parsed IR length for several harnesses
+            // (codex/hermes/claude add reasoning/tool/system turns), so seeding `parsed_len` from it
+            // makes the first `Updated` poll re-emit messages that predate the watcher. Parse here to
+            // record the true baseline.
+            let parsed_len = Self::parse(&r)
+                .map(|s| s.messages.len())
+                .unwrap_or(r.message_count);
             self.seen.insert(
                 Self::key(&r),
                 State {
                     trigger: Self::trigger_of(&r),
-                    parsed_len: r.message_count,
+                    parsed_len,
                 },
             );
         }

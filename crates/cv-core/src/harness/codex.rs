@@ -469,12 +469,20 @@ fn handle_item(
                 ("local_shell".to_string(), Value::Object(obj))
             } else {
                 let name = str_field("name");
+                // Tool `arguments`/`input` arrive as JSON-encoded *strings*. Only treat the decode as
+                // structured when it yields an object/array; a bare scalar (e.g. the literal arg `"42"`
+                // or `"true"`) must stay a string, or we'd silently retype the call's payload.
+                let as_structured = |s: &str| -> Value {
+                    match serde_json::from_str::<Value>(s) {
+                        Ok(v @ Value::Object(_)) | Ok(v @ Value::Array(_)) => v,
+                        _ => Value::String(s.to_string()),
+                    }
+                };
                 let input = if let Some(args) = p.get("arguments").and_then(Value::as_str) {
-                    // `arguments` is JSON-as-string; parse when possible.
-                    serde_json::from_str(args).unwrap_or(Value::String(args.to_string()))
+                    as_structured(args)
                 } else if let Some(input) = p.get("input").and_then(Value::as_str) {
                     // custom_tool_call `input` is a freeform string.
-                    serde_json::from_str(input).unwrap_or(Value::String(input.to_string()))
+                    as_structured(input)
                 } else {
                     p.get("input").cloned().unwrap_or(Value::Null)
                 };

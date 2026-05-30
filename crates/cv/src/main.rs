@@ -55,9 +55,10 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
-    /// Export a session to markdown or JSON (stdout).
+    /// Export a session to markdown, JSON, or self-contained HTML (stdout).
     Export {
         id: String,
+        /// Output format: `md` (default), `json`, or `html`.
         #[arg(long, default_value = "md")]
         format: String,
         #[arg(long)]
@@ -644,17 +645,24 @@ fn cmd_board(action: BoardCmd) -> Result<()> {
             }
         }
         BoardCmd::Release { channel, key, from } => {
-            // We can only `release` a real `Lease` (its dir/channel fields are private). Re-claim
-            // the key as `from` — if we own it (or it's free), claim renews and hands us back a
-            // releasable lease; then drop it. If another agent holds it, there's nothing of ours
-            // to release.
-            match board::claim(&channel, &from, &key, Duration::from_secs(1))? {
-                Some(lease) => {
-                    board::release(&lease)?;
-                    println!("✦ released {key} on #{channel}");
-                }
-                None => {
-                    println!("(claim {key} on #{channel} is held by another agent — nothing to release)");
+            // We can only `release` a real `Lease` (its dir/channel fields are private). But we must
+            // not *acquire* a free key just to drop it — that would print "released" for something we
+            // never held. So first confirm `from` actually owns a live claim on `key`; only then
+            // re-claim (which renews our own lease) and release it.
+            let owned = board::active_claims(&channel)?
+                .into_iter()
+                .any(|(k, owner, _)| k == key && owner == from);
+            if !owned {
+                println!("(you don't hold {key} on #{channel} — nothing to release)");
+            } else {
+                match board::claim(&channel, &from, &key, Duration::from_secs(1))? {
+                    Some(lease) => {
+                        board::release(&lease)?;
+                        println!("✦ released {key} on #{channel}");
+                    }
+                    None => {
+                        println!("(claim {key} on #{channel} is held by another agent — nothing to release)");
+                    }
                 }
             }
         }
@@ -1235,7 +1243,8 @@ fn cmd_export(id: &str, format: &str, harness: Option<String>) -> Result<()> {
     match format {
         "json" => println!("{}", serde_json::to_string_pretty(&session)?),
         "md" | "markdown" => print!("{}", to_markdown(&session)),
-        other => bail!("unknown format {other:?} (use md or json)"),
+        "html" => print!("{}", cv_core::html::to_html(&session)),
+        other => bail!("unknown format {other:?} (use md, json, or html)"),
     }
     Ok(())
 }
@@ -1458,9 +1467,14 @@ fn cmd_timeline(harness: Option<String>, cwd: Option<String>, limit: usize) -> R
 /// Compare two sessions message-by-message: a shared prefix (`=`) then a divergence marked
 /// `<` (only in A) / `>` (only in B). Comparison is on role + `Message::text()`.
 fn cmd_diff(a: &str, b: &str, harness: Option<String>) -> Result<()> {
-    let want = parse_harness(&harness)?;
-    let (ra, aa) = cv_core::find(a, want)?.with_context(|| format!("no session matching {a:?}"))?;
-    let (rb, ab) = cv_core::find(b, want)?.with_context(|| format!("no session matching {b:?}"))?;
+    let default = parse_harness(&harness)?;
+    // Each side may carry its own `harness:id` prefix so the two sessions can live in *different*
+    // harnesses — applying one `--harness` to both made cross-harness diffs impossible. A side with
+    // no recognized prefix falls back to the shared `--harness` (or unconstrained search).
+    let (wa, ida) = split_side_harness(a, default);
+    let (wb, idb) = split_side_harness(b, default);
+    let (ra, aa) = cv_core::find(ida, wa)?.with_context(|| format!("no session matching {a:?}"))?;
+    let (rb, ab) = cv_core::find(idb, wb)?.with_context(|| format!("no session matching {b:?}"))?;
     let sa = aa.parse(&ra)?;
     let sb = ab.parse(&rb)?;
 
@@ -1492,6 +1506,18 @@ fn cmd_diff(a: &str, b: &str, harness: Option<String>) -> Result<()> {
         nb - shared
     );
     Ok(())
+}
+
+/// Split an optional `<harness>:<id>` prefix off a diff side. Only treats the part before the first
+/// `:` as a harness when it actually names one; otherwise the whole string is the id and `fallback`
+/// (the shared `--harness`) applies.
+fn split_side_harness(spec: &str, fallback: Option<Harness>) -> (Option<Harness>, &str) {
+    if let Some((head, rest)) = spec.split_once(':') {
+        if let Some(h) = Harness::parse(head) {
+            return (Some(h), rest);
+        }
+    }
+    (fallback, spec)
 }
 
 /// One-line `role: text-preview` for a diff row.

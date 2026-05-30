@@ -459,10 +459,31 @@ fn claude_assistant_blocks(content: &[Block]) -> Vec<Value> {
                 let label = path.as_deref().or(source.as_deref()).unwrap_or("?");
                 out.push(json!({ "type": "text", "text": format!("[file: {label}]") }));
             }
-            Block::Image { media_type, .. } => out.push(json!({
-                "type": "image",
-                "source": { "media_type": media_type },
-            })),
+            Block::Image { media_type, data_ref } => {
+                // Reconstruct the Anthropic `source` from our `data_ref` so the reference survives a
+                // round-trip (the parser keeps a ref, not the bytes — but dropping it here lost even
+                // the `file:`/url pointer). Mirror the three shapes claude.rs parses.
+                let mut source = serde_json::Map::new();
+                if let Some(mt) = media_type {
+                    source.insert("media_type".into(), json!(mt));
+                }
+                match data_ref.as_deref() {
+                    Some(r) if r.starts_with("file:") => {
+                        source.insert("type".into(), json!("file"));
+                        source.insert("file_id".into(), json!(&r["file:".len()..]));
+                    }
+                    Some("base64:inline") => {
+                        // Bytes were intentionally not retained in the IR; mark the kind.
+                        source.insert("type".into(), json!("base64"));
+                    }
+                    Some(r) => {
+                        source.insert("type".into(), json!("url"));
+                        source.insert("url".into(), json!(r));
+                    }
+                    None => {}
+                }
+                out.push(json!({ "type": "image", "source": Value::Object(source) }));
+            }
         }
     }
     if out.is_empty() {

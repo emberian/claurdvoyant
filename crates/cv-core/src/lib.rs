@@ -8,7 +8,9 @@
 
 pub mod board;
 pub mod emit;
+pub mod harmony;
 pub mod harness;
+pub mod html;
 #[cfg(feature = "sqlite")]
 pub mod index;
 pub mod ingest;
@@ -40,7 +42,12 @@ pub fn discover_all() -> Vec<SessionRef> {
 }
 
 /// Find a single session by id (optionally constrained to one harness), returning its ref + adapter.
+///
+/// An exact id match always wins and returns immediately. Otherwise the id is treated as a prefix:
+/// a single prefix hit is returned, but *multiple* distinct prefix hits are an error rather than a
+/// silent "first one wins" — callers should disambiguate (e.g. by passing a longer id or a harness).
 pub fn find(id: &str, harness: Option<Harness>) -> Result<Option<(SessionRef, Box<dyn Adapter>)>> {
+    let mut prefix_hits: Vec<(SessionRef, Box<dyn Adapter>)> = Vec::new();
     for adapter in harness::all() {
         if let Some(h) = harness {
             if adapter.harness() != h {
@@ -51,10 +58,30 @@ pub fn find(id: &str, harness: Option<Harness>) -> Result<Option<(SessionRef, Bo
             continue;
         }
         for r in adapter.discover()? {
-            if r.id == id || r.id.starts_with(id) {
+            if r.id == id {
                 return Ok(Some((r, adapter)));
+            }
+            if r.id.starts_with(id) {
+                if let Some(fresh) = harness::for_harness(r.harness) {
+                    prefix_hits.push((r, fresh));
+                }
             }
         }
     }
-    Ok(None)
+    match prefix_hits.len() {
+        0 => Ok(None),
+        1 => Ok(prefix_hits.pop()),
+        _ => {
+            let mut ids: Vec<String> = prefix_hits
+                .iter()
+                .map(|(r, _)| format!("{}:{}", r.harness.as_str(), r.id))
+                .collect();
+            ids.sort();
+            anyhow::bail!(
+                "ambiguous session id {id:?} matches {} sessions: {} — pass a longer id or --harness",
+                ids.len(),
+                ids.join(", ")
+            )
+        }
+    }
 }

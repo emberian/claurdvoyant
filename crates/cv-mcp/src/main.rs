@@ -45,14 +45,18 @@ async fn main() -> anyhow::Result<()> {
     let stdin = tokio::io::stdin();
     let mut reader = BufReader::new(stdin);
     let mut stdout = tokio::io::stdout();
-    let mut line = String::new();
+    let mut buf: Vec<u8> = Vec::new();
 
     loop {
-        line.clear();
-        let n = reader.read_line(&mut line).await?;
+        buf.clear();
+        // Read raw bytes, not into a String: a single non-UTF-8 byte on stdin would make `read_line`
+        // error out, and `?` would tear down the whole server. Lossy-decode instead so one bad frame
+        // is tolerated rather than fatal.
+        let n = reader.read_until(b'\n', &mut buf).await?;
         if n == 0 {
             break; // EOF
         }
+        let line = String::from_utf8_lossy(&buf);
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
@@ -571,7 +575,19 @@ fn board_release(args: &Value) -> anyhow::Result<String> {
     let channel = arg_str(args, "channel").context("`channel` is required")?;
     let from = arg_str(args, "from").unwrap_or("agent");
     let key = arg_str(args, "key").context("`key` is required")?;
-    // Re-acquire (or no-op) with a minimal ttl, then release if we own it.
+    // Guard before re-claiming: claiming a *free* key just to release it would falsely report
+    // `released: true` for a lock we never held. Only proceed if `from` already owns a live claim.
+    let owned = cv_core::board::active_claims(channel)?
+        .into_iter()
+        .any(|(k, owner, _)| k == key && owner == from);
+    if !owned {
+        return Ok(serde_json::to_string_pretty(&json!({
+            "released": false,
+            "key": key,
+            "reason": "you don't hold this key; nothing released",
+        }))?);
+    }
+    // Re-acquire (renews our own lease) then release it.
     match cv_core::board::claim(channel, from, key, Duration::from_secs(1))? {
         Some(lease) => {
             cv_core::board::release(&lease)?;
@@ -796,23 +812,39 @@ fn list_sessions(args: &Value) -> anyhow::Result<String> {
     Ok(serde_json::to_string_pretty(&json!(out))?)
 }
 
+/// Whether two paths belong to the same project: equal, or one is an ancestor of the other —
+/// compared on **path-component** boundaries so `/foo` no longer matches `/foobar`, and a bare
+/// substring like `src` no longer drags in every unrelated repo. The query may be relative (e.g.
+/// just a project name), in which case `b` matching is by trailing-component containment.
+fn paths_related(a: &std::path::Path, b: &std::path::Path) -> bool {
+    let ac: Vec<_> = a.components().collect();
+    let bc: Vec<_> = b.components().collect();
+    let (short, long) = if ac.len() <= bc.len() {
+        (&ac, &bc)
+    } else {
+        (&bc, &ac)
+    };
+    // Ancestor relationship: `short` is a component-wise prefix of `long`.
+    if long.starts_with(short.as_slice()) {
+        return true;
+    }
+    // Relative query (e.g. "my-project"): match if it appears as a contiguous run of components.
+    if short.iter().any(|c| matches!(c, std::path::Component::Normal(_))) && !short.is_empty() {
+        long.windows(short.len()).any(|w| w == short.as_slice())
+    } else {
+        false
+    }
+}
+
 fn project_sessions(args: &Value) -> anyhow::Result<String> {
     let cwd = arg_str(args, "cwd")
         .ok_or_else(|| anyhow::anyhow!("missing required argument: cwd"))?;
     let limit = arg_usize(args, "limit", 20);
 
+    let query = std::path::Path::new(cwd);
     let mut refs: Vec<SessionRef> = cv_core::discover_all()
         .into_iter()
-        .filter(|r| {
-            r.cwd
-                .as_ref()
-                .map(|p| {
-                    let s = p.to_string_lossy();
-                    // equals or contains in either direction (project path under cwd, or cwd under project)
-                    s.contains(cwd) || cwd.contains(s.as_ref())
-                })
-                .unwrap_or(false)
-        })
+        .filter(|r| r.cwd.as_deref().map(|p| paths_related(p, query)).unwrap_or(false))
         .collect();
 
     sort_newest_first(&mut refs);

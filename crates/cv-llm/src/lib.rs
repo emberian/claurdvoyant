@@ -409,20 +409,46 @@ fn call_chat(
         ),
         Provider::LmStudio { base } => openai_call(format!("{base}/chat/completions"), None),
         Provider::Anthropic { key } => {
-            // Anthropic wants `system` separate and only user/assistant roles in `messages`.
+            // Anthropic wants `system` separate and only user/assistant roles in `messages`, which
+            // must additionally start with `user` and strictly alternate. Our IR can yield neither
+            // (a transcript may open on an assistant turn and have runs of same-role messages), so we
+            // hoist system text out, coalesce consecutive same-role turns, and guarantee a leading
+            // user message — otherwise the API 400s on the message sequence.
             let mut sys = system.unwrap_or("").to_string();
             let mut msgs: Vec<Value> = Vec::new();
             for m in messages {
-                if m["role"] == "system" {
+                let role = m["role"].as_str().unwrap_or("user");
+                if role == "system" {
                     if let Some(c) = m["content"].as_str() {
                         if !sys.is_empty() {
                             sys.push('\n');
                         }
                         sys.push_str(c);
                     }
-                } else {
-                    msgs.push(m.clone());
+                    continue;
                 }
+                // Normalize any non-system role to user/assistant.
+                let role = if role == "assistant" { "assistant" } else { "user" };
+                let content = m["content"].as_str().unwrap_or("").to_string();
+                match msgs.last_mut() {
+                    Some(prev) if prev["role"] == role => {
+                        // Coalesce: append onto the previous same-role turn.
+                        let merged =
+                            format!("{}\n{}", prev["content"].as_str().unwrap_or(""), content);
+                        prev["content"] = json!(merged);
+                    }
+                    _ => msgs.push(json!({ "role": role, "content": content })),
+                }
+            }
+            // Anthropic requires the first message to be `user`.
+            if msgs.first().map(|m| m["role"] == "assistant").unwrap_or(false) {
+                msgs.insert(
+                    0,
+                    json!({ "role": "user", "content": "(continue the transcript below)" }),
+                );
+            }
+            if msgs.is_empty() {
+                bail!("nothing to send to Anthropic after normalizing messages");
             }
             let mut body = json!({ "model": model, "max_tokens": max_tokens, "messages": msgs });
             if !sys.is_empty() {

@@ -7,6 +7,25 @@ tree, `.codex/sessions/…`, `.grok/sessions/…`, an OpenCode `storage/` tree, 
 chart, diff, and weave into new transcripts. Entirely in your browser. Nothing is
 uploaded.
 
+It also runs inside the **Tauri desktop shell** (the `app/` wrapper) and degrades
+gracefully to a plain browser — see **Desktop (Tauri) integration** below.
+
+## Keyboard shortcuts
+
+Press **`?`** (or the header `?` button) for an in-app overlay. The essentials:
+
+| Key | Action |
+| --- | --- |
+| `1`–`7` | Switch view (Sessions … OpenSession) |
+| `/` | Focus the session search |
+| `j` / `k` · `↓` / `↑` | Move the selection in the session list |
+| `Enter` | Open the focused session |
+| `t` | Cycle theme (dark → light → auto) |
+| `Esc` | Close help · back to the session list (narrow screens) |
+| `?` | Toggle the help overlay |
+
+Shortcuts never fire while you're typing in an input, and respect focus.
+
 ## How it works
 
 - `index.html` loads `main.js` as an ES module.
@@ -42,18 +61,25 @@ A tab bar (`<cv-app>`) switches between views, all reading from the merged pool:
   session, click **＋ loom** on any message to collect it, then reorder (▲ ▼ or
   drag), remove (✕), or **fork from here** (⑂). A live preview renders the
   composition as you build it. **Download** it as an OpenSession `.json` or
-  Markdown — pure client-side. Now it also *looms*: see **Generation & branches**
-  below.
+  Markdown — pure client-side. Now it also *looms*: see **Generation & the branch
+  tree** below.
 - **📡 Fleet** (`<cv-fleet>`) — a live dashboard over a running `cvd serve` HTTP
   API. See **Fleet dashboard** below.
 - **🧬 OpenSession** (`<cv-opensession>`) — the OpenSession standard, featured
   in-app. Also available as a standalone page at **`openSession.html`**.
 
-## ⚡ Loom: generation & branches
+## ⚡ Loom: generation & the branch tree
 
-The loom no longer only *rearranges* messages — with an OpenRouter API key it
-**generates** continuations, so you can fork a transcript and grow alternate
-futures with a model.
+The loom no longer only *rearranges* messages — with an OpenRouter API key (or the
+desktop runtime) it **generates** continuations, so you can fork a transcript and
+grow alternate futures with a model.
+
+The **branch tree** at the top of the loom is a real fork-structure
+visualization, not a flat bar: roots and their forked descendants are indented by
+depth with `├`/`└` guide rails, each child shows its fork point (`⑂N` = messages
+shared with its parent), the active branch is highlighted, and rows are
+keyboard-navigable (`↑`/`↓` to move, `Enter`/`Space` to switch). Deleting a branch
+re-parents its children so the tree stays connected.
 
 - **⚙ generation** (top-right of the loom) opens a settings panel: paste an
   **OpenRouter API key** and pick a **model** (free-text, with presets like
@@ -66,12 +92,14 @@ futures with a model.
   text/thinking/tool blocks flattened to text) and **appends** the model's reply
   as a new IR `assistant` message in the lane. The reply **streams** in
   (`fetch` + `ReadableStream` over SSE) when the provider supports it, with a
-  **stop** button; otherwise it awaits the full response.
-- **Branches.** A branch bar holds multiple named variants, each with its own
-  lane. **＋ branch** duplicates the active branch; **⑂** on any lane message
-  forks a *sibling branch* from that prefix. Switch branches, generate divergent
-  continuations, and compare them side-by-side in the **🔍 Compare** view (export
-  each branch to OpenSession `.json` and drop them back in).
+  **stop** button; otherwise it awaits the full response. Inside the desktop
+  shell this routes through the native `generate` command instead (no key — the
+  bar shows **🖥 native**).
+- **Branches.** The branch tree holds multiple named variants, each with its own
+  lane. **＋ branch** duplicates the active branch into a child; **⑂** on any lane
+  message forks a *child branch* from that prefix. Switch branches, generate
+  divergent continuations, and compare them side-by-side in the **🔍 Compare**
+  view (export each branch to OpenSession `.json` and drop them back in).
 - Errors (bad key `401/403`, no credits `402`, rate limit `429`, …) surface
   inline and never block the UI; the key always stays client-side.
 
@@ -116,13 +144,18 @@ All are plain native custom elements (no framework, no build step), in `componen
 - **`<cv-session-list>`** — sortable, filterable list. Free-text search across
   titles, cwd, model, and **all message content**; harness filter chips; sort by
   recency / oldest / title / message count.
-- **`<cv-transcript>`** — renders one `Session`: role-labeled turns; text (minimal
-  inline/fenced code); **collapsible thinking** (with encrypted/redacted/signature
-  handling); `tool_use` (auto-collapsed when large); `tool_result` (error styling,
-  `status`, `tool_name`, collapsible `details`); **`file`** blocks; images; and a
-  graceful fallback for unknown block kinds. Shows per-message **token usage** and
-  a session-total. Has per-session **Markdown / OpenSession-JSON export** buttons,
-  and an optional `pickMode` (used by the loom).
+- **`<cv-transcript>`** — renders one `Session`: role-labeled turns; **Markdown
+  prose** (headings, lists, blockquotes, emphasis, links, inline + fenced code
+  with a light highlighter — see `markdown.js`, XSS-safe by escaping before
+  injecting); **collapsible thinking** (with encrypted/redacted/signature
+  handling); `tool_use` (highlighted JSON, auto-collapsed when large);
+  `tool_result` (error styling, `status`, `tool_name`, collapsible `details`);
+  **`file`** blocks; images; and a graceful fallback for unknown block kinds.
+  Shows per-message **token usage** and a session-total. **Very long transcripts
+  are virtualized** — only a sliding window of messages is in the DOM, so a
+  12k-message session renders in ~30 ms instead of freezing the tab. Has
+  per-session **Markdown / OpenSession-JSON export** buttons, and an optional
+  `pickMode` (used by the loom).
 - **`<cv-timeline>`**, **`<cv-compare>`**, **`<cv-stats>`**, **`<cv-loom>`**,
   **`<cv-fleet>`**, **`<cv-opensession>`** — the views above.
 - **`<cv-harness-badge>`** — a small per-harness colored pill.
@@ -134,8 +167,33 @@ storage in `localStorage`, IR→chat conversion, and a streaming
 `components/util.js` holds shared helpers: HTML escaping, time formatting, search
 indexing, **normalization** (`normalizeSessions`, accepts both shapes),
 **export** (`toOpenSession`, `toMarkdown`, `downloadFile`), and token summing.
-`styles.css` is a hand-written "lite" stylesheet with light/dark themes (the theme
-toggle cycles dark → light → auto and persists to `localStorage`).
+`markdown.js` is the dependency-free, XSS-safe Markdown renderer + tiny code
+highlighter used by the transcript. `tauri.js` is the desktop-integration shim
+(see below). `styles.css` is a hand-written "lite" stylesheet with light/dark
+themes (the theme toggle cycles dark → light → auto and persists to
+`localStorage`).
+
+## Desktop (Tauri) integration
+
+The same `web/` runs unchanged in a plain browser **and** inside the Tauri desktop
+shell (the `app/` wrapper). All of `tauri.js` degrades to no-ops when
+`window.__TAURI__` is absent, so the browser path is never affected.
+
+When running under Tauri, claurdvoyant:
+
+- **routes generation through native commands.** The loom's **⚡ generate** calls
+  `window.__TAURI__.core.invoke('generate', { messages, model })` instead of the
+  in-JS OpenRouter path — **no API key needed** (the desktop env / a local LM
+  Studio does the work). The gen bar shows **🖥 native**. (The same `invoke`
+  pathway is ready for `distill` / `redact`.) Streaming is supported if the native
+  side emits `cv://generate-token` events; otherwise the full reply is awaited.
+- **loads sessions from the native File → Open.** It listens for the
+  `cv://open-sessions` Tauri event (payload = a JSON array of `Session`), via
+  `window.__TAURI__.event.listen`, and merges the opened sessions into the pool —
+  exactly like a drop. The `app/` agent emits that event from its native menu.
+
+In a browser none of this exists: `isTauri()` is `false`, `canInvokeNative()` is
+`false`, the loom falls back to OpenRouter, and the event listener is a no-op.
 
 ## Session schema
 

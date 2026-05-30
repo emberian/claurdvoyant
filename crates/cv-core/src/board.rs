@@ -480,8 +480,17 @@ fn load_claims(dir: &Path, channel: &str) -> Vec<ClaimRecord> {
 /// Atomically persist the claims map: write to a temp sibling then rename over the target so a
 /// reader never sees a half-written file. Caller MUST hold the channel lock.
 fn store_claims(dir: &Path, channel: &str, claims: &[ClaimRecord]) -> Result<()> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
     let path = claims_path(dir, channel);
-    let tmp = path.with_extension("json.tmp");
+    // Per-process-unique temp name: even though writes are channel-locked, a fixed `.json.tmp` left
+    // behind by a crashed writer (or a future unlocked caller) could be picked up mid-write. pid+seq
+    // makes the temp ours alone, and the rename onto `path` stays atomic.
+    let tmp = path.with_extension(format!(
+        "{}.{}.tmp",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
     let body = serde_json::to_string(claims).context("serializing claims")?;
     fs::write(&tmp, body).with_context(|| format!("writing {}", tmp.display()))?;
     fs::rename(&tmp, &path).with_context(|| format!("renaming into {}", path.display()))?;

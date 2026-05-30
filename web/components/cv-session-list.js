@@ -170,6 +170,25 @@ class CvSessionList extends HTMLElement {
     this.dispatchEvent(new CustomEvent("select", { detail: { session }, bubbles: true }));
   }
 
+  /**
+   * Move the selection by `dir` (+1 down / -1 up) through the *visible* rows,
+   * scroll it into view, focus it, and open it. Returns true if it moved.
+   * Used by the app-level j/k + arrow keyboard shortcuts.
+   */
+  moveSelection(dir) {
+    const rows = [...this.querySelectorAll(".session-row")];
+    if (!rows.length) return false;
+    let idx = rows.findIndex((li) => li.dataset.id === this._selectedId);
+    if (idx < 0) idx = dir > 0 ? -1 : rows.length; // wrap to an edge on first press
+    const next = Math.min(rows.length - 1, Math.max(0, idx + dir));
+    if (next === idx) return false;
+    const li = rows[next];
+    li.scrollIntoView({ block: "nearest" });
+    li.focus({ preventScroll: true });
+    this._selectById(li.dataset.id);
+    return true;
+  }
+
   _updateSelection() {
     this.querySelectorAll(".session-row").forEach((li) => {
       const on = li.dataset.id === this._selectedId;
