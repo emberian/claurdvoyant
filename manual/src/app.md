@@ -3,7 +3,7 @@
 Everything `cv` does on the command line, claurdvoyant also does with pixels. 🔮 The app is one static web UI — a header, a drop zone, a row of view tabs, and the active view — that runs two ways, with no code differences between them:
 
 - **The Tauri desktop app.** A thin native shell around that same UI. It reads **all** of your real local sessions natively (no zip, no upload, zero setup), bundles a `cvd serve` for the live Fleet dashboard, and adds native distill / redact / generate so your LLM keys never touch JavaScript. This is the one to install if it's your machine.
-- **The browser build.** Zero-install, hosted at the GitHub Pages site (<https://claurdvoyant.lunar.town/>). You **drop a harness `.zip`** (or an OpenSession `.json`) onto the page and explore. Nothing is uploaded — parsing happens in your browser via WASM. Great for a session a teammate sent you, or for poking around without installing anything.
+- **The browser build.** Zero-install, hosted at the GitHub Pages site (<https://emberian.github.io/claurdvoyant/>). You **drop a harness `.zip`** (or an OpenSession `.json`) onto the page and explore. Nothing is uploaded — parsing happens in your browser via WASM. Great for a session a teammate sent you, or for poking around without installing anything.
 
 Both open on a small **bundled sample** so the app is never empty, then quietly try to load your real sessions (see [Loading your sessions](#loading-your-sessions) below).
 

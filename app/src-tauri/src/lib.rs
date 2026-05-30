@@ -48,7 +48,7 @@ const CVD_PORT: u16 = 7777;
 const OPEN_SESSIONS_EVENT: &str = "cv://open-sessions";
 
 /// The public web demo, opened from Help → Open the web demo.
-const WEB_DEMO_URL: &str = "https://claurdvoyant.lunar.town/";
+const WEB_DEMO_URL: &str = "https://emberian.github.io/claurdvoyant/";
 
 /// Handle to the spawned `cvd serve` child, kept in Tauri managed state so we can kill it on exit
 /// (and toggle it from the menu).
