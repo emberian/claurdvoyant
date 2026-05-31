@@ -609,6 +609,18 @@ fn emit_codex(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<E
             }
             Role::User => {
                 let text = msg.text().unwrap_or_default();
+                // The `response_item` message is what Codex feeds back into the model on resume;
+                // the `event_msg` is only the UI transcript event. Emit BOTH (matching real
+                // rollouts) — without the response_item the resumed model has no memory of the
+                // user's turns. User content uses `input_text`.
+                lines.push(codex_response_item(
+                    &ts,
+                    json!({
+                        "type": "message",
+                        "role": "user",
+                        "content": [{ "type": "input_text", "text": text }],
+                    }),
+                ));
                 lines.push(codex_event_msg(
                     &ts,
                     json!({ "type": "user_message", "message": text }),
@@ -618,10 +630,23 @@ fn emit_codex(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<E
                 // Split assistant content into NL text (event_msg) and structured items.
                 for b in &msg.content {
                     match b {
-                        Block::Text { text } => lines.push(codex_event_msg(
-                            &ts,
-                            json!({ "type": "agent_message", "message": text }),
-                        )),
+                        Block::Text { text } => {
+                            // Same as user turns: the response_item carries the assistant text
+                            // into the resumed model context; the event_msg is UI-only. Assistant
+                            // content uses `output_text`.
+                            lines.push(codex_response_item(
+                                &ts,
+                                json!({
+                                    "type": "message",
+                                    "role": "assistant",
+                                    "content": [{ "type": "output_text", "text": text }],
+                                }),
+                            ));
+                            lines.push(codex_event_msg(
+                                &ts,
+                                json!({ "type": "agent_message", "message": text }),
+                            ));
+                        }
                         Block::Thinking { text, encrypted, .. } => {
                             let mut p = Map::new();
                             p.insert("type".into(), json!("reasoning"));
@@ -775,13 +800,38 @@ fn emit_grok(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<Em
     );
     summary.insert("created_at".into(), json!(created));
     summary.insert("updated_at".into(), json!(updated));
+    summary.insert("last_active_at".into(), json!(updated));
     summary.insert(
         "num_chat_messages".into(),
         json!(session.messages.len()),
     );
-    if let Some(model) = &session.model {
-        summary.insert("current_model_id".into(), json!(model));
+    // Real Grok summaries carry these too; without at least `chat_format_version`
+    // the loader rejects the dir with "Session does not exist". (Verified live against
+    // grok 0.1.219 — adding the full field set is what makes `grok --resume` discover it.)
+    let num_turns = session
+        .messages
+        .iter()
+        .filter(|m| matches!(m.role, Role::User))
+        .count();
+    summary.insert("num_messages".into(), json!(num_turns));
+    summary.insert("next_trace_turn".into(), json!(0));
+    summary.insert("chat_format_version".into(), json!(1));
+    summary.insert("agent_name".into(), json!("grok-build"));
+    if let Some(home) = std::env::var_os("HOME") {
+        summary.insert(
+            "grok_home".into(),
+            json!(format!("{}/.grok", Path::new(&home).to_string_lossy())),
+        );
     }
+    // Carry the source model only if it's actually a Grok model; otherwise default to
+    // `grok-build`. A foreign model id (e.g. `gpt-5.5`) would make Grok try to replay the
+    // history against an incompatible backend.
+    let model_id = session
+        .model
+        .as_deref()
+        .filter(|m| m.to_ascii_lowercase().contains("grok"))
+        .unwrap_or("grok-build");
+    summary.insert("current_model_id".into(), json!(model_id));
     if let Some(g) = &session.git {
         if let Some(b) = &g.branch {
             summary.insert("head_branch".into(), json!(b));
@@ -793,9 +843,10 @@ fn emit_grok(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<Em
             summary.insert("git_remotes".into(), json!([r]));
         }
     }
-    if let Some(t) = &session.title {
-        summary.insert("session_summary".into(), json!(t));
-    }
+    summary.insert(
+        "session_summary".into(),
+        json!(session.title.as_deref().unwrap_or("")),
+    );
     let summary_path = session_dir.join("summary.json");
     fs::write(&summary_path, serde_json::to_string_pretty(&summary)?)
         .with_context(|| format!("writing {}", summary_path.display()))?;
@@ -826,8 +877,14 @@ fn emit_grok(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<Em
                     if let Block::Thinking { text, encrypted, .. } = b {
                         let mut r = Map::new();
                         r.insert("text".into(), json!(text));
+                        // `encrypted` reasoning blobs are provider/account-bound. Carrying one
+                        // from a foreign harness (e.g. OpenAI's `encrypted_content`) makes Grok's
+                        // backend fail with "Could not decrypt the provided encrypted_content".
+                        // Only preserve it for a Grok→Grok port.
                         if let Some(enc) = encrypted {
-                            r.insert("encrypted".into(), json!(enc));
+                            if session.harness == Harness::Grok {
+                                r.insert("encrypted".into(), json!(enc));
+                            }
                         }
                         line.insert("reasoning".into(), Value::Object(r));
                         break;
