@@ -69,9 +69,12 @@ impl Adapter for Claude {
     }
 
     fn parse(&self, r: &SessionRef) -> Result<Session> {
-        let text = fs::read_to_string(&r.path)
-            .with_context(|| format!("reading {}", r.path.display()))?;
-        Ok(parse_str(&r.id, &text, Some(r.path.clone())))
+        // Stream the transcript line-by-line — a single Claude session can be >1 GB, and
+        // `read_to_string` would resident-spike the whole file (this OOM-killed cv on the
+        // 1.35 GB polyana transcript). `BufReader::lines()` keeps peak at O(largest line).
+        let file = fs::File::open(&r.path)
+            .with_context(|| format!("opening {}", r.path.display()))?;
+        Ok(parse_reader(&r.id, BufReader::new(file), Some(r.path.clone())))
     }
 
     fn can_emit(&self) -> bool {
@@ -84,7 +87,31 @@ impl Adapter for Claude {
 /// Pure (no filesystem); the on-disk [`Adapter::parse`] reads the file then delegates here. `id` is
 /// the session id (usually the file stem); `source_path` is recorded for provenance when known.
 pub fn parse_str(id: &str, text: &str, source_path: Option<PathBuf>) -> Session {
-    let mut session = Session {
+    let mut session = new_session(id, source_path);
+    for line in text.lines() {
+        ingest_line(&mut session, line);
+    }
+    session
+}
+
+/// Streaming parse from a buffered reader — the memory-safe entry the on-disk [`Adapter::parse`]
+/// uses. A single Claude transcript can exceed 1 GB; reading it whole (`read_to_string` + the
+/// resulting `String`) resident-spiked cv to ~65 GB across the corpus and OOM-killed it. Reading
+/// line-by-line keeps peak at O(largest line) + O(the accumulating Session). Semantics are
+/// identical to [`parse_str`] — both delegate to [`ingest_line`].
+pub fn parse_reader<R: BufRead>(id: &str, reader: R, source_path: Option<PathBuf>) -> Session {
+    let mut session = new_session(id, source_path);
+    for line in reader.lines() {
+        // A read error on one line (rare: invalid UTF-8 chunk) shouldn't abort the whole session.
+        let Ok(line) = line else { continue };
+        ingest_line(&mut session, &line);
+    }
+    session
+}
+
+/// An empty Claude [`Session`] shell, ready to accumulate records.
+fn new_session(id: &str, source_path: Option<PathBuf>) -> Session {
+    Session {
         id: id.to_string(),
         harness: Harness::Claude,
         cwd: None,
@@ -96,73 +123,73 @@ pub fn parse_str(id: &str, text: &str, source_path: Option<PathBuf>) -> Session 
         messages: Vec::new(),
         source_path,
         extra: serde_json::Map::new(),
+    }
+}
+
+/// Fold one JSONL record into `session`. Tolerates blank/corrupt lines (skips them). Factored out
+/// of [`parse_str`] so the streaming [`parse_reader`] shares byte-identical per-line semantics.
+fn ingest_line(session: &mut Session, line: &str) {
+    let line = line.trim();
+    if line.is_empty() {
+        return;
+    }
+    let v: Value = match serde_json::from_str(line) {
+        Ok(v) => v,
+        Err(_) => return, // tolerate the occasional corrupt line
     };
+    let ty = v.get("type").and_then(Value::as_str).unwrap_or("");
 
-    for line in text.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
+    // session-level metadata records
+    match ty {
+        "ai-title" => {
+            if let Some(t) = v.get("aiTitle").and_then(Value::as_str) {
+                session.title = Some(t.to_string());
+            }
+            return;
         }
-        let v: Value = match serde_json::from_str(line) {
-            Ok(v) => v,
-            Err(_) => continue, // tolerate the occasional corrupt line
-        };
-        let ty = v.get("type").and_then(Value::as_str).unwrap_or("");
-
-        // session-level metadata records
-        match ty {
-            "ai-title" => {
-                if let Some(t) = v.get("aiTitle").and_then(Value::as_str) {
+        // `summary`/`last-prompt` carry a title-ish/leaf pointer but no message body.
+        // `summary` lines have a `summary` string we can fall back to for the title.
+        "summary" => {
+            if session.title.is_none() {
+                if let Some(t) = v.get("summary").and_then(Value::as_str) {
                     session.title = Some(t.to_string());
                 }
-                continue;
             }
-            // `summary`/`last-prompt` carry a title-ish/leaf pointer but no message body.
-            // `summary` lines have a `summary` string we can fall back to for the title.
-            "summary" => {
-                if session.title.is_none() {
-                    if let Some(t) = v.get("summary").and_then(Value::as_str) {
-                        session.title = Some(t.to_string());
-                    }
-                }
-                continue;
-            }
-            // Pure bookkeeping / live-process records with no conversational payload.
-            // `progress`, `started`, `result` are sub-agent hook/streaming telemetry;
-            // `queue-operation` is the input queue; `mode`/`permission-mode`/`attachment`/
-            // `last-prompt` are UI state. Ignore (unknown types fall through and are ignored too).
-            "mode" | "permission-mode" | "last-prompt" | "attachment" | "progress" | "started"
-            | "result" | "queue-operation" | "x-quota" | "file-history-snapshot" => continue,
-            _ => {}
+            return;
         }
-
-        if session.cwd.is_none() {
-            if let Some(cwd) = v.get("cwd").and_then(Value::as_str) {
-                session.cwd = Some(PathBuf::from(cwd));
-            }
-        }
-        if session.git.is_none() {
-            if let Some(branch) = v.get("gitBranch").and_then(Value::as_str) {
-                session.git = Some(GitInfo {
-                    branch: Some(branch.to_string()),
-                    ..Default::default()
-                });
-            }
-        }
-        if let Some(ts) = v.get("timestamp").and_then(Value::as_str).and_then(parse_ts) {
-            session.created_at.get_or_insert(ts);
-            session.updated_at = Some(ts);
-        }
-
-        if let Some(msg) = parse_message(ty, &v) {
-            if session.model.is_none() {
-                session.model = msg.model.clone();
-            }
-            session.messages.push(msg);
-        }
+        // Pure bookkeeping / live-process records with no conversational payload.
+        // `progress`, `started`, `result` are sub-agent hook/streaming telemetry;
+        // `queue-operation` is the input queue; `mode`/`permission-mode`/`attachment`/
+        // `last-prompt` are UI state. Ignore (unknown types fall through and are ignored too).
+        "mode" | "permission-mode" | "last-prompt" | "attachment" | "progress" | "started"
+        | "result" | "queue-operation" | "x-quota" | "file-history-snapshot" => return,
+        _ => {}
     }
 
-    session
+    if session.cwd.is_none() {
+        if let Some(cwd) = v.get("cwd").and_then(Value::as_str) {
+            session.cwd = Some(PathBuf::from(cwd));
+        }
+    }
+    if session.git.is_none() {
+        if let Some(branch) = v.get("gitBranch").and_then(Value::as_str) {
+            session.git = Some(GitInfo {
+                branch: Some(branch.to_string()),
+                ..Default::default()
+            });
+        }
+    }
+    if let Some(ts) = v.get("timestamp").and_then(Value::as_str).and_then(parse_ts) {
+        session.created_at.get_or_insert(ts);
+        session.updated_at = Some(ts);
+    }
+
+    if let Some(msg) = parse_message(ty, &v) {
+        if session.model.is_none() {
+            session.model = msg.model.clone();
+        }
+        session.messages.push(msg);
+    }
 }
 
 /// Sub-agent transcripts spawned by `parent_path`'s session (Claude Code's Task tool). They live at
@@ -687,5 +714,23 @@ mod tests {
         let text = "not json\n{\"type\":\"x-quota\"}\n{\"type\":\"user\",\"uuid\":\"u1\",\"message\":{\"role\":\"user\",\"content\":\"hi\"}}\n";
         let s = parse_str("s", text, None);
         assert_eq!(s.messages.len(), 1);
+    }
+
+    #[test]
+    fn parse_reader_matches_parse_str() {
+        // The streaming on-disk path (`parse_reader`, used by `Adapter::parse` to avoid loading a
+        // multi-GB transcript whole) must produce the same Session as the whole-text `parse_str`.
+        // Both delegate to `ingest_line`; this guards the OOM-fix refactor against divergence.
+        let text = fixture("rich_blocks.jsonl");
+        let whole = parse_str("s1", &text, None);
+        let streamed = parse_reader("s1", std::io::Cursor::new(text.as_bytes()), None);
+        assert_eq!(whole.title, streamed.title);
+        assert_eq!(whole.cwd, streamed.cwd);
+        assert_eq!(whole.git.as_ref().map(|g| g.branch.clone()), streamed.git.as_ref().map(|g| g.branch.clone()));
+        assert_eq!(whole.model, streamed.model);
+        assert_eq!(whole.created_at, streamed.created_at);
+        assert_eq!(whole.updated_at, streamed.updated_at);
+        assert_eq!(whole.messages.len(), streamed.messages.len());
+        assert_eq!(whole.searchable_text(), streamed.searchable_text());
     }
 }

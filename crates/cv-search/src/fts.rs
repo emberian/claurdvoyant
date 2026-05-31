@@ -69,42 +69,58 @@ fn open_or_create(dir: &Path) -> Result<(Index, Fields)> {
     Ok((index, fields))
 }
 
-/// Discover + parse every session, then (re)build the full-text index at `dir`.
+/// Discover + parse every session, streaming each into the index at `dir` (full rebuild).
+/// Streams one session at a time (parse → add → drop) via `crate::stream_corpus`, so peak memory
+/// stays O(one session) rather than O(corpus) — this is what keeps `cv index` from OOM-ing on a
+/// multi-GB corpus. tantivy's writer buffers up to its memory budget and flushes segments itself.
 pub fn index_all(dir: &Path) -> Result<usize> {
-    let docs = crate::build_corpus();
-    index_docs(dir, &docs)
-}
-
-/// Index an explicit set of docs (full rebuild: clears prior contents first).
-pub(crate) fn index_docs(dir: &Path, docs: &[Doc]) -> Result<usize> {
     let (index, f) = open_or_create(dir)?;
     let mut writer: IndexWriter = index
         .writer(50_000_000)
         .context("creating tantivy index writer")?;
     // Full rebuild semantics: drop everything, then re-add. Simple and correct for a CLI reindex.
     writer.delete_all_documents().context("clearing index")?;
+    let n = crate::stream_corpus(|d| add_doc(&mut writer, &f, &d))?;
+    writer.commit().context("committing index")?;
+    Ok(n)
+}
+
+/// Index an explicit set of docs (full rebuild: clears prior contents first). Used by tests.
+pub(crate) fn index_docs(dir: &Path, docs: &[Doc]) -> Result<usize> {
+    let (index, f) = open_or_create(dir)?;
+    let mut writer: IndexWriter = index
+        .writer(50_000_000)
+        .context("creating tantivy index writer")?;
+    writer.delete_all_documents().context("clearing index")?;
     for d in docs {
-        let mut doc = TantivyDocument::default();
-        doc.add_text(f.id, &d.id);
-        doc.add_text(f.harness, &d.harness);
-        if let Some(cwd) = &d.cwd {
-            doc.add_text(f.cwd, cwd);
-        }
-        if let Some(title) = &d.title {
-            doc.add_text(f.title, title);
-        }
-        doc.add_text(f.body, &d.body);
-        doc.add_text(f.body_store, &d.body);
-        if let Some(t) = d.created_at {
-            doc.add_i64(f.created_at, t);
-        }
-        if let Some(t) = d.updated_at {
-            doc.add_i64(f.updated_at, t);
-        }
-        writer.add_document(doc).context("adding document")?;
+        add_doc(&mut writer, &f, d)?;
     }
     writer.commit().context("committing index")?;
     Ok(docs.len())
+}
+
+/// Add one [`Doc`] to `writer`. Shared by the streaming `index_all` and the slice-based
+/// `index_docs` so both build byte-identical tantivy documents.
+fn add_doc(writer: &mut IndexWriter, f: &Fields, d: &Doc) -> Result<()> {
+    let mut doc = TantivyDocument::default();
+    doc.add_text(f.id, &d.id);
+    doc.add_text(f.harness, &d.harness);
+    if let Some(cwd) = &d.cwd {
+        doc.add_text(f.cwd, cwd);
+    }
+    if let Some(title) = &d.title {
+        doc.add_text(f.title, title);
+    }
+    doc.add_text(f.body, &d.body);
+    doc.add_text(f.body_store, &d.body);
+    if let Some(t) = d.created_at {
+        doc.add_i64(f.created_at, t);
+    }
+    if let Some(t) = d.updated_at {
+        doc.add_i64(f.updated_at, t);
+    }
+    writer.add_document(doc).context("adding document")?;
+    Ok(())
 }
 
 /// Run a full-text query, returning up to `limit` highlighted hits ranked by BM25.

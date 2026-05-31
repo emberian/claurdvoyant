@@ -46,27 +46,41 @@ fn load_model() -> Result<StaticModel> {
     })
 }
 
+/// Sessions whose bodies are batched into one `model.encode` call. Bounds how many full session
+/// bodies are resident at once during embedding.
+const EMBED_BATCH: usize = 128;
+
 /// Discover + parse + embed every session, persisting vectors to `path` (JSON).
+///
+/// Streams the corpus in bounded batches via [`crate::stream_corpus`]: at most `EMBED_BATCH`
+/// session bodies are resident, and each body is dropped right after its batch is encoded — only
+/// the small `Record`s (200-char preview + the embedding vector) survive. The previous version
+/// collected the *whole* corpus into a `Vec<Doc>` AND `.clone()`d every body for the encode call
+/// (2× a ~35 GB corpus), which OOM-killed `cv`.
 pub fn embed_all(path: &Path) -> Result<usize> {
-    let docs = crate::build_corpus();
     let model = load_model()?;
 
-    // model2vec encodes a batch in one call; truncation to 512 tokens is the library default.
-    let texts: Vec<String> = docs.iter().map(|d| d.body.clone()).collect();
-    let vectors = model.encode(&texts);
+    let mut records: Vec<Record> = Vec::new();
+    // Pending batch: `pending[i]` is the Record for `bodies[i]` with its vector not yet filled.
+    let mut pending: Vec<Record> = Vec::new();
+    let mut bodies: Vec<String> = Vec::new();
 
-    let records = docs
-        .into_iter()
-        .zip(vectors)
-        .map(|(d, vector)| Record {
+    crate::stream_corpus(|d| {
+        pending.push(Record {
             id: d.id,
             harness: d.harness,
             cwd: d.cwd,
             title: d.title,
             preview: preview(&d.body, 200),
-            vector,
-        })
-        .collect::<Vec<_>>();
+            vector: Vec::new(),
+        });
+        bodies.push(d.body);
+        if bodies.len() >= EMBED_BATCH {
+            encode_batch(&model, &mut pending, &mut bodies, &mut records);
+        }
+        Ok(())
+    })?;
+    encode_batch(&model, &mut pending, &mut bodies, &mut records); // final partial batch
 
     let store = Store {
         model: MODEL_REPO.to_string(),
@@ -79,6 +93,26 @@ pub fn embed_all(path: &Path) -> Result<usize> {
     std::fs::write(path, json)
         .with_context(|| format!("writing embedding store {}", path.display()))?;
     Ok(store.records.len())
+}
+
+/// Encode the pending batch of bodies (one `model.encode` call — model2vec truncates to 512 tokens
+/// by default), attach each vector to its waiting `Record`, and move the finished records into
+/// `out`. Clears the batch (freeing the bodies) before returning.
+fn encode_batch(
+    model: &StaticModel,
+    pending: &mut Vec<Record>,
+    bodies: &mut Vec<String>,
+    out: &mut Vec<Record>,
+) {
+    if bodies.is_empty() {
+        return;
+    }
+    let vectors = model.encode(bodies.as_slice());
+    for (mut rec, vector) in pending.drain(..).zip(vectors) {
+        rec.vector = vector;
+        out.push(rec);
+    }
+    bodies.clear();
 }
 
 /// Embed `query` and return the top-`k` sessions by cosine similarity.
