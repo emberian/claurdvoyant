@@ -18,8 +18,12 @@ Harnesses tested live (real installed binaries): **claude-code 2.1.158**, **code
 | codex → grok         | ✅        | ✅                 | needed fix #2 |
 | grok → codex         | ✅        | ✅                 | relies on fix #1 |
 | codex → grok (real, w/ reasoning) | ✅ | ✅       | needed fix #3 |
+| claude → grok        | ✅        | ✅                 | confirms claude↔grok |
+| claude → hermes      | ✅ (loads)| n/a (see #4/#5)    | needed fix #4; model caveat |
+| hermes → codex       | ✅        | ✅                 | hermes parser is correct |
 
 All four priority directed pairs **failed before** these fixes and **pass after**.
+Second round added claude→grok, and the hermes pair (sqlite state.db).
 
 ## Bugs found & fixed (all live-validated)
 
@@ -51,7 +55,26 @@ Harness::Grok`); otherwise emit the plain reasoning text and drop the blob. Also
 model id would replay history against an incompatible backend). Validated on a **real** codex
 session containing reasoning → grok resumes and quotes the first message verbatim, no error.
 
+### Fix #4 — hermes emit couldn't write into an existing state.db  *(emit_hermes)*
+`cv convert --to hermes` (no `--out`) failed with *"creating /Users/.../state.db: File exists"*
+whenever hermes was actually installed. Cause: the hermes adapter's `storage_root()` returns the
+**state.db file path**, but `emit_hermes` treated `out_dir` as a directory and called
+`create_dir_all` on it. Fix: detect whether `out_dir` is the db file (is_file / `.db` ext) and use
+it directly, creating only its parent. After this, claude/codex→hermes emit the session + messages
++ FTS rows correctly and hermes discovers and loads them (verified: a 4-message port appears in
+`sessions`/`messages`, and hermes→codex round-trips the needle).
+
+### Fix #5 — hermes resume hint printed the wrong flag  *(emit_hermes resume_hint)*
+Hint said `hermes --session <id>`; the actual resume flag is `hermes --resume <id>`. Corrected.
+
 ## Caveats / not-yet-closed (honest list)
+
+- **hermes resume needs a usable model.** Hermes reads the session row's `model` and sends it as
+  `modelId`; a model-less source (no `session.model`) → empty `modelId` → API validation error, and
+  hermes does NOT fall back to a default (tested both `''` and `NULL`). Real ports carry the source
+  model (e.g. codex→hermes writes `gpt-5.2-codex`), so this only bites model-less sources — but that
+  ported model must be one the user's hermes is authed/configured for, or they must pass `-m`. Worth
+  emitting a default or warning when `session.model` is None.
 
 - **Symlink/realpath jail (claude target).** Claude resolves cwd via realpath; macOS `/tmp`
   → `/private/tmp`. Porting to a symlinked path writes `~/.claude/projects/-tmp-…` while

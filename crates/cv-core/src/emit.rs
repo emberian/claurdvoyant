@@ -1573,8 +1573,17 @@ fn emit_hermes(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<
         .clone()
         .unwrap_or_else(|| Uuid::new_v4().to_string());
 
-    fs::create_dir_all(out_dir).with_context(|| format!("creating {}", out_dir.display()))?;
-    let db_path = out_dir.join("state.db");
+    // `out_dir` may be a directory to drop state.db into, OR the state.db file itself — the hermes
+    // adapter's storage_root() returns the .db path, so `cv convert --to hermes` (no --out) passes
+    // the existing file here. Treating it as a dir made `create_dir_all` fail with "File exists".
+    let db_path = if out_dir.is_file() || out_dir.extension().is_some_and(|e| e == "db") {
+        out_dir.to_path_buf()
+    } else {
+        out_dir.join("state.db")
+    };
+    if let Some(parent) = db_path.parent() {
+        fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+    }
     let conn = Connection::open(&db_path)
         .with_context(|| format!("opening {}", db_path.display()))?;
 
@@ -1813,7 +1822,7 @@ fn emit_hermes(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<
     Ok(EmitResult {
         path: db_path,
         new_id: new_id.clone(),
-        resume_hint: Some(format!("hermes --session {new_id}")),
+        resume_hint: Some(format!("hermes --resume {new_id}")),
     })
 }
 
