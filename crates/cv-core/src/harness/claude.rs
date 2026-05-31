@@ -6,6 +6,7 @@
 
 use super::Adapter;
 use crate::ir::*;
+use crate::stream::{CollectSink, Flow, MessageSink, ParseOptions};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde_json::{Map, Value};
@@ -69,12 +70,28 @@ impl Adapter for Claude {
     }
 
     fn parse(&self, r: &SessionRef) -> Result<Session> {
+        crate::stream::collect(self, r)
+    }
+
+    fn stream(
+        &self,
+        r: &SessionRef,
+        opts: &ParseOptions,
+        sink: &mut dyn MessageSink,
+    ) -> Result<Session> {
         // Stream the transcript line-by-line — a single Claude session can be >1 GB, and
         // `read_to_string` would resident-spike the whole file (this OOM-killed cv on the
-        // 1.35 GB polyana transcript). `BufReader::lines()` keeps peak at O(largest line).
+        // 1.35 GB polyana transcript). `BufReader::lines()` keeps peak at O(largest line); handing
+        // each message to `sink` (instead of accumulating a `Vec`) keeps it at O(largest message).
         let file = fs::File::open(&r.path)
             .with_context(|| format!("opening {}", r.path.display()))?;
-        Ok(parse_reader(&r.id, BufReader::new(file), Some(r.path.clone())))
+        Ok(stream_reader(
+            &r.id,
+            BufReader::new(file),
+            Some(r.path.clone()),
+            opts,
+            sink,
+        ))
     }
 
     fn can_emit(&self) -> bool {
@@ -82,29 +99,66 @@ impl Adapter for Claude {
     }
 }
 
-/// Parse a Claude `.jsonl` transcript from its text contents into a [`Session`].
+/// Fully parse a Claude `.jsonl` transcript from its text contents into a [`Session`] (full
+/// fidelity, including `extra` sidecars).
 ///
-/// Pure (no filesystem); the on-disk [`Adapter::parse`] reads the file then delegates here. `id` is
-/// the session id (usually the file stem); `source_path` is recorded for provenance when known.
+/// Pure (no filesystem). `id` is the session id (usually the file stem); `source_path` is recorded
+/// for provenance when known. This is the whole-`Session` convenience over [`stream_str`].
 pub fn parse_str(id: &str, text: &str, source_path: Option<PathBuf>) -> Session {
+    let mut sink = CollectSink::default();
+    let mut session = stream_str(id, text, source_path, &ParseOptions::full(), &mut sink);
+    session.messages = sink.messages;
+    session
+}
+
+/// Stream a transcript's text into `sink`, returning the [`Session`] metadata with empty
+/// `messages`. The pure (no-filesystem) core that both [`parse_str`] and the on-disk
+/// [`Adapter::stream`] delegate to.
+pub fn stream_str(
+    id: &str,
+    text: &str,
+    source_path: Option<PathBuf>,
+    opts: &ParseOptions,
+    sink: &mut dyn MessageSink,
+) -> Session {
     let mut session = new_session(id, source_path);
     for line in text.lines() {
-        ingest_line(&mut session, line);
+        if ingest_line(&mut session, line, opts, sink) == Flow::Stop {
+            break;
+        }
     }
     session
 }
 
-/// Streaming parse from a buffered reader — the memory-safe entry the on-disk [`Adapter::parse`]
-/// uses. A single Claude transcript can exceed 1 GB; reading it whole (`read_to_string` + the
-/// resulting `String`) resident-spiked cv to ~65 GB across the corpus and OOM-killed it. Reading
-/// line-by-line keeps peak at O(largest line) + O(the accumulating Session). Semantics are
-/// identical to [`parse_str`] — both delegate to [`ingest_line`].
+/// Fully parse from a buffered reader (full fidelity) — the whole-`Session` convenience over
+/// [`stream_reader`], used by tests. The on-disk [`Adapter::parse`] goes through
+/// [`crate::stream::collect`] → [`Adapter::stream`] → [`stream_reader`] instead.
 pub fn parse_reader<R: BufRead>(id: &str, reader: R, source_path: Option<PathBuf>) -> Session {
+    let mut sink = CollectSink::default();
+    let mut session = stream_reader(id, reader, source_path, &ParseOptions::full(), &mut sink);
+    session.messages = sink.messages;
+    session
+}
+
+/// Streaming parse from a buffered reader — the memory-safe core the on-disk [`Adapter::stream`]
+/// uses. A single Claude transcript can exceed 1 GB; reading it whole (`read_to_string`)
+/// resident-spiked cv to ~65 GB across the corpus and OOM-killed it. Reading line-by-line and
+/// handing each message to `sink` keeps peak at O(largest line). Returns the [`Session`] metadata
+/// with empty `messages` (they went to the sink).
+pub fn stream_reader<R: BufRead>(
+    id: &str,
+    reader: R,
+    source_path: Option<PathBuf>,
+    opts: &ParseOptions,
+    sink: &mut dyn MessageSink,
+) -> Session {
     let mut session = new_session(id, source_path);
     for line in reader.lines() {
         // A read error on one line (rare: invalid UTF-8 chunk) shouldn't abort the whole session.
         let Ok(line) = line else { continue };
-        ingest_line(&mut session, &line);
+        if ingest_line(&mut session, &line, opts, sink) == Flow::Stop {
+            break;
+        }
     }
     session
 }
@@ -126,16 +180,22 @@ fn new_session(id: &str, source_path: Option<PathBuf>) -> Session {
     }
 }
 
-/// Fold one JSONL record into `session`. Tolerates blank/corrupt lines (skips them). Factored out
-/// of [`parse_str`] so the streaming [`parse_reader`] shares byte-identical per-line semantics.
-fn ingest_line(session: &mut Session, line: &str) {
+/// Fold one JSONL record into `session`: update session-level metadata, and hand any conversational
+/// message to `sink`. Tolerates blank/corrupt lines (skips them). Returns the sink's [`Flow`] so the
+/// caller can stop early. `opts` gates how much of each message is materialized.
+fn ingest_line(
+    session: &mut Session,
+    line: &str,
+    opts: &ParseOptions,
+    sink: &mut dyn MessageSink,
+) -> Flow {
     let line = line.trim();
     if line.is_empty() {
-        return;
+        return Flow::Continue;
     }
     let v: Value = match serde_json::from_str(line) {
         Ok(v) => v,
-        Err(_) => return, // tolerate the occasional corrupt line
+        Err(_) => return Flow::Continue, // tolerate the occasional corrupt line
     };
     let ty = v.get("type").and_then(Value::as_str).unwrap_or("");
 
@@ -145,7 +205,7 @@ fn ingest_line(session: &mut Session, line: &str) {
             if let Some(t) = v.get("aiTitle").and_then(Value::as_str) {
                 session.title = Some(t.to_string());
             }
-            return;
+            return Flow::Continue;
         }
         // `summary`/`last-prompt` carry a title-ish/leaf pointer but no message body.
         // `summary` lines have a `summary` string we can fall back to for the title.
@@ -155,14 +215,14 @@ fn ingest_line(session: &mut Session, line: &str) {
                     session.title = Some(t.to_string());
                 }
             }
-            return;
+            return Flow::Continue;
         }
         // Pure bookkeeping / live-process records with no conversational payload.
         // `progress`, `started`, `result` are sub-agent hook/streaming telemetry;
         // `queue-operation` is the input queue; `mode`/`permission-mode`/`attachment`/
         // `last-prompt` are UI state. Ignore (unknown types fall through and are ignored too).
         "mode" | "permission-mode" | "last-prompt" | "attachment" | "progress" | "started"
-        | "result" | "queue-operation" | "x-quota" | "file-history-snapshot" => return,
+        | "result" | "queue-operation" | "x-quota" | "file-history-snapshot" => return Flow::Continue,
         _ => {}
     }
 
@@ -184,12 +244,13 @@ fn ingest_line(session: &mut Session, line: &str) {
         session.updated_at = Some(ts);
     }
 
-    if let Some(msg) = parse_message(ty, &v) {
+    if let Some(msg) = parse_message(ty, &v, opts) {
         if session.model.is_none() {
             session.model = msg.model.clone();
         }
-        session.messages.push(msg);
+        return sink.message(msg);
     }
+    Flow::Continue
 }
 
 /// Sub-agent transcripts spawned by `parent_path`'s session (Claude Code's Task tool). They live at
@@ -286,9 +347,9 @@ fn parse_ts(s: &str) -> Option<DateTime<Utc>> {
 /// Turn one record into an IR [`Message`]. Handles `user`/`assistant` (the conversation) and the
 /// content-bearing `system` lines (compaction notices, away/error summaries, slash-command output).
 /// Returns `None` for line types with no conversational payload.
-fn parse_message(ty: &str, v: &Value) -> Option<Message> {
+fn parse_message(ty: &str, v: &Value, opts: &ParseOptions) -> Option<Message> {
     if ty == "system" {
-        return parse_system_message(v);
+        return parse_system_message(v, opts);
     }
 
     let role = match ty {
@@ -336,7 +397,9 @@ fn parse_message(ty: &str, v: &Value) -> Option<Message> {
     };
 
     let mut extra = Map::new();
-    collect_extra(v, msg, &mut extra);
+    if opts.extra {
+        collect_extra(v, msg, &mut extra);
+    }
 
     Some(Message {
         id,
@@ -353,7 +416,7 @@ fn parse_message(ty: &str, v: &Value) -> Option<Message> {
 /// `system` records cover a grab-bag of subtypes. Only some carry user-visible text worth surfacing
 /// as a [`Role::System`] message; the rest (timing, hook bookkeeping, killed-agent notices) have no
 /// body and are dropped. We preserve `subtype`/`level`/metadata in `extra` either way.
-fn parse_system_message(v: &Value) -> Option<Message> {
+fn parse_system_message(v: &Value, opts: &ParseOptions) -> Option<Message> {
     let subtype = v.get("subtype").and_then(Value::as_str).unwrap_or("");
     // Body text lives either at top-level `content` (a string) or, for compaction, is implied.
     let content = v.get("content").and_then(Value::as_str);
@@ -381,22 +444,24 @@ fn parse_system_message(v: &Value) -> Option<Message> {
     let timestamp = v.get("timestamp").and_then(Value::as_str).and_then(parse_ts);
 
     let mut extra = Map::new();
-    if !subtype.is_empty() {
-        extra.insert("subtype".into(), Value::String(subtype.to_string()));
-    }
-    for key in [
-        "level",
-        "compactMetadata",
-        "cause",
-        "error",
-        "isMeta",
-        "isSidechain",
-        "agentId",
-        "slug",
-        "logicalParentUuid",
-    ] {
-        if let Some(val) = v.get(key) {
-            extra.insert(key.to_string(), val.clone());
+    if opts.extra {
+        if !subtype.is_empty() {
+            extra.insert("subtype".into(), Value::String(subtype.to_string()));
+        }
+        for key in [
+            "level",
+            "compactMetadata",
+            "cause",
+            "error",
+            "isMeta",
+            "isSidechain",
+            "agentId",
+            "slug",
+            "logicalParentUuid",
+        ] {
+            if let Some(val) = v.get(key) {
+                extra.insert(key.to_string(), val.clone());
+            }
         }
     }
 
@@ -714,6 +779,46 @@ mod tests {
         let text = "not json\n{\"type\":\"x-quota\"}\n{\"type\":\"user\",\"uuid\":\"u1\",\"message\":{\"role\":\"user\",\"content\":\"hi\"}}\n";
         let s = parse_str("s", text, None);
         assert_eq!(s.messages.len(), 1);
+    }
+
+    #[test]
+    fn bulk_opts_skip_extra_but_keep_text() {
+        // The bulk path (`ParseOptions::bulk()`) must NOT materialize the fat `toolUseResult`
+        // sidecar — that's the whole point of gating `extra` for index/search/dataset — while the
+        // full path (`parse`) keeps it. The searchable text must be identical either way.
+        let text = fixture("rich_blocks.jsonl");
+
+        let full = parse_str("s1", &text, None);
+        let tool_full = full.messages.iter().find(|m| m.role == Role::Tool).unwrap();
+        assert!(
+            tool_full.extra.get("toolUseResult").is_some(),
+            "full parse must keep the sidecar"
+        );
+
+        let mut sink = CollectSink::default();
+        let mut bulk = stream_str("s1", &text, None, &ParseOptions::bulk(), &mut sink);
+        bulk.messages = sink.messages;
+        for m in &bulk.messages {
+            assert!(m.extra.is_empty(), "bulk opts must leave every message's extra empty");
+        }
+        assert_eq!(
+            full.searchable_text(),
+            bulk.searchable_text(),
+            "gating extra must not change searchable text"
+        );
+    }
+
+    #[test]
+    fn stream_can_stop_early() {
+        // A sink returning Stop ends the parse without visiting the rest of the transcript.
+        let text = fixture("rich_blocks.jsonl");
+        let mut seen = 0usize;
+        let mut sink = |_m: Message| {
+            seen += 1;
+            Flow::Stop
+        };
+        let _ = stream_str("s1", &text, None, &ParseOptions::bulk(), &mut sink);
+        assert_eq!(seen, 1, "Stop after the first message must halt streaming");
     }
 
     #[test]

@@ -4,6 +4,7 @@ use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use cv_core::ir::*;
 use cv_core::watch::{Filter, Watcher};
+use cv_core::Adapter;
 use cv_core::EmitOptions;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -135,11 +136,17 @@ enum Cmd {
         existing: bool,
     },
     /// Build/refresh the tantivy full-text index that makes `cv search` instant.
+    ///
+    /// Incremental by default: only changed/new sessions are re-indexed and vanished ones reaped,
+    /// so routine refreshes are fast and light. Use `--rebuild` to clear and rebuild from scratch.
     Index {
         /// Also build semantic embeddings (`cv search --semantic`). Downloads a small embedding
         /// model (~30MB) on first use.
         #[arg(long)]
         semantic: bool,
+        /// Clear and rebuild the index from scratch instead of incrementally updating it.
+        #[arg(long)]
+        rebuild: bool,
     },
     /// Fleet analytics over all discovered sessions.
     Stats,
@@ -378,7 +385,7 @@ fn main() -> Result<()> {
         Cmd::Convert { id, to, from, out, cwd } => cmd_convert(&id, &to, from, out, cwd),
         Cmd::Port { id, to, from, to_dir, out, no_context } => cmd_port(&id, to, from, to_dir, out, no_context),
         Cmd::Scry { harness, cwd, interval, existing } => cmd_scry(harness, cwd, interval, existing),
-        Cmd::Index { semantic } => cmd_index(semantic),
+        Cmd::Index { semantic, rebuild } => cmd_index(semantic, rebuild),
         Cmd::Stats => cmd_stats(),
         Cmd::Resume { id, harness, launch } => cmd_resume(&id, harness, launch),
         Cmd::Tree { id, harness } => cmd_tree(&id, harness),
@@ -733,9 +740,12 @@ fn print_board_msg(m: &cv_core::board::BoardMessage) {
     );
 }
 
-fn cmd_index(semantic: bool) -> Result<()> {
-    eprintln!("✦ building full-text index…");
-    let n = cv_search::index_all(None)?;
+fn cmd_index(semantic: bool, rebuild: bool) -> Result<()> {
+    eprintln!(
+        "✦ {} full-text index…",
+        if rebuild { "rebuilding" } else { "updating" }
+    );
+    let n = cv_search::index_all(None, rebuild)?;
     println!(
         "indexed {n} session(s) → {}",
         cv_search::default_tantivy_dir().display()
@@ -1145,8 +1155,6 @@ fn render_search_hits(
     query: &str,
     source: &str,
 ) {
-    // Dates aren't carried on Hit; pull them cheaply from discovery (no parse) for the rows we show.
-    let dates = session_date_map();
     let rows: Vec<&cv_search::Hit> = hits
         .iter()
         .filter(|h| want.map_or(true, |w| h.harness == w.as_str()))
@@ -1162,9 +1170,11 @@ fn render_search_hits(
         return;
     }
     for h in rows {
-        let date = dates
-            .get(&h.id)
-            .and_then(|d| *d)
+        // Dates ride on the hit straight from the index (FTS); semantic hits carry none.
+        let date = h
+            .updated_at
+            .or(h.created_at)
+            .and_then(|t| chrono::DateTime::from_timestamp(t, 0))
             .map(|d| d.format("%Y-%m-%d").to_string())
             .unwrap_or_else(|| "----------".into());
         println!(
@@ -1180,41 +1190,57 @@ fn render_search_hits(
     }
 }
 
-/// id → updated_at (falling back to created_at) from a cheap discovery pass.
-fn session_date_map() -> std::collections::HashMap<String, Option<chrono::DateTime<chrono::Utc>>> {
-    cv_core::discover_all()
-        .into_iter()
-        .map(|r| (r.id, r.updated_at.or(r.created_at)))
-        .collect()
-}
-
 fn cmd_search_live(query: &str, want: Option<Harness>, limit: usize) -> Result<()> {
+    use cv_core::{Flow, Message, MessageSink, ParseOptions, Role};
     let needle = query.to_lowercase();
     let mut hits = 0;
+
+    // A sink that builds one session's lowercased searchable haystack as messages stream past (each
+    // dropped immediately), and grabs the first user text for the label fallback. Peak per session is
+    // O(haystack) instead of O(whole Session) + a separate searchable_text copy + a lowercase copy.
+    struct HaySink {
+        hay: String,
+        first_user: Option<String>,
+    }
+    impl MessageSink for HaySink {
+        fn message(&mut self, m: Message) -> Flow {
+            if self.first_user.is_none() && m.role == Role::User {
+                if let Some(t) = m.text() {
+                    if !t.trim().is_empty() {
+                        self.first_user = Some(t);
+                    }
+                }
+            }
+            let mut piece = String::new();
+            cv_core::stream::append_searchable(&mut piece, &m);
+            self.hay.push_str(&piece.to_lowercase());
+            Flow::Continue
+        }
+    }
 
     for adapter in cv_core::harness::all() {
         if want.map_or(false, |h| adapter.harness() != h) || adapter.storage_root().is_none() {
             continue;
         }
         for r in adapter.discover()? {
-            let session = match adapter.parse(&r) {
-                Ok(s) => s,
+            let mut sink = HaySink { hay: String::new(), first_user: None };
+            let meta = match adapter.stream(&r, &ParseOptions::bulk(), &mut sink) {
+                Ok(m) => m,
                 Err(_) => continue,
             };
-            let hay = session.searchable_text().to_lowercase();
-            if let Some(pos) = hay.find(&needle) {
+            if let Some(pos) = sink.hay.find(&needle) {
                 hits += 1;
+                let label = cv_core::label_from(meta.title.as_deref(), sink.first_user.as_deref());
                 println!(
                     "{:8}  {:8}  {:10}  {}",
-                    session.harness.as_str(),
-                    short_id(&session.id),
-                    session
-                        .updated_at
+                    r.harness.as_str(),
+                    short_id(&r.id),
+                    r.updated_at
                         .map(|d| d.format("%Y-%m-%d").to_string())
                         .unwrap_or_else(|| "----------".into()),
-                    session.label(),
+                    label,
                 );
-                println!("          … {}", snippet(&hay, pos, needle.len()));
+                println!("          … {}", snippet(&sink.hay, pos, needle.len()));
                 if hits >= limit {
                     println!("\n(stopped at {limit} hits; use --limit)");
                     return Ok(());
@@ -1231,44 +1257,40 @@ fn cmd_search_live(query: &str, want: Option<Harness>, limit: usize) -> Result<(
 fn cmd_show(id: &str, harness: Option<String>, json: bool) -> Result<()> {
     let want = parse_harness(&harness)?;
     let (r, adapter) = cv_core::find(id, want)?.with_context(|| format!("no session matching {id:?}"))?;
-    let session = adapter.parse(&r)?;
 
+    // JSON wants the whole IR (incl. `extra`), so it materializes; the rendered transcript streams.
     if json {
+        let session = adapter.parse(&r)?;
         println!("{}", serde_json::to_string_pretty(&session)?);
         return Ok(());
     }
 
-    println!("# {}", session.label());
-    println!(
-        "{} · {} · {}{}",
-        session.harness,
-        session.id,
-        session
-            .cwd
-            .as_deref()
-            .map(home_rel)
-            .unwrap_or_else(|| "?".into()),
-        session
-            .model
-            .as_ref()
-            .map(|m| format!(" · {m}"))
-            .unwrap_or_default()
-    );
-    println!();
-    for m in &session.messages {
-        print_message(m);
-    }
+    let mut out = std::io::BufWriter::new(std::io::stdout().lock());
+    stream_session_render(adapter.as_ref(), &r, &mut out, show_header, show_message)?;
+    use std::io::Write;
+    out.flush()?;
     Ok(())
 }
 
 fn cmd_export(id: &str, format: &str, harness: Option<String>) -> Result<()> {
     let want = parse_harness(&harness)?;
     let (r, adapter) = cv_core::find(id, want)?.with_context(|| format!("no session matching {id:?}"))?;
-    let session = adapter.parse(&r)?;
     match format {
-        "json" => println!("{}", serde_json::to_string_pretty(&session)?),
-        "md" | "markdown" => print!("{}", to_markdown(&session)),
-        "html" => print!("{}", cv_core::html::to_html(&session)),
+        "md" | "markdown" => {
+            let mut out = std::io::BufWriter::new(std::io::stdout().lock());
+            stream_session_render(adapter.as_ref(), &r, &mut out, md_header, md_message)?;
+            use std::io::Write;
+            out.flush()?;
+        }
+        // JSON and HTML need the whole session at once (full IR / a single self-contained document).
+        "json" => {
+            let session = adapter.parse(&r)?;
+            println!("{}", serde_json::to_string_pretty(&session)?);
+        }
+        "html" => {
+            let session = adapter.parse(&r)?;
+            print!("{}", cv_core::html::to_html(&session));
+        }
         other => bail!("unknown format {other:?} (use md, json, or html)"),
     }
     Ok(())
@@ -1304,7 +1326,9 @@ fn cmd_dataset(
         let Some(adapter) = cv_core::harness::for_harness(r.harness) else {
             continue;
         };
-        let session = match adapter.parse(&r) {
+        // Bulk opts: we need every message of this session at once (one record per session), but
+        // dataset rendering never reads `extra`, so skip the fat sidecars.
+        let session = match cv_core::stream::collect_with(adapter.as_ref(), &r, &cv_core::ParseOptions::bulk()) {
             Ok(s) => s,
             Err(e) => {
                 eprintln!("cv dataset: skipping {} ({}): {e:#}", r.id, r.harness);
@@ -1802,86 +1826,244 @@ fn finish_composed(
 
 // ---------- rendering helpers ----------
 
-fn print_message(m: &Message) {
+/// Everything a streamed renderer needs for a session's header — derived from the cheap
+/// [`SessionRef`] (label/cwd) plus the model captured from the first assistant turn.
+struct HeaderInfo {
+    harness: Harness,
+    id: String,
+    cwd: Option<PathBuf>,
+    label: String,
+    model: Option<String>,
+}
+
+/// Render a session to `out` by **streaming** — each message is rendered and written as it arrives,
+/// then dropped, so a multi-GB transcript renders at O(largest message) instead of materializing the
+/// whole `Session`. The header needs the label and model, which come from the first user/assistant
+/// turns, so it's held behind a small bounded buffer (`HOLDBACK` messages) until those are known and
+/// then flushed ahead of the body — header info lives in the first turns, so the buffer stays tiny.
+fn stream_session_render<W: std::io::Write>(
+    adapter: &dyn Adapter,
+    r: &SessionRef,
+    out: &mut W,
+    header: impl Fn(&HeaderInfo) -> String,
+    render_msg: impl Fn(&Message) -> String,
+) -> Result<()> {
+    use cv_core::{Flow, MessageSink, ParseOptions};
+    const HOLDBACK: usize = 24;
+
+    struct Sink<'w, W, H, R> {
+        out: &'w mut W,
+        harness: Harness,
+        id: String,
+        cwd: Option<PathBuf>,
+        title: Option<String>,
+        model: Option<String>,
+        first_user: Option<String>,
+        header: H,
+        render_msg: R,
+        buf: Vec<String>,
+        printed: bool,
+        result: std::io::Result<()>,
+    }
+    impl<W: std::io::Write, H: Fn(&HeaderInfo) -> String, R: Fn(&Message) -> String> Sink<'_, W, H, R> {
+        fn write(&mut self, s: &str) {
+            if self.result.is_ok() {
+                self.result = self.out.write_all(s.as_bytes());
+            }
+        }
+        fn flush_header(&mut self) {
+            if self.printed {
+                return;
+            }
+            let info = HeaderInfo {
+                harness: self.harness,
+                id: self.id.clone(),
+                cwd: self.cwd.clone(),
+                label: cv_core::label_from(self.title.as_deref(), self.first_user.as_deref()),
+                model: self.model.clone(),
+            };
+            let head = (self.header)(&info);
+            self.write(&head);
+            let buffered = std::mem::take(&mut self.buf);
+            for s in buffered {
+                self.write(&s);
+            }
+            self.printed = true;
+        }
+    }
+    impl<W: std::io::Write, H: Fn(&HeaderInfo) -> String, R: Fn(&Message) -> String> MessageSink
+        for Sink<'_, W, H, R>
+    {
+        fn meta(&mut self, s: &Session) {
+            // Authoritative *parsed* session metadata, delivered before the body by the bridge
+            // `stream` and by adapters that call `sink.meta` (e.g. codex). The parsed title overrides
+            // the discovery-time `SessionRef` title so the header matches a full parse — some
+            // adapters' discovery title differs from the parsed one (codex's discovery title is the
+            // first user record, which the parse skips). Model/cwd fill in if discovery lacked them.
+            self.title = s.title.clone();
+            if self.model.is_none() {
+                self.model = s.model.clone();
+            }
+            if self.cwd.is_none() {
+                self.cwd = s.cwd.clone();
+            }
+        }
+        fn message(&mut self, m: Message) -> Flow {
+            if self.result.is_err() {
+                return Flow::Stop;
+            }
+            if self.model.is_none() {
+                if let Some(md) = &m.model {
+                    self.model = Some(md.clone());
+                }
+            }
+            if self.first_user.is_none() && m.role == Role::User {
+                if let Some(t) = m.text() {
+                    if !t.trim().is_empty() {
+                        self.first_user = Some(t);
+                    }
+                }
+            }
+            let rendered = (self.render_msg)(&m);
+            drop(m);
+            if self.printed {
+                self.write(&rendered);
+            } else {
+                self.buf.push(rendered);
+                let title_known = self.title.is_some() || self.first_user.is_some();
+                if (self.model.is_some() && title_known) || self.buf.len() >= HOLDBACK {
+                    self.flush_header();
+                }
+            }
+            if self.result.is_err() {
+                Flow::Stop
+            } else {
+                Flow::Continue
+            }
+        }
+    }
+
+    let mut sink = Sink {
+        out,
+        harness: r.harness,
+        id: r.id.clone(),
+        cwd: r.cwd.clone(),
+        title: r.title.clone(),
+        model: None,
+        first_user: None,
+        header,
+        render_msg,
+        buf: Vec::new(),
+        printed: false,
+        result: Ok(()),
+    };
+    adapter.stream(r, &ParseOptions::bulk(), &mut sink)?;
+    sink.flush_header(); // short sessions (no assistant turn / < HOLDBACK msgs) flush here
+    sink.result?;
+    Ok(())
+}
+
+/// Header for `cv show` (mirrors the old eager header exactly).
+fn show_header(h: &HeaderInfo) -> String {
+    format!(
+        "# {}\n{} · {} · {}{}\n\n",
+        h.label,
+        h.harness,
+        h.id,
+        h.cwd.as_deref().map(home_rel).unwrap_or_else(|| "?".into()),
+        h.model.as_ref().map(|m| format!(" · {m}")).unwrap_or_default(),
+    )
+}
+
+/// One rendered `cv show` message block (the String form of the old `print_message`).
+fn show_message(m: &Message) -> String {
     let tag = match m.role {
         Role::System => "system",
         Role::User => "user",
         Role::Assistant => "assistant",
         Role::Tool => "tool",
     };
-    println!("── {tag} ──");
+    let mut s = format!("── {tag} ──\n");
     for b in &m.content {
         match b {
-            Block::Text { text } => println!("{text}"),
-            Block::Thinking { text, .. } => println!("[thinking] {}", truncate(text, 200)),
-            Block::ToolUse { name, input, .. } => {
-                println!("[tool_use {name}] {}", truncate(&input.to_string(), 200))
+            Block::Text { text } => {
+                s.push_str(text);
+                s.push('\n');
             }
-            Block::ToolResult { content, is_error, .. } => println!(
-                "[tool_result{}] {}",
+            Block::Thinking { text, .. } => s.push_str(&format!("[thinking] {}\n", truncate(text, 200))),
+            Block::ToolUse { name, input, .. } => {
+                s.push_str(&format!("[tool_use {name}] {}\n", truncate(&input.to_string(), 200)))
+            }
+            Block::ToolResult { content, is_error, .. } => s.push_str(&format!(
+                "[tool_result{}] {}\n",
                 if *is_error { " error" } else { "" },
                 truncate(content, 200)
-            ),
-            Block::File { path, source, .. } => println!(
-                "[file: {}]",
+            )),
+            Block::File { path, source, .. } => s.push_str(&format!(
+                "[file: {}]\n",
                 path.as_deref().or(source.as_deref()).unwrap_or("?")
-            ),
-            Block::Image { .. } => println!("[image]"),
+            )),
+            Block::Image { .. } => s.push_str("[image]\n"),
         }
     }
-    println!();
+    s.push('\n');
+    s
 }
 
-fn to_markdown(s: &Session) -> String {
-    let mut out = String::new();
-    out.push_str(&format!("# {}\n\n", s.label()));
-    out.push_str(&format!(
-        "- harness: {}\n- id: {}\n- cwd: {}\n",
-        s.harness,
-        s.id,
-        s.cwd.as_deref().map(home_rel).unwrap_or_else(|| "?".into())
-    ));
-    if let Some(m) = &s.model {
-        out.push_str(&format!("- model: {m}\n"));
-    }
-    out.push('\n');
-    for m in &s.messages {
-        let who = match m.role {
-            Role::System => "System",
-            Role::User => "User",
-            Role::Assistant => "Assistant",
-            Role::Tool => "Tool",
-        };
-        out.push_str(&format!("## {who}\n\n"));
-        for b in &m.content {
-            match b {
-                Block::Text { text } => {
-                    out.push_str(text);
-                    out.push_str("\n\n");
-                }
-                Block::Thinking { text, .. } => {
-                    out.push_str("> 🧠 ");
-                    out.push_str(&text.replace('\n', "\n> "));
-                    out.push_str("\n\n");
-                }
-                Block::ToolUse { name, input, .. } => {
-                    out.push_str(&format!("**🔧 {name}**\n\n```json\n{input}\n```\n\n"));
-                }
-                Block::ToolResult { content, is_error, .. } => {
-                    out.push_str(&format!(
-                        "**↩ result{}**\n\n```\n{}\n```\n\n",
-                        if *is_error { " (error)" } else { "" },
-                        truncate(content, 4000)
-                    ));
-                }
-                Block::File { path, source, .. } => {
-                    out.push_str(&format!(
-                        "_[file: {}]_\n\n",
-                        path.as_deref().or(source.as_deref()).unwrap_or("?")
-                    ));
-                }
-                Block::Image { .. } => out.push_str("_[image]_\n\n"),
+/// Header for `cv export md`.
+fn md_header(h: &HeaderInfo) -> String {
+    let model = h
+        .model
+        .as_ref()
+        .map(|m| format!("- model: {m}\n"))
+        .unwrap_or_default();
+    format!(
+        "# {}\n\n- harness: {}\n- id: {}\n- cwd: {}\n{}\n",
+        h.label,
+        h.harness,
+        h.id,
+        h.cwd.as_deref().map(home_rel).unwrap_or_else(|| "?".into()),
+        model,
+    )
+}
+
+/// One rendered `cv export md` message section.
+fn md_message(m: &Message) -> String {
+    let who = match m.role {
+        Role::System => "System",
+        Role::User => "User",
+        Role::Assistant => "Assistant",
+        Role::Tool => "Tool",
+    };
+    let mut out = format!("## {who}\n\n");
+    for b in &m.content {
+        match b {
+            Block::Text { text } => {
+                out.push_str(text);
+                out.push_str("\n\n");
             }
+            Block::Thinking { text, .. } => {
+                out.push_str("> 🧠 ");
+                out.push_str(&text.replace('\n', "\n> "));
+                out.push_str("\n\n");
+            }
+            Block::ToolUse { name, input, .. } => {
+                out.push_str(&format!("**🔧 {name}**\n\n```json\n{input}\n```\n\n"));
+            }
+            Block::ToolResult { content, is_error, .. } => {
+                out.push_str(&format!(
+                    "**↩ result{}**\n\n```\n{}\n```\n\n",
+                    if *is_error { " (error)" } else { "" },
+                    truncate(content, 4000)
+                ));
+            }
+            Block::File { path, source, .. } => {
+                out.push_str(&format!(
+                    "_[file: {}]_\n\n",
+                    path.as_deref().or(source.as_deref()).unwrap_or("?")
+                ));
+            }
+            Block::Image { .. } => out.push_str("_[image]_\n\n"),
         }
     }
     out

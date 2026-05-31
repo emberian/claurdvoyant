@@ -145,6 +145,8 @@ pub fn semantic_search(path: &Path, query: &str, k: usize) -> Result<Vec<Hit>> {
             title: r.title.clone(),
             score,
             snippet: r.preview.clone(),
+            created_at: None,
+            updated_at: None,
         })
         .collect())
 }

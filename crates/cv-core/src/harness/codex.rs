@@ -21,10 +21,12 @@
 
 use super::Adapter;
 use crate::ir::*;
+use crate::stream::{Flow, MessageSink, ParseOptions};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde_json::{Map, Value};
 use std::fs;
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
@@ -93,10 +95,53 @@ impl Adapter for Codex {
     }
 
     fn parse(&self, r: &SessionRef) -> Result<Session> {
+        // Concrete full parse (used directly for full-fidelity ops, and by `stream`'s legacy-JSON
+        // branch). `stream` is the memory-light path for the bulk consumers.
         let text = fs::read_to_string(&r.path)
             .with_context(|| format!("reading {}", r.path.display()))?;
         let is_jsonl = r.path.extension().and_then(|e| e.to_str()) == Some("jsonl");
         Ok(parse_str(&r.id, &text, is_jsonl, Some(r.path.clone())))
+    }
+
+    fn stream(
+        &self,
+        r: &SessionRef,
+        opts: &ParseOptions,
+        sink: &mut dyn MessageSink,
+    ) -> Result<Session> {
+        let is_jsonl = r.path.extension().and_then(|e| e.to_str()) == Some("jsonl");
+        if !is_jsonl {
+            // 2025 legacy layout is a single JSON document — inherently whole-file. Reuse the full
+            // parse and replay (these sessions are rare and small).
+            let mut s = self.parse(r)?;
+            let messages = std::mem::take(&mut s.messages);
+            sink.meta(&s);
+            for m in messages {
+                if sink.message(m) == Flow::Stop {
+                    break;
+                }
+            }
+            return Ok(s);
+        }
+        // Modern `.jsonl` rollout: stream it. `has_events` is a whole-file property (do NL text
+        // come from `event_msg`s or `response_item`s?), so we make a cheap first pass to detect it,
+        // then a second streaming pass that emits one record's messages at a time. Both passes are
+        // O(largest line); the previous `parse_str` collected the entire file into a `Vec<Value>`.
+        let has_events = {
+            let f = fs::File::open(&r.path)
+                .with_context(|| format!("opening {}", r.path.display()))?;
+            detect_has_events(BufReader::new(f))
+        };
+        let f = fs::File::open(&r.path)
+            .with_context(|| format!("opening {}", r.path.display()))?;
+        Ok(stream_jsonl(
+            &r.id,
+            BufReader::new(f),
+            Some(r.path.clone()),
+            has_events,
+            opts,
+            sink,
+        ))
     }
 
     fn can_emit(&self) -> bool {
@@ -132,43 +177,16 @@ pub fn parse_str(id: &str, text: &str, is_jsonl: bool, source_path: Option<PathB
             .filter(|l| !l.trim().is_empty())
             .filter_map(|l| serde_json::from_str(l).ok())
             .collect();
-        let has_events = lines.iter().any(|v| {
-            v.get("type").and_then(Value::as_str) == Some("event_msg")
-                && matches!(
-                    v.pointer("/payload/type").and_then(Value::as_str),
-                    Some("user_message") | Some("agent_message")
-                )
-        });
+        let has_events = lines.iter().any(is_nl_event);
+        // Accumulate into one vec across all lines (NOT drained per line) so the cross-record
+        // `token_count` usage attachment can reach back to the preceding assistant message
+        // (`attach_usage = true`). Assigned to `s.messages` at the end. Using a separate `out` (not
+        // `&mut s.messages`) avoids borrowing `s` twice in `dispatch_line`.
+        let mut out: Vec<Message> = Vec::new();
         for v in &lines {
-            if let Some(ts) = top_ts(v) {
-                s.created_at.get_or_insert(ts);
-                s.updated_at = Some(ts);
-            }
-            match v.get("type").and_then(Value::as_str) {
-                None => {
-                    // bare {id,timestamp} header
-                    if s.id.is_empty() {
-                        if let Some(id) = v.get("id").and_then(Value::as_str) {
-                            s.id = id.to_string();
-                        }
-                    }
-                }
-                Some("session_meta") => apply_meta(&mut s, v.get("payload")),
-                Some("turn_context") => {
-                    apply_turn_context(&mut s, v.get("payload"), top_ts(v));
-                }
-                Some("event_msg") => {
-                    handle_event(v.get("payload"), has_events, top_ts(v), &mut s.messages);
-                }
-                Some("response_item") => {
-                    handle_item(v.get("payload"), has_events, top_ts(v), &mut s.messages);
-                }
-                Some("compacted") => {
-                    handle_compacted(v.get("payload"), top_ts(v), &mut s.messages);
-                }
-                _ => {}
-            }
+            dispatch_line(&mut s, &mut out, v, has_events, true);
         }
+        s.messages = out;
     } else if let Ok(root) = serde_json::from_str::<Value>(text) {
         apply_meta(&mut s, root.get("session"));
         let items = root
@@ -184,6 +202,128 @@ pub fn parse_str(id: &str, text: &str, is_jsonl: bool, source_path: Option<PathB
 
     if s.id.is_empty() {
         s.id = id.to_string();
+    }
+    s
+}
+
+/// Does this record carry natural-language text via `event_msg` (vs. `response_item`)? The
+/// whole-file `has_events` flag is `any()` of this over the records.
+fn is_nl_event(v: &Value) -> bool {
+    v.get("type").and_then(Value::as_str) == Some("event_msg")
+        && matches!(
+            v.pointer("/payload/type").and_then(Value::as_str),
+            Some("user_message") | Some("agent_message")
+        )
+}
+
+/// Fold one record into `s`'s metadata and push any resulting messages into `scratch`. Shared by the
+/// full [`parse_str`] and the streaming [`stream_jsonl`] so both produce identical messages.
+///
+/// `attach_usage` controls the one cross-record behavior: `token_count` events attach usage to the
+/// *preceding* assistant message. In streaming, prior messages have already been emitted (and aren't
+/// in `scratch`), and bulk consumers don't read usage — so the streaming path passes `false` to skip
+/// it rather than synthesize a spurious carrier message. The full parse passes `true`.
+fn dispatch_line(
+    s: &mut Session,
+    scratch: &mut Vec<Message>,
+    v: &Value,
+    has_events: bool,
+    attach_usage: bool,
+) {
+    if let Some(ts) = top_ts(v) {
+        s.created_at.get_or_insert(ts);
+        s.updated_at = Some(ts);
+    }
+    match v.get("type").and_then(Value::as_str) {
+        None => {
+            // bare {id,timestamp} header
+            if s.id.is_empty() {
+                if let Some(id) = v.get("id").and_then(Value::as_str) {
+                    s.id = id.to_string();
+                }
+            }
+        }
+        Some("session_meta") => apply_meta(s, v.get("payload")),
+        Some("turn_context") => apply_turn_context(s, scratch, v.get("payload"), top_ts(v)),
+        Some("event_msg") => handle_event(v.get("payload"), has_events, top_ts(v), scratch, attach_usage),
+        Some("response_item") => handle_item(v.get("payload"), has_events, top_ts(v), scratch),
+        Some("compacted") => handle_compacted(v.get("payload"), top_ts(v), scratch),
+        _ => {}
+    }
+}
+
+/// Cheap first pass over a rollout: are NL messages carried as `event_msg`s? (See [`is_nl_event`].)
+fn detect_has_events<R: BufRead>(reader: R) -> bool {
+    for line in reader.lines() {
+        let Ok(line) = line else { continue };
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Ok(v) = serde_json::from_str::<Value>(line) {
+            if is_nl_event(&v) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Streaming parse of a modern `.jsonl` rollout: emit each record's messages to `sink` and drop them
+/// before the next line, so peak memory is O(largest line) rather than O(whole file). Returns the
+/// [`Session`] metadata with empty `messages`.
+pub fn stream_jsonl<R: BufRead>(
+    id: &str,
+    reader: R,
+    source_path: Option<PathBuf>,
+    has_events: bool,
+    _opts: &ParseOptions,
+    sink: &mut dyn MessageSink,
+) -> Session {
+    let mut s = Session {
+        id: String::new(),
+        harness: Harness::Codex,
+        cwd: None,
+        title: None,
+        created_at: None,
+        updated_at: None,
+        model: None,
+        git: None,
+        messages: Vec::new(),
+        source_path,
+        extra: serde_json::Map::new(),
+    };
+    let mut scratch: Vec<Message> = Vec::new();
+    let mut meta_sent = false;
+    'outer: for line in reader.lines() {
+        let Ok(line) = line else { continue };
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        // Streaming skips token_count usage attachment (see `dispatch_line`'s `attach_usage`).
+        dispatch_line(&mut s, &mut scratch, &v, has_events, false);
+        // Hand the session metadata to the sink as soon as the model is known (session_meta /
+        // turn_context land in the first records, before any message), so header-rendering sinks
+        // have it ahead of the body.
+        if !meta_sent && s.model.is_some() {
+            sink.meta(&s);
+            meta_sent = true;
+        }
+        for m in scratch.drain(..) {
+            if sink.message(m) == Flow::Stop {
+                break 'outer;
+            }
+        }
+    }
+    if s.id.is_empty() {
+        s.id = id.to_string();
+    }
+    if !meta_sent {
+        sink.meta(&s);
     }
     s
 }
@@ -221,7 +361,12 @@ fn apply_meta(s: &mut Session, payload: Option<&Value>) {
 /// `turn_context` records persist per-turn config (model, cwd, sandbox/approval). We seed the
 /// session-level `model`/`cwd` from the first one, and emit a lightweight system marker whenever the
 /// effective model changes mid-session so that drift survives into the IR.
-fn apply_turn_context(s: &mut Session, payload: Option<&Value>, ts: Option<DateTime<Utc>>) {
+fn apply_turn_context(
+    s: &mut Session,
+    out: &mut Vec<Message>,
+    payload: Option<&Value>,
+    ts: Option<DateTime<Utc>>,
+) {
     let Some(p) = payload else { return };
     if s.cwd.is_none() {
         s.cwd = p.get("cwd").and_then(Value::as_str).map(PathBuf::from);
@@ -244,7 +389,7 @@ fn apply_turn_context(s: &mut Session, payload: Option<&Value>, ts: Option<DateT
             if let Some(cwd) = p.get("cwd").and_then(Value::as_str) {
                 msg.extra.insert("cwd".into(), Value::String(cwd.into()));
             }
-            s.messages.push(msg);
+            out.push(msg);
             s.model = Some(m.to_string());
         }
         _ => {}
@@ -262,6 +407,7 @@ fn handle_event(
     has_events: bool,
     ts: Option<DateTime<Utc>>,
     out: &mut Vec<Message>,
+    attach_usage: bool,
 ) {
     let Some(p) = payload else { return };
     match p.get("type").and_then(Value::as_str) {
@@ -302,10 +448,11 @@ fn handle_event(
             );
             out.push(m);
         }
-        Some("token_count") => {
+        Some("token_count") if attach_usage => {
             // Usage totals + rate limits. Attach to the latest message that lacks usage so the
             // numbers ride along with the assistant turn they belong to; otherwise drop a bare
-            // carrier message so the rate-limit snapshot isn't lost.
+            // carrier message so the rate-limit snapshot isn't lost. Skipped on the streaming path
+            // (the target message is already emitted, and bulk consumers don't read usage).
             apply_token_count(p, ts, out);
         }
         _ => {}

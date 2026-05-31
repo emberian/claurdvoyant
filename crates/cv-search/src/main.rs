@@ -41,7 +41,7 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
         Cmd::Index => {
-            let n = cv_search::index_all(None)?;
+            let n = cv_search::index_all(None, false)?;
             println!("indexed {n} sessions into {}", cv_search::default_tantivy_dir().display());
         }
         Cmd::Text { query, limit } => {

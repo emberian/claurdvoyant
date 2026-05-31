@@ -7,6 +7,7 @@
 //! them into the common [`Session`] IR. Cross-harness porting is then `parse(A) -> IR -> emit(B)`.
 
 pub mod board;
+pub mod catalog;
 pub mod dataset;
 pub mod discover_cache;
 pub mod emit;
@@ -20,11 +21,13 @@ pub mod ir;
 pub mod loom;
 pub mod redact;
 pub mod render;
+pub mod stream;
 pub mod watch;
 
 pub use emit::{EmitOptions, emit};
 pub use harness::{Adapter, EmitResult};
 pub use ir::*;
+pub use stream::{collect, CollectSink, Flow, MessageSink, ParseOptions};
 
 use anyhow::Result;
 
@@ -55,8 +58,10 @@ pub fn discover_all() -> Vec<SessionRef> {
     #[cfg(not(feature = "parallel"))]
     let out: Vec<SessionRef> = adapters.iter().flat_map(|a| run(a.as_ref())).collect();
 
-    // Persist any freshly-scanned metadata so the next discovery reuses it.
+    // Persist any freshly-scanned metadata so the next discovery reuses it, and refresh the
+    // id→session catalog so `find` can resolve an id without re-scanning the whole fleet.
     discover_cache::persist();
+    catalog::sync(&out);
     out
 }
 
@@ -114,41 +119,63 @@ pub fn subagents_of(r: &SessionRef) -> Vec<SessionRef> {
 /// a single prefix hit is returned, but *multiple* distinct prefix hits are an error rather than a
 /// silent "first one wins" — callers should disambiguate (e.g. by passing a longer id or a harness).
 pub fn find(id: &str, harness: Option<Harness>) -> Result<Option<(SessionRef, Box<dyn Adapter>)>> {
-    let mut prefix_hits: Vec<(SessionRef, Box<dyn Adapter>)> = Vec::new();
-    for adapter in harness::all() {
+    // Fast path: the persisted catalog resolves the id without touching the fleet. We trust a row
+    // only if its file still exists (a stale row — session deleted/moved — falls through to scan).
+    let cataloged = catalog::lookup(id, harness);
+    if !cataloged.is_empty() {
+        if let Some(r) = cataloged.iter().find(|r| r.id == id && r.path.exists()) {
+            if let Some(a) = harness::for_harness(r.harness) {
+                return Ok(Some((r.clone(), a)));
+            }
+        }
+        let live: Vec<&SessionRef> = cataloged.iter().filter(|r| r.path.exists()).collect();
+        match live.len() {
+            1 => {
+                if let Some(a) = harness::for_harness(live[0].harness) {
+                    return Ok(Some((live[0].clone(), a)));
+                }
+            }
+            n if n > 1 => return Err(ambiguous(id, live.into_iter())),
+            _ => {} // all stale → fall through to a fresh scan
+        }
+    }
+
+    // Slow path (cold/stale catalog): a full discovery — which re-warms the catalog — then match.
+    let refs = discover_all();
+    let mut prefix_hits: Vec<SessionRef> = Vec::new();
+    for r in refs {
         if let Some(h) = harness {
-            if adapter.harness() != h {
+            if r.harness != h {
                 continue;
             }
         }
-        if adapter.storage_root().is_none() {
-            continue;
+        if r.id == id {
+            let a = harness::for_harness(r.harness);
+            return Ok(a.map(|a| (r, a)));
         }
-        for r in adapter.discover()? {
-            if r.id == id {
-                return Ok(Some((r, adapter)));
-            }
-            if r.id.starts_with(id) {
-                if let Some(fresh) = harness::for_harness(r.harness) {
-                    prefix_hits.push((r, fresh));
-                }
-            }
+        if r.id.starts_with(id) {
+            prefix_hits.push(r);
         }
     }
     match prefix_hits.len() {
         0 => Ok(None),
-        1 => Ok(prefix_hits.pop()),
-        _ => {
-            let mut ids: Vec<String> = prefix_hits
-                .iter()
-                .map(|(r, _)| format!("{}:{}", r.harness.as_str(), r.id))
-                .collect();
-            ids.sort();
-            anyhow::bail!(
-                "ambiguous session id {id:?} matches {} sessions: {} — pass a longer id or --harness",
-                ids.len(),
-                ids.join(", ")
-            )
+        1 => {
+            let r = prefix_hits.pop().unwrap();
+            Ok(harness::for_harness(r.harness).map(|a| (r, a)))
         }
+        _ => Err(ambiguous(id, prefix_hits.iter())),
     }
+}
+
+/// The "ambiguous prefix" error shared by `find`'s fast and slow paths.
+fn ambiguous<'a>(id: &str, hits: impl Iterator<Item = &'a SessionRef>) -> anyhow::Error {
+    let mut ids: Vec<String> = hits
+        .map(|r| format!("{}:{}", r.harness.as_str(), r.id))
+        .collect();
+    ids.sort();
+    anyhow::anyhow!(
+        "ambiguous session id {id:?} matches {} sessions: {} — pass a longer id or --harness",
+        ids.len(),
+        ids.join(", ")
+    )
 }

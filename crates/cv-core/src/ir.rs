@@ -152,11 +152,7 @@ impl Session {
 
     /// A short human label for listings.
     pub fn label(&self) -> String {
-        self.title
-            .clone()
-            .or_else(|| self.first_user_text())
-            .map(|s| truncate(&s, 72))
-            .unwrap_or_else(|| "(untitled)".into())
+        label_from(self.title.as_deref(), self.first_user_text().as_deref())
     }
 
     /// All textual content concatenated — used to build a search index.
@@ -353,6 +349,15 @@ pub struct SessionRef {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub updated_at: Option<DateTime<Utc>>,
     pub message_count: usize,
+}
+
+/// A short human label from a title and/or first-user-text fallback — the projection
+/// [`Session::label`] makes, exposed so streaming consumers can build it without a whole `Session`.
+pub fn label_from(title: Option<&str>, first_user_text: Option<&str>) -> String {
+    title
+        .or(first_user_text)
+        .map(|s| truncate(s, 72))
+        .unwrap_or_else(|| "(untitled)".into())
 }
 
 pub(crate) fn truncate(s: &str, max: usize) -> String {

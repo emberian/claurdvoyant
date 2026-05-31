@@ -33,8 +33,14 @@ pub struct Hit {
     pub title: Option<String>,
     /// Relevance score (BM25 for FTS, cosine similarity for semantic).
     pub score: f32,
-    /// A representative, highlighted (for FTS) excerpt of the matching text.
+    /// A representative excerpt of the matching text (generated live from the hit session for FTS).
     pub snippet: String,
+    /// Unix timestamps carried straight off the index, so callers can date rows without
+    /// re-discovering the corpus. `None` when unknown / not stored (e.g. semantic hits).
+    #[serde(default)]
+    pub created_at: Option<i64>,
+    #[serde(default)]
+    pub updated_at: Option<i64>,
 }
 
 /// Root directory for cv-search's on-disk state: `$CLAURDVOYANT_HOME` or `~/.claurdvoyant`.
@@ -57,11 +63,12 @@ pub fn default_embeddings_path() -> PathBuf {
 
 // ---- Convenience wrappers over the default-located indexes ---------------------------------
 
-/// Discover, parse, and (re)build the full-text index at its default location.
-/// Returns the number of sessions indexed.
-pub fn index_all(dir: impl Into<Option<PathBuf>>) -> Result<usize> {
+/// Discover, parse, and update the full-text index at its default location. Incremental by default
+/// (only changed/new sessions are rewritten; vanished ones are reaped); `rebuild = true` clears and
+/// rebuilds from scratch. Returns the number of sessions discovered.
+pub fn index_all(dir: impl Into<Option<PathBuf>>, rebuild: bool) -> Result<usize> {
     let dir = dir.into().unwrap_or_else(default_tantivy_dir);
-    fts::index_all(&dir)
+    fts::index_all(&dir, rebuild)
 }
 
 /// Run a full-text query against the index at its default location.
@@ -102,28 +109,63 @@ pub fn semantic_search(
 /// they still see exactly the same searchable text but never hold the whole corpus at once.
 /// Shared by both indexers so they see exactly the same searchable text.
 pub(crate) fn stream_corpus(mut f: impl FnMut(Doc) -> Result<()>) -> Result<usize> {
+    use cv_core::{Flow, Message, MessageSink, ParseOptions, Role};
+
+    /// Builds a [`Doc`] body as messages stream past, dropping each message immediately. Peak memory
+    /// is O(largest message) + O(body) rather than O(whole `Session`), and the fat `extra` sidecars
+    /// are never materialized (we pass `ParseOptions::bulk()`).
+    struct DocSink {
+        body: String,
+        first_user_text: Option<String>,
+    }
+    impl MessageSink for DocSink {
+        fn message(&mut self, m: Message) -> Flow {
+            if self.first_user_text.is_none() && m.role == Role::User {
+                if let Some(t) = m.text() {
+                    if !t.trim().is_empty() {
+                        self.first_user_text = Some(t);
+                    }
+                }
+            }
+            cv_core::stream::append_searchable(&mut self.body, &m);
+            Flow::Continue
+        }
+    }
+
     let mut n = 0usize;
     for r in cv_core::discover_all() {
         let Some(adapter) = cv_core::harness::for_harness(r.harness) else {
             continue;
         };
-        let session = match adapter.parse(&r) {
-            Ok(s) => s,
+        let mut sink = DocSink {
+            body: String::new(),
+            first_user_text: None,
+        };
+        let meta = match adapter.stream(&r, &ParseOptions::bulk(), &mut sink) {
+            Ok(m) => m,
             Err(e) => {
                 eprintln!("cv-search: parse failed for {} ({}): {e:#}", r.id, r.harness);
                 continue;
             }
         };
+        let title = cv_core::label_from(meta.title.as_deref(), sink.first_user_text.as_deref());
+        let mtime_ns = std::fs::metadata(&r.path)
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_nanos() as i64)
+            .unwrap_or(0);
         let doc = Doc {
             id: r.id.clone(),
             harness: r.harness.as_str().to_string(),
             cwd: r.cwd.as_ref().map(|p| p.display().to_string()),
-            title: Some(session.label()),
+            title: Some(title),
             created_at: r.created_at.map(|t| t.timestamp()),
             updated_at: r.updated_at.map(|t| t.timestamp()),
-            body: session.searchable_text(),
+            body: sink.body,
+            path: Some(r.path.display().to_string()),
+            mtime_ns,
         };
-        drop(session); // free the parsed transcript before handing the doc downstream
         f(doc)?;
         n += 1;
     }
@@ -140,4 +182,10 @@ pub(crate) struct Doc {
     pub created_at: Option<i64>,
     pub updated_at: Option<i64>,
     pub body: String,
+    /// Source file path — stored (not the body), so search can snippet a hit by re-reading just that
+    /// one session live (see `fts::live_snippet`) instead of keeping a full stored copy of every body.
+    pub path: Option<String>,
+    /// File mtime in ns, the incremental-index key: an unchanged `(path, mtime)` is skipped on
+    /// reindex. `0` when the path can't be stat'd (then it's always reindexed).
+    pub mtime_ns: i64,
 }

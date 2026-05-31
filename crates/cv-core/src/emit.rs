@@ -1208,10 +1208,17 @@ fn emit_openclaw(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Resul
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_default();
 
-    let sessions_dir = out_dir
-        .join("agents")
-        .join(agent_id)
-        .join("sessions");
+    // `out_dir` is already the agents dir: storage_root() returns `~/.openclaw/agents` and discover()
+    // walks it for `<agentId>/sessions/<id>.jsonl`. Re-joining "agents" here produced
+    // `~/.openclaw/agents/agents/main/sessions/…`, which openclaw never scans (the session was written
+    // but undiscoverable). If a caller instead points `--out` at the state dir (`~/.openclaw`), accept
+    // that too by appending the missing `agents` segment.
+    let agents_root = if out_dir.file_name().is_some_and(|n| n == "agents") {
+        out_dir.to_path_buf()
+    } else {
+        out_dir.join("agents")
+    };
+    let sessions_dir = agents_root.join(agent_id).join("sessions");
     fs::create_dir_all(&sessions_dir)
         .with_context(|| format!("creating {}", sessions_dir.display()))?;
     let file_path = sessions_dir.join(format!("{new_id}.jsonl"));

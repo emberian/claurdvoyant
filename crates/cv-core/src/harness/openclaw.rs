@@ -42,11 +42,13 @@
 
 use super::Adapter;
 use crate::ir::*;
+use crate::stream::{CollectSink, Flow, MessageSink, ParseOptions};
 use anyhow::{Context, Result};
 use chrono::{DateTime, TimeZone, Utc};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::fs;
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
@@ -118,9 +120,20 @@ impl Adapter for OpenClaw {
     }
 
     fn parse(&self, r: &SessionRef) -> Result<Session> {
-        let text = fs::read_to_string(&r.path)
+        crate::stream::collect(self, r)
+    }
+
+    fn stream(
+        &self,
+        r: &SessionRef,
+        _opts: &ParseOptions,
+        sink: &mut dyn MessageSink,
+    ) -> Result<Session> {
+        // One record per line; stream them so peak memory is O(largest line), not O(transcript).
+        let file = fs::File::open(&r.path)
             .with_context(|| format!("reading {}", r.path.display()))?;
-        Ok(parse_text(&text, r))
+        let lines = BufReader::new(file).lines().map_while(Result::ok);
+        Ok(stream_core(lines, r, sink))
     }
 
     fn can_emit(&self) -> bool {
@@ -128,8 +141,22 @@ impl Adapter for OpenClaw {
     }
 }
 
-/// Core parse, split out so tests can drive it from a fixture string.
+/// Core parse, split out so tests can drive it from a fixture string. Full fidelity (collects).
 fn parse_text(text: &str, r: &SessionRef) -> Session {
+    let mut sink = CollectSink::default();
+    let mut s = stream_core(text.lines().map(str::to_string), r, &mut sink);
+    s.messages = sink.messages;
+    s
+}
+
+/// Streaming core shared by the on-disk [`Adapter::stream`] and the string-driven [`parse_text`]:
+/// fold each record's metadata into the session and emit any message to `sink`. Returns the session
+/// with empty `messages`.
+fn stream_core<I: Iterator<Item = String>>(
+    lines: I,
+    r: &SessionRef,
+    sink: &mut dyn MessageSink,
+) -> Session {
     let mut s = Session {
         id: r.id.clone(),
         harness: Harness::OpenClaw,
@@ -144,8 +171,9 @@ fn parse_text(text: &str, r: &SessionRef) -> Session {
         extra: serde_json::Map::new(),
     };
     let mut header_version: Option<i64> = None;
+    let mut meta_sent = false;
 
-    for line in text.lines() {
+    for line in lines {
         let line = line.trim();
         if line.is_empty() {
             continue;
@@ -179,11 +207,21 @@ fn parse_text(text: &str, r: &SessionRef) -> Session {
                     if let Some(ver) = header_version.take() {
                         m.extra.insert("openclaw_session_version".into(), Value::from(ver));
                     }
-                    s.messages.push(m);
+                    // Hand session metadata to the sink before the first message (header consumers).
+                    if !meta_sent {
+                        sink.meta(&s);
+                        meta_sent = true;
+                    }
+                    if sink.message(m) == Flow::Stop {
+                        break;
+                    }
                 }
             }
             _ => {}
         }
+    }
+    if !meta_sent {
+        sink.meta(&s);
     }
     s
 }

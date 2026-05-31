@@ -26,11 +26,13 @@
 
 use super::Adapter;
 use crate::ir::*;
+use crate::stream::{Flow, MessageSink, ParseOptions};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::fs;
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
@@ -81,14 +83,24 @@ impl Adapter for Grok {
     }
 
     fn parse(&self, r: &SessionRef) -> Result<Session> {
-        // r.path is the session directory.
+        crate::stream::collect(self, r)
+    }
+
+    fn stream(
+        &self,
+        r: &SessionRef,
+        _opts: &ParseOptions,
+        sink: &mut dyn MessageSink,
+    ) -> Result<Session> {
+        // r.path is the session directory. `summary.json` (small) carries all session-level
+        // metadata; the transcript is `chat_history.jsonl`, one record per line — streamed.
         let dir = &r.path;
         let summary: Value = fs::read_to_string(dir.join("summary.json"))
             .ok()
             .and_then(|t| serde_json::from_str(&t).ok())
             .unwrap_or(Value::Null);
 
-        let mut s = Session {
+        let s = Session {
             id: r.id.clone(),
             harness: Harness::Grok,
             cwd: summary
@@ -124,9 +136,14 @@ impl Adapter for Grok {
         // Sidecar enrichment: tool_call / tool_call_update entries from the ACP update stream.
         let enrich = read_update_enrichment(dir);
 
-        let chat = fs::read_to_string(dir.join("chat_history.jsonl"))
+        // All session metadata comes from summary.json (already set above), so hand it to the sink
+        // before the body — header-rendering consumers (cv show) get the title/model/cwd up front.
+        sink.meta(&s);
+
+        let file = fs::File::open(dir.join("chat_history.jsonl"))
             .with_context(|| format!("reading chat_history in {}", dir.display()))?;
-        for line in chat.lines() {
+        for line in BufReader::new(file).lines() {
+            let Ok(line) = line else { continue };
             let line = line.trim();
             if line.is_empty() {
                 continue;
@@ -135,7 +152,9 @@ impl Adapter for Grok {
                 continue;
             };
             if let Some(m) = chat_message(&v, &enrich) {
-                s.messages.push(m);
+                if sink.message(m) == Flow::Stop {
+                    break;
+                }
             }
         }
         Ok(s)
