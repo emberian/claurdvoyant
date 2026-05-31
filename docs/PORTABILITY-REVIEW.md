@@ -76,10 +76,12 @@ Hint said `hermes --session <id>`; the actual resume flag is `hermes --resume <i
   ported model must be one the user's hermes is authed/configured for, or they must pass `-m`. Worth
   emitting a default or warning when `session.model` is None.
 
-- **Symlink/realpath jail (claude target).** Claude resolves cwd via realpath; macOS `/tmp`
-  → `/private/tmp`. Porting to a symlinked path writes `~/.claude/projects/-tmp-…` while
-  claude looks under `-private-tmp-…` → "No conversation found". `cv` should canonicalize the
-  target cwd (or warn) when emitting claude. Likely also affects `/var`, `/home` symlinks.
+- **Symlink/realpath jail (claude target). FIXED.** Claude resolves cwd via realpath; macOS `/tmp`
+  → `/private/tmp`. Porting to a symlinked path used to write `~/.claude/projects/-tmp-…` while
+  claude looks under `-private-tmp-…` → "No conversation found". `emit_claude` now canonicalizes the
+  effective cwd (`realpath_for_claude`, falling back to the raw path when it can't be resolved) before
+  deriving the project-dir name, so the dir matches the realpath Claude discovers. Verified: porting
+  to `/tmp/cv-portcheck` writes `-private-tmp-cv-portcheck`. Covers `/var`, `/home` symlinks too.
 - **Not tested live:** claude↔grok direct, all hermes pairs, and full real claude→codex
   sessions containing tool calls (only synthetic text + one real reasoning session covered).
   emit_codex already routes tool_use→`function_call` / tool_result→`function_call_output` as
@@ -93,3 +95,57 @@ Hint said `hermes --session <id>`; the actual resume flag is `hermes --resume <i
 3. `codex exec --sandbox read-only resume <id> "<probe>"` / `grok -p "<probe>" -r <id>` /
    `claude -p "<probe>" --resume <id>` — run from the sandbox cwd.
 4. Compare recall vs. a no-resume control.
+
+---
+
+# Round 2 — source-backed harnesses (opencode / kimi / gemini / openclaw)
+
+We have full source for these in `~/pug`, so each was audited against its real loader code
+AND live-tested. Pattern that recurred: **the transcript bytes are usually right; the
+address (where/how the file is registered) is wrong.**
+
+| Direction       | Status | Notes |
+|-----------------|--------|-------|
+| claude → kimi   | ✅ FIXED + live | recalled needle after fix (committed 00ff132) |
+| hermes → codex  | ✅ (round 1) | |
+| claude → gemini | ⚠️ shape-correct, wrong dir | recall works once placed in `tmp/<slug>/chats/` |
+| claude → opencode | ❌ broken | binary moved to SQLite; legacy JSON ignored |
+| (openclaw)      | ⚠️ loads, lossy | source-verified; resume hint wrong |
+
+### Kimi — FIXED (commit 00ff132, `harness/kimi.rs`)
+Two placement bugs, both live-reproduced then fixed: (1) `storage_root()` returned
+`~/.kimi/sessions` while `emit()` re-joined `sessions/…` → doubled path `…/sessions/sessions/…`
+that kimi-cli never scans; (2) the cwd was never registered in `~/.kimi/kimi.json` `work_dirs[]`,
+so `Session.find` returned None and resume silently started an empty session. After fixing both,
+the real `kimi --resume` recalled the planted passphrase. Transcript schema was already correct.
+
+### OpenCode — BROKEN on current installs (spawned as a follow-up task)
+The installed opencode binary migrated to **SQLite** (`~/.local/share/opencode/opencode.db`) and
+no longer reads the file-based `storage/{session,message,part}/*.json` layout our `emit_opencode`
+writes (JSON→DB migration is one-shot, gated on the db not existing). Live: `opencode run --session
+<id>` → "Error: Session not found"; the row is absent from `opencode.db`. Fix options: emit into
+`opencode.db` (needs a `project` row keyed by the worktree's first-commit git hash, not our
+`prj_<fnv>` hash), or gate `cv` to refuse opencode emit until then. `can_emit()` is already `false`
+in the adapter. (emit.rs-resident — held; see below.)
+
+### Gemini — shape correct, output dir wrong (emit.rs-resident — held)
+`emit_gemini` writes the right legacy whole-file JSON, but to `~/.gemini/tmp/chats/` instead of
+`~/.gemini/tmp/<projectIdentifier>/chats/`. The installed gemini resumes only via `--resume`
+scoped to the project-slug dir (the `--session-file` flag the source suggests is NOT in this
+build). The slug is the cwd basename, registered in `~/.gemini/projects.json`. Proven: copying the
+emitted file into `~/.gemini/tmp/proj/chats/` made `gemini --resume <uuid>` recall the needle. Fix:
+write into `tmp/<slug>/chats/` and register the cwd→slug in `projects.json` (the kimi pattern).
+
+### OpenClaw — loads but lossy (emit.rs-resident — held)
+Source-verified (no real on-disk data to live-test): the threaded transcript loads and replays
+user/assistant text, BUT (1) the resume hint `openclaw --session <id>` is wrong — the headless
+command is `openclaw agent --session-id <id> --message "…" --local`; (2) IR System turns are emitted
+as `role:"system"`, which `buildSessionContext` silently drops (it only handles user/assistant/
+toolResult/custom) → context loss for sessions with system/compaction/custom turns; (3) assistant
+messages omit `provider`/`api`/`stopReason`/`usage` (degraded model resolution); (4) tool results can
+carry an empty `toolCallId` → orphan results some providers reject.
+
+## Holds (shared-file coordination)
+The gemini, openclaw, and opencode-gate fixes all live in `emit.rs`, which currently carries the
+sibling `realpath_for_claude` work uncommitted in the working tree. Held to avoid committing that
+work from under it. Kimi shipped because it lives in its own file (`harness/kimi.rs`).
