@@ -332,6 +332,21 @@ fn branch_of(session: &Session) -> Option<String> {
 // Claude
 // ------------------------------------------------------------------------------------------------
 
+/// Resolve symlinks in `cwd` the way Claude Code does when it looks for sessions to `--resume`.
+///
+/// Claude derives a session's project dir from the *realpath* of the directory it's launched in, so
+/// a session we write must be keyed off the resolved path or `claude --resume` reports "No
+/// conversation found". This bites on macOS, where `/tmp` and `/var` are symlinks into `/private`:
+/// porting a session whose cwd is `/tmp/foo` would write `-tmp-foo` while Claude, launched from
+/// `/tmp/foo`, looks under `-private-tmp-foo`. Canonicalizing here keeps the two in lockstep and
+/// also matches what Claude records in its own transcripts (it runs in the resolved dir).
+///
+/// Falls back to the path as-given when it can't be resolved — e.g. the target dir doesn't exist
+/// yet — which preserves the prior behavior for those cases.
+fn realpath_for_claude(cwd: &Path) -> PathBuf {
+    fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf())
+}
+
 /// Encode a cwd into Claude's project-dir name: leading `-`, then every `/` and `.` becomes `-`.
 fn claude_encode_cwd(cwd: &Path) -> String {
     let s = cwd.to_string_lossy();
@@ -353,7 +368,8 @@ fn emit_claude(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<
         .new_id
         .clone()
         .unwrap_or_else(|| Uuid::new_v4().to_string());
-    let cwd = effective_cwd(session, opts);
+    // Resolve symlinks so the project-dir name matches the realpath Claude resolves at resume time.
+    let cwd = effective_cwd(session, opts).map(|p| realpath_for_claude(&p));
     let cwd_str = cwd
         .as_ref()
         .map(|p| p.to_string_lossy().to_string())
@@ -972,6 +988,20 @@ fn epoch_ms(t: Option<DateTime<Utc>>) -> i64 {
 /// message. We honour all of that. Tool results are folded back onto the originating assistant
 /// message's `tool` part (matched by `tool_use_id`), since OpenCode has no standalone tool turn.
 fn emit_opencode(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<EmitResult> {
+    // OpenCode migrated to a SQLite store (`opencode.db`, sibling of this `storage/` dir). Once that
+    // DB exists the binary no longer reads the file-based `storage/{session,message,part}/*.json`
+    // layout we write here — the JSON→DB import is one-shot, gated on the DB's absence — so a session
+    // emitted into `storage/` is invisible to resume (`opencode run --session <id>` → "Session not
+    // found", verified live). Refuse rather than silently produce an unresumable session. Emitting
+    // INTO opencode.db is tracked as a follow-up. If the DB is absent (fresh install), the legacy JSON
+    // is still imported on next launch, so we proceed normally.
+    if out_dir.parent().map(|p| p.join("opencode.db")).is_some_and(|db| db.exists()) {
+        anyhow::bail!(
+            "opencode has migrated to SQLite (opencode.db); it no longer reads the file-based \
+             storage/ layout, so a session converted here cannot be resumed. Emitting into \
+             opencode.db isn't implemented yet — see docs/PORTABILITY-REVIEW.md."
+        );
+    }
     let new_id = opts
         .new_id
         .clone()
@@ -1291,7 +1321,12 @@ fn emit_openclaw(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Resul
     Ok(EmitResult {
         path: file_path,
         new_id: new_id.clone(),
-        resume_hint: Some(format!("openclaw --session {new_id}")),
+        // Headless resume is the `agent` subcommand with `--session-id` + a `--message`, run
+        // in-process via `--local` (verified against openclaw's CLI registration; there is no
+        // `openclaw --session` flag outside the interactive TUI launcher).
+        resume_hint: Some(format!(
+            "openclaw agent --session-id {new_id} --message \"<your prompt>\" --local"
+        )),
     })
 }
 
@@ -1378,9 +1413,21 @@ fn emit_gemini(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<
         .clone()
         .unwrap_or_else(|| Uuid::new_v4().to_string());
     let cwd = effective_cwd(session, opts);
+    let cwd_str = cwd
+        .as_ref()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_default();
 
-    // gemini stores recordings under chats/; place ours there so discover() can find it too.
-    let chats_dir = out_dir.join("chats");
+    // Gemini's `--resume` / `--list-sessions` only scan `<globalTemp>/<projectIdentifier>/chats/`,
+    // where `out_dir` is `<globalTemp>` (~/.gemini/tmp) and `<projectIdentifier>` is the cwd basename
+    // registered in `<globalTemp>/../projects.json`. Writing to a bare `chats/` (no identifier dir)
+    // makes the session invisible to the installed binary. So register the cwd→slug mapping (matching
+    // gemini's getShortId) and write into the slug's chats dir. (Verified live: with the file in the
+    // right slug dir, `gemini --resume <uuid>` recalls the conversation.)
+    let chats_dir = match gemini_register_project(out_dir, &cwd_str) {
+        Some(slug) => out_dir.join(slug).join("chats"),
+        None => out_dir.join("chats"), // no cwd → fall back to the legacy bare path
+    };
     fs::create_dir_all(&chats_dir)
         .with_context(|| format!("creating {}", chats_dir.display()))?;
     let file_path = chats_dir.join(format!("session-{new_id}.json"));
@@ -1495,10 +1542,7 @@ fn emit_gemini(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<
     let mut record = Map::new();
     record.insert("sessionId".into(), json!(new_id));
     // gemini keys recordings by an opaque projectHash; synthesize a stable one from the cwd.
-    let cwd_str = cwd
-        .as_ref()
-        .map(|p| p.to_string_lossy().to_string())
-        .unwrap_or_default();
+    // (The resume path doesn't validate this value; discovery is by the slug dir computed above.)
     record.insert("projectHash".into(), json!(short_hash(&cwd_str)));
     record.insert("startTime".into(), json!(start));
     record.insert("lastUpdated".into(), json!(last));
@@ -1516,8 +1560,81 @@ fn emit_gemini(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<
     Ok(EmitResult {
         path: file_path,
         new_id: new_id.clone(),
-        resume_hint: Some(format!("gemini --resume {new_id}")),
+        resume_hint: Some(match &cwd {
+            Some(c) => format!("gemini --resume {new_id}  (run from {})", c.display()),
+            None => format!("gemini --resume {new_id}"),
+        }),
     })
+}
+
+/// Bind `cwd` to a slug dir under gemini's `<globalTemp>` (=`out_dir`), replicating
+/// `ProjectRegistry.getShortId`/`claimNewSlug`. Gemini owns a slug dir via a `.project_root` marker
+/// file containing the project path; on launch it RE-derives the slug and, if our dir lacks a marker
+/// (or the projects.json entry can't be verified), reassigns a fresh slug — so writing only
+/// projects.json is not enough. We therefore: pick the cwd basename (suffixing `-2`, `-3`… if a
+/// DIFFERENT path already owns that dir's marker), write the `.project_root` marker, and record the
+/// projects.json mapping (the fast path; gemini heals from the marker regardless). After this,
+/// `gemini --resume`/`--list-sessions` discover the session. Returns the slug, `None` if `cwd` empty.
+fn gemini_register_project(global_tmp: &Path, cwd: &str) -> Option<String> {
+    if cwd.is_empty() {
+        return None;
+    }
+    const MARKER: &str = ".project_root";
+    // Reuse the slug whose marker already owns this cwd, if any (gemini's findExistingSlugForPath).
+    let owned_by = |slug_dir: &Path| -> Option<String> {
+        fs::read_to_string(slug_dir.join(MARKER))
+            .ok()
+            .map(|s| s.trim().to_string())
+    };
+    if let Ok(entries) = fs::read_dir(global_tmp) {
+        for e in entries.flatten() {
+            if owned_by(&e.path()).as_deref() == Some(cwd) {
+                return e.file_name().to_str().map(str::to_string);
+            }
+        }
+    }
+    // Otherwise claim the basename, skipping dirs whose marker owns a different path.
+    let base = Path::new(cwd)
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "session".to_string());
+    let mut slug = base.clone();
+    let mut n = 2;
+    loop {
+        let dir = global_tmp.join(&slug);
+        match owned_by(&dir) {
+            Some(owner) if owner != cwd => {
+                slug = format!("{base}-{n}");
+                n += 1;
+            }
+            _ => break, // free, or already ours
+        }
+    }
+    let slug_dir = global_tmp.join(&slug);
+    let _ = fs::create_dir_all(&slug_dir);
+    let _ = fs::write(slug_dir.join(MARKER), cwd);
+    // Record the projects.json fast-path mapping too (best-effort).
+    if let Some(parent) = global_tmp.parent() {
+        let projects_json = parent.join("projects.json");
+        let mut doc: Value = fs::read_to_string(&projects_json)
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .filter(Value::is_object)
+            .unwrap_or_else(|| json!({}));
+        let projects = doc
+            .as_object_mut()
+            .unwrap()
+            .entry("projects")
+            .or_insert_with(|| json!({}));
+        if let Some(m) = projects.as_object_mut() {
+            m.insert(cwd.to_string(), json!(slug));
+        }
+        if let Ok(s) = serde_json::to_string_pretty(&doc) {
+            let _ = fs::write(&projects_json, s);
+        }
+    }
+    Some(slug)
 }
 
 /// Map IR blocks → a Gemini `Part[]` (`text` / thought `text` / `inlineData`). Tool calls are
@@ -1985,6 +2102,41 @@ mod tests {
             claude_encode_cwd(Path::new("/Users/test/my.project")),
             "-Users-test-my-project"
         );
+    }
+
+    /// Porting to a symlinked cwd must key the project dir off the *realpath*, so `claude --resume`
+    /// — which resolves symlinks on the launch dir — discovers the session. Guards the macOS
+    /// `/tmp` → `/private/tmp` jail. See `realpath_for_claude`.
+    #[test]
+    #[cfg(unix)]
+    fn claude_project_dir_follows_symlinked_cwd() {
+        use std::os::unix::fs::symlink;
+
+        let base = temp_dir();
+        let real = base.join("real_project");
+        fs::create_dir_all(&real).unwrap();
+        let link = base.join("link_project");
+        symlink(&real, &link).unwrap();
+
+        // Sanity: the link path encodes differently from its realpath, else the test proves nothing.
+        let resolved = fs::canonicalize(&link).unwrap();
+        assert_ne!(claude_encode_cwd(&link), claude_encode_cwd(&resolved));
+
+        let out = temp_dir();
+        let res = emit(
+            &sample_session(Harness::Claude),
+            Harness::Claude,
+            &out,
+            &EmitOptions {
+                new_cwd: Some(link.clone()),
+                new_id: None,
+            },
+        )
+        .unwrap();
+
+        let proj_dir = res.path.parent().unwrap().file_name().unwrap();
+        assert_eq!(proj_dir, claude_encode_cwd(&resolved).as_str());
+        assert_ne!(proj_dir, claude_encode_cwd(&link).as_str());
     }
 
     #[test]
