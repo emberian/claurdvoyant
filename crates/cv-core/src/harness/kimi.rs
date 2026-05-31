@@ -84,7 +84,13 @@ impl Adapter for Kimi {
     }
 
     fn storage_root(&self) -> Option<PathBuf> {
-        self.sessions.clone()
+        // The share root (`~/.kimi`), NOT `<root>/sessions`. `emit()` joins `sessions/<hash>/<id>`
+        // itself and also writes `kimi.json` at this root, so it must receive the share root.
+        // (Returning `sessions` here produced `~/.kimi/sessions/sessions/...`, which kimi-cli never
+        // discovers.) Fall back to `<sessions>/..` if only the sessions dir was detected.
+        self.root
+            .clone()
+            .or_else(|| self.sessions.as_ref().and_then(|s| s.parent().map(Path::to_path_buf)))
     }
 
     fn discover(&self) -> Result<Vec<SessionRef>> {
@@ -349,6 +355,17 @@ pub fn emit(
     let wire_path = session_dir.join("wire.jsonl");
     write_jsonl(&wire_path, &wire_lines)?;
 
+    // Register the work_dir in `kimi.json`. kimi-cli's `Session.find` returns None (→ silently
+    // starts a fresh, empty session) unless the cwd is present in `work_dirs[]`, matched on exact
+    // `path` + `kaos`. Local dirs use `kaos: "local"` and a session dir hash of md5(path) — which is
+    // exactly what we wrote above. Without this, the ported session exists on disk but is invisible
+    // to resume. Best-effort: never fatal.
+    if !cwd_str.is_empty() {
+        if let Err(e) = register_work_dir(out_dir, &cwd_str, &new_id) {
+            eprintln!("cv: kimi work_dir registration skipped ({e}); resume may not find the session");
+        }
+    }
+
     let resume = match &cwd {
         Some(c) => format!("kimi --resume {new_id}  (run from {})", c.display()),
         None => format!("kimi --resume {new_id}"),
@@ -358,6 +375,51 @@ pub fn emit(
         new_id,
         resume_hint: Some(resume),
     })
+}
+
+/// Upsert a `work_dirs[]` entry in `<root>/kimi.json` so kimi-cli's `Session.find` can locate the
+/// ported session for this cwd. Local dirs are keyed by `kaos: "local"`; we match/update on `path`
+/// and refresh `last_session_id` (so `--continue` also reaches it). Creates kimi.json if absent.
+fn register_work_dir(root: &Path, cwd: &str, session_id: &str) -> Result<()> {
+    let kimi_json = root.join("kimi.json");
+    let mut doc: Value = match fs::read_to_string(&kimi_json) {
+        Ok(s) => serde_json::from_str(&s).unwrap_or_else(|_| serde_json::json!({})),
+        Err(_) => serde_json::json!({}),
+    };
+    if !doc.is_object() {
+        doc = serde_json::json!({});
+    }
+    let obj = doc.as_object_mut().expect("doc is object");
+    let dirs = obj
+        .entry("work_dirs")
+        .or_insert_with(|| Value::Array(Vec::new()));
+    let arr = match dirs.as_array_mut() {
+        Some(a) => a,
+        None => {
+            *dirs = Value::Array(Vec::new());
+            dirs.as_array_mut().unwrap()
+        }
+    };
+    // Update existing local entry for this path, else append.
+    let existing = arr.iter_mut().find(|e| {
+        e.get("path").and_then(Value::as_str) == Some(cwd)
+            && e.get("kaos").and_then(Value::as_str) == Some("local")
+    });
+    match existing {
+        Some(e) => {
+            if let Some(m) = e.as_object_mut() {
+                m.insert("last_session_id".into(), Value::String(session_id.to_string()));
+            }
+        }
+        None => arr.push(serde_json::json!({
+            "path": cwd,
+            "kaos": "local",
+            "last_session_id": session_id,
+        })),
+    }
+    fs::write(&kimi_json, serde_json::to_string_pretty(&doc)?)
+        .map_err(|e| anyhow::anyhow!("writing {}: {e}", kimi_json.display()))?;
+    Ok(())
 }
 
 /// User `content`: a bare string for a single text block (matching how kimi-cli stores single-part
