@@ -64,6 +64,28 @@ enum Cmd {
         #[arg(long)]
         harness: Option<String>,
     },
+    /// Export the corpus as a fine-tuning dataset (JSONL, one session per line).
+    /// `chatml`/`sharegpt` import directly into Unsloth Studio / TRL / HF — no adapter.
+    Dataset {
+        /// `chatml` (default) → {"messages":[…]}, or `sharegpt` → {"conversations":[…]}.
+        #[arg(long, default_value = "chatml")]
+        format: String,
+        /// Only this harness (claude, codex, hermes, …); omit for all.
+        #[arg(long)]
+        harness: Option<String>,
+        /// Stop after N emitted records.
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Skip sessions with fewer than this many messages (drops trivial/empty ones).
+        #[arg(long, default_value_t = 2)]
+        min_messages: usize,
+        /// Scrub secrets/PII from every session before emitting (cv_core::redact).
+        #[arg(long)]
+        redact: bool,
+        /// Write to this file instead of stdout.
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
     /// Convert a session into another harness's native format (cross-harness port).
     Convert {
         id: String,
@@ -350,6 +372,9 @@ fn main() -> Result<()> {
         Cmd::Search { query, harness, limit, semantic } => cmd_search(&query, harness, limit, semantic),
         Cmd::Show { id, harness, json } => cmd_show(&id, harness, json),
         Cmd::Export { id, format, harness } => cmd_export(&id, &format, harness),
+        Cmd::Dataset { format, harness, limit, min_messages, redact, out } => {
+            cmd_dataset(&format, harness, limit, min_messages, redact, out)
+        }
         Cmd::Convert { id, to, from, out, cwd } => cmd_convert(&id, &to, from, out, cwd),
         Cmd::Port { id, to, from, to_dir, out, no_context } => cmd_port(&id, to, from, to_dir, out, no_context),
         Cmd::Scry { harness, cwd, interval, existing } => cmd_scry(harness, cwd, interval, existing),
@@ -1246,6 +1271,78 @@ fn cmd_export(id: &str, format: &str, harness: Option<String>) -> Result<()> {
         "html" => print!("{}", cv_core::html::to_html(&session)),
         other => bail!("unknown format {other:?} (use md, json, or html)"),
     }
+    Ok(())
+}
+
+fn cmd_dataset(
+    format: &str,
+    harness: Option<String>,
+    limit: Option<usize>,
+    min_messages: usize,
+    redact: bool,
+    out: Option<PathBuf>,
+) -> Result<()> {
+    use std::io::Write;
+    if !matches!(format, "chatml" | "sharegpt") {
+        bail!("unknown format {format:?} (use chatml or sharegpt)");
+    }
+    let want = parse_harness(&harness)?;
+    let mut writer: Box<dyn Write> = match &out {
+        Some(p) => Box::new(std::io::BufWriter::new(fs::File::create(p)?)),
+        None => Box::new(std::io::BufWriter::new(std::io::stdout())),
+    };
+
+    // Stream the corpus one session at a time (parse -> emit -> drop) so memory stays bounded.
+    let mut emitted = 0usize;
+    let mut skipped = 0usize;
+    for r in cv_core::discover_all() {
+        if let Some(w) = want {
+            if r.harness != w {
+                continue;
+            }
+        }
+        let Some(adapter) = cv_core::harness::for_harness(r.harness) else {
+            continue;
+        };
+        let session = match adapter.parse(&r) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("cv dataset: skipping {} ({}): {e:#}", r.id, r.harness);
+                continue;
+            }
+        };
+        if session.messages.len() < min_messages {
+            skipped += 1;
+            continue;
+        }
+        let session = if redact {
+            cv_core::redact::redact(&session)
+        } else {
+            session
+        };
+        let rec = match format {
+            "chatml" => cv_core::dataset::to_chatml(&session),
+            _ => cv_core::dataset::to_sharegpt(&session),
+        };
+        match rec {
+            Some(rec) => {
+                writeln!(writer, "{}", serde_json::to_string(&rec)?)?;
+                emitted += 1;
+                if let Some(l) = limit {
+                    if emitted >= l {
+                        break;
+                    }
+                }
+            }
+            None => skipped += 1,
+        }
+    }
+    writer.flush()?;
+    let dest = out
+        .as_ref()
+        .map(|p| format!(" to {}", p.display()))
+        .unwrap_or_default();
+    eprintln!("✦ {format}: wrote {emitted} record(s){dest} ({skipped} skipped)");
     Ok(())
 }
 

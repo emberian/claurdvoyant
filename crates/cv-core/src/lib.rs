@@ -7,6 +7,7 @@
 //! them into the common [`Session`] IR. Cross-harness porting is then `parse(A) -> IR -> emit(B)`.
 
 pub mod board;
+pub mod dataset;
 pub mod discover_cache;
 pub mod emit;
 pub mod harmony;
