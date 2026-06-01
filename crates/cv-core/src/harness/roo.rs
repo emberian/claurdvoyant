@@ -29,9 +29,10 @@
 //! (`<task>…</task>` + `<environment_details># Current Working Directory (/abs/path) Files`), so the
 //! parser recovers both `cwd` and `title` from the transcript itself.
 
-use super::cline::{discover_in, parse_task_dir, task_roots, ROO_EXT_IDS};
+use super::cline::{discover_in, stream_task_dir, task_roots, ROO_EXT_IDS};
 use super::Adapter;
 use crate::ir::*;
+use crate::stream::{MessageSink, ParseOptions};
 use anyhow::{Context, Result};
 use serde_json::{json, Map, Value};
 use std::fs;
@@ -69,7 +70,16 @@ impl Adapter for Roo {
     }
 
     fn parse(&self, r: &SessionRef) -> Result<Session> {
-        parse_task_dir(&r.path, &r.id, Harness::Roo)
+        crate::stream::collect(self, r)
+    }
+
+    fn stream(
+        &self,
+        r: &SessionRef,
+        opts: &ParseOptions,
+        sink: &mut dyn MessageSink,
+    ) -> Result<Session> {
+        stream_task_dir(&r.path, &r.id, Harness::Roo, opts, sink)
     }
 
     fn emit(&self, session: &Session, out_dir: &Path) -> Result<crate::harness::EmitResult> {
@@ -322,7 +332,7 @@ fn roo_image_block(media_type: &Option<String>, data_ref: &Option<String>) -> Va
 
 #[cfg(test)]
 mod tests {
-    use super::super::cline::parse_history_str;
+    use super::super::cline::{parse_history_str, parse_task_dir};
     use super::*;
 
     fn fixture(name: &str) -> String {

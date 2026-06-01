@@ -47,11 +47,13 @@
 
 use super::Adapter;
 use crate::ir::*;
+use crate::stream::{Flow, MessageSink, ParseOptions};
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::fs;
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
 pub struct Kimi {
@@ -152,6 +154,31 @@ impl Adapter for Kimi {
     }
 
     fn parse(&self, r: &SessionRef) -> Result<Session> {
+        // Collect the streamed message body, then run the whole-vec wire post-passes that can't run
+        // on the streaming path (they need the full `messages` slice — see `stream`). This keeps
+        // `parse()` output byte-identical while `stream` stays O(largest message).
+        let mut s = crate::stream::collect(self, r)?;
+
+        // Re-read the wire sidecar to apply the positional post-passes over the collected messages.
+        let (_transcript, wire) = locate_transcript(&r.path, &r.id);
+        let enrich = wire.as_ref().map(read_wire_enrichment).unwrap_or_default();
+
+        // Attach StatusUpdate usage / message_id to assistant turns in order. wire emits one
+        // StatusUpdate per assistant step; we zip them onto assistant messages positionally.
+        attach_status_updates(&mut s.messages, &enrich);
+
+        // Per-message timestamps from wire (best-effort, positional over recognized turns).
+        attach_timestamps(&mut s.messages, &enrich);
+
+        Ok(s)
+    }
+
+    fn stream(
+        &self,
+        r: &SessionRef,
+        _opts: &ParseOptions,
+        sink: &mut dyn MessageSink,
+    ) -> Result<Session> {
         // r.path is the session dir (modern) or the hash dir (legacy). Locate the transcript.
         let (transcript, wire) = locate_transcript(&r.path, &r.id);
 
@@ -172,7 +199,12 @@ impl Adapter for Kimi {
             extra: serde_json::Map::new(),
         };
 
-        // Sidecar enrichment from wire.jsonl (tolerant: absent/empty/malformed ⇒ empty).
+        // Sidecar enrichment from wire.jsonl (tolerant: absent/empty/malformed ⇒ empty). The
+        // per-message `tool_results` map (keyed by tool_call_id) is a per-line enrichment, so it's
+        // safe on the streaming path. The WHOLE-VEC post-passes (`attach_status_updates` /
+        // `attach_timestamps`) zip positionally over the full `messages` slice and therefore CANNOT
+        // run here — they're applied only in the full `parse` path (mirrors codex's `attach_usage`
+        // skip). Bulk consumers (index/search/dataset) don't read usage/timestamps.
         let enrich = wire.as_ref().map(read_wire_enrichment).unwrap_or_default();
 
         // Note archived compaction segments (context_1.jsonl…), if any, for fidelity bookkeeping.
@@ -184,10 +216,18 @@ impl Adapter for Kimi {
             );
         }
 
-        let Ok(text) = fs::read_to_string(&transcript) else {
+        // Session metadata is known up front; hand it to the sink before the body.
+        sink.meta(&s);
+
+        // Stream the transcript line-by-line (a single session can be large; `read_to_string` would
+        // resident-spike the whole file). Each record becomes at most one Message, emitted to `sink`
+        // and dropped before the next line, so peak memory is O(largest message).
+        let Ok(file) = fs::File::open(&transcript) else {
             return Ok(s);
         };
-        for line in text.lines() {
+        for line in BufReader::new(file).lines() {
+            // A read error on one line (rare: invalid UTF-8 chunk) shouldn't abort the session.
+            let Ok(line) = line else { continue };
             let line = line.trim();
             if line.is_empty() {
                 continue;
@@ -196,16 +236,11 @@ impl Adapter for Kimi {
                 continue;
             };
             if let Some(m) = context_message(&v, &enrich) {
-                s.messages.push(m);
+                if sink.message(m) == Flow::Stop {
+                    break;
+                }
             }
         }
-
-        // Attach StatusUpdate usage / message_id to assistant turns in order. wire emits one
-        // StatusUpdate per assistant step; we zip them onto assistant messages positionally.
-        attach_status_updates(&mut s.messages, &enrich);
-
-        // Per-message timestamps from wire (best-effort, positional over recognized turns).
-        attach_timestamps(&mut s.messages, &enrich);
 
         Ok(s)
     }

@@ -28,6 +28,7 @@
 
 use super::Adapter;
 use crate::ir::*;
+use crate::stream::{Flow, MessageSink, ParseOptions};
 use anyhow::{Context, Result};
 use chrono::{TimeZone, Utc};
 use rusqlite::{Connection, OpenFlags};
@@ -146,12 +147,21 @@ impl Adapter for Cursor {
     }
 
     fn parse(&self, r: &SessionRef) -> Result<Session> {
+        crate::stream::collect(self, r)
+    }
+
+    fn stream(
+        &self,
+        r: &SessionRef,
+        _opts: &ParseOptions,
+        sink: &mut dyn MessageSink,
+    ) -> Result<Session> {
         // `path` is the DB the thread lives in. Legacy refs carry a `legacy:` id prefix.
         let conn = open_ro(&r.path)?;
         if let Some(legacy_id) = r.id.strip_prefix("legacy:") {
-            return parse_legacy(&conn, r, legacy_id);
+            return stream_legacy(&conn, r, legacy_id, sink);
         }
-        parse_global(&conn, r)
+        stream_global(&conn, r, sink)
     }
 }
 
@@ -343,7 +353,7 @@ fn conversation_len(d: &Value) -> usize {
         .unwrap_or(0)
 }
 
-fn parse_global(conn: &Connection, r: &SessionRef) -> Result<Session> {
+fn stream_global(conn: &Connection, r: &SessionRef, sink: &mut dyn MessageSink) -> Result<Session> {
     let key = format!("composerData:{}", r.id);
     let raw = disk_kv_get(conn, &key)
         .with_context(|| format!("composerData:{} not found", r.id))?;
@@ -375,7 +385,19 @@ fn parse_global(conn: &Connection, r: &SessionRef) -> Result<Session> {
     // free-form Session.extra). Each bubble's own `unifiedMode` is preserved in Message.extra
     // instead. See the report for the proposed Session.extra addition.
 
-    // Newer shape: headers point at external bubble rows. Older shape: inline conversation array.
+    // Session model: the latest message's model (whole-Vec `rev().find_map` originally). Tracked
+    // incrementally here — each emitted message overwrites it when it carries a model — so the last
+    // one wins without retaining the body. Falls back to the composer's modelConfig below.
+    let mut last_model: Option<String> = None;
+    let mut emit = |sink: &mut dyn MessageSink, m: Message| -> Flow {
+        if m.model.is_some() {
+            last_model = m.model.clone();
+        }
+        sink.message(m)
+    };
+
+    // Newer shape: headers point at external bubble rows (each a separate DB row, fetched lazily so
+    // one bubble is resident at a time). Older shape: inline conversation array.
     if let Some(headers) = d
         .get("fullConversationHeadersOnly")
         .and_then(Value::as_array)
@@ -392,29 +414,27 @@ fn parse_global(conn: &Connection, r: &SessionRef) -> Result<Session> {
                 continue;
             };
             if let Some(m) = bubble_to_message(&bv) {
-                session.messages.push(m);
+                if emit(sink, m) == Flow::Stop {
+                    break;
+                }
             }
         }
     } else if let Some(conv) = d.get("conversation").and_then(Value::as_array) {
         for bv in conv {
             if let Some(m) = bubble_to_message(bv) {
-                session.messages.push(m);
+                if emit(sink, m) == Flow::Stop {
+                    break;
+                }
             }
         }
     }
 
-    // Session model: prefer the latest assistant message's model, else the composer's modelConfig.
-    session.model = session
-        .messages
-        .iter()
-        .rev()
-        .find_map(|m| m.model.clone())
-        .or_else(|| {
-            d.pointer("/modelConfig/modelName")
-                .and_then(Value::as_str)
-                .filter(|s| !s.is_empty())
-                .map(str::to_string)
-        });
+    session.model = last_model.or_else(|| {
+        d.pointer("/modelConfig/modelName")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    });
 
     Ok(session)
 }
@@ -652,7 +672,12 @@ fn discover_legacy_workspace(
     }
 }
 
-fn parse_legacy(conn: &Connection, r: &SessionRef, tab_id: &str) -> Result<Session> {
+fn stream_legacy(
+    conn: &Connection,
+    r: &SessionRef,
+    tab_id: &str,
+    sink: &mut dyn MessageSink,
+) -> Result<Session> {
     let raw = item_table_get(conn, LEGACY_CHAT_KEY).context("legacy chatdata not found")?;
     let v: Value = serde_json::from_str(&raw).context("legacy chatdata JSON")?;
     let tabs = v
@@ -670,7 +695,7 @@ fn parse_legacy(conn: &Connection, r: &SessionRef, tab_id: &str) -> Result<Sessi
         .filter(|s| !s.trim().is_empty())
         .map(str::to_string)
         .or_else(|| r.title.clone());
-    let mut session = Session {
+    let session = Session {
         id: r.id.clone(),
         harness: Harness::Cursor,
         cwd: r.cwd.clone(),
@@ -683,10 +708,13 @@ fn parse_legacy(conn: &Connection, r: &SessionRef, tab_id: &str) -> Result<Sessi
         source_path: Some(r.path.clone()),
         extra: serde_json::Map::new(),
     };
+    sink.meta(&session);
     if let Some(bubbles) = tab.get("bubbles").and_then(Value::as_array) {
         for b in bubbles {
             if let Some(m) = legacy_bubble_to_message(b) {
-                session.messages.push(m);
+                if sink.message(m) == Flow::Stop {
+                    break;
+                }
             }
         }
     }
@@ -707,6 +735,24 @@ fn legacy_bubble_to_message(b: &Value) -> Option<Message> {
         });
     }
     (!m.content.is_empty()).then_some(m)
+}
+
+/// Whole-`Session` convenience over [`stream_global`] for tests: stream into a [`CollectSink`].
+#[cfg(test)]
+fn parse_global(conn: &Connection, r: &SessionRef) -> Result<Session> {
+    let mut sink = crate::stream::CollectSink::default();
+    let mut s = stream_global(conn, r, &mut sink)?;
+    s.messages = sink.messages;
+    Ok(s)
+}
+
+/// Whole-`Session` convenience over [`stream_legacy`] for tests.
+#[cfg(test)]
+fn parse_legacy(conn: &Connection, r: &SessionRef, tab_id: &str) -> Result<Session> {
+    let mut sink = crate::stream::CollectSink::default();
+    let mut s = stream_legacy(conn, r, tab_id, &mut sink)?;
+    s.messages = sink.messages;
+    Ok(s)
 }
 
 #[cfg(test)]

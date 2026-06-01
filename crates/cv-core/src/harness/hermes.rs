@@ -30,6 +30,7 @@
 
 use super::Adapter;
 use crate::ir::*;
+use crate::stream::{Flow, MessageSink, ParseOptions};
 use anyhow::{Context, Result};
 use chrono::{DateTime, TimeZone, Utc};
 use rusqlite::{Connection, OpenFlags};
@@ -133,10 +134,19 @@ impl Adapter for Hermes {
     }
 
     fn parse(&self, r: &SessionRef) -> Result<Session> {
+        crate::stream::collect(self, r)
+    }
+
+    fn stream(
+        &self,
+        r: &SessionRef,
+        _opts: &ParseOptions,
+        sink: &mut dyn MessageSink,
+    ) -> Result<Session> {
         // Route by the ref's own DB path (set at discovery time), NOT a single self.db — this is
         // what lets one Hermes adapter span many profile DBs without id collisions.
         let conn = Self::open_path(&r.path)?;
-        parse_conn(&conn, r)
+        stream_conn(&conn, r, sink)
     }
 
     fn can_emit(&self) -> bool {
@@ -203,7 +213,7 @@ fn discover_conn(conn: &Connection, path: &PathBuf) -> Result<Vec<SessionRef>> {
     Ok(out)
 }
 
-fn parse_conn(conn: &Connection, r: &SessionRef) -> Result<Session> {
+fn stream_conn(conn: &Connection, r: &SessionRef, sink: &mut dyn MessageSink) -> Result<Session> {
     // session-level metadata (guard optional columns for historical schemas).
     let has_model = session_has_col(conn, "model");
     let has_title = session_has_col(conn, "title");
@@ -242,7 +252,7 @@ fn parse_conn(conn: &Connection, r: &SessionRef) -> Result<Session> {
         })
         .unwrap_or((None, None, None, r.title.clone(), None, None, None));
 
-    let mut s = Session {
+    let s = Session {
         id: r.id.clone(),
         harness: Harness::Hermes,
         cwd: None,
@@ -279,14 +289,23 @@ fn parse_conn(conn: &Connection, r: &SessionRef) -> Result<Session> {
     }
     let select_list = select_cols.join(", ");
 
-    for sid in &lineage {
+    // Hand the session-level metadata to the sink before the body (header-rendering sinks use it).
+    sink.meta(&s);
+
+    // Dedup the replayed first user message at compression boundaries — streamed: a tiny bounded
+    // look-back (the trailing run of user single-texts since the last substantive assistant turn),
+    // not the whole transcript, so peak stays O(one message).
+    let mut dedup = ReplayDedup::default();
+    'lineage: for sid in &lineage {
         let sql = format!(
             "SELECT {select_list} FROM messages WHERE session_id = ?1 ORDER BY timestamp ASC, id ASC"
         );
         let mut stmt = conn.prepare(&sql)?;
         // Map column name -> index so we can read by name regardless of which optionals exist.
         let idx = |name: &str| select_cols.iter().position(|c| *c == name);
-        let rows = stmt.query_map([sid], |row| {
+        // Stream rows lazily: one `MsgRow` -> one `Message` at a time, emitted and dropped before
+        // the next row (a single Hermes session can be large; never materialize the whole Vec).
+        let mut rows = stmt.query_map([sid], |row| {
             let get_str = |name: &str| -> Option<String> {
                 idx(name).and_then(|i| row.get::<_, Option<String>>(i).ok().flatten())
             };
@@ -313,17 +332,69 @@ fn parse_conn(conn: &Connection, r: &SessionRef) -> Result<Session> {
             })
         })?;
 
-        for row in rows.flatten() {
+        while let Some(row) = rows.next() {
+            let Ok(row) = row else { continue };
             if let Some(m) = row.into_message() {
                 // Dedup the replayed first user message at compression boundaries.
-                if is_duplicate_replayed_user_message(&s.messages, &m) {
+                if dedup.is_duplicate(&m) {
                     continue;
                 }
-                s.messages.push(m);
+                dedup.observe(&m);
+                if sink.message(m) == Flow::Stop {
+                    break 'lineage;
+                }
             }
         }
     }
     Ok(s)
+}
+
+/// Streaming equivalent of [`is_duplicate_replayed_user_message`]: tracks only the trailing run of
+/// user single-texts since the last substantive assistant turn (the exact look-back window the
+/// whole-Vec scan uses), so the streaming path stays byte-identical without retaining the session.
+#[derive(Default)]
+struct ReplayDedup {
+    /// Single-texts of consecutive trailing user messages (most recent last). Cleared when a
+    /// substantive assistant turn passes (which ends the look-back window).
+    recent_user_texts: Vec<String>,
+}
+
+impl ReplayDedup {
+    /// Mirror of the look-back in [`is_duplicate_replayed_user_message`].
+    fn is_duplicate(&self, msg: &Message) -> bool {
+        if msg.role != Role::User {
+            return false;
+        }
+        let Some(text) = single_text(msg) else {
+            return false;
+        };
+        if text.is_empty() {
+            return false;
+        }
+        self.recent_user_texts.iter().any(|t| t == &text)
+    }
+
+    /// Fold an *emitted* message into the look-back state.
+    fn observe(&mut self, m: &Message) {
+        match m.role {
+            Role::User => {
+                if let Some(text) = single_text(m) {
+                    self.recent_user_texts.push(text);
+                }
+            }
+            Role::Assistant => {
+                // A substantive assistant turn (text or tool call) ends the look-back window.
+                let has_content = m
+                    .content
+                    .iter()
+                    .any(|b| matches!(b, Block::Text { .. } | Block::ToolUse { .. }));
+                if has_content {
+                    self.recent_user_texts.clear();
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 /// Walk `parent_session_id` from `session_id` up to the root, return root→tip order.
@@ -364,39 +435,8 @@ fn session_lineage_root_to_tip(conn: &Connection, session_id: &str) -> Vec<Strin
 
 /// Mirrors `SessionDB._is_duplicate_replayed_user_message`: a compression continuation re-injects
 /// the boundary's last user message as its first message; suppress that duplicate when merging.
-fn is_duplicate_replayed_user_message(existing: &[Message], msg: &Message) -> bool {
-    if msg.role != Role::User {
-        return false;
-    }
-    let Some(text) = single_text(msg) else {
-        return false;
-    };
-    if text.is_empty() {
-        return false;
-    }
-    for prev in existing.iter().rev() {
-        match prev.role {
-            Role::User => {
-                if single_text(prev).as_deref() == Some(text.as_str()) {
-                    return true;
-                }
-            }
-            Role::Assistant => {
-                // Any substantive assistant turn (text or tool call) ends the look-back window.
-                let has_content = prev
-                    .content
-                    .iter()
-                    .any(|b| matches!(b, Block::Text { .. } | Block::ToolUse { .. }));
-                if has_content {
-                    return false;
-                }
-            }
-            _ => {}
-        }
-    }
-    false
-}
-
+/// The streaming equivalent is [`ReplayDedup`] (a bounded look-back over the trailing user run).
+///
 /// Plain text of a message iff it is exactly one Text block (the shape Hermes replays as a string).
 fn single_text(m: &Message) -> Option<String> {
     if m.content.len() == 1 {
@@ -688,6 +728,16 @@ fn secs_to_dt(s: f64) -> Option<DateTime<Utc>> {
         return None;
     }
     Utc.timestamp_millis_opt((s * 1000.0) as i64).single()
+}
+
+/// Whole-`Session` convenience over [`stream_conn`] for tests: stream into a [`CollectSink`] and
+/// reattach the messages. The production path goes through `Adapter::parse` → `stream::collect`.
+#[cfg(test)]
+fn parse_conn(conn: &Connection, r: &SessionRef) -> Result<Session> {
+    let mut sink = crate::stream::CollectSink::default();
+    let mut s = stream_conn(conn, r, &mut sink)?;
+    s.messages = sink.messages;
+    Ok(s)
 }
 
 #[cfg(test)]

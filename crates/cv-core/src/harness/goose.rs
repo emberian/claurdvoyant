@@ -58,6 +58,7 @@
 
 use super::Adapter;
 use crate::ir::*;
+use crate::stream::{Flow, MessageSink, ParseOptions};
 use anyhow::{Context, Result};
 use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
 use rusqlite::{Connection, OpenFlags};
@@ -179,12 +180,21 @@ impl Adapter for Goose {
     }
 
     fn parse(&self, r: &SessionRef) -> Result<Session> {
+        crate::stream::collect(self, r)
+    }
+
+    fn stream(
+        &self,
+        r: &SessionRef,
+        _opts: &ParseOptions,
+        sink: &mut dyn MessageSink,
+    ) -> Result<Session> {
         // A legacy session's `path` is the `.jsonl`; a DB session's `path` is `sessions.db`.
         if r.path.extension().is_some_and(|e| e == "jsonl") {
-            return parse_legacy(&r.id, &r.path);
+            return stream_legacy(&r.id, &r.path, sink);
         }
         let conn = open_ro(&r.path)?;
-        parse_db(&conn, r)
+        stream_db(&conn, r, sink)
     }
 }
 
@@ -260,7 +270,7 @@ fn discover_db(conn: &Connection, db: &Path) -> Result<Vec<SessionRef>> {
     Ok(out)
 }
 
-fn parse_db(conn: &Connection, r: &SessionRef) -> Result<Session> {
+fn stream_db(conn: &Connection, r: &SessionRef, sink: &mut dyn MessageSink) -> Result<Session> {
     let cols = columns(conn, "sessions");
     let has = |c: &str| cols.contains(c);
     let title_expr = match (has("description"), has("name")) {
@@ -300,7 +310,7 @@ fn parse_db(conn: &Connection, r: &SessionRef) -> Result<Session> {
 
     let model = reconstruct_model(provider.as_deref(), model_cfg.as_deref());
 
-    let mut s = Session {
+    let s = Session {
         id: r.id.clone(),
         harness: Harness::Goose,
         cwd: wd
@@ -318,6 +328,8 @@ fn parse_db(conn: &Connection, r: &SessionRef) -> Result<Session> {
         source_path: Some(r.path.clone()),
         extra: serde_json::Map::new(),
     };
+    // All session metadata is known up front, so hand it to the sink before the body.
+    sink.meta(&s);
 
     let mcols = columns(conn, "messages");
     let has_msg = |c: &str| mcols.contains(c);
@@ -328,7 +340,9 @@ fn parse_db(conn: &Connection, r: &SessionRef) -> Result<Session> {
          FROM messages WHERE session_id = ?1 ORDER BY created_timestamp, id"
     );
     let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map([&r.id], |row| {
+    // Stream rows lazily: build one `DbMsg` -> one `Message`, emit it, drop it before the next row,
+    // so a large Goose session never fully materializes (peak = one message's content).
+    let mut rows = stmt.query_map([&r.id], |row| {
         Ok(DbMsg {
             role: row.get::<_, String>(0).unwrap_or_default(),
             content_json: row.get::<_, Option<String>>(1).ok().flatten().unwrap_or_default(),
@@ -338,11 +352,14 @@ fn parse_db(conn: &Connection, r: &SessionRef) -> Result<Session> {
         })
     })?;
 
-    // Track tool-request names so we can label later tool responses.
+    // Track tool-request names so we can label later tool responses (forward-only state).
     let mut tool_names: HashMap<String, String> = HashMap::new();
-    for row in rows.flatten() {
+    while let Some(row) = rows.next() {
+        let Ok(row) = row else { continue };
         if let Some(m) = row.into_message(&mut tool_names) {
-            s.messages.push(m);
+            if sink.message(m) == Flow::Stop {
+                break;
+            }
         }
     }
     Ok(s)
@@ -434,16 +451,23 @@ fn discover_legacy(name: &str, path: &Path) -> Option<SessionRef> {
     })
 }
 
-fn parse_legacy(name: &str, path: &Path) -> Result<Session> {
-    let text = std::fs::read_to_string(path)
+fn stream_legacy(name: &str, path: &Path, sink: &mut dyn MessageSink) -> Result<Session> {
+    use std::io::{BufRead, BufReader};
+    // Stream line-by-line: a legacy transcript can be large, and `read_to_string` would
+    // resident-spike the whole file. `BufReader::lines()` keeps peak at O(largest line) and handing
+    // each message to the sink keeps it at O(largest message).
+    let file = std::fs::File::open(path)
         .with_context(|| format!("reading {}", path.display()))?;
-    let mut lines = text.lines();
+    let mut lines = BufReader::new(file).lines();
+
+    // First line is the metadata header.
     let header: Value = lines
         .next()
-        .and_then(|l| serde_json::from_str(l).ok())
+        .and_then(|l| l.ok())
+        .and_then(|l| serde_json::from_str(&l).ok())
         .unwrap_or(Value::Null);
 
-    let mut s = Session {
+    let s = Session {
         id: name.to_string(),
         harness: Harness::Goose,
         cwd: header
@@ -464,13 +488,15 @@ fn parse_legacy(name: &str, path: &Path) -> Result<Session> {
         source_path: Some(path.to_path_buf()),
         extra: serde_json::Map::new(),
     };
+    sink.meta(&s);
 
     let mut tool_names: HashMap<String, String> = HashMap::new();
     for line in lines {
+        let Ok(line) = line else { continue };
         if line.trim().is_empty() {
             continue;
         }
-        let Ok(v) = serde_json::from_str::<Value>(line) else {
+        let Ok(v) = serde_json::from_str::<Value>(&line) else {
             continue;
         };
         let role = v.get("role").and_then(Value::as_str).unwrap_or("user");
@@ -481,7 +507,9 @@ fn parse_legacy(name: &str, path: &Path) -> Result<Session> {
             .map(|c| content_to_blocks(c, &mut tool_names))
             .unwrap_or_default();
         if let Some(m) = build_message(role, id, ts, None, blocks) {
-            s.messages.push(m);
+            if sink.message(m) == Flow::Stop {
+                break;
+            }
         }
     }
     Ok(s)
@@ -708,6 +736,24 @@ fn parse_ts_text(s: &str) -> Option<DateTime<Utc>> {
         }
     }
     None
+}
+
+/// Whole-`Session` convenience over [`stream_db`] for tests: stream into a [`CollectSink`].
+#[cfg(test)]
+fn parse_db(conn: &Connection, r: &SessionRef) -> Result<Session> {
+    let mut sink = crate::stream::CollectSink::default();
+    let mut s = stream_db(conn, r, &mut sink)?;
+    s.messages = sink.messages;
+    Ok(s)
+}
+
+/// Whole-`Session` convenience over [`stream_legacy`] for tests.
+#[cfg(test)]
+fn parse_legacy(name: &str, path: &Path) -> Result<Session> {
+    let mut sink = crate::stream::CollectSink::default();
+    let mut s = stream_legacy(name, path, &mut sink)?;
+    s.messages = sink.messages;
+    Ok(s)
 }
 
 #[cfg(test)]

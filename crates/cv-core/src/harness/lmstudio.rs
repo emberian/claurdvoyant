@@ -37,8 +37,10 @@
 use super::Adapter;
 use super::EmitResult;
 use crate::ir::*;
+use crate::stream::{Flow, MessageSink, ParseOptions};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
+use serde_json::value::RawValue;
 use serde_json::{json, Map, Value};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -106,49 +108,159 @@ impl Adapter for LmStudio {
     }
 
     fn parse(&self, r: &SessionRef) -> Result<Session> {
-        let text = fs::read_to_string(&r.path)
+        // The whole-session parse is "stream into a CollectSink" — see [`crate::stream::collect`].
+        crate::stream::collect(self, r)
+    }
+
+    /// Native streaming parse. An LM Studio conversation is a single JSON document
+    /// (`{name, createdAt, messages:[…], systemPrompt, perChatPredictionConfig, …}`), so rather than
+    /// building the whole-document `Value` (which owns every `messages[]` turn — including every
+    /// regenerated `versions[]` variant, easily gigabytes), we borrow-deserialize only the document
+    /// *structure*: the small session-level fields by value (createdAt, the system-prompt sources,
+    /// pinned) and `messages` as a `Vec<&RawValue>` slicing the mapped/owned bytes. Each turn is then
+    /// turned into one small `Value` ([`parse_message`]), emitted to `sink`, and dropped before the
+    /// next — so peak memory is O(largest turn) + the mmap (reclaimable) + the slice vec.
+    fn stream(
+        &self,
+        r: &SessionRef,
+        _opts: &ParseOptions,
+        sink: &mut dyn MessageSink,
+    ) -> Result<Session> {
+        let bytes = read_bytes(&r.path)
             .with_context(|| format!("reading {}", r.path.display()))?;
-        let v: Value = serde_json::from_str(&text)
+        let doc: Doc = serde_json::from_slice(bytes.as_ref())
             .with_context(|| format!("parsing {}", r.path.display()))?;
 
-        let created_at = v.get("createdAt").and_then(ms_to_dt);
+        let created_at = doc.created_at.as_ref().and_then(ms_to_dt);
         let updated_at = file_mtime(&r.path).or(created_at);
 
-        let mut messages = Vec::new();
-        let mut session_model: Option<String> = None;
-        if let Some(arr) = v.get("messages").and_then(Value::as_array) {
-            for raw in arr {
-                if let Some(m) = parse_message(raw, &mut session_model) {
-                    messages.push(m);
-                }
-            }
-        }
-
         let mut extra = serde_json::Map::new();
-        // Preserve the per-chat / global system prompt so it isn't silently dropped.
-        if let Some(sp) = system_prompt(&v) {
+        // Preserve the per-chat / global system prompt so it isn't silently dropped. These
+        // session-level fields are small, so capturing them as owned `Value`s costs nothing.
+        if let Some(sp) = doc.system_prompt() {
             if !sp.trim().is_empty() {
-                extra.insert("systemPrompt".into(), Value::String(sp));
+                extra.insert("systemPrompt".into(), Value::String(sp.to_string()));
             }
         }
-        if let Some(p) = v.get("pinned").and_then(Value::as_bool).filter(|p| *p) {
-            extra.insert("pinned".into(), Value::Bool(p));
+        if doc.pinned == Some(true) {
+            extra.insert("pinned".into(), Value::Bool(true));
         }
 
-        Ok(Session {
+        let mut s = Session {
             id: r.id.clone(),
             harness: Harness::LmStudio,
             cwd: None, // LM Studio is a chat app: no working directory.
             title: r.title.clone(),
             created_at,
             updated_at,
-            model: session_model,
+            model: None,
             git: None,
-            messages,
+            messages: Vec::new(),
             source_path: Some(r.path.clone()),
             extra,
-        })
+        };
+
+        // `model` is backfilled from the first genInfo seen while iterating turns, so hand the
+        // metadata to the sink after the loop (the bridge sinks read it from the returned Session).
+        let mut session_model: Option<String> = None;
+        sink.meta(&s);
+        for raw in doc.messages {
+            // ONE small Value per turn — parsed, emitted, dropped before the next.
+            let Ok(v) = serde_json::from_str::<Value>(raw.get()) else {
+                continue;
+            };
+            if let Some(m) = parse_message(&v, &mut session_model) {
+                if sink.message(m) == Flow::Stop {
+                    break;
+                }
+            }
+        }
+        s.model = session_model;
+
+        Ok(s)
     }
+}
+
+// ------------------------------------------------------------------------------------------------
+// Streaming document structure (borrows the mapped/owned bytes)
+// ------------------------------------------------------------------------------------------------
+
+/// The document *structure* of an LM Studio conversation, borrowed from the source bytes: the small
+/// session-level fields by value and `messages` as raw turn slices (NOT materialized into owned
+/// `Value`s). Borrowing avoids building the whole-document `Value` for [`LmStudio::stream`].
+#[derive(serde::Deserialize)]
+struct Doc<'a> {
+    #[serde(default, rename = "createdAt")]
+    created_at: Option<Value>,
+    #[serde(default, rename = "systemPrompt")]
+    system_prompt: Option<String>,
+    #[serde(default, rename = "perChatPredictionConfig")]
+    per_chat_prediction_config: Option<Value>,
+    #[serde(default)]
+    pinned: Option<bool>,
+    #[serde(default, borrow)]
+    messages: Vec<&'a RawValue>,
+}
+
+impl Doc<'_> {
+    /// The effective system prompt: the per-chat override
+    /// (`perChatPredictionConfig.fields[key==llm.prediction.systemPrompt]`) takes precedence over
+    /// the top-level `systemPrompt`. The borrowed counterpart of the test-only standalone
+    /// `system_prompt` helper that pins this precedence rule.
+    fn system_prompt(&self) -> Option<&str> {
+        if let Some(fields) = self
+            .per_chat_prediction_config
+            .as_ref()
+            .and_then(|c| c.pointer("/fields"))
+            .and_then(Value::as_array)
+        {
+            for f in fields {
+                if f.get("key").and_then(Value::as_str) == Some("llm.prediction.systemPrompt") {
+                    if let Some(val) = f.get("value").and_then(Value::as_str) {
+                        if !val.trim().is_empty() {
+                            return Some(val);
+                        }
+                    }
+                }
+            }
+        }
+        self.system_prompt
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+    }
+}
+
+/// Owns either an mmap of `path` or its bytes read into a `Vec`, exposing `.as_ref()` as `&[u8]`.
+enum Bytes {
+    #[cfg(feature = "mmap")]
+    Mapped(memmap2::Mmap),
+    Owned(Vec<u8>),
+}
+
+impl AsRef<[u8]> for Bytes {
+    fn as_ref(&self) -> &[u8] {
+        match self {
+            #[cfg(feature = "mmap")]
+            Bytes::Mapped(m) => m,
+            Bytes::Owned(v) => v,
+        }
+    }
+}
+
+/// Memory-map `path` (default `mmap` feature) so a large conversation's bytes are paged in on demand
+/// and reclaimable; fall back to reading the whole file into a `Vec` when the feature is off or the
+/// map fails (e.g. a zero-length file).
+fn read_bytes(path: &Path) -> std::io::Result<Bytes> {
+    #[cfg(feature = "mmap")]
+    {
+        let file = fs::File::open(path)?;
+        // SAFETY: cv reads its own session store; a concurrent truncation by another process could
+        // in theory cause a SIGBUS, the standard caveat for all mmap'd file reads.
+        if let Ok(map) = unsafe { memmap2::Mmap::map(&file) } {
+            return Ok(Bytes::Mapped(map));
+        }
+    }
+    fs::read(path).map(Bytes::Owned)
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -474,8 +586,11 @@ fn chat_title(v: &Value) -> Option<String> {
     None
 }
 
-/// The system prompt: the per-chat override (`perChatPredictionConfig.fields[key==
-/// llm.prediction.systemPrompt]`) takes precedence over the top-level `systemPrompt`.
+/// The system prompt over a whole `Value`: the per-chat override (`perChatPredictionConfig.fields[
+/// key==llm.prediction.systemPrompt]`) takes precedence over the top-level `systemPrompt`. The
+/// streaming parser uses the borrowed [`Doc::system_prompt`] instead; this whole-`Value` form is
+/// retained as the reference the unit test pins the precedence rule against.
+#[cfg(test)]
 fn system_prompt(v: &Value) -> Option<String> {
     if let Some(fields) = v
         .pointer("/perChatPredictionConfig/fields")
@@ -943,5 +1058,57 @@ mod tests {
         // Model + usage still parsed from genInfo.
         assert_eq!(a.model.as_deref(), Some("openai/gpt-oss-120b"));
         assert_eq!(a.usage.as_ref().unwrap().output_tokens, Some(68));
+    }
+
+    /// The native `stream` must emit incrementally (not collect-then-replay): a sink that stops on
+    /// the first turn ends the parse with exactly one message seen, never materializing the rest.
+    /// Session-level extras (the system prompt) are still captured up front.
+    #[test]
+    fn stream_is_incremental_and_honors_stop() {
+        use crate::stream::{Flow, MessageSink};
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir()
+            .join(format!("cv-lmstudio-stream-{}-{}", std::process::id(), n));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("c.conversation.json");
+        fs::write(
+            &path,
+            r#"{"name":"T","createdAt":1754425094719,"systemPrompt":"be terse","messages":[
+                {"currentlySelected":0,"versions":[{"type":"singleStep","role":"user","content":[{"type":"text","text":"one"}]}]},
+                {"currentlySelected":0,"versions":[{"type":"singleStep","role":"user","content":[{"type":"text","text":"two"}]}]},
+                {"currentlySelected":0,"versions":[{"type":"singleStep","role":"user","content":[{"type":"text","text":"three"}]}]}
+            ]}"#,
+        )
+        .unwrap();
+
+        let r = scan(&path).unwrap().unwrap();
+
+        struct StopFirst {
+            seen: Vec<String>,
+        }
+        impl MessageSink for StopFirst {
+            fn message(&mut self, m: Message) -> Flow {
+                self.seen.push(m.text().unwrap_or_default());
+                Flow::Stop
+            }
+        }
+        let mut sink = StopFirst { seen: Vec::new() };
+        let s = LmStudio { root: None }
+            .stream(&r, &ParseOptions::full(), &mut sink)
+            .unwrap();
+
+        assert_eq!(sink.seen, vec!["one".to_string()]);
+        assert!(s.messages.is_empty(), "stream returns empty messages");
+        // Session-level extras survive without being subject to early-stop.
+        assert_eq!(
+            s.extra.get("systemPrompt").and_then(Value::as_str),
+            Some("be terse")
+        );
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }

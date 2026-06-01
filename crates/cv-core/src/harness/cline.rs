@@ -43,8 +43,10 @@
 
 use super::Adapter;
 use crate::ir::*;
+use crate::stream::{CollectSink, Flow, MessageSink, ParseOptions};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
+use serde_json::value::RawValue;
 use serde_json::{json, Map, Value};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -86,7 +88,16 @@ impl Adapter for Cline {
     }
 
     fn parse(&self, r: &SessionRef) -> Result<Session> {
-        parse_task_dir(&r.path, &r.id, Harness::Cline)
+        crate::stream::collect(self, r)
+    }
+
+    fn stream(
+        &self,
+        r: &SessionRef,
+        opts: &ParseOptions,
+        sink: &mut dyn MessageSink,
+    ) -> Result<Session> {
+        stream_task_dir(&r.path, &r.id, Harness::Cline, opts, sink)
     }
 
     fn emit(&self, session: &Session, out_dir: &Path) -> Result<crate::harness::EmitResult> {
@@ -244,29 +255,169 @@ fn scan(dir: &Path, id: &str, harness: Harness) -> Option<SessionRef> {
 /// Read a task dir (`api_conversation_history.json` + sidecars) into a `Session`. Tolerant: a
 /// missing/empty/corrupt history yields an empty-message session rather than an error. Shared by
 /// Cline and Roo.
+///
+/// This is the materializing twin of [`stream_task_dir`]: it streams into a [`CollectSink`] and
+/// reattaches the messages, so it stays byte-identical with the streaming path (and never builds a
+/// whole-document `Value`). Kept as a `pub` entry point because `roo.rs`'s emit round-trip test and
+/// other callers re-parse a task dir directly.
 pub fn parse_task_dir(dir: &Path, id: &str, harness: Harness) -> Result<Session> {
-    let history = dir.join("api_conversation_history.json");
-    let text = fs::read_to_string(&history)
-        .with_context(|| format!("reading {}", history.display()))?;
-    let mut session = parse_history_str(id, &text, harness, Some(dir.to_path_buf()));
+    let mut sink = CollectSink::default();
+    let mut session = stream_task_dir(dir, id, harness, &ParseOptions::full(), &mut sink)?;
+    session.messages = sink.messages;
+    Ok(session)
+}
 
-    // Title: prefer the first user text already captured; else metadata; else leave None.
-    if session.cwd.is_none() {
-        session.cwd = cwd_from_metadata(dir);
+/// Streaming core: read a task dir and emit each [`Message`] to `sink`, dropping it before the next,
+/// so peak memory is O(largest message) rather than O(transcript). Returns the session metadata with
+/// an **empty** `messages` vec. Shared by both Cline's and Roo's `stream`.
+///
+/// The OOM fix lives here: we do **not** `serde_json::from_str::<Value>` the whole
+/// `api_conversation_history.json` (a single JSON document holding the message array). Instead we
+/// memory-map it (or `fs::read` it when the `mmap` feature is off) and deserialize only the array
+/// *structure* as `Vec<&RawValue>` — borrowing the bytes, so each message stays a cheap slice into
+/// the mapped file. We then parse one message `Value` at a time and emit it, keeping at most one
+/// message + the (file-backed, reclaimable) mapping + the slice vec resident.
+pub fn stream_task_dir(
+    dir: &Path,
+    id: &str,
+    harness: Harness,
+    opts: &ParseOptions,
+    sink: &mut dyn MessageSink,
+) -> Result<Session> {
+    let _ = opts; // Cline/Roo have no fat `extra` sidecar to gate; full fidelity either way.
+    let history = dir.join("api_conversation_history.json");
+
+    let mut session = Session {
+        id: id.to_string(),
+        harness,
+        cwd: None,
+        title: None,
+        created_at: None,
+        updated_at: None,
+        model: None,
+        git: None,
+        messages: Vec::new(),
+        source_path: Some(dir.to_path_buf()),
+        extra: Map::new(),
+    };
+
+    // Sidecar metadata is small; resolve timestamps up front. cwd-from-metadata is only a *fallback*
+    // (the first user turn's <environment_details> wins, mirroring the old parse order), so it's
+    // applied after the body — kept here for the early `meta` signal only.
+    let meta_cwd = cwd_from_metadata(dir);
+    session.cwd = meta_cwd.clone();
+    session.created_at = task_id_to_time(id);
+    session.updated_at = newest_mtime(dir).or(session.created_at);
+    // ui_messages.json gives the most precise created/updated and the first user turn's timestamp.
+    let (ui_created, ui_updated, first_user_ts) = ui_message_times(dir);
+    if let Some(c) = ui_created {
+        session.created_at = Some(c);
+    }
+    if let Some(u) = ui_updated {
+        if session.updated_at.map(|cur| u > cur).unwrap_or(true) {
+            session.updated_at = Some(u);
+        }
     }
 
-    // Timestamps: taskId for created, newest sidecar mtime for updated.
-    session.created_at = session.created_at.or_else(|| task_id_to_time(id));
-    session.updated_at = newest_mtime(dir).or(session.created_at);
+    // Emit the early `meta` signal with the sidecar-derived fields (header-rendering sinks use it;
+    // most ignore it). The authoritative cwd/title are folded from the transcript below and live on
+    // the returned `Session`, which `collect`/`parse` reattach the messages to.
+    sink.meta(&session);
+    // Now clear cwd so the first user turn's <environment_details> takes priority; we re-apply the
+    // metadata fallback after the body if the transcript yielded nothing.
+    session.cwd = None;
 
-    // Enrich per-message timestamps from ui_messages.json (best-effort).
-    enrich_from_ui_messages(dir, &mut session);
+    // Memory-map (or read) the history document. A missing/empty/corrupt file yields an
+    // empty-message session rather than an error (tolerant, as before).
+    let Some(bytes) = read_history_bytes(&history) else {
+        session.cwd = meta_cwd;
+        return Ok(session);
+    };
+    // Parse ONLY the array structure, borrowing the bytes: each item is a `&RawValue` slice, not an
+    // owned message. If the document isn't a JSON array (corrupt / `{}`), tolerate it.
+    let items: Vec<&RawValue> = match serde_json::from_slice(bytes.as_ref()) {
+        Ok(items) => items,
+        Err(_) => {
+            session.cwd = meta_cwd;
+            return Ok(session);
+        }
+    };
+
+    let mut stamped_first_user = false;
+    for item in &items {
+        // ONE message Value at a time (small), parsed from the borrowed slice. Dropped at the end of
+        // the loop body before the next item is touched.
+        let Ok(v) = serde_json::from_str::<Value>(item.get()) else {
+            continue;
+        };
+        if let Some(mut msg) = parse_message(&v, &mut session) {
+            // Stamp the first user turn with the ui_messages first timestamp (best-effort), matching
+            // the old `enrich_from_ui_messages` behavior.
+            if !stamped_first_user && msg.role == Role::User {
+                stamped_first_user = true;
+                if let Some(ts) = first_user_ts {
+                    msg.timestamp.get_or_insert(ts);
+                }
+            }
+            if sink.message(msg) == Flow::Stop {
+                break;
+            }
+        }
+        drop(v);
+    }
+
+    // cwd fallback: the first user turn's <environment_details> wins; only if it yielded nothing do
+    // we fall back to the task_metadata.json hint (matching the old parse order).
+    if session.cwd.is_none() {
+        session.cwd = meta_cwd;
+    }
 
     Ok(session)
 }
 
+/// Memory-map the history file (default `mmap` feature) or fall back to a resident `fs::read`. The
+/// returned `HistoryBytes` derefs to `&[u8]`; for the mmap path it is file-backed and reclaimable by
+/// the OS under pressure. `None` on any I/O error (tolerant: caller yields an empty session).
+fn read_history_bytes(path: &Path) -> Option<HistoryBytes> {
+    #[cfg(feature = "mmap")]
+    {
+        let file = fs::File::open(path).ok()?;
+        // SAFETY: standard mmap-of-a-file caveat — concurrent external truncation could fault. These
+        // are the user's own transcript files, read-only, same as every other adapter's read.
+        let map = unsafe { memmap2::Mmap::map(&file).ok()? };
+        Some(HistoryBytes::Mapped(map))
+    }
+    #[cfg(not(feature = "mmap"))]
+    {
+        let buf = fs::read(path).ok()?;
+        Some(HistoryBytes::Owned(buf))
+    }
+}
+
+/// A byte buffer for the history document: a memory map under the `mmap` feature, otherwise an owned
+/// `Vec<u8>`. Both `AsRef<[u8]>` so the `serde_json::from_slice` call is identical.
+enum HistoryBytes {
+    #[cfg(feature = "mmap")]
+    Mapped(memmap2::Mmap),
+    #[cfg(not(feature = "mmap"))]
+    Owned(Vec<u8>),
+}
+
+impl AsRef<[u8]> for HistoryBytes {
+    fn as_ref(&self) -> &[u8] {
+        match self {
+            #[cfg(feature = "mmap")]
+            HistoryBytes::Mapped(m) => m.as_ref(),
+            #[cfg(not(feature = "mmap"))]
+            HistoryBytes::Owned(v) => v.as_slice(),
+        }
+    }
+}
+
 /// Pure parser: an `api_conversation_history.json` *array* text → `Session`. No filesystem access,
-/// so it's unit-testable with a small fixture string. Shared by Cline and Roo.
+/// so it's unit-testable with a small fixture string. Shared by Cline and Roo. Drives the same
+/// per-message parse as [`stream_task_dir`] (one message `Value` at a time, off `&RawValue` slices),
+/// so the two paths stay byte-identical without building the whole-document `Value`.
 pub fn parse_history_str(
     id: &str,
     text: &str,
@@ -287,16 +438,17 @@ pub fn parse_history_str(
         extra: Map::new(),
     };
 
-    let arr: Value = match serde_json::from_str(text) {
-        Ok(v) => v,
-        Err(_) => return session, // tolerate corrupt files
-    };
-    let Some(items) = arr.as_array() else {
-        return session;
+    // Borrow the array structure as raw items; tolerate corrupt / non-array documents.
+    let items: Vec<&RawValue> = match serde_json::from_str(text) {
+        Ok(items) => items,
+        Err(_) => return session,
     };
 
-    for item in items {
-        if let Some(msg) = parse_message(item, &mut session) {
+    for item in &items {
+        let Ok(v) = serde_json::from_str::<Value>(item.get()) else {
+            continue;
+        };
+        if let Some(msg) = parse_message(&v, &mut session) {
             session.messages.push(msg);
         }
     }
@@ -797,19 +949,31 @@ fn cwd_from_metadata(dir: &Path) -> Option<PathBuf> {
     None
 }
 
-/// Optionally enrich session/message timestamps from `ui_messages.json`. That file is an array of
-/// `{ts: epoch_ms, type, say/ask, text}` events. We use the first/last `ts` to set session
-/// created/updated when the taskId/mtime didn't give us something better, and stamp the first user
-/// and first assistant turn with the first matching ts (best-effort, not a strict alignment).
-fn enrich_from_ui_messages(dir: &Path, session: &mut Session) {
+/// Read timestamp hints from `ui_messages.json` (an array of `{ts: epoch_ms, type, say/ask, text}`
+/// events) without materializing message bodies. Returns `(created, updated, first_user_ts)`:
+///
+/// - `created`: the first event's `ts` — the most precise "created" we have (overrides taskId/mtime,
+///   matching the old `enrich_from_ui_messages` which unconditionally set `created_at` from it).
+/// - `updated`: the last event's `ts` (the caller keeps it only if it's newer than the mtime guess).
+/// - `first_user_ts`: same first `ts`, which the streaming core stamps onto the first user turn.
+///
+/// Small file (one entry per UI event, no transcript bodies), so a plain `from_str::<Value>` here is
+/// fine — the OOM concern is `api_conversation_history.json`, not this sidecar.
+fn ui_message_times(
+    dir: &Path,
+) -> (
+    Option<DateTime<Utc>>,
+    Option<DateTime<Utc>>,
+    Option<DateTime<Utc>>,
+) {
     let Ok(text) = fs::read_to_string(dir.join("ui_messages.json")) else {
-        return;
+        return (None, None, None);
     };
     let Ok(arr) = serde_json::from_str::<Value>(&text) else {
-        return;
+        return (None, None, None);
     };
     let Some(items) = arr.as_array() else {
-        return;
+        return (None, None, None);
     };
 
     let mut first_ts: Option<DateTime<Utc>> = None;
@@ -822,19 +986,8 @@ fn enrich_from_ui_messages(dir: &Path, session: &mut Session) {
             }
         }
     }
-
-    if let Some(f) = first_ts {
-        // ui_messages first event is the most precise "created" we have.
-        session.created_at = Some(f);
-        if let Some(m) = session.messages.iter_mut().find(|m| m.role == Role::User) {
-            m.timestamp.get_or_insert(f);
-        }
-    }
-    if let Some(l) = last_ts {
-        if session.updated_at.map(|u| l > u).unwrap_or(true) {
-            session.updated_at = Some(l);
-        }
-    }
+    // created and first_user_ts are both the first event's ts (as the old code used `f` for both).
+    (first_ts, last_ts, first_ts)
 }
 
 #[cfg(test)]

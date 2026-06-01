@@ -27,6 +27,7 @@
 
 use super::Adapter;
 use crate::ir::*;
+use crate::stream::{Flow, MessageSink, ParseOptions};
 use anyhow::{Context, Result};
 use chrono::{DateTime, TimeZone, Utc};
 use serde_json::{json, Map, Value};
@@ -119,6 +120,24 @@ impl Adapter for OpenCode {
     }
 
     fn parse(&self, r: &SessionRef) -> Result<Session> {
+        crate::stream::collect(self, r)
+    }
+
+    fn stream(
+        &self,
+        r: &SessionRef,
+        _opts: &ParseOptions,
+        sink: &mut dyn MessageSink,
+    ) -> Result<Session> {
+        // OpenCode stores a session as a *directory* of per-message JSON files (plus per-message
+        // part files). The old `parse` slurped every message body into a `Vec` to sort it — for a
+        // large session that resident-spikes the whole transcript. Here we instead:
+        //   1. read the small session meta file,
+        //   2. cheaply order the message files (read each only to pull its `time/created` key, then
+        //      drop the body — peak is O(one message file), not the whole session),
+        //   3. re-read each file in order, build its IR message(s), emit to `sink`, and drop it
+        //      before touching the next.
+        // `load_parts` already loads one message's parts at a time, so peak stays O(one message).
         let text = fs::read_to_string(&r.path)
             .with_context(|| format!("reading {}", r.path.display()))?;
         let meta: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
@@ -140,31 +159,40 @@ impl Adapter for OpenCode {
             extra: serde_json::Map::new(),
         };
 
-        // collect & order messages by created time
-        let mut msgs: Vec<(i64, Value)> = Vec::new();
+        // Order message files by `time/created` (same ordering as before) while holding only the
+        // sort key + path per file — never all message bodies at once.
+        let mut order: Vec<(i64, PathBuf)> = Vec::new();
         if let Some(mdir) = self.message_dir(&r.id) {
             if let Ok(rd) = fs::read_dir(&mdir) {
                 for e in rd.filter_map(|e| e.ok()) {
-                    if let Ok(t) = fs::read_to_string(e.path()) {
+                    let path = e.path();
+                    if let Ok(t) = fs::read_to_string(&path) {
                         if let Ok(v) = serde_json::from_str::<Value>(&t) {
                             let when =
                                 v.pointer("/time/created").and_then(Value::as_i64).unwrap_or(0);
-                            msgs.push((when, v));
+                            order.push((when, path));
                         }
                     }
                 }
             }
         }
-        msgs.sort_by_key(|(t, _)| *t);
+        order.sort_by_key(|(t, _)| *t);
 
-        for (_, mv) in &msgs {
+        sink.meta(&s);
+
+        // Re-read one message file at a time, emit, then drop before the next.
+        for (_, path) in &order {
+            let Ok(t) = fs::read_to_string(path) else { continue };
+            let Ok(mv) = serde_json::from_str::<Value>(&t) else { continue };
             let msg_id = mv.get("id").and_then(Value::as_str).unwrap_or("");
             let parts = self.load_parts(msg_id);
-            for built in build_messages(mv, &parts) {
+            for built in build_messages(&mv, &parts) {
                 if s.model.is_none() {
                     s.model = built.model.clone();
                 }
-                s.messages.push(built);
+                if sink.message(built) == Flow::Stop {
+                    return Ok(s);
+                }
             }
         }
 

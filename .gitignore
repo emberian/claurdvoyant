@@ -10,3 +10,4 @@ app/src-tauri/gen/
 # mdBook generated output (built in CI)
 /manual/book/
 /web/manual/
+.claude/worktrees/

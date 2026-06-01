@@ -32,8 +32,10 @@
 
 use super::Adapter;
 use crate::ir::*;
+use crate::stream::{Flow, MessageSink, ParseOptions};
 use anyhow::Result;
 use chrono::{DateTime, Utc};
+use serde_json::value::RawValue;
 use serde_json::{Map, Value, json};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -113,6 +115,23 @@ impl Adapter for Continue {
     }
 
     fn parse(&self, r: &SessionRef) -> Result<Session> {
+        // The whole-session parse is "stream into a CollectSink" — see [`crate::stream::collect`].
+        crate::stream::collect(self, r)
+    }
+
+    /// Native streaming parse. A Continue session is a single JSON document
+    /// (`{title, workspaceDirectory, history:[Item,…]}`), so instead of building the whole-document
+    /// `Value` (which owns every `history` item body — gigabytes for a large session), we
+    /// borrow-deserialize only the document *structure*: the small session-level strings by value,
+    /// and `history` as a `Vec<&RawValue>` slicing the mapped/owned bytes. Each item is then turned
+    /// into one small `Value` ([`history_item_to_message`]), emitted to `sink`, and dropped before
+    /// the next — so peak memory is O(largest item) + the mmap (reclaimable) + the slice vec.
+    fn stream(
+        &self,
+        r: &SessionRef,
+        _opts: &ParseOptions,
+        sink: &mut dyn MessageSink,
+    ) -> Result<Session> {
         let mut s = Session {
             id: r.id.clone(),
             harness: Harness::Continue,
@@ -127,33 +146,44 @@ impl Adapter for Continue {
             extra: serde_json::Map::new(),
         };
 
-        let Ok(text) = fs::read_to_string(&r.path) else {
+        // Map (or read) the file's raw bytes; the borrowed `Doc` slices into them.
+        let Some(bytes) = read_bytes(&r.path) else {
+            sink.meta(&s);
             return Ok(s);
         };
-        let Ok(v) = serde_json::from_str::<Value>(&text) else {
+        let Ok(doc) = serde_json::from_slice::<Doc>(bytes.as_ref()) else {
+            sink.meta(&s);
             return Ok(s);
         };
 
         // Backfill session-level fields from the file itself (index may be sparse/absent).
         if s.title.is_none() {
-            s.title = v
-                .get("title")
-                .and_then(Value::as_str)
+            s.title = doc
+                .title
+                .as_deref()
                 .filter(|t| !t.trim().is_empty())
                 .map(|t| crate::ir::truncate(t, 80));
         }
         if s.cwd.is_none() {
-            s.cwd = v
-                .get("workspaceDirectory")
-                .and_then(Value::as_str)
+            s.cwd = doc
+                .workspace_directory
+                .as_deref()
                 .filter(|p| !p.is_empty())
                 .map(workspace_to_path);
         }
 
-        if let Some(history) = v.get("history").and_then(Value::as_array) {
-            for item in history {
-                if let Some(m) = history_item_to_message(item, &mut s.model) {
-                    s.messages.push(m);
+        // Metadata is fully known now (model is only ever backfilled per-item below, and the bridge
+        // sinks read it from the returned Session); hand the header to the sink before the body.
+        sink.meta(&s);
+
+        for item in doc.history {
+            // ONE small Value per item — parsed, emitted, dropped before the next.
+            let Ok(v) = serde_json::from_str::<Value>(item.get()) else {
+                continue;
+            };
+            if let Some(m) = history_item_to_message(&v, &mut s.model) {
+                if sink.message(m) == Flow::Stop {
+                    break;
                 }
             }
         }
@@ -168,6 +198,59 @@ impl Adapter for Continue {
     fn emit(&self, session: &Session, out_dir: &Path) -> Result<super::EmitResult> {
         emit(session, out_dir, &crate::emit::EmitOptions::default())
     }
+}
+
+// ---------------------------------------------------------------------------
+// Streaming document structure (borrows the mapped/owned bytes)
+// ---------------------------------------------------------------------------
+
+/// The document *structure* of a Continue session, borrowed from the source bytes: the small
+/// session-level strings by value, and `history` as raw item slices (NOT materialized into owned
+/// `Value`s). Borrowing avoids building the whole-document `Value` for [`Continue::stream`].
+#[derive(serde::Deserialize)]
+struct Doc<'a> {
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default, rename = "workspaceDirectory")]
+    workspace_directory: Option<String>,
+    #[serde(default, borrow)]
+    history: Vec<&'a RawValue>,
+}
+
+/// Owns either an mmap of `path` or its bytes read into a `Vec`, exposing `.as_ref()` as `&[u8]`.
+/// `None` on any read/map error (callers treat it as an empty/unparseable session, like the old
+/// `read_to_string`/`from_str` did).
+enum Bytes {
+    #[cfg(feature = "mmap")]
+    Mapped(memmap2::Mmap),
+    Owned(Vec<u8>),
+}
+
+impl AsRef<[u8]> for Bytes {
+    fn as_ref(&self) -> &[u8] {
+        match self {
+            #[cfg(feature = "mmap")]
+            Bytes::Mapped(m) => m,
+            Bytes::Owned(v) => v,
+        }
+    }
+}
+
+/// Memory-map `path` (default `mmap` feature) so a large session's bytes are paged in on demand and
+/// reclaimable; fall back to reading the whole file into a `Vec` when the feature is off or the map
+/// fails (e.g. a zero-length file, where mmap is invalid).
+fn read_bytes(path: &Path) -> Option<Bytes> {
+    #[cfg(feature = "mmap")]
+    {
+        if let Ok(file) = fs::File::open(path) {
+            // SAFETY: cv reads its own session store; a concurrent truncation by another process
+            // could in theory cause a SIGBUS, the standard caveat for all mmap'd file reads.
+            if let Ok(map) = unsafe { memmap2::Mmap::map(&file) } {
+                return Some(Bytes::Mapped(map));
+            }
+        }
+    }
+    fs::read(path).ok().map(Bytes::Owned)
 }
 
 // ---------------------------------------------------------------------------
@@ -1037,5 +1120,63 @@ mod tests {
         assert_eq!(r.cwd.as_deref(), Some(Path::new("/Users/me/proj")));
         assert!(r.message_count >= 3);
         assert!(r.created_at.is_some());
+    }
+
+    /// The native `stream` must emit incrementally (not collect-then-replay): a sink that stops on
+    /// the first message ends the parse with exactly one message seen, never materializing the rest.
+    #[test]
+    fn stream_is_incremental_and_honors_stop() {
+        use crate::stream::{Flow, MessageSink};
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir()
+            .join(format!("cv-continue-stream-{}-{}", std::process::id(), n));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("s.json");
+        fs::write(
+            &path,
+            r#"{"sessionId":"s","title":"T","workspaceDirectory":"/w","history":[
+                {"message":{"role":"user","content":"one"}},
+                {"message":{"role":"assistant","content":"two"}},
+                {"message":{"role":"user","content":"three"}}
+            ]}"#,
+        )
+        .unwrap();
+
+        let r = SessionRef {
+            id: "s".into(),
+            harness: Harness::Continue,
+            path: path.clone(),
+            cwd: None,
+            title: None,
+            created_at: None,
+            updated_at: None,
+            message_count: 0,
+        };
+
+        // A sink that records every message it sees and stops after the first.
+        struct StopFirst {
+            seen: Vec<String>,
+        }
+        impl MessageSink for StopFirst {
+            fn message(&mut self, m: Message) -> Flow {
+                self.seen.push(m.text().unwrap_or_default());
+                Flow::Stop
+            }
+        }
+        let mut sink = StopFirst { seen: Vec::new() };
+        let s = Continue { sessions: None }
+            .stream(&r, &ParseOptions::full(), &mut sink)
+            .unwrap();
+
+        // Only the first message was ever materialized; the returned Session is metadata-only.
+        assert_eq!(sink.seen, vec!["one".to_string()]);
+        assert!(s.messages.is_empty(), "stream returns empty messages");
+        assert_eq!(s.cwd.as_deref(), Some(Path::new("/w")));
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }
