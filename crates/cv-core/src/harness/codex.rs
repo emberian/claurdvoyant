@@ -21,6 +21,7 @@
 
 use super::Adapter;
 use crate::ir::*;
+use crate::lazy::{json_string_span, RawValue, Text};
 use crate::stream::{Flow, MessageSink, ParseOptions};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -132,6 +133,16 @@ impl Adapter for Codex {
                 .with_context(|| format!("opening {}", r.path.display()))?;
             detect_has_events(BufReader::new(f))
         };
+        // Span path (partial-access / chunked index): mmap the file and emit a lazy `Span` for a giant
+        // `function_call_output` string output instead of reading/materializing the 100s-of-MB line.
+        #[cfg(feature = "mmap")]
+        if opts.spans {
+            if let Ok(file) = fs::File::open(&r.path) {
+                if let Ok(map) = unsafe { memmap2::Mmap::map(&file) } {
+                    return Ok(stream_jsonl_spans(&r.id, &map, Some(r.path.clone()), has_events, sink));
+                }
+            }
+        }
         let f = fs::File::open(&r.path)
             .with_context(|| format!("opening {}", r.path.display()))?;
         Ok(stream_jsonl(
@@ -326,6 +337,130 @@ pub fn stream_jsonl<R: BufRead>(
         sink.meta(&s);
     }
     s
+}
+
+/// Span-producing streaming parse over the source bytes (an mmap). Mirrors [`stream_jsonl`] but
+/// iterates line slices (tracking file offsets) and, for a giant `function_call_output` with a plain
+/// **string** output, emits a lazy [`Span`](crate::lazy::Span) for that output instead of
+/// reading/parsing the (often 100s of MB) line whole.
+#[cfg(feature = "mmap")]
+pub fn stream_jsonl_spans(
+    id: &str,
+    data: &[u8],
+    source_path: Option<PathBuf>,
+    has_events: bool,
+    sink: &mut dyn MessageSink,
+) -> Session {
+    let mut s = Session {
+        id: String::new(),
+        harness: Harness::Codex,
+        cwd: None,
+        title: None,
+        created_at: None,
+        updated_at: None,
+        model: None,
+        git: None,
+        messages: Vec::new(),
+        source_path,
+        extra: serde_json::Map::new(),
+    };
+    let mut scratch: Vec<Message> = Vec::new();
+    let mut meta_sent = false;
+    let mut off = 0u64;
+    'outer: for raw_line in data.split(|&b| b == b'\n') {
+        let line_off = off;
+        off += raw_line.len() as u64 + 1; // +1 for the consumed '\n'
+        let lead = raw_line.iter().take_while(|b| b.is_ascii_whitespace()).count();
+        let endw =
+            raw_line.len() - raw_line[lead..].iter().rev().take_while(|b| b.is_ascii_whitespace()).count();
+        if lead >= endw {
+            continue;
+        }
+        let slice = &raw_line[lead..endw];
+        let base_off = line_off + lead as u64;
+
+        if let Some(msg) = giant_fco_span(slice, base_off, &mut s) {
+            scratch.push(msg);
+        } else if let Ok(v) = serde_json::from_slice::<Value>(slice) {
+            dispatch_line(&mut s, &mut scratch, &v, has_events, false);
+        } else {
+            continue;
+        }
+        if !meta_sent && s.model.is_some() {
+            sink.meta(&s);
+            meta_sent = true;
+        }
+        for m in scratch.drain(..) {
+            if sink.message(m) == Flow::Stop {
+                break 'outer;
+            }
+        }
+    }
+    if s.id.is_empty() {
+        s.id = id.to_string();
+    }
+    if !meta_sent {
+        sink.meta(&s);
+    }
+    s
+}
+
+/// If `slice` is a large `function_call_output`/`custom_tool_call_output` whose `output` is a plain
+/// JSON string, emit a Tool message whose content is a lazy [`Span`](crate::lazy::Span) of that
+/// string — without materializing it. Updates `s` timestamps as `dispatch_line` would. `None` ⇒ fall
+/// back to the normal Value dispatch (small records, non-string outputs, other types).
+#[cfg(feature = "mmap")]
+fn giant_fco_span(slice: &[u8], base_off: u64, s: &mut Session) -> Option<Message> {
+    if slice.len() <= crate::lazy::INLINE_MAX {
+        return None;
+    }
+    #[derive(serde::Deserialize)]
+    struct Rec<'a> {
+        #[serde(rename = "type")]
+        ty: Option<&'a str>,
+        timestamp: Option<&'a str>,
+        #[serde(borrow)]
+        payload: Option<&'a RawValue>,
+    }
+    let rec: Rec = serde_json::from_slice(slice).ok()?;
+    if rec.ty != Some("response_item") {
+        return None;
+    }
+    let payload = rec.payload?;
+    #[derive(serde::Deserialize)]
+    struct Pay<'a> {
+        #[serde(rename = "type")]
+        pty: Option<&'a str>,
+        call_id: Option<String>,
+        #[serde(borrow, default)]
+        output: Option<&'a RawValue>,
+    }
+    let pay: Pay = serde_json::from_str(payload.get()).ok()?;
+    if !matches!(
+        pay.pty,
+        Some("function_call_output") | Some("custom_tool_call_output")
+    ) {
+        return None;
+    }
+    // Only a plain *string* output spans (object/array output is transformed by coerce_output → fall
+    // back to the materializing path; those giant cases are rare).
+    let span = json_string_span(pay.output?, slice, base_off)?;
+    let ts = rec.timestamp.and_then(parse_ts);
+    if let Some(ts) = ts {
+        s.created_at.get_or_insert(ts);
+        s.updated_at = Some(ts);
+    }
+    let mut m = Message::new(Role::Tool);
+    m.timestamp = ts;
+    m.content.push(Block::ToolResult {
+        tool_use_id: pay.call_id.unwrap_or_default(),
+        content: Text::Span(span),
+        is_error: false, // a string output is never an error (output_is_error only fires on objects)
+        tool_name: None,
+        status: Some("completed".into()),
+        details: None,
+    });
+    Some(m)
 }
 
 fn apply_meta(s: &mut Session, payload: Option<&Value>) {
@@ -1287,6 +1422,60 @@ mod tests {
             Block::Image { data_ref, .. } => assert_eq!(data_ref.as_deref(), Some("/tmp/x.png")),
             _ => unreachable!(),
         }
+    }
+
+    #[cfg(feature = "mmap")]
+    #[test]
+    fn giant_fco_string_output_spans_and_resolves() {
+        use std::io::Write;
+        // A function_call_output whose string output is > INLINE_MAX and contains escapes (\n, ").
+        let body = "out line \"q\"\nmore ".repeat(400); // ~7 KB, with \n and " escapes
+        let rec = serde_json::json!({
+            "timestamp": "2026-01-01T00:00:00Z",
+            "type": "response_item",
+            "payload": { "type": "function_call_output", "call_id": "c1", "output": body }
+        })
+        .to_string();
+        let dir = std::env::temp_dir().join(format!("cv-codex-span-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("rollout-x.jsonl");
+        {
+            let mut f = std::fs::File::create(&path).unwrap();
+            writeln!(f, "{rec}").unwrap();
+        }
+        let data = std::fs::read(&path).unwrap();
+        let mut sink = crate::stream::CollectSink::default();
+        let mut s = stream_jsonl_spans("fallback", &data, Some(path.clone()), false, &mut sink);
+        s.messages = sink.messages;
+
+        let content = s
+            .messages
+            .iter()
+            .find_map(|m| {
+                m.content.iter().find_map(|b| match b {
+                    Block::ToolResult { content, .. } => Some(content),
+                    _ => None,
+                })
+            })
+            .expect("tool result present");
+        assert!(content.is_span(), "giant fco output should be a span");
+        let resolver = s.resolver();
+        assert_eq!(content.resolve(&resolver), body.as_str(), "span must resolve to the exact output");
+
+        // And it matches the inline (bulk) parse of the same record.
+        let inline = parse_str("fallback", &String::from_utf8(data).unwrap(), true, Some(path.clone()));
+        let inline_c = inline
+            .messages
+            .iter()
+            .find_map(|m| {
+                m.content.iter().find_map(|b| match b {
+                    Block::ToolResult { content, .. } => content.inline_str(),
+                    _ => None,
+                })
+            })
+            .expect("inline tool result");
+        assert_eq!(inline_c, body.as_str());
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

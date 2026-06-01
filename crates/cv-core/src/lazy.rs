@@ -61,6 +61,14 @@ impl Text {
         matches!(self, Text::Span(_))
     }
 
+    /// The span, if this is lazy content.
+    pub fn as_span(&self) -> Option<&Span> {
+        match self {
+            Text::Span(sp) => Some(sp),
+            Text::Inline(_) => None,
+        }
+    }
+
     /// Resolve to the text, borrowing the inline string or (for a span) reading it from `resolver`.
     /// Cheap for inline and for unescaped spans (borrows the mmap); allocates only to unescape.
     pub fn resolve<'a>(&'a self, resolver: &'a Resolver) -> Cow<'a, str> {
@@ -211,6 +219,29 @@ impl Resolver {
         }
     }
 
+    /// Feed the span's text to `f` in `chunk`-byte pieces **without materializing the whole field** —
+    /// for unescaped spans the pieces are borrowed straight from the mmap (only touched pages page in,
+    /// and they're reclaimable). Chunk boundaries are kept on char boundaries; if `escaped`, the whole
+    /// field is unescaped once (escapes can't be unescaped piecewise) then chunked. Lets a consumer
+    /// (e.g. the chunked indexer) stream a 700 MB field through a 4 MB window.
+    pub fn for_each_chunk(&self, sp: &Span, chunk: usize, mut f: impl FnMut(&str)) {
+        let chunk = chunk.max(1);
+        match self.raw_bytes(sp) {
+            None => {}
+            Some(bytes) if sp.escaped => {
+                // Escaped: must unescape as a whole (rare for truly giant fields — those are usually
+                // base64/file dumps without many escapes; unescape only allocates when there ARE
+                // backslashes). Then hand out in char-boundary pieces.
+                let s = unescape_json_body(&bytes);
+                emit_chunks(&s, chunk, &mut f);
+            }
+            Some(bytes) => {
+                let s = String::from_utf8_lossy(&bytes);
+                emit_chunks(&s, chunk, &mut f);
+            }
+        }
+    }
+
     #[cfg(feature = "mmap")]
     fn raw_bytes<'a>(&'a self, sp: &'a Span) -> Option<Cow<'a, [u8]>> {
         let path = self.path_for(sp)?.to_path_buf();
@@ -246,6 +277,47 @@ impl Resolver {
         let mut buf = vec![0u8; sp.len as usize];
         f.read_exact(&mut buf).ok()?;
         Some(Cow::Owned(buf))
+    }
+}
+
+/// Build a [`Span`] for a raw JSON string value `raw` (e.g. from `serde_json::value::RawValue`) that
+/// borrows somewhere inside the record bytes `within` starting at absolute file offset `base_off`.
+/// The span covers the string *body* (between the quotes); `escaped` is set if it contains a
+/// backslash. `None` if `raw` isn't a JSON string or doesn't lie within `within`. Used by adapters'
+/// span-producing parse paths (claude, codex).
+pub fn json_string_span(raw: &RawValue, within: &[u8], base_off: u64) -> Option<Span> {
+    let b = raw.get().as_bytes();
+    if b.len() < 2 || b.first() != Some(&b'"') || b.last() != Some(&b'"') {
+        return None;
+    }
+    let off = (b.as_ptr() as usize).checked_sub(within.as_ptr() as usize)?;
+    if off + b.len() > within.len() {
+        return None;
+    }
+    let body = &b[1..b.len() - 1];
+    Some(Span {
+        source: None,
+        offset: base_off + off as u64 + 1,
+        len: body.len() as u64,
+        escaped: body.contains(&b'\\'),
+    })
+}
+
+/// A serde_json `RawValue`, re-exported so adapters' span paths can name the type without depending
+/// on the `raw_value` feature surface directly.
+pub use serde_json::value::RawValue;
+
+/// Emit `s` in `chunk`-byte pieces split on char boundaries.
+fn emit_chunks(s: &str, chunk: usize, f: &mut impl FnMut(&str)) {
+    let mut start = 0;
+    let bytes = s.as_bytes();
+    while start < s.len() {
+        let mut end = (start + chunk).min(s.len());
+        while end < s.len() && (bytes[end] & 0xC0) == 0x80 {
+            end += 1; // don't split a UTF-8 continuation byte
+        }
+        f(&s[start..end]);
+        start = end;
     }
 }
 

@@ -152,7 +152,9 @@ pub fn index_all(dir: &Path, rebuild: bool) -> Result<usize> {
         };
         let docs = {
             let mut sink = ChunkSink::new(&mut writer, &f, &r, mtime);
-            if let Err(e) = adapter.stream(&r, &ParseOptions::bulk(), &mut sink) {
+            // `lazy()` so adapters defer large content to spans, which the sink chunk-resolves —
+            // a giant field feeds tantivy in 4 MB pieces and is never owned whole.
+            if let Err(e) = adapter.stream(&r, &ParseOptions::lazy(), &mut sink) {
                 eprintln!("cv-search: parse failed for {} ({}): {e:#}", r.id, r.harness);
                 continue;
             }
@@ -292,6 +294,56 @@ impl<'w> ChunkSink<'w> {
     }
 }
 
+impl<'w> ChunkSink<'w> {
+    /// Append `s` to the buffer, flushing a doc whenever it reaches a chunk.
+    fn push_chunk(&mut self, s: &str) {
+        self.buf.push_str(s);
+        if self.buf.len() >= CHUNK_BYTES {
+            self.flush(false);
+        }
+    }
+
+    /// Append a content `Text`: chunk-resolved from the source for a span (never owned whole), or the
+    /// inline string. `r` is the session resolver (moved out of `self` to avoid a borrow conflict with
+    /// the chunk callback, which mutates `self`).
+    fn append_text(&mut self, r: &cv_core::Resolver, text: &cv_core::Text) {
+        if let Some(sp) = text.as_span() {
+            r.for_each_chunk(sp, CHUNK_BYTES, |s| self.push_chunk(s));
+        } else if let Some(s) = text.inline_str() {
+            self.push_chunk(s);
+        }
+    }
+
+    /// Append one block's searchable text — identical projection to
+    /// [`cv_core::stream::append_searchable`], but chunk-resolving span content.
+    fn append_block(&mut self, r: &cv_core::Resolver, b: &cv_core::Block) {
+        use cv_core::Block;
+        match b {
+            Block::Text { text } | Block::Thinking { text, .. } => {
+                self.append_text(r, text);
+                self.push_chunk("\n");
+            }
+            Block::ToolUse { name, input, .. } => {
+                self.push_chunk(name);
+                self.push_chunk(" ");
+                self.push_chunk(&input.to_string());
+                self.push_chunk("\n");
+            }
+            Block::ToolResult { content, .. } => {
+                self.append_text(r, content);
+                self.push_chunk("\n");
+            }
+            Block::File { path, source, .. } => {
+                if let Some(p) = path.as_deref().or(source.as_deref()) {
+                    self.push_chunk(p);
+                    self.push_chunk("\n");
+                }
+            }
+            Block::Image { .. } => {}
+        }
+    }
+}
+
 impl cv_core::MessageSink for ChunkSink<'_> {
     fn meta(&mut self, s: &cv_core::Session) {
         self.meta_title = s.title.clone();
@@ -300,22 +352,30 @@ impl cv_core::MessageSink for ChunkSink<'_> {
             self.cwd = s.cwd.as_ref().map(|p| p.display().to_string());
         }
     }
-    fn message(&mut self, mut m: cv_core::Message) -> cv_core::Flow {
+    fn message(&mut self, m: cv_core::Message) -> cv_core::Flow {
+        use cv_core::Block;
         if self.err.is_some() {
             return cv_core::Flow::Stop;
         }
-        m.materialize(&self.resolver);
+        // Move the resolver out so the chunk callbacks (which mutate `self`) don't conflict with it.
+        let r = std::mem::replace(&mut self.resolver, cv_core::Resolver::new(None));
+        // First user text → the title fallback (resolve if it's a span; it's usually small/early).
         if self.first_user.is_none() && m.role == cv_core::Role::User {
-            if let Some(t) = m.text() {
-                if !t.trim().is_empty() {
-                    self.first_user = Some(t);
+            for b in &m.content {
+                if let Block::Text { text } = b {
+                    let s = text.resolve(&r);
+                    let t = s.trim();
+                    if !t.is_empty() {
+                        self.first_user = Some(t.to_string());
+                        break;
+                    }
                 }
             }
         }
-        cv_core::stream::append_searchable(&mut self.buf, &m);
-        if self.buf.len() >= CHUNK_BYTES {
-            self.flush(false);
+        for b in &m.content {
+            self.append_block(&r, b);
         }
+        self.resolver = r;
         cv_core::Flow::Continue
     }
 }

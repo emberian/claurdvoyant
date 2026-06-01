@@ -266,12 +266,28 @@ duplication is cheap. Verified: dedup correct (the only "dup" short-ids are genu
 codex sessions with colliding 8-char time-prefixes), search finds the right sessions, 224 tests
 green. Index rebuild peak 4.2 → 3.9 GB.
 
-**The remaining floor is codex.** The headline 699 MB record is a *single* codex message, and codex
-isn't span-migrated — its parse reads the 699 MB line and builds a `Value` + owned `String` *before*
-the index sees it, so chunking (which bounds *multi*-message sessions) can't help it. Fixing it needs
-**codex span production** (Part B: the same `read_until` + `RawValue` parse as claude) **plus**
-chunk-*resolving* a span message inside `ChunkSink` (read the span in pieces rather than
-`materialize`-ing it whole). Then a 699 MB codex field is fed to tantivy in 4 MB pieces, never owned.
+### Codex spans + chunk-resolve — LANDED (Part B)
+
+The 699 MB record is a *single* codex `function_call_output` with a plain-string `output`. Codex now
+has a span path: with `ParseOptions::lazy()` it **mmaps** the file, iterates line slices (tracking
+byte offsets), and for a giant `function_call_output`/`custom_tool_call_output` whose `output` is a
+plain JSON string, emits a lazy `Span` of that output (via `serde_json::value::RawValue`, borrowing
+the mmap) — **never reading or materializing** the line. `output_is_error` is `false` for a string
+output, so the `ToolResult` is reproduced exactly (`is_error=false`, `status="completed"`); a unit
+test confirms the span resolves byte-identically to the inline parse (incl. escapes). `ChunkSink`
+chunk-*resolves* span content (`Resolver::for_each_chunk` hands out ≤4 MB pieces straight off the
+mmap), so the 699 MB output feeds tantivy in 4 MB chunks.
+
+Result: indexing the 699 MB codex output no longer **owns** it — it's reclaimable file-backed mmap,
+streamed in 4 MB pieces (the original 65 GB OOM cause is gone). Verified: searching `SandboxDenied`
+(a term *only* inside that 699 MB output) finds session `019c6a2b`, so the span→chunk→index pipeline
+indexed it correctly. Index rebuild peak 4.2 → 3.4 GB (the residual is the *reclaimable* mmap pages
+of the 699 MB output while tantivy tokenizes it — irreducible: indexing C bytes reads C bytes — plus
+tantivy's term buffers; none of it is owned/OOM-prone). 218 tests green.
+
+`cv dataset` of that one session still materializes the 699 MB (it's emitting it as a training
+example — inherent); everything else (parse, index, search, show) is now streaming/chunked/mmap and
+never owns a giant field.
 
 Lower-churn partial win available without the IR change: **incremental tantivy field-fill** — add each
 message's text to the doc as it streams instead of concatenating a whole-session `body` String (drops

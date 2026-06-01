@@ -757,24 +757,10 @@ fn span_of_string_field(item_raw: &RawValue, field: &str, ctx: &SpanCtx) -> Opti
     raw_string_span(map.get(field)?, ctx)
 }
 
-/// Span the *body* (between the quotes) of a raw JSON string value, as an absolute file offset.
-/// Relies on `fr` borrowing `ctx.slice` so pointer subtraction yields the in-slice byte offset.
+/// Span the *body* of a raw JSON string value as an absolute file offset (delegates to the shared
+/// [`crate::lazy::json_string_span`]; relies on `fr` borrowing `ctx.slice`).
 fn raw_string_span(fr: &RawValue, ctx: &SpanCtx) -> Option<Span> {
-    let raw = fr.get().as_bytes();
-    if raw.len() < 2 || raw.first() != Some(&b'"') || raw.last() != Some(&b'"') {
-        return None; // not a JSON string
-    }
-    let off_in_slice = (raw.as_ptr() as usize).checked_sub(ctx.slice.as_ptr() as usize)?;
-    if off_in_slice + raw.len() > ctx.slice.len() {
-        return None; // sanity: must lie within the slice
-    }
-    let body = &raw[1..raw.len() - 1];
-    Some(Span {
-        source: None,
-        offset: ctx.base_off + off_in_slice as u64 + 1, // skip the opening quote
-        len: body.len() as u64,
-        escaped: body.contains(&b'\\'),
-    })
+    crate::lazy::json_string_span(fr, ctx.slice, ctx.base_off)
 }
 
 /// The raw JSON of `message.content`, borrowing `slice`.
