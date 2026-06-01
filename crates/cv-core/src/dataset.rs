@@ -13,7 +13,7 @@
 //! Reasoning is kept in a `<thinking>` wrapper — it's high-signal for distilling into smaller
 //! models, and a downstream filter can strip it if a given run wants answer-only SFT.
 
-use crate::ir::{Block, Role, Session};
+use crate::ir::{Block, Message, Role, Session};
 use serde_json::{json, Value};
 
 /// Serialize a session as a ChatML record. Returns `None` if it has no non-empty turns.
@@ -68,44 +68,223 @@ pub fn to_sharegpt(session: &Session) -> Option<Value> {
     Some(json!({ "conversations": conversations }))
 }
 
-/// Flatten one message's blocks into a single training-text string, resolving lazy content spans
-/// against `resolver` (so a giant field is materialized transiently, not held).
+/// Chunk size for streaming a span's content into the JSONL writer (bounds peak per giant field).
+const SPAN_CHUNK: usize = 1 << 20; // 1 MiB
+
+/// Flatten one message's blocks into a single training-text string (materializing — used by the
+/// `Value`-building [`to_chatml`]/[`to_sharegpt`] and tests). Prefer [`write_chatml`] for export.
 fn render_blocks(blocks: &[Block], resolver: &crate::lazy::Resolver) -> String {
-    let mut parts: Vec<String> = Vec::new();
+    let mut out = String::new();
+    render_blocks_into(blocks, resolver, &mut |s| out.push_str(s));
+    out
+}
+
+/// Stream one message's blocks as training text to `emit`, resolving span content **in chunks** (so a
+/// giant field is never materialized whole). Byte-identical to the old `parts.join("\n\n")`: the same
+/// parts, separated by `\n\n`, with empty/redacted text turns producing no part.
+fn render_blocks_into(
+    blocks: &[Block],
+    resolver: &crate::lazy::Resolver,
+    emit: &mut dyn FnMut(&str),
+) {
+    let mut started = false;
+    let mut sep = |started: &mut bool, emit: &mut dyn FnMut(&str)| {
+        if *started {
+            emit("\n\n");
+        }
+        *started = true;
+    };
     for b in blocks {
         match b {
             Block::Text { text } => {
-                let text = text.resolve(resolver);
-                if !text.trim().is_empty() {
-                    parts.push(text.into_owned());
+                if let Some(s) = text.inline_str() {
+                    if s.trim().is_empty() {
+                        continue;
+                    }
+                    sep(&mut started, emit);
+                    emit(s);
+                } else if let Some(sp) = text.as_span() {
+                    sep(&mut started, emit);
+                    resolver.for_each_chunk(sp, SPAN_CHUNK, |c| emit(c));
                 }
             }
             Block::Thinking { text, redacted, .. } => {
-                let text = text.resolve(resolver);
-                if !*redacted && !text.trim().is_empty() {
-                    parts.push(format!("<thinking>\n{text}\n</thinking>"));
+                if *redacted {
+                    continue;
+                }
+                if let Some(s) = text.inline_str() {
+                    if s.trim().is_empty() {
+                        continue;
+                    }
+                    sep(&mut started, emit);
+                    emit("<thinking>\n");
+                    emit(s);
+                    emit("\n</thinking>");
+                } else if let Some(sp) = text.as_span() {
+                    sep(&mut started, emit);
+                    emit("<thinking>\n");
+                    resolver.for_each_chunk(sp, SPAN_CHUNK, |c| emit(c));
+                    emit("\n</thinking>");
                 }
             }
             Block::ToolUse { name, input, .. } => {
-                let args = serde_json::to_string(input).unwrap_or_default();
-                parts.push(format!("```tool_call\n{name} {args}\n```"));
+                sep(&mut started, emit);
+                emit("```tool_call\n");
+                emit(name);
+                emit(" ");
+                emit(&serde_json::to_string(input).unwrap_or_default());
+                emit("\n```");
             }
             Block::ToolResult { content, is_error, .. } => {
-                let tag = if *is_error { "tool_result error" } else { "tool_result" };
-                let content = content.resolve(resolver);
-                parts.push(format!("```{tag}\n{content}\n```"));
+                sep(&mut started, emit);
+                emit(if *is_error {
+                    "```tool_result error\n"
+                } else {
+                    "```tool_result\n"
+                });
+                if let Some(s) = content.inline_str() {
+                    emit(s);
+                } else if let Some(sp) = content.as_span() {
+                    resolver.for_each_chunk(sp, SPAN_CHUNK, |c| emit(c));
+                }
+                emit("\n```");
             }
             Block::Image { media_type, .. } => {
-                let m = media_type.as_deref().map(|m| format!(": {m}")).unwrap_or_default();
-                parts.push(format!("[image{m}]"));
+                sep(&mut started, emit);
+                emit("[image");
+                if let Some(m) = media_type.as_deref() {
+                    emit(": ");
+                    emit(m);
+                }
+                emit("]");
             }
             Block::File { path, mime, .. } => {
-                let label = path.as_deref().or(mime.as_deref()).unwrap_or("attachment");
-                parts.push(format!("[file: {label}]"));
+                sep(&mut started, emit);
+                emit("[file: ");
+                emit(path.as_deref().or(mime.as_deref()).unwrap_or("attachment"));
+                emit("]");
             }
         }
     }
-    parts.join("\n\n")
+}
+
+/// Whether a message renders to no training text (so [`to_chatml`]/[`write_chatml`] drop it) — the
+/// cheap, no-resolve predicate matching [`render_blocks_into`]'s emptiness (only empty/redacted text
+/// turns are empty; any tool/image/file block, or any span, makes it non-empty).
+fn message_is_empty(m: &Message) -> bool {
+    !m.content.iter().any(|b| match b {
+        Block::Text { text } => {
+            text.is_span() || text.inline_str().is_some_and(|s| !s.trim().is_empty())
+        }
+        Block::Thinking { text, redacted, .. } => {
+            !*redacted && (text.is_span() || text.inline_str().is_some_and(|s| !s.trim().is_empty()))
+        }
+        _ => true,
+    })
+}
+
+/// Which export shape — the only difference is the array/role/content key names and the role labels.
+#[derive(Clone, Copy)]
+pub enum Format {
+    Chatml,
+    ShareGpt,
+}
+
+/// Write `session` as one JSONL record (no trailing newline) **streaming** — content (incl. giant
+/// span fields) is rendered straight to `w` in chunks and JSON-escaped per chunk, so the whole record
+/// is never held in memory. Returns `false` (writing nothing) when the session has no non-empty turns
+/// — matching [`to_chatml`]'s `None`. With `redact`, each message is scrubbed (one materialized
+/// message at a time) before rendering.
+pub fn write_record<W: std::io::Write>(
+    session: &Session,
+    w: &mut W,
+    fmt: Format,
+    redact: Option<&crate::redact::RedactOptions>,
+) -> std::io::Result<bool> {
+    // Cheap pre-scan: skip the whole record if every turn is empty (no resolve needed).
+    if !session.messages.iter().any(|m| !message_is_empty(m)) {
+        return Ok(false);
+    }
+    let (array_key, role_key, content_key) = match fmt {
+        Format::Chatml => ("messages", "role", "content"),
+        Format::ShareGpt => ("conversations", "from", "value"),
+    };
+    let role_label = |r: Role| -> &'static str {
+        match (fmt, r) {
+            (Format::Chatml, Role::System) | (Format::ShareGpt, Role::System) => "system",
+            (Format::Chatml, Role::User) => "user",
+            (Format::ShareGpt, Role::User) => "human",
+            (Format::Chatml, Role::Assistant) => "assistant",
+            (Format::ShareGpt, Role::Assistant) => "gpt",
+            (_, Role::Tool) => "tool",
+        }
+    };
+
+    // serde_json's `Map` is a BTreeMap, so a one-shot `json!({role, content})` serializes its keys
+    // in lexicographic order. Match that exactly: emit the smaller key first.
+    let role_first = role_key < content_key;
+
+    let resolver = session.resolver();
+    write!(w, "{{\"{array_key}\":[")?;
+    let mut first = true;
+    for m in &session.messages {
+        if message_is_empty(m) {
+            continue;
+        }
+        if !first {
+            w.write_all(b",")?;
+        }
+        first = false;
+        let role = role_label(m.role);
+        if role_first {
+            write!(w, "{{\"{role_key}\":\"{role}\",\"{content_key}\":\"")?;
+        } else {
+            write!(w, "{{\"{content_key}\":\"")?;
+        }
+        let mut err: std::io::Result<()> = Ok(());
+        {
+            let mut emit = |piece: &str| {
+                if err.is_ok() {
+                    err = write_json_escaped(w, piece);
+                }
+            };
+            if let Some(opts) = redact {
+                // Scrub one materialized message at a time (peak = one message), then render inline.
+                let mut mm = m.clone();
+                mm.materialize(&resolver);
+                let mut stats = crate::redact::RedactStats::default();
+                crate::redact::redact_message(&mut mm, opts, &mut stats);
+                render_blocks_into(&mm.content, &resolver, &mut emit);
+            } else {
+                render_blocks_into(&m.content, &resolver, &mut emit);
+            }
+        }
+        err?;
+        if role_first {
+            w.write_all(b"\"}")?;
+        } else {
+            write!(w, "\",\"{role_key}\":\"{role}\"}}")?;
+        }
+    }
+    w.write_all(b"]}")?;
+    Ok(true)
+}
+
+/// Convenience: stream a ChatML record. See [`write_record`].
+pub fn write_chatml<W: std::io::Write>(session: &Session, w: &mut W) -> std::io::Result<bool> {
+    write_record(session, w, Format::Chatml, None)
+}
+
+/// Write `s` to `w` as the *body* of a JSON string (no surrounding quotes), JSON-escaped exactly as
+/// `serde_json` would. Escaping is context-free, so escaping each chunk and concatenating equals
+/// escaping the whole — keeping streamed output byte-identical to a one-shot `serde_json::to_string`.
+fn write_json_escaped<W: std::io::Write>(w: &mut W, s: &str) -> std::io::Result<()> {
+    if s.is_empty() {
+        return Ok(());
+    }
+    let quoted = serde_json::to_string(s).map_err(std::io::Error::other)?;
+    // `quoted` is `"…escaped…"`; write the body between the quotes.
+    w.write_all(&quoted.as_bytes()[1..quoted.len() - 1])
 }
 
 #[cfg(test)]

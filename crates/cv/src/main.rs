@@ -1328,9 +1328,10 @@ fn cmd_dataset(
         let Some(adapter) = cv_core::harness::for_harness(r.harness) else {
             continue;
         };
-        // Bulk opts: we need every message of this session at once (one record per session), but
-        // dataset rendering never reads `extra`, so skip the fat sidecars.
-        let session = match cv_core::stream::collect_with(adapter.as_ref(), &r, &cv_core::ParseOptions::bulk()) {
+        // Lazy opts: large content stays a span (held as a 16-byte ref), and `write_record` streams
+        // it straight to the writer in chunks — so even a 700 MB record never materializes. `extra`
+        // isn't read by dataset rendering, so it's skipped too.
+        let session = match cv_core::stream::collect_with(adapter.as_ref(), &r, &cv_core::ParseOptions::lazy()) {
             Ok(s) => s,
             Err(e) => {
                 eprintln!("cv dataset: skipping {} ({}): {e:#}", r.id, r.harness);
@@ -1341,29 +1342,24 @@ fn cmd_dataset(
             skipped += 1;
             continue;
         }
-        let session = if redact {
-            // redact reads content directly, so resolve lazy spans to inline first.
-            let mut s = session;
-            s.materialize();
-            cv_core::redact::redact(&s)
-        } else {
-            session
+        // Stream the record directly to the writer (chunked, JSON-escaped per chunk — never holds the
+        // whole record). `--redact` scrubs one materialized message at a time inside the writer.
+        let fmt = match format {
+            "chatml" => cv_core::dataset::Format::Chatml,
+            _ => cv_core::dataset::Format::ShareGpt,
         };
-        let rec = match format {
-            "chatml" => cv_core::dataset::to_chatml(&session),
-            _ => cv_core::dataset::to_sharegpt(&session),
-        };
-        match rec {
-            Some(rec) => {
-                writeln!(writer, "{}", serde_json::to_string(&rec)?)?;
-                emitted += 1;
-                if let Some(l) = limit {
-                    if emitted >= l {
-                        break;
-                    }
+        let redact_opts = redact.then(cv_core::redact::RedactOptions::default);
+        let wrote = cv_core::dataset::write_record(&session, &mut writer, fmt, redact_opts.as_ref())?;
+        if wrote {
+            writeln!(writer)?;
+            emitted += 1;
+            if let Some(l) = limit {
+                if emitted >= l {
+                    break;
                 }
             }
-            None => skipped += 1,
+        } else {
+            skipped += 1;
         }
     }
     writer.flush()?;

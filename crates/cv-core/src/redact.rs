@@ -92,7 +92,9 @@ pub fn redact_text(s: &str) -> String {
     scrub(s, &RedactOptions::default(), &mut stats)
 }
 
-fn redact_message(msg: &mut Message, opts: &RedactOptions, stats: &mut RedactStats) {
+/// Redact secrets from a single message in place. Public so streaming consumers (dataset export) can
+/// scrub one message at a time without materializing the whole session.
+pub fn redact_message(msg: &mut Message, opts: &RedactOptions, stats: &mut RedactStats) {
     for block in &mut msg.content {
         match block {
             Block::Text { text } | Block::Thinking { text, .. } => {
