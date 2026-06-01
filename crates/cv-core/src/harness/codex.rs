@@ -380,7 +380,7 @@ fn apply_turn_context(
             let mut msg = Message::new(Role::System);
             msg.timestamp = ts;
             msg.content.push(Block::Text {
-                text: format!("[model changed: {prev} → {m}]"),
+                text: format!("[model changed: {prev} → {m}]").into(),
             });
             msg.extra
                 .insert("codex_event".into(), Value::String("turn_context".into()));
@@ -528,7 +528,7 @@ fn handle_compacted(payload: Option<&Value>, ts: Option<DateTime<Utc>>, out: &mu
     } else {
         format!("[history compacted]\n{summary}")
     };
-    m.content.push(Block::Text { text });
+    m.content.push(Block::Text { text: text.into() });
     m.extra
         .insert("codex_event".into(), Value::String("compacted".into()));
     if let Some(rh) = p.get("replacement_history").and_then(Value::as_array) {
@@ -594,7 +594,7 @@ fn handle_item(
                     m.extra.insert("reasoning_summary".into(), Value::String(summary));
                 }
                 m.content.push(Block::Thinking {
-                    text,
+                    text: text.into(),
                     signature: None,
                     encrypted,
                     redacted: false,
@@ -661,7 +661,7 @@ fn handle_item(
             m.timestamp = ts;
             m.content.push(Block::ToolResult {
                 tool_use_id: call_id,
-                content,
+                content: content.into(),
                 is_error,
                 tool_name: None,
                 status: Some(if is_error { "error" } else { "completed" }.into()),
@@ -699,7 +699,7 @@ fn handle_item(
             m.timestamp = ts;
             m.content.push(Block::ToolResult {
                 tool_use_id: call_id,
-                content,
+                content: content.into(),
                 is_error: false,
                 tool_name: Some("tool_search".into()),
                 status: None,
@@ -767,7 +767,7 @@ fn handle_item(
 /// Build IR content blocks from a `ContentItem[]` (or a bare string), preserving text + images.
 fn content_blocks(v: Option<&Value>) -> Vec<Block> {
     match v {
-        Some(Value::String(s)) if !s.is_empty() => vec![Block::Text { text: s.clone() }],
+        Some(Value::String(s)) if !s.is_empty() => vec![Block::Text { text: s.clone().into() }],
         Some(Value::Array(items)) => {
             let mut out = Vec::new();
             for it in items {

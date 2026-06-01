@@ -18,6 +18,7 @@ pub mod html;
 pub mod index;
 pub mod ingest;
 pub mod ir;
+pub mod lazy;
 pub mod loom;
 pub mod redact;
 pub mod render;
@@ -27,6 +28,7 @@ pub mod watch;
 pub use emit::{EmitOptions, emit};
 pub use harness::{Adapter, EmitResult};
 pub use ir::*;
+pub use lazy::{Resolver, Span, Text, INLINE_MAX};
 pub use stream::{collect, CollectSink, Flow, MessageSink, ParseOptions};
 
 use anyhow::Result;

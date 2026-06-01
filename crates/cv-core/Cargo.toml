@@ -19,9 +19,13 @@ rusqlite = { workspace = true, optional = true }
 rayon = { workspace = true, optional = true }
 dirs.workspace = true
 uuid.workspace = true
+memmap2 = { version = "0.9", optional = true }
 
 [features]
-default = ["sqlite", "parallel"]
+default = ["sqlite", "parallel", "mmap"]
+# `mmap` resolves lazy content spans by memory-mapping the source file (only touched pages page in).
+# Off for wasm32 (no mmap); the resolver falls back to a positioned ranged read, behavior identical.
+mmap = ["dep:memmap2"]
 # `sqlite` pulls in rusqlite (native C SQLite) for the Hermes adapter and the FTS index.
 # Disable it (e.g. `--no-default-features`) to compile cv-core for wasm32.
 sqlite = ["dep:rusqlite"]

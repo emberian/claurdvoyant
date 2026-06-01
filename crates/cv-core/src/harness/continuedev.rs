@@ -401,7 +401,7 @@ fn tool_result_of(content: &[Block]) -> (String, String) {
             ..
         } = b
         {
-            return (tool_use_id.clone(), content.clone());
+            return (tool_use_id.clone(), content.to_string());
         }
     }
     (String::new(), String::new())
@@ -553,7 +553,7 @@ fn history_item_to_message(item: &Value, model: &mut Option<String>) -> Option<M
                 .to_string();
             m.content.push(Block::ToolResult {
                 tool_use_id,
-                content,
+                content: content.into(),
                 is_error: false,
                 tool_name: None,
                 status: Some("completed".into()),
@@ -597,7 +597,7 @@ fn push_content(m: &mut Message, content: Option<&Value>) {
     match content {
         Some(Value::String(s)) => {
             if !s.is_empty() {
-                m.content.push(Block::Text { text: s.clone() });
+                m.content.push(Block::Text { text: s.clone().into() });
             }
         }
         Some(Value::Array(parts)) => {
@@ -617,7 +617,7 @@ fn part_to_block(p: &Value) -> Option<Block> {
     match ty {
         "text" => {
             let text = p.get("text").and_then(Value::as_str).unwrap_or("").to_string();
-            (!text.is_empty()).then_some(Block::Text { text })
+            (!text.is_empty()).then_some(Block::Text { text: text.into() })
         }
         "imageUrl" => {
             let url = p

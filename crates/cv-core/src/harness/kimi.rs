@@ -334,7 +334,7 @@ pub fn emit(
                         // Richer ToolResult in wire (return_value{is_error,output,extras}).
                         let mut rv = serde_json::Map::new();
                         rv.insert("is_error".into(), Value::Bool(*is_error));
-                        rv.insert("output".into(), Value::String(content.clone()));
+                        rv.insert("output".into(), Value::String(content.to_string()));
                         if let Some(d) = details {
                             rv.insert("extras".into(), d.clone());
                         }
@@ -426,7 +426,7 @@ fn register_work_dir(root: &Path, cwd: &str, session_id: &str) -> Result<()> {
 /// user turns, and exactly what `push_parts` round-trips), else a `[Part]` array.
 fn user_content(content: &[Block]) -> Value {
     if let [Block::Text { text }] = content {
-        return Value::String(text.clone());
+        return Value::String(text.to_string());
     }
     Value::Array(content_parts(content))
 }
@@ -441,7 +441,7 @@ fn content_parts(content: &[Block]) -> Vec<Value> {
             Block::Thinking { text, encrypted, .. } => {
                 let mut p = serde_json::Map::new();
                 p.insert("type".into(), Value::String("think".into()));
-                p.insert("think".into(), Value::String(text.clone()));
+                p.insert("think".into(), Value::String(text.to_string()));
                 if let Some(enc) = encrypted {
                     p.insert("encrypted".into(), Value::String(enc.clone()));
                 }
@@ -492,7 +492,7 @@ fn coerce_message_text(msg: &Message) -> String {
     let mut parts = Vec::new();
     for b in &msg.content {
         match b {
-            Block::Text { text } | Block::Thinking { text, .. } => parts.push(text.clone()),
+            Block::Text { text } | Block::Thinking { text, .. } => parts.push(text.to_string()),
             _ => {}
         }
     }
@@ -709,7 +709,7 @@ fn context_message(v: &Value, enrich: &WireEnrich) -> Option<Message> {
         "_system_prompt" => {
             let text = coerce_content_text(v.get("content"));
             let mut m = Message::new(Role::System);
-            m.content.push(Block::Text { text });
+            m.content.push(Block::Text { text: text.into() });
             Some(m)
         }
         "user" => {
@@ -755,7 +755,7 @@ fn context_message(v: &Value, enrich: &WireEnrich) -> Option<Message> {
             let mut m = Message::new(Role::Tool);
             m.content.push(Block::ToolResult {
                 tool_use_id,
-                content,
+                content: content.into(),
                 is_error,
                 tool_name: None,
                 status,
@@ -772,7 +772,7 @@ fn push_parts(m: &mut Message, content: Option<&Value>) {
     match content {
         Some(Value::String(s)) => {
             if !s.is_empty() {
-                m.content.push(Block::Text { text: s.clone() });
+                m.content.push(Block::Text { text: s.clone().into() });
             }
         }
         Some(Value::Array(parts)) => {
@@ -792,13 +792,13 @@ fn part_to_block(p: &Value) -> Option<Block> {
     match ty {
         "text" => {
             let text = p.get("text").and_then(Value::as_str).unwrap_or("").to_string();
-            Some(Block::Text { text })
+            Some(Block::Text { text: text.into() })
         }
         "think" => {
             let text = p.get("think").and_then(Value::as_str).unwrap_or("").to_string();
             let encrypted = p.get("encrypted").and_then(Value::as_str).map(str::to_string);
             Some(Block::Thinking {
-                text,
+                text: text.into(),
                 signature: encrypted.clone(),
                 encrypted,
                 redacted: false,

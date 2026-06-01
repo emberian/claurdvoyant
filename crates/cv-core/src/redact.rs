@@ -96,7 +96,7 @@ fn redact_message(msg: &mut Message, opts: &RedactOptions, stats: &mut RedactSta
     for block in &mut msg.content {
         match block {
             Block::Text { text } | Block::Thinking { text, .. } => {
-                *text = scrub(text, opts, stats);
+                *text = scrub(text, opts, stats).into();
             }
             Block::ToolUse { input, .. } => {
                 scrub_value(input, opts, stats);
@@ -104,7 +104,7 @@ fn redact_message(msg: &mut Message, opts: &RedactOptions, stats: &mut RedactSta
             Block::ToolResult {
                 content, details, ..
             } => {
-                *content = scrub(content, opts, stats);
+                *content = scrub(content, opts, stats).into();
                 if let Some(d) = details {
                     scrub_value(d, opts, stats);
                 }

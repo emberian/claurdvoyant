@@ -472,6 +472,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "dirs 5.0.1",
+ "memmap2",
  "percent-encoding",
  "rayon",
  "rusqlite",

@@ -497,7 +497,7 @@ fn content_to_blocks(content: &Value, tool_names: &mut HashMap<String, String>) 
         // A bare string content (defensive; Goose stores arrays) → one Text block.
         if let Some(t) = content.as_str() {
             if !t.is_empty() {
-                return vec![Block::Text { text: t.to_string() }];
+                return vec![Block::Text { text: t.to_string().into() }];
             }
         }
         return vec![];
@@ -515,7 +515,7 @@ fn item_to_block(item: &Value, tool_names: &mut HashMap<String, String>) -> Opti
     match item.get("type").and_then(Value::as_str)? {
         "text" => {
             let text = item.get("text").and_then(Value::as_str)?.to_string();
-            Some(Block::Text { text })
+            Some(Block::Text { text: text.into() })
         }
         "image" => Some(Block::Image {
             media_type: item.get("mimeType").and_then(Value::as_str).map(str::to_string),
@@ -525,7 +525,7 @@ fn item_to_block(item: &Value, tool_names: &mut HashMap<String, String>) -> Opti
                 .map(|d| crate::ir::truncate(d, 120)),
         }),
         "thinking" => Some(Block::Thinking {
-            text: item.get("thinking").and_then(Value::as_str).unwrap_or("").to_string(),
+            text: item.get("thinking").and_then(Value::as_str).unwrap_or("").to_string().into(),
             signature: item
                 .get("signature")
                 .and_then(Value::as_str)
@@ -535,7 +535,7 @@ fn item_to_block(item: &Value, tool_names: &mut HashMap<String, String>) -> Opti
             redacted: false,
         }),
         "redactedThinking" => Some(Block::Thinking {
-            text: String::new(),
+            text: String::new().into(),
             signature: None,
             encrypted: item.get("data").and_then(Value::as_str).map(str::to_string),
             redacted: true,
@@ -587,7 +587,7 @@ fn item_to_block(item: &Value, tool_names: &mut HashMap<String, String>) -> Opti
             };
             Some(Block::ToolResult {
                 tool_use_id: id,
-                content,
+                content: content.into(),
                 is_error,
                 tool_name,
                 status: None,

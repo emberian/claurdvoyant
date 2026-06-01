@@ -276,7 +276,7 @@ fn parse_logs_str(text: &str, source_path: Option<PathBuf>) -> Vec<Session> {
             }
             let mut m = Message::new(role);
             m.timestamp = e.get("timestamp").and_then(Value::as_str).and_then(parse_ts);
-            m.content.push(Block::Text { text });
+            m.content.push(Block::Text { text: text.into() });
             s.messages.push(m);
         }
         out.push(s);
@@ -461,7 +461,7 @@ fn record_to_session(
                         };
                         if !text.is_empty() {
                             m.content.push(Block::Thinking {
-                                text,
+                                text: text.into(),
                                 signature: None,
                                 encrypted: None,
                                 redacted: false,
@@ -503,7 +503,7 @@ fn record_to_session(
                         if !content.is_empty() {
                             tool_results.push(Block::ToolResult {
                                 tool_use_id: call_id,
-                                content,
+                                content: content.into(),
                                 is_error,
                                 tool_name: Some(name.to_string()),
                                 status: status.map(str::to_string),
@@ -575,7 +575,7 @@ fn push_content_blocks(out: &mut Vec<Block>, content: Option<&Value>) {
     match content {
         Value::String(s) => {
             if !s.is_empty() {
-                out.push(Block::Text { text: s.clone() });
+                out.push(Block::Text { text: s.clone().into() });
             }
         }
         Value::Array(parts) => {
@@ -591,7 +591,7 @@ fn push_content_blocks(out: &mut Vec<Block>, content: Option<&Value>) {
 fn push_part(out: &mut Vec<Block>, part: &Value) {
     if let Some(s) = part.as_str() {
         if !s.is_empty() {
-            out.push(Block::Text { text: s.to_string() });
+            out.push(Block::Text { text: s.to_string().into() });
         }
         return;
     }
@@ -624,7 +624,7 @@ fn push_part(out: &mut Vec<Block>, part: &Value) {
             .unwrap_or_default();
         out.push(Block::ToolResult {
             tool_use_id: id,
-            content,
+            content: content.into(),
             is_error: false,
             tool_name: Some(name.to_string()),
             status: None,
@@ -654,13 +654,13 @@ fn push_part(out: &mut Vec<Block>, part: &Value) {
         }
         if is_thought {
             out.push(Block::Thinking {
-                text: text.to_string(),
+                text: text.to_string().into(),
                 signature: None,
                 encrypted: None,
                 redacted: false,
             });
         } else {
-            out.push(Block::Text { text: text.to_string() });
+            out.push(Block::Text { text: text.to_string().into() });
         }
     }
 }

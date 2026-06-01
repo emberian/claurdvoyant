@@ -117,9 +117,12 @@ pub(crate) fn stream_corpus(mut f: impl FnMut(Doc) -> Result<()>) -> Result<usiz
     struct DocSink {
         body: String,
         first_user_text: Option<String>,
+        resolver: cv_core::Resolver,
     }
     impl MessageSink for DocSink {
-        fn message(&mut self, m: Message) -> Flow {
+        fn message(&mut self, mut m: Message) -> Flow {
+            // Resolve lazy content spans for this one message (peak = one message), then append.
+            m.materialize(&self.resolver);
             if self.first_user_text.is_none() && m.role == Role::User {
                 if let Some(t) = m.text() {
                     if !t.trim().is_empty() {
@@ -140,6 +143,7 @@ pub(crate) fn stream_corpus(mut f: impl FnMut(Doc) -> Result<()>) -> Result<usiz
         let mut sink = DocSink {
             body: String::new(),
             first_user_text: None,
+            resolver: cv_core::Resolver::new(Some(r.path.clone())),
         };
         let meta = match adapter.stream(&r, &ParseOptions::bulk(), &mut sink) {
             Ok(m) => m,

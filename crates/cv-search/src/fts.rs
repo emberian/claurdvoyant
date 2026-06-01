@@ -307,9 +307,11 @@ fn live_snippet(path: &str, harness: &str, query: &str) -> Option<String> {
 
     struct Acc {
         buf: String,
+        resolver: cv_core::Resolver,
     }
     impl MessageSink for Acc {
-        fn message(&mut self, m: Message) -> Flow {
+        fn message(&mut self, mut m: Message) -> Flow {
+            m.materialize(&self.resolver);
             cv_core::stream::append_searchable(&mut self.buf, &m);
             if self.buf.len() >= SNIPPET_SCAN_CAP {
                 Flow::Stop
@@ -318,7 +320,10 @@ fn live_snippet(path: &str, harness: &str, query: &str) -> Option<String> {
             }
         }
     }
-    let mut acc = Acc { buf: String::new() };
+    let mut acc = Acc {
+        buf: String::new(),
+        resolver: cv_core::Resolver::new(Some(PathBuf::from(path))),
+    };
     adapter.stream(&sref, &ParseOptions::bulk(), &mut acc).ok()?;
     Some(make_snippet(&acc.buf, query))
 }

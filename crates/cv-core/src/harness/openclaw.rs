@@ -373,7 +373,7 @@ fn parse_entry(v: &Value) -> Option<Message> {
             capture_assistant_meta(&mut m, msg);
         }
         "user" | "system" => match msg.get("content") {
-            Some(Value::String(s)) => m.content.push(Block::Text { text: s.clone() }),
+            Some(Value::String(s)) => m.content.push(Block::Text { text: s.clone().into() }),
             content => parse_content_array(&mut m, content),
         },
         "bashExecution" => parse_bash_execution(&mut m, msg),
@@ -394,7 +394,7 @@ fn parse_tool_result(m: &mut Message, msg: &Value) {
         .to_string();
     m.content.push(Block::ToolResult {
         tool_use_id,
-        content: coerce_content_text(msg.get("content")),
+        content: coerce_content_text(msg.get("content")).into(),
         is_error: msg.get("isError").and_then(Value::as_bool).unwrap_or(false),
         tool_name: msg.get("toolName").and_then(Value::as_str).map(str::to_string),
         status: None,
@@ -483,7 +483,7 @@ fn parse_bash_execution(m: &mut Message, msg: &Value) {
         text.push('\n');
         text.push_str(output);
     }
-    m.content.push(Block::Text { text });
+    m.content.push(Block::Text { text: text.into() });
     m.extra.insert("openclaw_message_role".into(), Value::from("bashExecution"));
     for key in ["exitCode", "cancelled", "truncated", "fullOutputPath", "excludeFromContext"] {
         if let Some(val) = msg.get(key) {
@@ -496,7 +496,7 @@ fn parse_bash_execution(m: &mut Message, msg: &Value) {
 
 fn parse_branch_summary(m: &mut Message, msg: &Value) {
     let summary = msg.get("summary").and_then(Value::as_str).unwrap_or("");
-    m.content.push(Block::Text { text: summary.to_string() });
+    m.content.push(Block::Text { text: summary.to_string().into() });
     m.extra.insert("openclaw_message_role".into(), Value::from("branchSummary"));
     if let Some(from_id) = msg.get("fromId").and_then(Value::as_str) {
         m.extra.insert("branch_from_id".into(), Value::from(from_id));
@@ -505,7 +505,7 @@ fn parse_branch_summary(m: &mut Message, msg: &Value) {
 
 fn parse_compaction_summary(m: &mut Message, msg: &Value) {
     let summary = msg.get("summary").and_then(Value::as_str).unwrap_or("");
-    m.content.push(Block::Text { text: summary.to_string() });
+    m.content.push(Block::Text { text: summary.to_string().into() });
     m.extra.insert("openclaw_message_role".into(), Value::from("compactionSummary"));
     for key in ["tokensBefore", "tokensAfter", "firstKeptEntryId"] {
         if let Some(val) = msg.get(key) {
@@ -519,7 +519,7 @@ fn parse_compaction_summary(m: &mut Message, msg: &Value) {
 fn parse_custom(m: &mut Message, msg: &Value) {
     let text = coerce_content_text(msg.get("content"));
     if !text.is_empty() {
-        m.content.push(Block::Text { text });
+        m.content.push(Block::Text { text: text.into() });
     }
     m.extra.insert("openclaw_message_role".into(), Value::from("custom"));
     if let Some(ct) = msg.get("customType").and_then(Value::as_str) {
@@ -540,14 +540,14 @@ fn parse_custom(m: &mut Message, msg: &Value) {
 fn content_block(item: &Value) -> Option<Block> {
     match item.get("type").and_then(Value::as_str)? {
         "text" => Some(Block::Text {
-            text: item.get("text").and_then(Value::as_str)?.to_string(),
+            text: item.get("text").and_then(Value::as_str)?.to_string().into(),
         }),
         "thinking" => Some(Block::Thinking {
             text: item
                 .get("thinking")
                 .and_then(Value::as_str)
                 .unwrap_or("")
-                .to_string(),
+                .to_string().into(),
             // OpenClaw uses `thinkingSignature`; `redacted` flags a server-redacted reasoning block.
             signature: item
                 .get("thinkingSignature")

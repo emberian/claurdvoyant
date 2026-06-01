@@ -6,14 +6,25 @@
 
 use super::Adapter;
 use crate::ir::*;
+use crate::lazy::{Span, Text, INLINE_MAX};
 use crate::stream::{CollectSink, Flow, MessageSink, ParseOptions};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
+use serde_json::value::RawValue;
 use serde_json::{Map, Value};
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 use walkdir::WalkDir;
+
+/// Context for turning large content fields into lazy [`Span`]s during streaming: the raw bytes of
+/// the current record line and the file offset where they begin. Present only on the on-disk
+/// streaming path (which knows file offsets); the pure-string [`parse_str`] path passes `None` and
+/// keeps content inline.
+struct SpanCtx<'a> {
+    slice: &'a [u8],
+    base_off: u64,
+}
 
 pub struct Claude {
     root: Option<PathBuf>,
@@ -153,14 +164,55 @@ pub fn stream_reader<R: BufRead>(
     sink: &mut dyn MessageSink,
 ) -> Session {
     let mut session = new_session(id, source_path);
-    for line in reader.lines() {
-        // A read error on one line (rare: invalid UTF-8 chunk) shouldn't abort the whole session.
-        let Ok(line) = line else { continue };
-        if ingest_line(&mut session, &line, opts, sink) == Flow::Stop {
+    // Read raw bytes (not `lines()`) so we know each record's byte offset in the file — that's what
+    // lets large content fields become lazy [`Span`]s pointing back into the source instead of owned
+    // strings. `read_until` keeps peak at O(largest line) just like `lines()` did.
+    let mut reader = reader;
+    let mut buf: Vec<u8> = Vec::new();
+    let mut file_off: u64 = 0;
+    loop {
+        buf.clear();
+        let n = match reader.read_until(b'\n', &mut buf) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(_) => break,
+        };
+        if ingest_bytes(&mut session, &buf[..n], file_off, opts, sink) == Flow::Stop {
             break;
         }
+        file_off += n as u64;
     }
     session
+}
+
+/// Streaming ingest of one raw record line (with its file offset) — parses, updates metadata, and
+/// emits the message to `sink`, turning large content fields into [`Span`]s into the source file.
+fn ingest_bytes(
+    session: &mut Session,
+    buf: &[u8],
+    file_off: u64,
+    opts: &ParseOptions,
+    sink: &mut dyn MessageSink,
+) -> Flow {
+    // Trim leading/trailing ASCII whitespace (incl. the trailing `\n`), tracking how far the content
+    // shifted so span offsets stay relative to the file.
+    let lead = buf.iter().take_while(|b| b.is_ascii_whitespace()).count();
+    let end = buf.len() - buf[lead..].iter().rev().take_while(|b| b.is_ascii_whitespace()).count();
+    if lead >= end {
+        return Flow::Continue;
+    }
+    let slice = &buf[lead..end];
+    let v: Value = match serde_json::from_slice(slice) {
+        Ok(v) => v,
+        Err(_) => return Flow::Continue,
+    };
+    // Only defer large content to spans when the consumer asked for it (partial-access). Bulk/full
+    // consumers read everything, so inline content is cheaper (no mmap on resolve).
+    let ctx = opts.spans.then(|| SpanCtx {
+        slice,
+        base_off: file_off + lead as u64,
+    });
+    ingest_value(session, &v, opts, sink, ctx.as_ref())
 }
 
 /// An empty Claude [`Session`] shell, ready to accumulate records.
@@ -197,6 +249,20 @@ fn ingest_line(
         Ok(v) => v,
         Err(_) => return Flow::Continue, // tolerate the occasional corrupt line
     };
+    // Pure-string path (parse_str, tests): no file offsets, so all content stays inline.
+    ingest_value(session, &v, opts, sink, None)
+}
+
+/// Shared record handler: session-level metadata + emit the conversational message to `sink`. With a
+/// [`SpanCtx`] (streaming on-disk path) large content fields become [`Span`]s; without it (string
+/// path) they're inline.
+fn ingest_value(
+    session: &mut Session,
+    v: &Value,
+    opts: &ParseOptions,
+    sink: &mut dyn MessageSink,
+    span: Option<&SpanCtx>,
+) -> Flow {
     let ty = v.get("type").and_then(Value::as_str).unwrap_or("");
 
     // session-level metadata records
@@ -244,7 +310,7 @@ fn ingest_line(
         session.updated_at = Some(ts);
     }
 
-    if let Some(msg) = parse_message(ty, &v, opts) {
+    if let Some(msg) = parse_message(ty, v, opts, span) {
         if session.model.is_none() {
             session.model = msg.model.clone();
         }
@@ -347,9 +413,9 @@ fn parse_ts(s: &str) -> Option<DateTime<Utc>> {
 /// Turn one record into an IR [`Message`]. Handles `user`/`assistant` (the conversation) and the
 /// content-bearing `system` lines (compaction notices, away/error summaries, slash-command output).
 /// Returns `None` for line types with no conversational payload.
-fn parse_message(ty: &str, v: &Value, opts: &ParseOptions) -> Option<Message> {
+fn parse_message(ty: &str, v: &Value, opts: &ParseOptions, span: Option<&SpanCtx>) -> Option<Message> {
     if ty == "system" {
-        return parse_system_message(v, opts);
+        return parse_system_message(v, opts, span);
     }
 
     let role = match ty {
@@ -373,10 +439,24 @@ fn parse_message(ty: &str, v: &Value, opts: &ParseOptions) -> Option<Message> {
 
     let mut blocks = Vec::new();
     match msg.get("content") {
-        Some(Value::String(s)) => blocks.push(Block::Text { text: s.clone() }),
+        Some(Value::String(s)) => {
+            // Bare-string content: span it (the whole `message.content` string) when large.
+            let text = match span {
+                Some(ctx) if s.len() > INLINE_MAX => raw_msg_content_string_span(ctx)
+                    .inspect(|sp| debug_assert_span(sp, ctx, s))
+                    .map(Text::Span)
+                    .unwrap_or_else(|| Text::Inline(s.clone())),
+                _ => Text::Inline(s.clone()),
+            };
+            blocks.push(Block::Text { text });
+        }
         Some(Value::Array(items)) => {
-            for item in items {
-                if let Some(b) = parse_block(item) {
+            // Raw items are the *same* JSON array as `items`, so they align 1:1 by index — giving
+            // each block its source field's byte span for free.
+            let raw_items = span.and_then(|ctx| raw_msg_content_items(ctx.slice));
+            for (i, item) in items.iter().enumerate() {
+                let raw = raw_items.as_ref().and_then(|r| r.get(i).copied());
+                if let Some(b) = parse_block(item, raw.zip(span)) {
                     blocks.push(b);
                 }
             }
@@ -416,7 +496,7 @@ fn parse_message(ty: &str, v: &Value, opts: &ParseOptions) -> Option<Message> {
 /// `system` records cover a grab-bag of subtypes. Only some carry user-visible text worth surfacing
 /// as a [`Role::System`] message; the rest (timing, hook bookkeeping, killed-agent notices) have no
 /// body and are dropped. We preserve `subtype`/`level`/metadata in `extra` either way.
-fn parse_system_message(v: &Value, opts: &ParseOptions) -> Option<Message> {
+fn parse_system_message(v: &Value, opts: &ParseOptions, span: Option<&SpanCtx>) -> Option<Message> {
     let subtype = v.get("subtype").and_then(Value::as_str).unwrap_or("");
     // Body text lives either at top-level `content` (a string) or, for compaction, is implied.
     let content = v.get("content").and_then(Value::as_str);
@@ -430,10 +510,16 @@ fn parse_system_message(v: &Value, opts: &ParseOptions) -> Option<Message> {
         return None;
     }
 
-    let text = match content {
-        Some(c) => c.to_string(),
+    let text: Text = match content {
+        Some(c) => match span {
+            Some(ctx) if c.len() > INLINE_MAX => top_content_span(ctx)
+                .inspect(|sp| debug_assert_span(sp, ctx, c))
+                .map(Text::Span)
+                .unwrap_or_else(|| Text::Inline(c.to_string())),
+            _ => Text::Inline(c.to_string()),
+        },
         // compact_boundary often has only structured metadata; synthesize a marker.
-        None => "[conversation compacted]".to_string(),
+        None => Text::Inline("[conversation compacted]".to_string()),
     };
 
     let id = v.get("uuid").and_then(Value::as_str).map(str::to_string);
@@ -471,7 +557,7 @@ fn parse_system_message(v: &Value, opts: &ParseOptions) -> Option<Message> {
         role: Role::System,
         timestamp,
         model: None,
-        content: vec![Block::Text { text }],
+        content: vec![Block::Text { text: text.into() }],
         usage: None,
         extra,
     })
@@ -525,17 +611,17 @@ fn collect_extra(v: &Value, msg: &Value, extra: &mut Map<String, Value>) {
     }
 }
 
-fn parse_block(item: &Value) -> Option<Block> {
+fn parse_block(item: &Value, span_field: Option<(&RawValue, &SpanCtx)>) -> Option<Block> {
     match item.get("type").and_then(Value::as_str)? {
         "text" => Some(Block::Text {
-            text: item.get("text").and_then(Value::as_str)?.to_string(),
+            text: spanned_or_inline(item.get("text").and_then(Value::as_str)?, "text", span_field),
         }),
         "thinking" => Some(Block::Thinking {
-            text: item
-                .get("thinking")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string(),
+            text: spanned_or_inline(
+                item.get("thinking").and_then(Value::as_str).unwrap_or(""),
+                "thinking",
+                span_field,
+            ),
             signature: item
                 .get("signature")
                 .and_then(Value::as_str)
@@ -546,7 +632,7 @@ fn parse_block(item: &Value) -> Option<Block> {
         // Encrypted reasoning the API returns when thinking can't be shown in the clear. The plaintext
         // is intentionally absent; stash the opaque blob in `encrypted` so it's not silently lost.
         "redacted_thinking" => Some(Block::Thinking {
-            text: String::new(),
+            text: String::new().into(),
             signature: None,
             encrypted: item
                 .get("data")
@@ -563,18 +649,36 @@ fn parse_block(item: &Value) -> Option<Block> {
                 .to_string(),
             input: item.get("input").cloned().unwrap_or(Value::Null),
         }),
-        "tool_result" => Some(Block::ToolResult {
-            tool_use_id: item
-                .get("tool_use_id")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string(),
-            content: coerce_text(item.get("content")),
-            is_error: item.get("is_error").and_then(Value::as_bool).unwrap_or(false),
-            tool_name: None,
-            status: None,
-            details: None,
-        }),
+        "tool_result" => {
+            let cv = item.get("content");
+            let coerced = coerce_text(cv);
+            // Span only when the raw content is a *plain JSON string* (then the span body unescapes
+            // back to exactly `coerced`); array/mixed content is transformed by `coerce_text`, so it
+            // can't be a verbatim slice — keep it inline.
+            let content = match span_field {
+                Some((raw, ctx))
+                    if coerced.len() > INLINE_MAX && matches!(cv, Some(Value::String(_))) =>
+                {
+                    span_of_string_field(raw, "content", ctx)
+                        .inspect(|sp| debug_assert_span(sp, ctx, &coerced))
+                        .map(Text::Span)
+                        .unwrap_or_else(|| Text::Inline(coerced))
+                }
+                _ => Text::Inline(coerced),
+            };
+            Some(Block::ToolResult {
+                tool_use_id: item
+                    .get("tool_use_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+                content,
+                is_error: item.get("is_error").and_then(Value::as_bool).unwrap_or(false),
+                tool_name: None,
+                status: None,
+                details: None,
+            })
+        }
         "image" => {
             let source = item.get("source");
             let media_type = source
@@ -629,6 +733,131 @@ fn parse_block(item: &Value) -> Option<Block> {
         _ => None,
     }
 }
+
+/// Make a [`Text`] for a content string: a lazy [`Span`] into the source when large and a span is
+/// computable, else inline. The `debug_assert` re-resolves the span from the same bytes and checks it
+/// equals `s`, so any offset/escape bug trips immediately in dev/test.
+fn spanned_or_inline(s: &str, field: &str, span_field: Option<(&RawValue, &SpanCtx)>) -> Text {
+    if s.len() > INLINE_MAX {
+        if let Some((raw, ctx)) = span_field {
+            if let Some(sp) = span_of_string_field(raw, field, ctx) {
+                debug_assert_span(&sp, ctx, s);
+                return Text::Span(sp);
+            }
+        }
+    }
+    Text::Inline(s.to_string())
+}
+
+/// The byte span of a string `field` inside a content item's raw JSON (`item_raw`), as an absolute
+/// file offset. `None` if the field is absent or isn't a JSON string.
+fn span_of_string_field(item_raw: &RawValue, field: &str, ctx: &SpanCtx) -> Option<Span> {
+    let map: std::collections::HashMap<&str, &RawValue> =
+        serde_json::from_str(item_raw.get()).ok()?;
+    raw_string_span(map.get(field)?, ctx)
+}
+
+/// Span the *body* (between the quotes) of a raw JSON string value, as an absolute file offset.
+/// Relies on `fr` borrowing `ctx.slice` so pointer subtraction yields the in-slice byte offset.
+fn raw_string_span(fr: &RawValue, ctx: &SpanCtx) -> Option<Span> {
+    let raw = fr.get().as_bytes();
+    if raw.len() < 2 || raw.first() != Some(&b'"') || raw.last() != Some(&b'"') {
+        return None; // not a JSON string
+    }
+    let off_in_slice = (raw.as_ptr() as usize).checked_sub(ctx.slice.as_ptr() as usize)?;
+    if off_in_slice + raw.len() > ctx.slice.len() {
+        return None; // sanity: must lie within the slice
+    }
+    let body = &raw[1..raw.len() - 1];
+    Some(Span {
+        source: None,
+        offset: ctx.base_off + off_in_slice as u64 + 1, // skip the opening quote
+        len: body.len() as u64,
+        escaped: body.contains(&b'\\'),
+    })
+}
+
+/// The raw JSON of `message.content`, borrowing `slice`.
+fn message_content_raw(slice: &[u8]) -> Option<&RawValue> {
+    #[derive(serde::Deserialize)]
+    struct P<'a> {
+        #[serde(borrow)]
+        message: Option<Pm<'a>>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Pm<'a> {
+        #[serde(borrow, default)]
+        content: Option<&'a RawValue>,
+    }
+    serde_json::from_slice::<P>(slice)
+        .ok()
+        .and_then(|p| p.message)
+        .and_then(|m| m.content)
+}
+
+/// The content array items as raw JSON (aligned 1:1 with the `Value` array), or `None` if content
+/// isn't an array.
+fn raw_msg_content_items(slice: &[u8]) -> Option<Vec<&RawValue>> {
+    let content = message_content_raw(slice)?;
+    if content.get().as_bytes().first() == Some(&b'[') {
+        serde_json::from_str::<Vec<&RawValue>>(content.get()).ok()
+    } else {
+        None
+    }
+}
+
+/// Span for a bare-string `message.content` (the whole string is the content).
+fn raw_msg_content_string_span(ctx: &SpanCtx) -> Option<Span> {
+    let content = message_content_raw(ctx.slice)?;
+    if content.get().as_bytes().first() == Some(&b'"') {
+        raw_string_span(content, ctx)
+    } else {
+        None
+    }
+}
+
+/// Span for a top-level `content` string (system records).
+fn top_content_span(ctx: &SpanCtx) -> Option<Span> {
+    #[derive(serde::Deserialize)]
+    struct T<'a> {
+        #[serde(borrow, default)]
+        content: Option<&'a RawValue>,
+    }
+    let content = serde_json::from_slice::<T>(ctx.slice).ok()?.content?;
+    if content.get().as_bytes().first() == Some(&b'"') {
+        raw_string_span(content, ctx)
+    } else {
+        None
+    }
+}
+
+/// Dev/test guard: resolve `sp` from the same record bytes and assert it equals the inline text the
+/// span replaces. Compiled out in release.
+#[cfg(debug_assertions)]
+fn debug_assert_span(sp: &Span, ctx: &SpanCtx, expected: &str) {
+    let lo = match sp.offset.checked_sub(ctx.base_off) {
+        Some(x) => x as usize,
+        None => {
+            debug_assert!(false, "span offset before base");
+            return;
+        }
+    };
+    let hi = lo + sp.len as usize;
+    debug_assert!(hi <= ctx.slice.len(), "span exceeds record slice");
+    let raw = &ctx.slice[lo..hi.min(ctx.slice.len())];
+    let got = if sp.escaped {
+        let mut q = Vec::with_capacity(raw.len() + 2);
+        q.push(b'"');
+        q.extend_from_slice(raw);
+        q.push(b'"');
+        serde_json::from_slice::<String>(&q).unwrap_or_default()
+    } else {
+        String::from_utf8_lossy(raw).into_owned()
+    };
+    debug_assert_eq!(got, expected, "lazy span resolved to the wrong content");
+}
+#[cfg(not(debug_assertions))]
+fn debug_assert_span(_: &Span, _: &SpanCtx, _: &str) {}
 
 /// Claude tool_result `content` is sometimes a string, sometimes `[{type:text,text}]`, and sometimes
 /// a mix of text and `image` blocks (e.g. a screenshot tool). We flatten to text, replacing image
@@ -779,6 +1008,70 @@ mod tests {
         let text = "not json\n{\"type\":\"x-quota\"}\n{\"type\":\"user\",\"uuid\":\"u1\",\"message\":{\"role\":\"user\",\"content\":\"hi\"}}\n";
         let s = parse_str("s", text, None);
         assert_eq!(s.messages.len(), 1);
+    }
+
+    #[test]
+    fn lazy_spans_resolve_to_same_text() {
+        // A record with content well over INLINE_MAX: the lazy path must produce a Span whose
+        // resolved text equals the inline parse, byte-for-byte (incl. escapes).
+        use std::io::Write;
+        let big = "x\n\"quoted\"\t".repeat(1000); // ~10 KB with escapes (\n, \", \t)
+        let line = serde_json::json!({
+            "type": "assistant",
+            "uuid": "u1",
+            "message": { "role": "assistant", "content": [{"type": "text", "text": big}] }
+        })
+        .to_string();
+        let dir = std::env::temp_dir().join(format!("cv-lazy-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("s.jsonl");
+        let mut f = std::fs::File::create(&path).unwrap();
+        writeln!(f, "{line}").unwrap();
+        drop(f);
+
+        let r = SessionRef {
+            id: "s".into(),
+            harness: Harness::Claude,
+            path: path.clone(),
+            cwd: None,
+            title: None,
+            created_at: None,
+            updated_at: None,
+            message_count: 1,
+        };
+        // Lazy parse → expect a Span; resolving it must equal `big`.
+        let mut sink = CollectSink::default();
+        let file = BufReader::new(fs::File::open(&path).unwrap());
+        let mut s = stream_reader_lazy(&r.id, file, Some(path.clone()), &mut sink);
+        s.messages = sink.messages;
+        match &s.messages[0].content[0] {
+            Block::Text { text } => {
+                assert!(text.is_span(), "large content should be a span");
+                let resolver = s.resolver();
+                assert_eq!(text.resolve(&resolver), big.as_str());
+            }
+            _ => panic!("expected text block"),
+        }
+        // And materialize() makes it inline and equal.
+        s.materialize();
+        match &s.messages[0].content[0] {
+            Block::Text { text } => {
+                assert!(!text.is_span());
+                assert_eq!(text.inline_str(), Some(big.as_str()));
+            }
+            _ => panic!("expected text block"),
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // Test helper: stream a file with span production enabled.
+    fn stream_reader_lazy<R: BufRead>(
+        id: &str,
+        reader: R,
+        source_path: Option<PathBuf>,
+        sink: &mut dyn MessageSink,
+    ) -> Session {
+        stream_reader(id, reader, source_path, &ParseOptions::lazy(), sink)
     }
 
     #[test]

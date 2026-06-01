@@ -229,7 +229,7 @@ fn build_messages(mv: &Value, parts: &[Value]) -> Vec<Message> {
             "text" => {
                 if let Some(t) = part.get("text").and_then(Value::as_str) {
                     if !t.is_empty() {
-                        m.content.push(Block::Text { text: t.to_string() });
+                        m.content.push(Block::Text { text: t.to_string().into() });
                     }
                 }
             }
@@ -245,7 +245,7 @@ fn build_messages(mv: &Value, parts: &[Value]) -> Vec<Message> {
                             .or_else(|| find_signature(part.get("metadata")))
                             .map(str::to_string);
                         m.content.push(Block::Thinking {
-                            text: t.to_string(),
+                            text: t.to_string().into(),
                             signature,
                             encrypted: None,
                             redacted: false,
@@ -268,7 +268,7 @@ fn build_messages(mv: &Value, parts: &[Value]) -> Vec<Message> {
                 // block fits; surface its name as text and keep the structured form in extra.
                 if let Some(name) = part.get("name").and_then(Value::as_str) {
                     m.content.push(Block::Text {
-                        text: format!("@{name}"),
+                        text: format!("@{name}").into(),
                     });
                 }
                 push_extra_array(&mut m.extra, "agent_refs", part.clone());
@@ -279,7 +279,7 @@ fn build_messages(mv: &Value, parts: &[Value]) -> Vec<Message> {
                 let agent = part.get("agent").and_then(Value::as_str).unwrap_or("agent");
                 let prompt = part.get("prompt").and_then(Value::as_str).unwrap_or("");
                 m.content.push(Block::Text {
-                    text: format!("[subtask → {agent}] {prompt}"),
+                    text: format!("[subtask → {agent}] {prompt}").into(),
                 });
                 push_extra_array(&mut m.extra, "subtasks", part.clone());
             }
@@ -307,7 +307,7 @@ fn build_messages(mv: &Value, parts: &[Value]) -> Vec<Message> {
         if let Some(text) = summary {
             if !text.is_empty() {
                 m.content.push(Block::Text {
-                    text: text.to_string(),
+                    text: text.to_string().into(),
                 });
             }
         }
@@ -350,7 +350,7 @@ fn tool_blocks(part: &Value) -> (Block, Option<Block>) {
         "completed" | "running" | "pending" => {
             part.pointer("/state/output").map(|out| Block::ToolResult {
                 tool_use_id: call_id.clone(),
-                content: coerce_text(out),
+                content: coerce_text(out).into(),
                 is_error: false,
                 tool_name: tool_name.clone(),
                 status: status_field.clone(),
@@ -365,7 +365,7 @@ fn tool_blocks(part: &Value) -> (Block, Option<Block>) {
                 .unwrap_or_default();
             Some(Block::ToolResult {
                 tool_use_id: call_id.clone(),
-                content,
+                content: content.into(),
                 is_error: true,
                 tool_name: tool_name.clone(),
                 status: status_field.clone(),
@@ -375,7 +375,7 @@ fn tool_blocks(part: &Value) -> (Block, Option<Block>) {
         // Unknown status but an output is present — still surface it.
         _ => part.pointer("/state/output").map(|out| Block::ToolResult {
             tool_use_id: call_id.clone(),
-            content: coerce_text(out),
+            content: coerce_text(out).into(),
             is_error: false,
             tool_name: tool_name.clone(),
             status: status_field.clone(),
@@ -568,7 +568,7 @@ mod tests {
         ]);
         let out = build_messages(&mv, &p);
         let res = out.iter().flat_map(|m| &m.content).find_map(|b| match b {
-            Block::ToolResult { content, is_error, .. } => Some((content.clone(), *is_error)),
+            Block::ToolResult { content, is_error, .. } => Some((content.to_string(), *is_error)),
             _ => None,
         });
         assert_eq!(res, Some(("oldString not found".to_string(), true)));

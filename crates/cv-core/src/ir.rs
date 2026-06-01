@@ -191,6 +191,23 @@ impl Session {
         }
         out
     }
+
+    /// A [`Resolver`](crate::lazy::Resolver) for this session's lazy content spans, rooted at its
+    /// `source_path`. Streaming consumers create one and resolve each block as it passes.
+    pub fn resolver(&self) -> crate::lazy::Resolver {
+        crate::lazy::Resolver::new(self.source_path.clone())
+    }
+
+    /// Resolve every lazy content [`Span`](crate::lazy::Span) in place, so the session owns all its
+    /// content inline. Whole-session consumers (cross-harness emit building output in memory, JSON
+    /// serialization) call this; streaming consumers resolve per-block instead. After it, every
+    /// content `Text` is `Inline`, so `Deref`/`Display`/`searchable_text` are safe.
+    pub fn materialize(&mut self) {
+        let resolver = self.resolver();
+        for m in &mut self.messages {
+            m.materialize(&resolver);
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -248,6 +265,23 @@ impl Message {
         }
     }
 
+    /// Resolve this message's lazy content spans in place against `resolver`, so its content is owned
+    /// inline. Streaming consumers call this per message (peak = one message) instead of holding a
+    /// whole materialized session.
+    pub fn materialize(&mut self, resolver: &crate::lazy::Resolver) {
+        for b in &mut self.content {
+            let slot = match b {
+                Block::Text { text } | Block::Thinking { text, .. } => text,
+                Block::ToolResult { content, .. } => content,
+                _ => continue,
+            };
+            if slot.is_span() {
+                let owned = slot.resolve(resolver).into_owned();
+                *slot = crate::lazy::Text::Inline(owned);
+            }
+        }
+    }
+
     /// Concatenated plain text of this message's text blocks (ignores thinking/tools).
     pub fn text(&self) -> Option<String> {
         let mut s = String::new();
@@ -268,11 +302,11 @@ impl Message {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Block {
     Text {
-        text: String,
+        text: crate::lazy::Text,
     },
     /// Extended reasoning / chain-of-thought. `encrypted` holds an opaque blob some providers emit.
     Thinking {
-        text: String,
+        text: crate::lazy::Text,
         #[serde(skip_serializing_if = "Option::is_none")]
         signature: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -290,7 +324,7 @@ pub enum Block {
     /// The result of a tool/function call.
     ToolResult {
         tool_use_id: String,
-        content: String,
+        content: crate::lazy::Text,
         #[serde(default)]
         is_error: bool,
         /// Name of the tool this result is for, when the adapter knows it.

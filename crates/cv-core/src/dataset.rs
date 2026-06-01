@@ -18,11 +18,12 @@ use serde_json::{json, Value};
 
 /// Serialize a session as a ChatML record. Returns `None` if it has no non-empty turns.
 pub fn to_chatml(session: &Session) -> Option<Value> {
+    let resolver = session.resolver();
     let messages: Vec<Value> = session
         .messages
         .iter()
         .filter_map(|m| {
-            let content = render_blocks(&m.content);
+            let content = render_blocks(&m.content, &resolver);
             if content.trim().is_empty() {
                 return None;
             }
@@ -43,11 +44,12 @@ pub fn to_chatml(session: &Session) -> Option<Value> {
 
 /// Serialize a session as a ShareGPT record. Returns `None` if it has no non-empty turns.
 pub fn to_sharegpt(session: &Session) -> Option<Value> {
+    let resolver = session.resolver();
     let conversations: Vec<Value> = session
         .messages
         .iter()
         .filter_map(|m| {
-            let value = render_blocks(&m.content);
+            let value = render_blocks(&m.content, &resolver);
             if value.trim().is_empty() {
                 return None;
             }
@@ -66,17 +68,20 @@ pub fn to_sharegpt(session: &Session) -> Option<Value> {
     Some(json!({ "conversations": conversations }))
 }
 
-/// Flatten one message's blocks into a single training-text string.
-fn render_blocks(blocks: &[Block]) -> String {
+/// Flatten one message's blocks into a single training-text string, resolving lazy content spans
+/// against `resolver` (so a giant field is materialized transiently, not held).
+fn render_blocks(blocks: &[Block], resolver: &crate::lazy::Resolver) -> String {
     let mut parts: Vec<String> = Vec::new();
     for b in blocks {
         match b {
             Block::Text { text } => {
+                let text = text.resolve(resolver);
                 if !text.trim().is_empty() {
-                    parts.push(text.clone());
+                    parts.push(text.into_owned());
                 }
             }
             Block::Thinking { text, redacted, .. } => {
+                let text = text.resolve(resolver);
                 if !*redacted && !text.trim().is_empty() {
                     parts.push(format!("<thinking>\n{text}\n</thinking>"));
                 }
@@ -87,6 +92,7 @@ fn render_blocks(blocks: &[Block]) -> String {
             }
             Block::ToolResult { content, is_error, .. } => {
                 let tag = if *is_error { "tool_result error" } else { "tool_result" };
+                let content = content.resolve(resolver);
                 parts.push(format!("```{tag}\n{content}\n```"));
             }
             Block::Image { media_type, .. } => {

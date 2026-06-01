@@ -623,7 +623,7 @@ fn push_text(m: &mut Message, text: String, as_thinking: bool) {
     if as_thinking {
         // Explicit reasoning steps (`style.type=="thinking"`) stay a single Thinking block.
         m.content.push(Block::Thinking {
-            text,
+            text: text.into(),
             signature: None,
             encrypted: None,
             redacted: false,
@@ -634,7 +634,7 @@ fn push_text(m: &mut Message, text: String, as_thinking: bool) {
         // first-class IR blocks instead of leaving the raw `<|channel|>…` markers in the text.
         m.content.extend(crate::harmony::decode_content(&text));
     } else {
-        m.content.push(Block::Text { text });
+        m.content.push(Block::Text { text: text.into() });
     }
 }
 
@@ -829,18 +829,18 @@ mod tests {
         // Build a small session: a user turn and an assistant turn with thinking + text.
         let mut user = Message::new(Role::User);
         user.content.push(Block::Text {
-            text: "Hello there".to_string(),
+            text: "Hello there".to_string().into(),
         });
         let mut assistant = Message::new(Role::Assistant);
         assistant.model = Some("openai/gpt-oss-120b".to_string());
         assistant.content.push(Block::Thinking {
-            text: "the user said hi".to_string(),
+            text: "the user said hi".to_string().into(),
             signature: None,
             encrypted: None,
             redacted: false,
         });
         assistant.content.push(Block::Text {
-            text: "Hi! How can I help?".to_string(),
+            text: "Hi! How can I help?".to_string().into(),
         });
         assistant.usage = Some(Usage {
             input_tokens: Some(12),

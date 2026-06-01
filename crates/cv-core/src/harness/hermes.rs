@@ -401,7 +401,7 @@ fn is_duplicate_replayed_user_message(existing: &[Message], msg: &Message) -> bo
 fn single_text(m: &Message) -> Option<String> {
     if m.content.len() == 1 {
         if let Block::Text { text } = &m.content[0] {
-            return Some(text.clone());
+            return Some(text.to_string());
         }
     }
     None
@@ -508,7 +508,7 @@ impl MsgRow {
         }
         if !reasoning_text.is_empty() || encrypted.is_some() {
             m.content.push(Block::Thinking {
-                text: reasoning_text,
+                text: reasoning_text.into(),
                 signature: None,
                 encrypted,
                 redacted: false,
@@ -519,7 +519,7 @@ impl MsgRow {
         if role == Role::Tool {
             m.content.push(Block::ToolResult {
                 tool_use_id: self.tool_call_id.unwrap_or_default(),
-                content: self.content.unwrap_or_default(),
+                content: self.content.unwrap_or_default().into(),
                 is_error: false,
                 tool_name: self.tool_name.clone(),
                 status: None,
@@ -568,7 +568,7 @@ fn decode_content(raw: &str) -> Vec<Block> {
         vec![]
     } else {
         vec![Block::Text {
-            text: raw.to_string(),
+            text: raw.to_string().into(),
         }]
     }
 }
@@ -583,7 +583,7 @@ fn object_content_to_blocks(map: &serde_json::Map<String, Value>) -> Option<Vec<
                 part_to_block(p).or_else(|| {
                     p.get("text")
                         .and_then(Value::as_str)
-                        .map(|t| Block::Text { text: t.to_string() })
+                        .map(|t| Block::Text { text: t.to_string().into() })
                 })
             })
             .collect();
@@ -598,7 +598,7 @@ fn part_to_block(part: &Value) -> Option<Block> {
     match part.get("type").and_then(Value::as_str)? {
         // OpenAI chat (`text`) and Responses (`input_text`/`output_text`) text parts.
         "text" | "input_text" | "output_text" => Some(Block::Text {
-            text: part.get("text").and_then(Value::as_str)?.to_string(),
+            text: part.get("text").and_then(Value::as_str)?.to_string().into(),
         }),
         // `image_url` parts hold either `{image_url:{url}}` or, for `input_image`, `{image_url:"…"}`.
         "image_url" | "input_image" => {

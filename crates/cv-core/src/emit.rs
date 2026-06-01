@@ -1397,7 +1397,7 @@ fn openclaw_tool_result(content: &[Block]) -> (String, String, bool, Option<Stri
         {
             return (
                 tool_use_id.clone(),
-                content.clone(),
+                content.to_string(),
                 *is_error,
                 tool_name.clone(),
             );
@@ -1464,7 +1464,7 @@ fn emit_gemini(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<
                     ..
                 } = b
                 {
-                    tool_results.insert(tool_use_id.clone(), (content.clone(), *is_error));
+                    tool_results.insert(tool_use_id.clone(), (content.to_string(), *is_error));
                 }
             }
         }
@@ -1881,7 +1881,7 @@ fn emit_hermes(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<
                     conn.execute(
                         "INSERT INTO messages (session_id, role, content, tool_call_id, timestamp) \
                          VALUES (?1, 'tool', ?2, ?3, ?4)",
-                        params![new_id, content, tool_use_id, ts],
+                        params![new_id, content.to_string(), tool_use_id, ts],
                     )
                     .context("inserting hermes tool message")?;
                 }

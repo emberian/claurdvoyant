@@ -487,7 +487,7 @@ mod tests {
     fn msg(role: Role, text: &str) -> Message {
         let mut m = Message::new(role);
         m.content.push(Block::Text {
-            text: text.to_string(),
+            text: text.to_string().into(),
         });
         m
     }

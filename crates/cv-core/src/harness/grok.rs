@@ -271,7 +271,7 @@ fn chat_message(v: &Value, enrich: &HashMap<String, ToolEnrich>) -> Option<Messa
         let mut m = Message::new(Role::Tool);
         m.content.push(Block::ToolResult {
             tool_use_id,
-            content,
+            content: content.into(),
             is_error,
             tool_name,
             status,
@@ -301,7 +301,7 @@ fn chat_message(v: &Value, enrich: &HashMap<String, ToolEnrich>) -> Option<Messa
             .map(str::to_string);
         if !text.is_empty() || encrypted.is_some() {
             m.content.push(Block::Thinking {
-                text,
+                text: text.into(),
                 signature: None,
                 encrypted,
                 redacted: false,
@@ -314,7 +314,7 @@ fn chat_message(v: &Value, enrich: &HashMap<String, ToolEnrich>) -> Option<Messa
 
     let text = coerce_content(v.get("content"));
     if !text.is_empty() {
-        m.content.push(Block::Text { text });
+        m.content.push(Block::Text { text: text.into() });
     }
 
     // assistant tool_calls → ToolUse blocks (arguments is a JSON *string*).

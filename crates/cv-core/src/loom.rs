@@ -141,7 +141,7 @@ mod tests {
             m.parent_id = prev.take();
             m.timestamp = Some(Utc.timestamp_opt(1_000 + i as i64, 0).unwrap());
             m.content = vec![Block::Text {
-                text: format!("{id}#{i}"),
+                text: format!("{id}#{i}").into(),
             }];
             prev = Some(mid);
             messages.push(m);

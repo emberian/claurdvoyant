@@ -54,7 +54,7 @@ struct HarmonyMsg<'a> {
 pub fn decode_content(text: &str) -> Vec<Block> {
     if !looks_like_harmony(text) {
         return vec![Block::Text {
-            text: text.to_string(),
+            text: text.to_string().into(),
         }];
     }
 
@@ -65,7 +65,7 @@ pub fn decode_content(text: &str) -> Vec<Block> {
                 let body = msg.body.trim();
                 if !body.is_empty() {
                     blocks.push(Block::Thinking {
-                        text: body.to_string(),
+                        text: body.to_string().into(),
                         signature: None,
                         encrypted: None,
                         redacted: false,
@@ -76,7 +76,7 @@ pub fn decode_content(text: &str) -> Vec<Block> {
                 let body = msg.body.trim();
                 if !body.is_empty() {
                     blocks.push(Block::Text {
-                        text: body.to_string(),
+                        text: body.to_string().into(),
                     });
                 }
             }
@@ -94,7 +94,7 @@ pub fn decode_content(text: &str) -> Vec<Block> {
                     let body = msg.body.trim();
                     if !body.is_empty() {
                         blocks.push(Block::Text {
-                            text: body.to_string(),
+                            text: body.to_string().into(),
                         });
                     }
                 }
@@ -112,7 +112,7 @@ pub fn decode_content(text: &str) -> Vec<Block> {
                     let body = msg.body.trim();
                     if !body.is_empty() {
                         blocks.push(Block::Text {
-                            text: body.to_string(),
+                            text: body.to_string().into(),
                         });
                     }
                 }
@@ -124,7 +124,7 @@ pub fn decode_content(text: &str) -> Vec<Block> {
     // content is never lost.
     if blocks.is_empty() {
         return vec![Block::Text {
-            text: text.to_string(),
+            text: text.to_string().into(),
         }];
     }
     blocks

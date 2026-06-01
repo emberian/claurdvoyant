@@ -448,7 +448,7 @@ fn bubble_to_message(b: &Value) -> Option<Message> {
             .filter(|s| !s.is_empty());
         if !text.is_empty() || signature.is_some() {
             m.content.push(Block::Thinking {
-                text,
+                text: text.into(),
                 signature,
                 encrypted: None,
                 redacted: false,
@@ -460,12 +460,12 @@ fn bubble_to_message(b: &Value) -> Option<Message> {
     let text = b.get("text").and_then(Value::as_str).unwrap_or("");
     if !text.is_empty() {
         m.content.push(Block::Text {
-            text: text.to_string(),
+            text: text.to_string().into(),
         });
     } else if let Some(rt) = b.get("richText") {
         if let Some(extracted) = lexical_plain_text(rt) {
             if !extracted.trim().is_empty() {
-                m.content.push(Block::Text { text: extracted });
+                m.content.push(Block::Text { text: extracted.into() });
             }
         }
     }
@@ -561,7 +561,7 @@ fn push_tool_former(m: &mut Message, tf: &Value) {
     if let Some(content) = result_text {
         m.content.push(Block::ToolResult {
             tool_use_id: id,
-            content,
+            content: content.into(),
             is_error,
             tool_name: Some(tool_name),
             status: (!status.is_empty()).then(|| status.to_string()),
@@ -703,7 +703,7 @@ fn legacy_bubble_to_message(b: &Value) -> Option<Message> {
     let mut m = Message::new(role);
     if let Some(text) = b.get("text").and_then(Value::as_str).filter(|s| !s.is_empty()) {
         m.content.push(Block::Text {
-            text: text.to_string(),
+            text: text.to_string().into(),
         });
     }
     (!m.content.is_empty()).then_some(m)

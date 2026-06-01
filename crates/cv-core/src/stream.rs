@@ -25,19 +25,31 @@ pub struct ParseOptions {
     /// turn and can dwarf the visible transcript. Bulk text consumers (index/search/dataset) never
     /// read it; only full-fidelity paths (json export, cross-harness convert/port, round-trips) do.
     pub extra: bool,
+    /// Emit large content as lazy [`Span`](crate::lazy::Span)s into the source instead of owned
+    /// strings. Off by default: it only pays off for **partial-access** consumers (e.g. reading a
+    /// window of messages, web pagination) that never touch the giant fields — a consumer that
+    /// reads *all* content materializes it anyway and just adds mmap overhead. Adapters that can't
+    /// span ignore it and produce inline content regardless.
+    pub spans: bool,
 }
 
 impl ParseOptions {
-    /// Full fidelity: every harness-specific field materialized. Used by [`collect`] / `parse` and
-    /// by conversion/round-trip paths that must lose nothing.
+    /// Full fidelity: every harness-specific field materialized, inline content. Used by [`collect`]
+    /// / `parse` and by conversion/round-trip paths that must lose nothing.
     pub fn full() -> Self {
-        ParseOptions { extra: true }
+        ParseOptions { extra: true, spans: false }
     }
 
-    /// The lean bulk-text pass: faithful message text, but no fat `extra` sidecars. Used by
-    /// indexing, search, and dataset export.
+    /// The lean bulk-text pass: faithful message text, no fat `extra` sidecars, inline content
+    /// (these consumers read everything, so spans wouldn't help). Used by index/search/dataset.
     pub fn bulk() -> Self {
         ParseOptions::default()
+    }
+
+    /// Partial-access pass: lazy content [`Span`](crate::lazy::Span)s so unread giant fields are
+    /// never materialized. For windowed reads / pagination (Phase 2).
+    pub fn lazy() -> Self {
+        ParseOptions { extra: false, spans: true }
     }
 }
 
@@ -90,12 +102,17 @@ impl MessageSink for CollectSink {
 /// at full fidelity. This is the default body of [`Adapter::parse`](crate::harness::Adapter::parse)
 /// for adapters that implement a native `stream`.
 pub fn collect(adapter: &dyn Adapter, r: &SessionRef) -> Result<Session> {
-    collect_with(adapter, r, &ParseOptions::full())
+    let mut session = collect_with(adapter, r, &ParseOptions::full())?;
+    // Full-fidelity parse: resolve any lazy content spans so the returned `Session` owns all its
+    // content inline (safe for `--json` serialization, cross-harness emit, `Deref` reads, etc.).
+    session.materialize();
+    Ok(session)
 }
 
-/// Like [`collect`] but with explicit [`ParseOptions`] — e.g. `ParseOptions::bulk()` to materialize
-/// every message but skip the fat `extra` sidecars (for consumers like dataset export that need all
-/// of one session's messages at once but never read `extra`).
+/// Like [`collect`] but with explicit [`ParseOptions`] and **without** materializing — the returned
+/// session may carry lazy content [`Span`]s. Consumers that hold the whole session but read it once
+/// (e.g. dataset export) use this and resolve per block, so a giant field is never owned wholesale.
+/// Use [`collect`] (or call `.materialize()`) when you need owned inline content.
 pub fn collect_with(adapter: &dyn Adapter, r: &SessionRef, opts: &ParseOptions) -> Result<Session> {
     let mut sink = CollectSink::default();
     let mut session = adapter.stream(r, opts, &mut sink)?;

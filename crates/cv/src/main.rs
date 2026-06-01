@@ -1201,9 +1201,11 @@ fn cmd_search_live(query: &str, want: Option<Harness>, limit: usize) -> Result<(
     struct HaySink {
         hay: String,
         first_user: Option<String>,
+        resolver: cv_core::Resolver,
     }
     impl MessageSink for HaySink {
-        fn message(&mut self, m: Message) -> Flow {
+        fn message(&mut self, mut m: Message) -> Flow {
+            m.materialize(&self.resolver);
             if self.first_user.is_none() && m.role == Role::User {
                 if let Some(t) = m.text() {
                     if !t.trim().is_empty() {
@@ -1223,7 +1225,7 @@ fn cmd_search_live(query: &str, want: Option<Harness>, limit: usize) -> Result<(
             continue;
         }
         for r in adapter.discover()? {
-            let mut sink = HaySink { hay: String::new(), first_user: None };
+            let mut sink = HaySink { hay: String::new(), first_user: None, resolver: cv_core::Resolver::new(Some(r.path.clone())) };
             let meta = match adapter.stream(&r, &ParseOptions::bulk(), &mut sink) {
                 Ok(m) => m,
                 Err(_) => continue,
@@ -1340,7 +1342,10 @@ fn cmd_dataset(
             continue;
         }
         let session = if redact {
-            cv_core::redact::redact(&session)
+            // redact reads content directly, so resolve lazy spans to inline first.
+            let mut s = session;
+            s.materialize();
+            cv_core::redact::redact(&s)
         } else {
             session
         };
@@ -1780,7 +1785,7 @@ fn finish_composed(
             &cv_llm::GenerateOptions { model: gen_model, ..Default::default() },
         )?;
         let mut m = Message::new(Role::Assistant);
-        m.content.push(Block::Text { text });
+        m.content.push(Block::Text { text: text.into() });
         session.messages.push(m);
         eprintln!("  ↳ grew the branch by 1 generated turn ({} msg total)", session.messages.len());
     }
@@ -1864,6 +1869,7 @@ fn stream_session_render<W: std::io::Write>(
         buf: Vec<String>,
         printed: bool,
         result: std::io::Result<()>,
+        resolver: cv_core::Resolver,
     }
     impl<W: std::io::Write, H: Fn(&HeaderInfo) -> String, R: Fn(&Message) -> String> Sink<'_, W, H, R> {
         fn write(&mut self, s: &str) {
@@ -1908,10 +1914,12 @@ fn stream_session_render<W: std::io::Write>(
                 self.cwd = s.cwd.clone();
             }
         }
-        fn message(&mut self, m: Message) -> Flow {
+        fn message(&mut self, mut m: Message) -> Flow {
             if self.result.is_err() {
                 return Flow::Stop;
             }
+            // Resolve this message's lazy content spans (peak = one message) before rendering.
+            m.materialize(&self.resolver);
             if self.model.is_none() {
                 if let Some(md) = &m.model {
                     self.model = Some(md.clone());
@@ -1956,6 +1964,7 @@ fn stream_session_render<W: std::io::Write>(
         buf: Vec::new(),
         printed: false,
         result: Ok(()),
+        resolver: cv_core::Resolver::new(Some(r.path.clone())),
     };
     adapter.stream(r, &ParseOptions::bulk(), &mut sink)?;
     sink.flush_header(); // short sessions (no assistant turn / < HOLDBACK msgs) flush here

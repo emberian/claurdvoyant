@@ -315,7 +315,7 @@ fn parse_message(v: &Value, session: &mut Session) -> Option<Message> {
 
     let mut blocks = Vec::new();
     match v.get("content") {
-        Some(Value::String(s)) => blocks.push(Block::Text { text: s.clone() }),
+        Some(Value::String(s)) => blocks.push(Block::Text { text: s.clone().into() }),
         Some(Value::Array(items)) => {
             for it in items {
                 if let Some(b) = parse_block(it) {
@@ -331,7 +331,7 @@ fn parse_message(v: &Value, session: &mut Session) -> Option<Message> {
         let plain = blocks
             .iter()
             .filter_map(|b| match b {
-                Block::Text { text } => Some(text.as_str()),
+                Block::Text { text } => text.inline_str(),
                 _ => None,
             })
             .collect::<Vec<_>>()
@@ -365,14 +365,14 @@ fn parse_message(v: &Value, session: &mut Session) -> Option<Message> {
 fn parse_block(item: &Value) -> Option<Block> {
     match item.get("type").and_then(Value::as_str)? {
         "text" => Some(Block::Text {
-            text: item.get("text").and_then(Value::as_str)?.to_string(),
+            text: item.get("text").and_then(Value::as_str)?.to_string().into(),
         }),
         "thinking" => Some(Block::Thinking {
             text: item
                 .get("thinking")
                 .and_then(Value::as_str)
                 .unwrap_or("")
-                .to_string(),
+                .to_string().into(),
             signature: item
                 .get("signature")
                 .and_then(Value::as_str)
@@ -381,7 +381,7 @@ fn parse_block(item: &Value) -> Option<Block> {
             redacted: false,
         }),
         "redacted_thinking" => Some(Block::Thinking {
-            text: String::new(),
+            text: String::new().into(),
             signature: None,
             encrypted: item.get("data").and_then(Value::as_str).map(str::to_string),
             redacted: true,
@@ -401,7 +401,7 @@ fn parse_block(item: &Value) -> Option<Block> {
                 .and_then(Value::as_str)
                 .unwrap_or("")
                 .to_string(),
-            content: coerce_text(item.get("content")),
+            content: coerce_text(item.get("content")).into(),
             is_error: item.get("is_error").and_then(Value::as_bool).unwrap_or(false),
             tool_name: None,
             status: None,
@@ -944,12 +944,12 @@ mod tests {
         };
 
         let mut user = Message::new(Role::User);
-        user.content = vec![Block::Text { text: "please fix it".to_string() }];
+        user.content = vec![Block::Text { text: "please fix it".to_string().into() }];
         session.messages.push(user);
 
         let mut asst = Message::new(Role::Assistant);
         asst.content = vec![
-            Block::Text { text: "on it".to_string() },
+            Block::Text { text: "on it".to_string().into() },
             Block::ToolUse {
                 id: "toolu_1".to_string(),
                 name: "read_file".to_string(),
@@ -961,7 +961,7 @@ mod tests {
         let mut tool = Message::new(Role::Tool);
         tool.content = vec![Block::ToolResult {
             tool_use_id: "toolu_1".to_string(),
-            content: "fn main() {}".to_string(),
+            content: "fn main() {}".to_string().into(),
             is_error: false,
             tool_name: None,
             status: None,
