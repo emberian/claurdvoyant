@@ -55,6 +55,12 @@ enum Cmd {
         /// Emit the raw unified IR as JSON instead of a rendered transcript.
         #[arg(long)]
         json: bool,
+        /// Only render messages in this 0-based, end-exclusive window: `<start>-<end>`,
+        /// `<start>-` (through the last), or `-<end>` (from the first). Messages outside the
+        /// window are never resolved — large content stays on disk, so a windowed view of a
+        /// huge session reads only the bytes it shows.
+        #[arg(long)]
+        range: Option<String>,
     },
     /// Export a session to markdown, JSON, or self-contained HTML (stdout).
     Export {
@@ -377,7 +383,7 @@ fn main() -> Result<()> {
     match cli.cmd {
         Cmd::Ls { harness, cwd, limit } => cmd_ls(harness, cwd, limit),
         Cmd::Search { query, harness, limit, semantic } => cmd_search(&query, harness, limit, semantic),
-        Cmd::Show { id, harness, json } => cmd_show(&id, harness, json),
+        Cmd::Show { id, harness, json, range } => cmd_show(&id, harness, json, range),
         Cmd::Export { id, format, harness } => cmd_export(&id, &format, harness),
         Cmd::Dataset { format, harness, limit, min_messages, redact, out } => {
             cmd_dataset(&format, harness, limit, min_messages, redact, out)
@@ -1256,22 +1262,60 @@ fn cmd_search_live(query: &str, want: Option<Harness>, limit: usize) -> Result<(
     Ok(())
 }
 
-fn cmd_show(id: &str, harness: Option<String>, json: bool) -> Result<()> {
+fn cmd_show(id: &str, harness: Option<String>, json: bool, range: Option<String>) -> Result<()> {
     let want = parse_harness(&harness)?;
     let (r, adapter) = cv_core::find(id, want)?.with_context(|| format!("no session matching {id:?}"))?;
+    let range = range.as_deref().map(parse_msg_range).transpose()?;
 
     // JSON wants the whole IR (incl. `extra`), so it materializes; the rendered transcript streams.
     if json {
-        let session = adapter.parse(&r)?;
+        let mut session = adapter.parse(&r)?;
+        if let Some((start, end)) = range {
+            let end = end.unwrap_or(session.messages.len()).min(session.messages.len());
+            let start = start.min(end);
+            session.messages = session.messages.drain(start..end).collect();
+        }
         println!("{}", serde_json::to_string_pretty(&session)?);
         return Ok(());
     }
 
     let mut out = std::io::BufWriter::new(std::io::stdout().lock());
-    stream_session_render(adapter.as_ref(), &r, &mut out, show_header, show_message)?;
+    stream_session_render(adapter.as_ref(), &r, &mut out, show_header, show_message, range)?;
     use std::io::Write;
     out.flush()?;
     Ok(())
+}
+
+/// Parse `<start>-<end>` | `<start>-` | `-<end>` | `<start>` into a 0-based, end-exclusive
+/// `(start, Option<end>)` window. `<start>` alone means just that single message.
+fn parse_msg_range(spec: &str) -> Result<(usize, Option<usize>)> {
+    let spec = spec.trim();
+    match spec.split_once('-') {
+        None => {
+            let n: usize = spec
+                .parse()
+                .with_context(|| format!("bad range {spec:?}: expected <start>-<end>, <start>-, -<end>, or <n>"))?;
+            Ok((n, Some(n + 1)))
+        }
+        Some((s, e)) => {
+            let start = if s.trim().is_empty() {
+                0
+            } else {
+                s.trim().parse().with_context(|| format!("bad range {spec:?}: start must be a number"))?
+            };
+            let end = if e.trim().is_empty() {
+                None
+            } else {
+                Some(e.trim().parse().with_context(|| format!("bad range {spec:?}: end must be a number"))?)
+            };
+            if let Some(end) = end {
+                if end < start {
+                    bail!("bad range {spec:?}: end ({end}) is before start ({start})");
+                }
+            }
+            Ok((start, end))
+        }
+    }
 }
 
 fn cmd_export(id: &str, format: &str, harness: Option<String>) -> Result<()> {
@@ -1280,7 +1324,7 @@ fn cmd_export(id: &str, format: &str, harness: Option<String>) -> Result<()> {
     match format {
         "md" | "markdown" => {
             let mut out = std::io::BufWriter::new(std::io::stdout().lock());
-            stream_session_render(adapter.as_ref(), &r, &mut out, md_header, md_message)?;
+            stream_session_render(adapter.as_ref(), &r, &mut out, md_header, md_message, None)?;
             use std::io::Write;
             out.flush()?;
         }
@@ -1848,6 +1892,7 @@ fn stream_session_render<W: std::io::Write>(
     out: &mut W,
     header: impl Fn(&HeaderInfo) -> String,
     render_msg: impl Fn(&Message) -> String,
+    range: Option<(usize, Option<usize>)>,
 ) -> Result<()> {
     use cv_core::{Flow, MessageSink, ParseOptions};
     const HOLDBACK: usize = 24;
@@ -1866,6 +1911,11 @@ fn stream_session_render<W: std::io::Write>(
         printed: bool,
         result: std::io::Result<()>,
         resolver: cv_core::Resolver,
+        // Windowed view: 0-based message index we're at, plus the [start, end) bounds. Messages
+        // outside the window are never materialized — their on-disk content is never touched.
+        idx: usize,
+        start: usize,
+        end: Option<usize>,
     }
     impl<W: std::io::Write, H: Fn(&HeaderInfo) -> String, R: Fn(&Message) -> String> Sink<'_, W, H, R> {
         fn write(&mut self, s: &str) {
@@ -1910,17 +1960,37 @@ fn stream_session_render<W: std::io::Write>(
                 self.cwd = s.cwd.clone();
             }
         }
-        fn message(&mut self, mut m: Message) -> Flow {
+        fn message(&mut self, m: Message) -> Flow {
             if self.result.is_err() {
                 return Flow::Stop;
             }
-            // Resolve this message's lazy content spans (peak = one message) before rendering.
-            m.materialize(&self.resolver);
+            let idx = self.idx;
+            self.idx += 1;
+
+            // Past the window's end: nothing left to render — stop early so we never read the
+            // rest of the file (the whole point of a windowed show on a huge session).
+            if let Some(end) = self.end {
+                if idx >= end {
+                    return Flow::Stop;
+                }
+            }
+
+            // Model is a small already-parsed field — pick it up even from out-of-window messages
+            // so the header stays accurate, without touching any content bytes.
             if self.model.is_none() {
                 if let Some(md) = &m.model {
                     self.model = Some(md.clone());
                 }
             }
+
+            // Before the window: skip entirely. We do NOT materialize, so no span content is read.
+            if idx < self.start {
+                return Flow::Continue;
+            }
+
+            // In-window: resolve this message's lazy content spans (peak = one message) and render.
+            let mut m = m;
+            m.materialize(&self.resolver);
             if self.first_user.is_none() && m.role == Role::User {
                 if let Some(t) = m.text() {
                     if !t.trim().is_empty() {
@@ -1961,6 +2031,9 @@ fn stream_session_render<W: std::io::Write>(
         printed: false,
         result: Ok(()),
         resolver: cv_core::Resolver::new(Some(r.path.clone())),
+        idx: 0,
+        start: range.map(|(s, _)| s).unwrap_or(0),
+        end: range.and_then(|(_, e)| e),
     };
     adapter.stream(r, &ParseOptions::bulk(), &mut sink)?;
     sink.flush_header(); // short sessions (no assistant turn / < HOLDBACK msgs) flush here
@@ -2124,4 +2197,25 @@ fn dim_cwd(p: Option<&Path>) -> String {
 
 fn dirs_home() -> Option<std::path::PathBuf> {
     std::env::var_os("HOME").map(std::path::PathBuf::from)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_msg_range;
+
+    #[test]
+    fn msg_range_forms() {
+        assert_eq!(parse_msg_range("10-13").unwrap(), (10, Some(13)));
+        assert_eq!(parse_msg_range("10-").unwrap(), (10, None));
+        assert_eq!(parse_msg_range("-13").unwrap(), (0, Some(13)));
+        assert_eq!(parse_msg_range("5").unwrap(), (5, Some(6))); // single message
+        assert_eq!(parse_msg_range(" 2 - 4 ").unwrap(), (2, Some(4))); // whitespace-tolerant
+    }
+
+    #[test]
+    fn msg_range_rejects_inverted_and_garbage() {
+        assert!(parse_msg_range("9-3").is_err()); // end before start
+        assert!(parse_msg_range("abc").is_err());
+        assert!(parse_msg_range("1-x").is_err());
+    }
 }
