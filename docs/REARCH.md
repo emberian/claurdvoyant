@@ -255,6 +255,24 @@ record) wants the same `RawValue` parse to make its giant sessions partial-acces
 Net: the lazy-IR machinery is **landed, correct, and ready** (opt-in, no regression); the visible win
 arrives with Phase 2 partial-access consumers + codex span production.
 
+### Chunked tantivy ingestion — LANDED (Part A)
+
+The index no longer builds a whole-session body string. `index_all` streams each session through a
+`ChunkSink` that flushes a tantivy document every `CHUNK_BYTES` (4 MB) — so a large *multi-message*
+session becomes several small docs (all sharing the session id), and the indexer never holds its
+whole body. Search **dedups** hits back to one row per id (over-fetch + keep best-scoring doc);
+`delete_term(id)` reaps all of a session's chunks on reindex; the per-doc metadata is tiny so the
+duplication is cheap. Verified: dedup correct (the only "dup" short-ids are genuinely distinct
+codex sessions with colliding 8-char time-prefixes), search finds the right sessions, 224 tests
+green. Index rebuild peak 4.2 → 3.9 GB.
+
+**The remaining floor is codex.** The headline 699 MB record is a *single* codex message, and codex
+isn't span-migrated — its parse reads the 699 MB line and builds a `Value` + owned `String` *before*
+the index sees it, so chunking (which bounds *multi*-message sessions) can't help it. Fixing it needs
+**codex span production** (Part B: the same `read_until` + `RawValue` parse as claude) **plus**
+chunk-*resolving* a span message inside `ChunkSink` (read the span in pieces rather than
+`materialize`-ing it whole). Then a 699 MB codex field is fed to tantivy in 4 MB pieces, never owned.
+
 Lower-churn partial win available without the IR change: **incremental tantivy field-fill** — add each
 message's text to the doc as it streams instead of concatenating a whole-session `body` String (drops
 the index path from O(session) to O(largest message); byte-identical, no new deps).

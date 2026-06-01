@@ -94,6 +94,12 @@ fn open_or_create(dir: &Path) -> Result<(Index, Fields)> {
 
 const COMMIT_EVERY: usize = 256;
 
+/// Max searchable bytes per tantivy document. A session's body is flushed into **multiple** docs of
+/// at most this size (all sharing the session id), so the index never holds a whole large session's
+/// body at once — search dedups hits back to one row per id. 4 MB keeps per-doc memory bounded while
+/// staying well above almost every individual message.
+const CHUNK_BYTES: usize = 4 * 1024 * 1024;
+
 /// Discover + parse every session and bring the index at `dir` up to date.
 ///
 /// Incremental by default: a session whose `(id, file-mtime)` already matches the index is **skipped**
@@ -101,10 +107,13 @@ const COMMIT_EVERY: usize = 256;
 /// added; and sessions whose source files no longer exist are deleted. Pass `rebuild = true` to clear
 /// and rebuild from scratch. Returns the number of sessions discovered (not just the changed ones).
 ///
-/// Streams one session at a time via [`crate::stream_corpus`], and commits periodically so segments
-/// (and their term dictionaries) flush to disk instead of accumulating in the writer's heap — keeping
-/// peak RSS bounded rather than scaling with the corpus.
+/// **Chunked ingestion:** each session streams message-by-message into a bounded body buffer that
+/// flushes a tantivy document every [`CHUNK_BYTES`], so a large session is indexed as several small
+/// docs (same id) and the indexer never holds its whole body. Commits periodically so segments flush
+/// rather than accumulating in the writer's heap.
 pub fn index_all(dir: &Path, rebuild: bool) -> Result<usize> {
+    use cv_core::ParseOptions;
+
     let (index, f) = open_or_create(dir)?;
     let mut writer: IndexWriter = index
         .writer(50_000_000)
@@ -115,7 +124,6 @@ pub fn index_all(dir: &Path, rebuild: bool) -> Result<usize> {
         writer.commit().context("commit after clear")?;
     }
 
-    // The skip-set: id → indexed file mtime. Empty on rebuild (everything is rewritten).
     let existing: HashMap<String, i64> = if rebuild {
         HashMap::new()
     } else {
@@ -125,26 +133,39 @@ pub fn index_all(dir: &Path, rebuild: bool) -> Result<usize> {
     let mut seen: HashSet<String> = HashSet::new();
     let mut since_commit = 0usize;
     let mut changed = 0usize;
+    let mut total = 0usize;
 
-    let total = crate::stream_corpus(|d| {
-        seen.insert(d.id.clone());
-        // Unchanged since last index (and we have a real mtime to trust) → skip entirely.
-        if let Some(&mt) = existing.get(&d.id) {
-            if mt == d.mtime_ns && d.mtime_ns != 0 {
-                return Ok(());
+    for r in cv_core::discover_all() {
+        total += 1;
+        seen.insert(r.id.clone());
+        let mtime = file_mtime_ns(&r.path);
+        // Unchanged since last index (real mtime) → skip entirely.
+        if let Some(&mt) = existing.get(&r.id) {
+            if mt == mtime && mtime != 0 {
+                continue;
             }
-            // Changed: drop the old copy before re-adding (delete is by the exact id term).
-            writer.delete_term(Term::from_field_text(f.id, &d.id));
+            // Changed: drop *all* of this session's docs (delete by the shared id term) before re-add.
+            writer.delete_term(Term::from_field_text(f.id, &r.id));
         }
-        add_doc(&mut writer, &f, &d)?;
+        let Some(adapter) = cv_core::harness::for_harness(r.harness) else {
+            continue;
+        };
+        let docs = {
+            let mut sink = ChunkSink::new(&mut writer, &f, &r, mtime);
+            if let Err(e) = adapter.stream(&r, &ParseOptions::bulk(), &mut sink) {
+                eprintln!("cv-search: parse failed for {} ({}): {e:#}", r.id, r.harness);
+                continue;
+            }
+            sink.finish()?;
+            sink.docs
+        };
         changed += 1;
-        since_commit += 1;
+        since_commit += docs;
         if since_commit >= COMMIT_EVERY {
             writer.commit().context("interim commit")?;
             since_commit = 0;
         }
-        Ok(())
-    })?;
+    }
 
     // Reap sessions that disappeared from disk since the last index (incremental only).
     let mut removed = 0usize;
@@ -159,9 +180,144 @@ pub fn index_all(dir: &Path, rebuild: bool) -> Result<usize> {
 
     writer.commit().context("committing index")?;
     if !rebuild {
-        eprintln!("  ↳ index: {changed} changed/new, {removed} removed, {} unchanged", total.saturating_sub(changed));
+        eprintln!(
+            "  ↳ index: {changed} changed/new, {removed} removed, {} unchanged",
+            total.saturating_sub(changed)
+        );
     }
     Ok(total)
+}
+
+fn file_mtime_ns(path: &Path) -> i64 {
+    std::fs::metadata(path)
+        .ok()
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos() as i64)
+        .unwrap_or(0)
+}
+
+/// Streams one session's messages into bounded-size tantivy docs (all sharing the session id), so a
+/// large session never materializes its whole body in the index.
+struct ChunkSink<'w> {
+    writer: &'w mut IndexWriter,
+    f: &'w Fields,
+    id: String,
+    harness: String,
+    cwd: Option<String>,
+    path: String,
+    created_at: Option<i64>,
+    updated_at: Option<i64>,
+    mtime: i64,
+    disc_title: Option<String>,
+    meta_title: Option<String>,
+    meta_received: bool,
+    first_user: Option<String>,
+    resolver: cv_core::Resolver,
+    buf: String,
+    docs: usize,
+    err: Option<anyhow::Error>,
+}
+
+impl<'w> ChunkSink<'w> {
+    fn new(writer: &'w mut IndexWriter, f: &'w Fields, r: &cv_core::SessionRef, mtime: i64) -> Self {
+        ChunkSink {
+            writer,
+            f,
+            id: r.id.clone(),
+            harness: r.harness.as_str().to_string(),
+            cwd: r.cwd.as_ref().map(|p| p.display().to_string()),
+            path: r.path.display().to_string(),
+            created_at: r.created_at.map(|t| t.timestamp()),
+            updated_at: r.updated_at.map(|t| t.timestamp()),
+            mtime,
+            disc_title: r.title.clone(),
+            meta_title: None,
+            meta_received: false,
+            first_user: None,
+            resolver: cv_core::Resolver::new(Some(r.path.clone())),
+            buf: String::new(),
+            docs: 0,
+            err: None,
+        }
+    }
+
+    /// Session label for display: the parsed title when the adapter delivered metadata (authoritative,
+    /// e.g. codex's None → first-user fallback), else the discovery-time title (claude's ai-title).
+    fn title(&self) -> String {
+        let primary = if self.meta_received {
+            self.meta_title.as_deref()
+        } else {
+            self.disc_title.as_deref()
+        };
+        cv_core::label_from(primary, self.first_user.as_deref())
+    }
+
+    /// Flush the current buffer as one document. `force` emits even an empty buffer (so a session with
+    /// no body still gets a doc — needed for incremental mtime tracking).
+    fn flush(&mut self, force: bool) {
+        if self.err.is_some() || (self.buf.is_empty() && !force) {
+            return;
+        }
+        let mut doc = TantivyDocument::default();
+        doc.add_text(self.f.id, &self.id);
+        doc.add_text(self.f.harness, &self.harness);
+        if let Some(cwd) = &self.cwd {
+            doc.add_text(self.f.cwd, cwd);
+        }
+        doc.add_text(self.f.title, self.title());
+        doc.add_text(self.f.body, &self.buf);
+        doc.add_text(self.f.path, &self.path);
+        if let Some(t) = self.created_at {
+            doc.add_i64(self.f.created_at, t);
+        }
+        if let Some(t) = self.updated_at {
+            doc.add_i64(self.f.updated_at, t);
+        }
+        doc.add_i64(self.f.mtime, self.mtime);
+        if let Err(e) = self.writer.add_document(doc) {
+            self.err = Some(e.into());
+        }
+        self.buf.clear();
+        self.docs += 1;
+    }
+
+    /// Flush the trailing buffer (always emits ≥1 doc for the session), propagating any deferred error.
+    fn finish(&mut self) -> Result<()> {
+        self.flush(self.docs == 0);
+        if let Some(e) = self.err.take() {
+            return Err(e);
+        }
+        Ok(())
+    }
+}
+
+impl cv_core::MessageSink for ChunkSink<'_> {
+    fn meta(&mut self, s: &cv_core::Session) {
+        self.meta_title = s.title.clone();
+        self.meta_received = true;
+        if self.cwd.is_none() {
+            self.cwd = s.cwd.as_ref().map(|p| p.display().to_string());
+        }
+    }
+    fn message(&mut self, mut m: cv_core::Message) -> cv_core::Flow {
+        if self.err.is_some() {
+            return cv_core::Flow::Stop;
+        }
+        m.materialize(&self.resolver);
+        if self.first_user.is_none() && m.role == cv_core::Role::User {
+            if let Some(t) = m.text() {
+                if !t.trim().is_empty() {
+                    self.first_user = Some(t);
+                }
+            }
+        }
+        cv_core::stream::append_searchable(&mut self.buf, &m);
+        if self.buf.len() >= CHUNK_BYTES {
+            self.flush(false);
+        }
+        cv_core::Flow::Continue
+    }
 }
 
 /// Read `id → mtime` for every live document in the index — the incremental skip-set. Stored fields
@@ -251,18 +407,29 @@ pub fn text_search(dir: &Path, query: &str, limit: usize) -> Result<Vec<Hit>> {
         .parse_query(query)
         .with_context(|| format!("parsing query {query:?}"))?;
 
+    // A session is several docs (body chunks) sharing one id, so over-fetch and dedup to one row per
+    // id, keeping the best-scoring doc (TopDocs is score-ordered, so the first id occurrence wins).
+    let fetch = (limit.saturating_mul(4)).max(64);
     let top = searcher
-        .search(&parsed, &TopDocs::with_limit(limit).order_by_score())
+        .search(&parsed, &TopDocs::with_limit(fetch).order_by_score())
         .context("running search")?;
 
-    let mut hits = Vec::with_capacity(top.len());
+    let mut hits = Vec::with_capacity(limit);
+    let mut seen: HashSet<String> = HashSet::new();
     for (score, addr) in top {
+        if hits.len() >= limit {
+            break;
+        }
         let doc: TantivyDocument = searcher.doc(addr).context("loading stored doc")?;
         let get_str = |field: Field| -> Option<String> {
             doc.get_first(field)
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string())
         };
+        let id = get_str(f.id).unwrap_or_default();
+        if !seen.insert(id.clone()) {
+            continue; // another chunk of a session we already have
+        }
         let harness = get_str(f.harness).unwrap_or_default();
         let path = get_str(f.path);
         let snippet = path
@@ -271,7 +438,7 @@ pub fn text_search(dir: &Path, query: &str, limit: usize) -> Result<Vec<Hit>> {
             .unwrap_or_default();
 
         hits.push(Hit {
-            id: get_str(f.id).unwrap_or_default(),
+            id,
             harness,
             cwd: get_str(f.cwd),
             title: get_str(f.title),
