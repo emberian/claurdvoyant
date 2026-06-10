@@ -150,33 +150,61 @@ pub fn index_all(dir: &Path, rebuild: bool) -> Result<usize> {
     let mut changed = 0usize;
     let mut total = 0usize;
 
-    // One query for the whole event skip-table — the per-session `needs_ingest` opens (and runs
-    // DDL on) a fresh sqlite connection per call, which a ~2,400-session sweep pays ~2,400 times.
+    // One query for the whole event/offsets skip-tables — the per-session checks would open (and
+    // run DDL on) a fresh sqlite connection per call, which a ~2,400-session sweep pays ~2,400×.
     let event_sync = cv_core::events::SyncTable::load();
+    let offset_sync = cv_core::offsets::SyncTable::load();
 
     for r in cv_core::discover_all() {
         total += 1;
         seen.insert(r.id.clone());
-        let mtime = file_mtime_ns(&r.path);
+        let (mtime, size) = cv_core::offsets::file_sig(&r.path);
         let fts_fresh = existing
             .get(&r.id)
             .is_some_and(|&mt| mt == mtime && mtime != 0);
         let events_stale = event_sync.needs_ingest(&r, mtime);
-        // Unchanged on both axes → skip entirely (no re-parse beyond the metadata scan).
-        if fts_fresh && !events_stale {
+        // Message byte offsets (seekable `cv show --range` — see [`cv_core::offsets`]) ride the
+        // same pass, for the harnesses whose adapters can stamp them.
+        let offsets_stale =
+            cv_core::offsets::supported(r.harness) && offset_sync.needs_record(&r, mtime, size);
+        // Unchanged on all axes → skip entirely (no re-parse beyond the metadata scan).
+        if fts_fresh && !events_stale && !offsets_stale {
             continue;
         }
         let Some(adapter) = cv_core::harness::for_harness(r.harness) else {
             continue;
         };
         let mut events = events_stale.then(|| cv_core::events::EventSink::new(r.cwd.clone()));
+        let mut offsets = offsets_stale.then(cv_core::offsets::OffsetSink::new);
+        // The recording pass needs per-message offset stamps; otherwise plain lazy. Identical for
+        // every other consumer on the tee (the stamp is one small `extra` entry nobody reads).
+        let opts = if offsets.is_some() {
+            ParseOptions::lazy_offsets()
+        } else {
+            ParseOptions::lazy()
+        };
 
-        // FTS docs current but events missing/stale (e.g. first run after upgrading, or after a
-        // catalog wipe): an events-only pass that never touches tantivy.
+        // FTS docs current but events/offsets missing/stale (e.g. first run after upgrading, or
+        // after a catalog wipe): a catalog-only pass that never touches tantivy.
         if fts_fresh {
-            let sink = events.as_mut().expect("events_stale implies a sink");
-            match adapter.stream(&r, &ParseOptions::lazy(), sink) {
-                Ok(_) => cv_core::events::record(&r, sink.events(), mtime),
+            let res = match (events.as_mut(), offsets.as_mut()) {
+                (Some(es), Some(os)) => {
+                    let mut tee = cv_core::TeeSink::new(es, os);
+                    adapter.stream(&r, &opts, &mut tee)
+                }
+                (Some(es), None) => adapter.stream(&r, &opts, es),
+                (None, Some(os)) => adapter.stream(&r, &opts, os),
+                (None, None) => unreachable!("skip above covers fresh+fresh"),
+            };
+            match res {
+                Ok(_) => {
+                    if let Some(es) = &events {
+                        cv_core::events::record(&r, es.events(), mtime);
+                    }
+                    if let Some(os) = &offsets {
+                        cv_core::offsets::record(&r, os, mtime, size);
+                    }
+                }
                 Err(e) => eprintln!("cv-search: parse failed for {} ({}): {e:#}", r.id, r.harness),
             }
             continue;
@@ -186,18 +214,28 @@ pub fn index_all(dir: &Path, rebuild: bool) -> Result<usize> {
             // Changed: drop *all* of this session's docs (delete by the shared id term) before re-add.
             writer.delete_term(Term::from_field_text(f.id, &r.id));
         }
-        let docs = match index_session(&mut writer, &f, adapter.as_ref(), &r, mtime, events.as_mut())
-        {
+        let docs = match index_session(
+            &mut writer,
+            &f,
+            adapter.as_ref(),
+            &r,
+            mtime,
+            events.as_mut(),
+            offsets.as_mut(),
+        ) {
             Ok(docs) => docs,
             Err(e) => {
                 eprintln!("cv-search: parse failed for {} ({}): {e:#}", r.id, r.harness);
                 continue;
             }
         };
-        // Only stamp events after a *complete* pass — a parse error above leaves the sync row
-        // untouched so the session is retried next run.
+        // Only stamp events/offsets after a *complete* pass — a parse error above leaves the sync
+        // rows untouched so the session is retried next run.
         if let Some(es) = events {
             cv_core::events::record(&r, es.events(), mtime);
+        }
+        if let Some(os) = offsets {
+            cv_core::offsets::record(&r, &os, mtime, size);
         }
         changed += 1;
         since_commit += docs;
@@ -228,12 +266,11 @@ pub fn index_all(dir: &Path, rebuild: bool) -> Result<usize> {
     Ok(total)
 }
 
-use cv_core::events::file_mtime_ns;
-
 /// Stream one session into bounded tantivy docs through [`ChunkSink`] — teeing the same pass into
-/// `events` when given, so the transcript is read once for both consumers. `lazy()` keeps large
-/// content as spans: the chunk sink chunk-resolves them and the event sink never reads them at all.
-/// Returns the number of docs written.
+/// `events` and/or `offsets` when given, so the transcript is read once for all consumers.
+/// `lazy()` keeps large content as spans: the chunk sink chunk-resolves them and the other sinks
+/// never read them at all; with an offsets sink the pass runs under `lazy_offsets()` so the
+/// adapter stamps each message's byte offset for it to harvest. Returns the docs written.
 fn index_session(
     writer: &mut IndexWriter,
     f: &Fields,
@@ -241,16 +278,31 @@ fn index_session(
     r: &cv_core::SessionRef,
     mtime: i64,
     events: Option<&mut cv_core::events::EventSink>,
+    offsets: Option<&mut cv_core::offsets::OffsetSink>,
 ) -> Result<usize> {
     use cv_core::ParseOptions;
+    let opts = if offsets.is_some() {
+        ParseOptions::lazy_offsets()
+    } else {
+        ParseOptions::lazy()
+    };
     let mut sink = ChunkSink::new(writer, f, r, mtime);
-    match events {
-        Some(es) => {
+    match (events, offsets) {
+        (Some(es), Some(os)) => {
             let mut tee = cv_core::TeeSink::new(&mut sink, es);
-            adapter.stream(r, &ParseOptions::lazy(), &mut tee)?;
+            let mut tee = cv_core::TeeSink::new(&mut tee, os);
+            adapter.stream(r, &opts, &mut tee)?;
         }
-        None => {
-            adapter.stream(r, &ParseOptions::lazy(), &mut sink)?;
+        (Some(es), None) => {
+            let mut tee = cv_core::TeeSink::new(&mut sink, es);
+            adapter.stream(r, &opts, &mut tee)?;
+        }
+        (None, Some(os)) => {
+            let mut tee = cv_core::TeeSink::new(&mut sink, os);
+            adapter.stream(r, &opts, &mut tee)?;
+        }
+        (None, None) => {
+            adapter.stream(r, &opts, &mut sink)?;
         }
     }
     sink.finish()?;
@@ -506,11 +558,12 @@ fn read_indexed_mtimes(index: &Index, f: &Fields) -> Result<HashMap<String, i64>
 /// Index an explicit set of sessions through the real production [`index_session`] path — the same
 /// indexer [`index_all`] drives, minus only the global `discover_all()` scan. Full rebuild: clears
 /// prior contents first. Used by tests so date-field (and chunk) indexing is exercised against the
-/// code that actually ships rather than a parallel per-doc path. `events = true` additionally tees
-/// each pass into the event catalog like `index_all` does (only set it under an isolated
-/// `CLAURDVOYANT_HOME` — it writes the shared catalog db).
+/// code that actually ships rather than a parallel per-doc path. `catalog = true` additionally tees
+/// each pass into the event catalog and (for supported harnesses) the message-offsets store, like
+/// `index_all` does (only set it under an isolated `CLAURDVOYANT_HOME` — it writes the shared
+/// catalog db).
 #[cfg(test)]
-pub(crate) fn index_refs(dir: &Path, refs: &[cv_core::SessionRef], events: bool) -> Result<usize> {
+pub(crate) fn index_refs(dir: &Path, refs: &[cv_core::SessionRef], catalog: bool) -> Result<usize> {
     let (index, f) = open_or_create(dir)?;
     let mut writer: IndexWriter = index
         .writer(50_000_000)
@@ -520,12 +573,17 @@ pub(crate) fn index_refs(dir: &Path, refs: &[cv_core::SessionRef], events: bool)
         let Some(adapter) = cv_core::harness::for_harness(r.harness) else {
             continue;
         };
-        let mtime = file_mtime_ns(&r.path);
-        let mut es = events.then(|| cv_core::events::EventSink::new(r.cwd.clone()));
-        index_session(&mut writer, &f, adapter.as_ref(), r, mtime, es.as_mut())
+        let (mtime, size) = cv_core::offsets::file_sig(&r.path);
+        let mut es = catalog.then(|| cv_core::events::EventSink::new(r.cwd.clone()));
+        let mut os = (catalog && cv_core::offsets::supported(r.harness))
+            .then(cv_core::offsets::OffsetSink::new);
+        index_session(&mut writer, &f, adapter.as_ref(), r, mtime, es.as_mut(), os.as_mut())
             .with_context(|| format!("indexing {}", r.id))?;
         if let Some(es) = es {
             cv_core::events::record(r, es.events(), mtime);
+        }
+        if let Some(os) = os {
+            cv_core::offsets::record(r, &os, mtime, size);
         }
     }
     writer.commit().context("committing index")?;

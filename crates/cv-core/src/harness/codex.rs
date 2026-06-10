@@ -139,7 +139,14 @@ impl Adapter for Codex {
         if opts.spans {
             if let Ok(file) = fs::File::open(&r.path) {
                 if let Ok(map) = unsafe { memmap2::Mmap::map(&file) } {
-                    return Ok(stream_jsonl_spans(&r.id, &map, Some(r.path.clone()), has_events, sink));
+                    return Ok(stream_jsonl_spans(
+                        &r.id,
+                        &map,
+                        Some(r.path.clone()),
+                        has_events,
+                        opts.offsets,
+                        sink,
+                    ));
                 }
             }
         }
@@ -312,7 +319,9 @@ impl EventDetector {
 
 /// Bounded first pass over a rollout: are NL messages carried as `event_msg`s? (See
 /// [`EventDetector`] for the bounding rule and its corpus-measured safety margin.)
-fn detect_has_events<R: BufRead>(reader: R) -> bool {
+/// `pub(crate)` so the seek path ([`crate::offsets::stream_range`]) can re-detect it with the
+/// same head-bounded read before replaying mid-file.
+pub(crate) fn detect_has_events<R: BufRead>(reader: R) -> bool {
     let mut det = EventDetector::default();
     super::for_each_json_line(reader, |v| det.feed(&v));
     det.found
@@ -398,13 +407,64 @@ pub fn stream_jsonl<R: BufRead>(
 /// Span-producing streaming parse over the source bytes (an mmap). Mirrors [`stream_jsonl`] but
 /// iterates line slices (tracking file offsets) and, for a giant `function_call_output` with a plain
 /// **string** output, emits a lazy [`Span`](crate::lazy::Span) for that output instead of
-/// reading/parsing the (often 100s of MB) line whole.
+/// reading/parsing the (often 100s of MB) line whole. `stamp_offsets` additionally stamps each
+/// message's record byte offset into `extra` (the [`crate::offsets`] recording pass).
 #[cfg(feature = "mmap")]
 pub fn stream_jsonl_spans(
     id: &str,
     data: &[u8],
     source_path: Option<PathBuf>,
     has_events: bool,
+    stamp_offsets: bool,
+    sink: &mut dyn MessageSink,
+) -> Session {
+    stream_spans_core(id, data, 0, source_path, has_events, None, true, stamp_offsets, sink)
+}
+
+/// Seek-replay over the source bytes from `start_off` (a **record start**) — the cooperation entry
+/// [`crate::offsets::stream_range`] drives after looking up a message's recorded offset.
+///
+/// Differences from a top-of-file stream, by design of the recording side:
+/// * `has_events` must be supplied (it's a head property; the caller re-detects it with one small
+///   bounded read — the file is signature-guarded, so the verdict matches the recording pass).
+/// * No `meta()` is emitted; the caller replays the recorded metadata snapshot itself (the head
+///   records that would populate it were skipped).
+/// * `seed_model` is the model in effect at `start_off`, so in-window `turn_context` records
+///   compare against the right baseline. Sessions with mid-stream model *changes* are never
+///   recorded as seekable (the change note needs prior state), so the session's single known
+///   model is correct everywhere.
+///
+/// Every other codex record parses independently of the skipped prefix: the only cross-record
+/// message behavior — `token_count` usage attaching to the assistant message it trails — is
+/// scoped to the *held previous* message, and a recorded offset always points at the record that
+/// *created* its message, so the follow-up attach replays inside the window.
+#[cfg(feature = "mmap")]
+pub(crate) fn stream_spans_from(
+    data: &[u8],
+    start_off: u64,
+    source_path: Option<PathBuf>,
+    has_events: bool,
+    seed_model: Option<String>,
+    stamp_offsets: bool,
+    sink: &mut dyn MessageSink,
+) -> Session {
+    stream_spans_core(
+        "", data, start_off, source_path, has_events, seed_model, false, stamp_offsets, sink,
+    )
+}
+
+/// Shared body of [`stream_jsonl_spans`] (whole file) and [`stream_spans_from`] (seek replay).
+#[cfg(feature = "mmap")]
+#[allow(clippy::too_many_arguments)]
+fn stream_spans_core(
+    id: &str,
+    data: &[u8],
+    start_off: u64,
+    source_path: Option<PathBuf>,
+    has_events: bool,
+    seed_model: Option<String>,
+    emit_meta: bool,
+    stamp_offsets: bool,
     sink: &mut dyn MessageSink,
 ) -> Session {
     let mut s = Session {
@@ -414,17 +474,26 @@ pub fn stream_jsonl_spans(
         title: None,
         created_at: None,
         updated_at: None,
-        model: None,
+        model: seed_model,
         git: None,
         messages: Vec::new(),
         source_path,
         extra: serde_json::Map::new(),
     };
+    if start_off as usize >= data.len() {
+        if emit_meta {
+            sink.meta(&s);
+        }
+        if s.id.is_empty() {
+            s.id = id.to_string();
+        }
+        return s;
+    }
     let mut scratch: Vec<Message> = Vec::new();
     let mut meta_sent = false;
     let mut skipped = 0u64;
-    let mut off = 0u64;
-    'outer: for raw_line in data.split(|&b| b == b'\n') {
+    let mut off = start_off;
+    'outer: for raw_line in data[start_off as usize..].split(|&b| b == b'\n') {
         let line_off = off;
         off += raw_line.len() as u64 + 1; // +1 for the consumed '\n'
         let lead = raw_line.iter().take_while(|b| b.is_ascii_whitespace()).count();
@@ -436,6 +505,7 @@ pub fn stream_jsonl_spans(
         let slice = &raw_line[lead..endw];
         let base_off = line_off + lead as u64;
 
+        let before = scratch.len();
         if let Some(msg) = giant_fco_span(slice, base_off, &mut s) {
             scratch.push(msg);
         } else if let Ok(v) = serde_json::from_slice::<Value>(slice) {
@@ -444,7 +514,16 @@ pub fn stream_jsonl_spans(
             skipped += 1; // corrupt line — tolerated, but counted (see note_skipped_lines)
             continue;
         }
-        if !meta_sent && s.model.is_some() {
+        if stamp_offsets {
+            // Stamp this record's byte offset on the message(s) it produced (offset recording —
+            // see [`crate::offsets::OFFSET_KEY`]). Messages a later record amends (token_count
+            // usage) keep their creating record's offset, which is the correct replay point.
+            for m in &mut scratch[before..] {
+                m.extra
+                    .insert(crate::offsets::OFFSET_KEY.into(), base_off.into());
+            }
+        }
+        if emit_meta && !meta_sent && s.model.is_some() {
             sink.meta(&s);
             meta_sent = true;
         }
@@ -464,7 +543,7 @@ pub fn stream_jsonl_spans(
     if s.id.is_empty() {
         s.id = id.to_string();
     }
-    if !meta_sent {
+    if emit_meta && !meta_sent {
         sink.meta(&s);
     }
     s
@@ -1500,7 +1579,7 @@ mod tests {
         }
         let data = std::fs::read(&path).unwrap();
         let mut sink = crate::stream::CollectSink::default();
-        let mut s = stream_jsonl_spans("fallback", &data, Some(path.clone()), false, &mut sink);
+        let mut s = stream_jsonl_spans("fallback", &data, Some(path.clone()), false, false, &mut sink);
         s.messages = sink.messages;
 
         let content = s
@@ -1531,6 +1610,73 @@ mod tests {
             .expect("inline tool result");
         assert_eq!(inline_c, body.as_str());
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The seek cooperation (REARCH Phase 2): the span path under offset-stamping marks every
+    /// message with its creating record's byte offset, and `stream_spans_from` replayed at any
+    /// stamped offset (with the session model seeded) reproduces exactly the full stream's suffix
+    /// — including a `token_count` attaching usage to the held assistant inside the window, the
+    /// stale-snapshot carrier, and a giant span output.
+    #[cfg(feature = "mmap")]
+    #[test]
+    fn offset_stamps_replay_byte_identically_from_any_message() {
+        let big = "giant tool output line\n".repeat(400); // > INLINE_MAX → a Span
+        let lines = [
+            r#"{"timestamp":"2026-01-01T00:00:00Z","type":"session_meta","payload":{"id":"seek-1","cwd":"/work"}}"#.to_string(),
+            r#"{"timestamp":"2026-01-01T00:00:01Z","type":"turn_context","payload":{"cwd":"/work","model":"gpt-test"}}"#.to_string(),
+            r#"{"timestamp":"2026-01-01T00:00:02Z","type":"event_msg","payload":{"type":"user_message","message":"hi"}}"#.to_string(),
+            r#"{"timestamp":"2026-01-01T00:00:03Z","type":"event_msg","payload":{"type":"agent_message","message":"working"}}"#.to_string(),
+            r#"{"timestamp":"2026-01-01T00:00:04Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":10,"output_tokens":5}}}}"#.to_string(),
+            r#"{"timestamp":"2026-01-01T00:00:05Z","type":"response_item","payload":{"type":"function_call","name":"shell","arguments":"{}","call_id":"c1"}}"#.to_string(),
+            serde_json::json!({"timestamp":"2026-01-01T00:00:06Z","type":"response_item",
+                "payload":{"type":"function_call_output","call_id":"c1","output":big}})
+            .to_string(),
+            r#"{"timestamp":"2026-01-01T00:00:07Z","type":"event_msg","payload":{"type":"token_count","rate_limits":{"primary":{"used_percent":9.0}}}}"#.to_string(),
+            r#"{"timestamp":"2026-01-01T00:00:08Z","type":"event_msg","payload":{"type":"agent_message","message":"bye"}}"#.to_string(),
+        ];
+        let data = format!("{}\n", lines.join("\n")).into_bytes();
+        let has_events = detect_has_events(std::io::Cursor::new(&data[..]));
+        assert!(has_events);
+
+        let mut full = crate::stream::CollectSink::default();
+        let s = stream_jsonl_spans("fb", &data, None, has_events, true, &mut full);
+        let full = full.messages;
+        assert_eq!(s.model.as_deref(), Some("gpt-test"));
+        // user, assistant(+usage), tool-use, giant span result, carrier, trailing assistant.
+        assert_eq!(full.len(), 6);
+        assert!(full[1].usage.is_some(), "token_count attached to held assistant");
+        assert!(full[3]
+            .content
+            .iter()
+            .any(|b| matches!(b, Block::ToolResult { content, .. } if content.is_span())));
+        let offs: Vec<u64> = full
+            .iter()
+            .map(|m| {
+                m.extra
+                    .get(crate::offsets::OFFSET_KEY)
+                    .and_then(Value::as_u64)
+                    .expect("every message stamped")
+            })
+            .collect();
+        assert!(offs.windows(2).all(|w| w[0] <= w[1]));
+
+        for k in 1..full.len() {
+            let mut replay = crate::stream::CollectSink::default();
+            stream_spans_from(
+                &data,
+                offs[k],
+                None,
+                has_events,
+                Some("gpt-test".into()),
+                true,
+                &mut replay,
+            );
+            assert_eq!(
+                serde_json::to_value(&full[k..]).unwrap(),
+                serde_json::to_value(&replay.messages).unwrap(),
+                "replay from message {k}'s offset must equal the full-stream suffix"
+            );
+        }
     }
 
     #[test]

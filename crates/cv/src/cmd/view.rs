@@ -434,6 +434,8 @@ pub(crate) fn stream_session_render<W: std::io::Write>(
         }
     }
 
+    let start = range.map(|(s, _)| s).unwrap_or(0);
+    let end = range.and_then(|(_, e)| e);
     let mut sink = Sink {
         out,
         harness: r.harness,
@@ -449,8 +451,8 @@ pub(crate) fn stream_session_render<W: std::io::Write>(
         result: Ok(()),
         resolver: cv_core::Resolver::new(Some(r.path.clone())),
         idx: 0,
-        start: range.map(|(s, _)| s).unwrap_or(0),
-        end: range.and_then(|(_, e)| e),
+        start,
+        end,
     };
     // Windowed: lazy spans, so out-of-window giant fields arrive as 16-byte handles and only
     // in-window messages materialize (the sink already resolves per message). A full show reads
@@ -460,6 +462,21 @@ pub(crate) fn stream_session_render<W: std::io::Write>(
     } else {
         ParseOptions::bulk()
     };
+    // Windowed reads first try the seekable-session store (offsets recorded by `cv index`): jump
+    // straight to message `start`'s byte offset and parse only the window, instead of streaming
+    // from byte 0 and discarding everything before it. `stream_range` delivers one `meta()` (the
+    // recorded metadata snapshot — including the model the skipped prefix would have provided)
+    // plus exactly the window's messages, so the sink starts its index at `start`. `false` means
+    // no/stale offsets — the sink is untouched; fall through to the full stream below.
+    if start > 0 {
+        sink.idx = start;
+        if cv_core::offsets::stream_range(r, start, end, &opts, &mut sink)? {
+            sink.flush_header();
+            sink.result?;
+            return Ok(());
+        }
+        sink.idx = 0;
+    }
     adapter.stream(r, &opts, &mut sink)?;
     sink.flush_header(); // short sessions (no assistant turn / < HOLDBACK msgs) flush here
     sink.result?;
@@ -570,4 +587,173 @@ fn md_message(m: &Message) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    /// `CLAURDVOYANT_HOME` is process-global — these are the only env-touching unit tests in
+    /// this binary, serialized against each other.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn temp_home(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("cv-view-seek-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// Record message offsets for `r` the way `cv index`'s ride-along does.
+    fn record_offsets(r: &SessionRef) {
+        let adapter = cv_core::harness::for_harness(r.harness).unwrap();
+        let (mtime, size) = cv_core::offsets::file_sig(&r.path);
+        let mut sink = cv_core::offsets::OffsetSink::new();
+        adapter
+            .stream(r, &cv_core::ParseOptions::lazy_offsets(), &mut sink)
+            .unwrap();
+        assert!(sink.seekable());
+        cv_core::offsets::record(r, &sink, mtime, size);
+    }
+
+    fn render(r: &SessionRef, range: Option<(usize, Option<usize>)>) -> String {
+        let adapter = cv_core::harness::for_harness(r.harness).unwrap();
+        let mut out = Vec::new();
+        stream_session_render(adapter.as_ref(), r, &mut out, show_header, show_message, range)
+            .unwrap();
+        String::from_utf8(out).unwrap()
+    }
+
+    /// Whether a windowed render of `r` would take the seek path right now.
+    fn seekable(r: &SessionRef, start: usize) -> bool {
+        let mut sink = cv_core::CollectSink::default();
+        cv_core::offsets::stream_range(r, start, Some(start + 1), &cv_core::ParseOptions::lazy(), &mut sink)
+            .unwrap()
+    }
+
+    /// THE Phase-2 contract: the same window rendered via the seek path (offsets recorded) and
+    /// via the full stream (no offsets) must be **byte-identical** — header (incl. the model the
+    /// skipped prefix provides) and body. And a stale recording falls back, output unchanged.
+    #[test]
+    fn windowed_render_is_byte_identical_via_seek_and_full_stream() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let home = temp_home("claude");
+        std::env::set_var("CLAURDVOYANT_HOME", &home);
+
+        let path = home.join("s.jsonl");
+        let big = "long \"quoted\" content\n".repeat(400);
+        let mut f = std::fs::File::create(&path).unwrap();
+        writeln!(f, r#"{{"type":"ai-title","aiTitle":"render seek"}}"#).unwrap();
+        writeln!(f, r#"{{"type":"user","uuid":"u0","cwd":"/w","message":{{"role":"user","content":"q one"}}}}"#).unwrap();
+        writeln!(
+            f,
+            "{}",
+            serde_json::json!({"type":"assistant","uuid":"a1","message":{"role":"assistant",
+                "model":"claude-test","content":[{"type":"text","text":"a one"}]}})
+        )
+        .unwrap();
+        writeln!(
+            f,
+            "{}",
+            serde_json::json!({"type":"user","uuid":"u2","message":{"role":"user","content":big}})
+        )
+        .unwrap();
+        for i in 0..8 {
+            writeln!(
+                f,
+                "{}",
+                serde_json::json!({"type":"user","uuid":format!("u{}", 3+i),
+                    "message":{"role":"user","content":format!("follow-up {i}")}})
+            )
+            .unwrap();
+        }
+        drop(f);
+        let r = SessionRef {
+            id: "render-seek".into(),
+            harness: Harness::Claude,
+            path: path.clone(),
+            cwd: Some("/w".into()),
+            title: Some("render seek".into()),
+            created_at: None,
+            updated_at: None,
+            message_count: 11,
+        };
+        record_offsets(&r);
+        assert!(seekable(&r, 3), "recording must enable the seek path");
+
+        // Window past the model-carrying assistant turn: the header's model must come from the
+        // recorded metadata on the seek path. Compare against the full stream with no catalog.
+        for range in [(3usize, Some(6usize)), (2, Some(11)), (5, None), (1, Some(2))] {
+            let seeked = render(&r, Some((range.0, range.1)));
+            std::env::remove_var("CLAURDVOYANT_HOME");
+            std::env::set_var("CLAURDVOYANT_HOME", temp_home("claude-empty"));
+            assert!(!seekable(&r, range.0), "empty catalog must fall back");
+            let full = render(&r, Some((range.0, range.1)));
+            std::env::set_var("CLAURDVOYANT_HOME", &home);
+            assert_eq!(seeked, full, "range {range:?} render must be byte-identical");
+            assert!(seeked.contains("claude-test"), "header model expected in {range:?}");
+        }
+
+        // Staleness: appending a message makes the recording stale → fallback, still correct.
+        {
+            let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+            writeln!(f, r#"{{"type":"user","uuid":"uz","message":{{"role":"user","content":"appended"}}}}"#).unwrap();
+        }
+        assert!(!seekable(&r, 3), "appended file must read as stale");
+        let after = render(&r, Some((9, Some(12))));
+        assert!(after.contains("follow-up 7") && after.contains("appended"));
+
+        std::env::remove_var("CLAURDVOYANT_HOME");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// Same contract for codex, whose metadata comes from the recorded `meta()` snapshot (the
+    /// parse-time title — `None` — must override the discovery title on both paths).
+    #[test]
+    fn codex_windowed_render_is_byte_identical_via_seek_and_full_stream() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let home = temp_home("codex");
+        std::env::set_var("CLAURDVOYANT_HOME", &home);
+
+        let path = home.join("rollout-r.jsonl");
+        let big = "giant output\n".repeat(500);
+        let mut f = std::fs::File::create(&path).unwrap();
+        for l in [
+            r#"{"timestamp":"2026-01-01T00:00:00Z","type":"session_meta","payload":{"id":"rollout-r","cwd":"/work"}}"#.to_string(),
+            r#"{"timestamp":"2026-01-01T00:00:01Z","type":"turn_context","payload":{"cwd":"/work","model":"gpt-test"}}"#.to_string(),
+            r#"{"timestamp":"2026-01-01T00:00:02Z","type":"event_msg","payload":{"type":"user_message","message":"hello there"}}"#.to_string(),
+            r#"{"timestamp":"2026-01-01T00:00:03Z","type":"event_msg","payload":{"type":"agent_message","message":"working"}}"#.to_string(),
+            r#"{"timestamp":"2026-01-01T00:00:04Z","type":"response_item","payload":{"type":"function_call","name":"shell","arguments":"{}","call_id":"c1"}}"#.to_string(),
+            serde_json::json!({"timestamp":"2026-01-01T00:00:05Z","type":"response_item",
+                "payload":{"type":"function_call_output","call_id":"c1","output":big}}).to_string(),
+            r#"{"timestamp":"2026-01-01T00:00:06Z","type":"event_msg","payload":{"type":"agent_message","message":"all done"}}"#.to_string(),
+        ] {
+            writeln!(f, "{l}").unwrap();
+        }
+        drop(f);
+        let r = SessionRef {
+            id: "rollout-r".into(),
+            harness: Harness::Codex,
+            path: path.clone(),
+            cwd: Some("/work".into()),
+            title: Some("discovery title".into()),
+            created_at: None,
+            updated_at: None,
+            message_count: 3,
+        };
+        record_offsets(&r);
+        assert!(seekable(&r, 2));
+
+        for range in [(2usize, Some(4usize)), (1, None), (3, Some(5))] {
+            let seeked = render(&r, Some((range.0, range.1)));
+            std::env::set_var("CLAURDVOYANT_HOME", temp_home("codex-empty"));
+            let full = render(&r, Some((range.0, range.1)));
+            std::env::set_var("CLAURDVOYANT_HOME", &home);
+            assert_eq!(seeked, full, "range {range:?} render must be byte-identical");
+            assert!(seeked.contains("gpt-test"), "header model expected in {range:?}");
+        }
+
+        std::env::remove_var("CLAURDVOYANT_HOME");
+        std::fs::remove_dir_all(&home).ok();
+    }
 }

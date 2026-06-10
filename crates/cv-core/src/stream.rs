@@ -49,13 +49,22 @@ pub struct ParseOptions {
     /// reads *all* content materializes it anyway and just adds mmap overhead. Adapters that can't
     /// span ignore it and produce inline content regardless.
     pub spans: bool,
+    /// Stamp each message's source **byte offset** into
+    /// `Message.extra[`[`offsets::OFFSET_KEY`](crate::offsets::OFFSET_KEY)`]` (the offset of the
+    /// record line that produced it). Only the offset-recording ingest pass
+    /// ([`offsets::OffsetSink`](crate::offsets::OffsetSink) riding `cv index`) turns this on —
+    /// ordinary lazy/bulk/full consumers never see the stamp, so their output is unchanged.
+    /// Adapters that don't track byte positions (everything but claude/codex JSONL) ignore it.
+    /// Implies nothing by itself: the adapters only stamp on their span-tracking paths, so use
+    /// [`lazy_offsets()`](ParseOptions::lazy_offsets) (spans + offsets) rather than setting it solo.
+    pub offsets: bool,
 }
 
 impl ParseOptions {
     /// Full fidelity: every harness-specific field materialized, inline content. Used by [`collect`]
     /// / `parse` and by conversion/round-trip paths that must lose nothing.
     pub fn full() -> Self {
-        ParseOptions { extra: true, spans: false }
+        ParseOptions { extra: true, ..Default::default() }
     }
 
     /// The lean bulk-text pass: faithful message text, no fat `extra` sidecars, inline content
@@ -67,7 +76,14 @@ impl ParseOptions {
     /// Partial-access pass: lazy content [`Span`](crate::lazy::Span)s so unread giant fields are
     /// never materialized. For windowed reads / pagination (Phase 2).
     pub fn lazy() -> Self {
-        ParseOptions { extra: false, spans: true }
+        ParseOptions { spans: true, ..Default::default() }
+    }
+
+    /// [`lazy()`](ParseOptions::lazy) plus per-message byte-offset stamping — the **recording**
+    /// pass `cv index` makes so [`offsets`](crate::offsets) can persist seek points. Everything
+    /// else should use plain `lazy()`.
+    pub fn lazy_offsets() -> Self {
+        ParseOptions { spans: true, offsets: true, ..Default::default() }
     }
 }
 

@@ -160,13 +160,31 @@ pub fn stream_reader<R: BufRead>(
     opts: &ParseOptions,
     sink: &mut dyn MessageSink,
 ) -> Session {
+    stream_reader_from(id, reader, source_path, 0, opts, sink)
+}
+
+/// [`stream_reader`] generalized to a reader positioned at byte `start_off` (a **record start**)
+/// of the source — the seek-cooperation entry [`crate::offsets::stream_range`] drives after
+/// seeking to a recorded message offset. Every claude record parses independently of the skipped
+/// prefix (per-line state only feeds *session* metadata, never message content), so the messages
+/// streamed from here are identical to the tail of a full stream. With `start_off > 0` the
+/// returned `Session` metadata is partial (head records were skipped) — seek callers use the
+/// recorded metadata instead.
+pub(crate) fn stream_reader_from<R: BufRead>(
+    id: &str,
+    reader: R,
+    source_path: Option<PathBuf>,
+    start_off: u64,
+    opts: &ParseOptions,
+    sink: &mut dyn MessageSink,
+) -> Session {
     let mut session = new_session(id, source_path);
     // Read raw bytes (not `lines()`) so we know each record's byte offset in the file — that's what
     // lets large content fields become lazy [`Span`]s pointing back into the source instead of owned
     // strings. `read_until` keeps peak at O(largest line) just like `lines()` did.
     let mut reader = reader;
     let mut buf: Vec<u8> = Vec::new();
-    let mut file_off: u64 = 0;
+    let mut file_off: u64 = start_off;
     loop {
         buf.clear();
         let n = match reader.read_until(b'\n', &mut buf) {
@@ -286,7 +304,16 @@ fn ingest_value(
         session.updated_at = Some(ts);
     }
 
-    if let Some(msg) = parse_message(ty, v, opts, span) {
+    if let Some(mut msg) = parse_message(ty, v, opts, span) {
+        // Offset-recording pass: stamp the record's byte offset so `cv index` can persist a seek
+        // point for this message (see [`crate::offsets`]). Requires the on-disk span path (`span`
+        // carries the offset); ordinary lazy/bulk/full streams never set `opts.offsets`.
+        if opts.offsets {
+            if let Some(ctx) = span {
+                msg.extra
+                    .insert(crate::offsets::OFFSET_KEY.into(), ctx.base_off.into());
+            }
+        }
         if session.model.is_none() {
             session.model = msg.model.clone();
         }
@@ -1017,6 +1044,96 @@ mod tests {
         sink: &mut dyn MessageSink,
     ) -> Session {
         stream_reader(id, reader, source_path, &ParseOptions::lazy(), sink)
+    }
+
+    /// The seek cooperation (REARCH Phase 2): under `lazy_offsets()` every message is stamped
+    /// with its record's byte offset, and `stream_reader_from` replayed at any stamped offset
+    /// reproduces exactly the suffix of the full stream — message-for-message, span-for-span.
+    #[test]
+    fn offset_stamps_replay_byte_identically_from_any_message() {
+        use std::io::{Seek, SeekFrom, Write};
+        let big = "wide \"payload\"\n".repeat(600); // > INLINE_MAX, with escapes → a Span
+        let lines = [
+            serde_json::json!({"type":"ai-title","aiTitle":"seek test"}),
+            serde_json::json!({"type":"user","uuid":"u0","cwd":"/w","gitBranch":"main",
+                "message":{"role":"user","content":"first question"}}),
+            serde_json::json!({"type":"assistant","uuid":"a1","timestamp":"2026-06-01T00:00:01Z",
+                "message":{"role":"assistant","model":"claude-test-1","content":[
+                    {"type":"text","text":"answer one"},
+                    {"type":"tool_use","id":"t1","name":"Bash","input":{"command":"ls"}}]}}),
+            serde_json::json!({"type":"user","uuid":"u2","message":{"role":"user","content":[
+                {"type":"tool_result","tool_use_id":"t1","content":big,"is_error":false}]}}),
+            serde_json::json!({"type":"system","subtype":"away_summary","uuid":"s3",
+                "content":"came back"}),
+            serde_json::json!({"type":"user","uuid":"u4","message":{"role":"user","content":"second question"}}),
+            serde_json::json!({"type":"assistant","uuid":"a5","message":{"role":"assistant",
+                "model":"claude-test-1","content":[{"type":"text","text":"answer two"}]}}),
+        ];
+        let dir = std::env::temp_dir().join(format!("cv-claude-seek-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("s.jsonl");
+        let mut f = std::fs::File::create(&path).unwrap();
+        for l in &lines {
+            writeln!(f, "{l}").unwrap();
+        }
+        drop(f);
+
+        let opts = ParseOptions::lazy_offsets();
+        let mut full = CollectSink::default();
+        stream_reader(
+            "s",
+            BufReader::new(fs::File::open(&path).unwrap()),
+            Some(path.clone()),
+            &opts,
+            &mut full,
+        );
+        let full = full.messages;
+        assert_eq!(full.len(), 6); // user, assistant, tool, system, user, assistant
+        let offs: Vec<u64> = full
+            .iter()
+            .map(|m| {
+                m.extra
+                    .get(crate::offsets::OFFSET_KEY)
+                    .and_then(Value::as_u64)
+                    .expect("every message stamped under lazy_offsets")
+            })
+            .collect();
+        assert!(offs.windows(2).all(|w| w[0] < w[1]), "offsets follow file order");
+
+        for k in 1..full.len() {
+            let mut file = fs::File::open(&path).unwrap();
+            file.seek(SeekFrom::Start(offs[k])).unwrap();
+            let mut replay = CollectSink::default();
+            stream_reader_from(
+                "s",
+                BufReader::new(file),
+                Some(path.clone()),
+                offs[k],
+                &opts,
+                &mut replay,
+            );
+            assert_eq!(
+                serde_json::to_value(&full[k..]).unwrap(),
+                serde_json::to_value(&replay.messages).unwrap(),
+                "replay from message {k}'s offset must equal the full-stream suffix"
+            );
+        }
+
+        // And bulk/full options never stamp (their output stays byte-identical to before).
+        let mut bulk = CollectSink::default();
+        stream_reader(
+            "s",
+            BufReader::new(fs::File::open(&path).unwrap()),
+            Some(path.clone()),
+            &ParseOptions::bulk(),
+            &mut bulk,
+        );
+        assert!(bulk
+            .messages
+            .iter()
+            .all(|m| !m.extra.contains_key(crate::offsets::OFFSET_KEY)));
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
