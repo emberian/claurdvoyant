@@ -18,6 +18,24 @@ use anyhow::Result;
 
 /// Knobs controlling how much of each message an adapter materializes. Everything off (the
 /// [`Default`]) is the cheapest faithful pass; full-fidelity callers opt back in.
+///
+/// # Which constructor? (the decision rule)
+///
+/// - [`full()`](ParseOptions::full) — you will **re-emit or round-trip** the session (convert,
+///   port, `--json`, splice/loom, redact-to-file). Everything materialized, inline. Most
+///   expensive; wrong for anything that only *reads*.
+/// - [`bulk()`](ParseOptions::bulk) — you read **all** the text once, forward-only, and never
+///   touch `extra` (live search over small/whole-doc harnesses, dataset-style flattening of
+///   sessions you'll fully consume). Inline content, no sidecars.
+/// - [`lazy()`](ParseOptions::lazy) — you read **at most a bounded amount** of any one field, or
+///   skip content entirely: windowed/`--range` reads, metadata/event extraction, snippet scans,
+///   head-only embedding, chunk-wise indexing. Large fields arrive as [`Span`](crate::lazy::Span)s
+///   you resolve (possibly capped via [`Resolver::resolve_prefix`](crate::lazy::Resolver::
+///   resolve_prefix) or chunked via `for_each_chunk`) — a 700 MB record costs 16 bytes until you
+///   choose otherwise. Adapters without a span path just hand you inline content, so `lazy()` is
+///   never *less* correct than `bulk()`, only cheaper when spans exist.
+///
+/// Rule of thumb: emit ⇒ `full`, read-everything ⇒ `bulk`, read-some/bounded ⇒ `lazy`.
 #[derive(Debug, Clone, Default)]
 pub struct ParseOptions {
     /// Populate the harness-specific `extra` maps — most importantly Claude's `toolUseResult`

@@ -87,6 +87,27 @@ fn render_blocks_into(
     resolver: &crate::lazy::Resolver,
     emit: &mut dyn FnMut(&str),
 ) {
+    render_blocks_impl(blocks, resolver, None, emit)
+}
+
+/// Per-block redaction context for [`render_blocks_impl`]: the options plus the running stats.
+type RedactCtx<'a> = (&'a crate::redact::RedactOptions, &'a mut crate::redact::RedactStats);
+
+/// The shared block renderer behind [`render_blocks_into`] (plain) and the redacting path of
+/// [`write_record`].
+///
+/// Without `redact`, span content is chunk-resolved straight to `emit` (a giant field is never held
+/// whole). With `redact`, each text field is scrubbed **per block** — resolve (a span must be
+/// scanned whole to redact it), scrub, emit, drop — so the peak is one field, and nothing is cloned
+/// when a field is clean ([`scrub_cow`](crate::redact::scrub_cow) borrows). This replaced a
+/// clone-the-whole-`Message`-then-redact path; only tool inputs still clone (small JSON, mutated by
+/// structural scrubbing).
+fn render_blocks_impl(
+    blocks: &[Block],
+    resolver: &crate::lazy::Resolver,
+    mut redact: Option<RedactCtx<'_>>,
+    emit: &mut dyn FnMut(&str),
+) {
     let mut started = false;
     let sep = |started: &mut bool, emit: &mut dyn FnMut(&str)| {
         if *started {
@@ -97,7 +118,14 @@ fn render_blocks_into(
     for b in blocks {
         match b {
             Block::Text { text } => {
-                if let Some(s) = text.inline_str() {
+                if let Some((opts, stats)) = redact.as_mut() {
+                    let s = text.resolve(resolver);
+                    if s.trim().is_empty() {
+                        continue;
+                    }
+                    sep(&mut started, emit);
+                    emit(&crate::redact::scrub_cow(&s, opts, stats));
+                } else if let Some(s) = text.inline_str() {
                     if s.trim().is_empty() {
                         continue;
                     }
@@ -112,7 +140,16 @@ fn render_blocks_into(
                 if *redacted {
                     continue;
                 }
-                if let Some(s) = text.inline_str() {
+                if let Some((opts, stats)) = redact.as_mut() {
+                    let s = text.resolve(resolver);
+                    if s.trim().is_empty() {
+                        continue;
+                    }
+                    sep(&mut started, emit);
+                    emit("<thinking>\n");
+                    emit(&crate::redact::scrub_cow(&s, opts, stats));
+                    emit("\n</thinking>");
+                } else if let Some(s) = text.inline_str() {
                     if s.trim().is_empty() {
                         continue;
                     }
@@ -132,7 +169,16 @@ fn render_blocks_into(
                 emit("```tool_call\n");
                 emit(name);
                 emit(" ");
-                emit(&serde_json::to_string(input).unwrap_or_default());
+                let json = if let Some((opts, stats)) = redact.as_mut() {
+                    // Structural scrub (string values only, keys/shape intact) needs a mutable
+                    // value; tool inputs are small, so this clone is cheap.
+                    let mut input = input.clone();
+                    crate::redact::scrub_value(&mut input, opts, stats);
+                    serde_json::to_string(&input).unwrap_or_default()
+                } else {
+                    serde_json::to_string(input).unwrap_or_default()
+                };
+                emit(&json);
                 emit("\n```");
             }
             Block::ToolResult { content, is_error, .. } => {
@@ -142,7 +188,10 @@ fn render_blocks_into(
                 } else {
                     "```tool_result\n"
                 });
-                if let Some(s) = content.inline_str() {
+                if let Some((opts, stats)) = redact.as_mut() {
+                    let s = content.resolve(resolver);
+                    emit(&crate::redact::scrub_cow(&s, opts, stats));
+                } else if let Some(s) = content.inline_str() {
                     emit(s);
                 } else if let Some(sp) = content.as_span() {
                     resolver.for_each_chunk(sp, SPAN_CHUNK, |c| emit(c));
@@ -249,12 +298,10 @@ pub fn write_record<W: std::io::Write>(
                 }
             };
             if let Some(opts) = redact {
-                // Scrub one materialized message at a time (peak = one message), then render inline.
-                let mut mm = m.clone();
-                mm.materialize(&resolver);
+                // Scrub per block — resolve, scrub, emit, drop — so the peak is one field and a
+                // clean message is never cloned (the old path cloned + materialized each message).
                 let mut stats = crate::redact::RedactStats::default();
-                crate::redact::redact_message(&mut mm, opts, &mut stats);
-                render_blocks_into(&mm.content, &resolver, &mut emit);
+                render_blocks_impl(&m.content, &resolver, Some((opts, &mut stats)), &mut emit);
             } else {
                 render_blocks_into(&m.content, &resolver, &mut emit);
             }
@@ -349,6 +396,59 @@ mod tests {
     fn empty_session_is_none() {
         assert!(to_chatml(&session(vec![])).is_none());
         assert!(to_chatml(&session(vec![msg(Role::User, vec![Block::Text { text: "  ".into() }])])).is_none());
+    }
+
+    /// The per-block redacting renderer must produce exactly what "redact the whole session first,
+    /// then render plain" produces — the old clone-and-materialize path it replaced.
+    #[test]
+    fn redacted_record_equals_redact_then_render() {
+        let s = session(vec![
+            msg(Role::User, vec![Block::Text { text: "my key is sk-abcDEF1234567890ghijkl ok".into() }]),
+            msg(
+                Role::Assistant,
+                vec![
+                    Block::Thinking {
+                        text: "they pasted sk-zzzzzzzzzzzzzzzzzzzz hmm".into(),
+                        signature: None,
+                        encrypted: None,
+                        redacted: false,
+                    },
+                    Block::ToolUse {
+                        id: "1".into(),
+                        name: "Bash".into(),
+                        input: json!({"command": "export TOKEN=plain", "auth": "Bearer abcdef1234567890XYZ"}),
+                    },
+                ],
+            ),
+            msg(
+                Role::Tool,
+                vec![Block::ToolResult {
+                    tool_use_id: "1".into(),
+                    content: "leaked ghp_0123456789abcdefABCDEF0123456789abcd done".into(),
+                    is_error: false,
+                    tool_name: None,
+                    status: None,
+                    details: None,
+                }],
+            ),
+            // A clean message: must render identically (and untouched) under redaction.
+            msg(Role::User, vec![Block::Text { text: "thanks, looks good".into() }]),
+        ]);
+        let opts = crate::redact::RedactOptions::default();
+
+        let (scrubbed_session, _) = crate::redact::redact_with(&s, &opts);
+        let mut expect = Vec::new();
+        write_record(&scrubbed_session, &mut expect, Format::Chatml, None).unwrap();
+
+        let mut got = Vec::new();
+        write_record(&s, &mut got, Format::Chatml, Some(&opts)).unwrap();
+
+        let got = String::from_utf8(got).unwrap();
+        assert_eq!(got, String::from_utf8(expect).unwrap());
+        assert!(got.contains("[REDACTED:api_key]"));
+        assert!(!got.contains("sk-abcDEF1234567890ghijkl"));
+        assert!(!got.contains("ghp_0123456789abcdef"));
+        assert!(got.contains("thanks, looks good"));
     }
 
     #[test]

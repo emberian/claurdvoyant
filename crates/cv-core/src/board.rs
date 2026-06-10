@@ -583,6 +583,12 @@ pub fn active_claims_in_dir(
     dir: &Path,
     channel: &str,
 ) -> Result<Vec<(String, String, DateTime<Utc>)>> {
+    // A board dir that was never created means nobody ever claimed anything — empty, not an
+    // error. (Without this, acquiring the lock `create_new`s a file inside the missing dir and
+    // fails with NotFound — the one reader that errored on a fresh $CLAURDVOYANT_HOME.)
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
     let _lock = ChannelLock::acquire(lock_path(dir, channel))?;
     let now = Utc::now();
     let mut out: Vec<_> = load_claims(dir, channel)

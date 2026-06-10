@@ -29,6 +29,7 @@
 
 use crate::ir::{Block, Message, Session};
 use serde_json::Value;
+use std::borrow::Cow;
 
 /// Knobs for [`redact_with`]. Defaults scrub everything.
 #[derive(Debug, Clone, Default)]
@@ -92,7 +93,11 @@ pub fn redact_message(msg: &mut Message, opts: &RedactOptions, stats: &mut Redac
     for block in &mut msg.content {
         match block {
             Block::Text { text } | Block::Thinking { text, .. } => {
-                *text = scrub(text, opts, stats).into();
+                // `scrub_cow` borrows when clean, so untouched text (the common case) is not
+                // reallocated — only actually-redacted fields are rewritten.
+                if let Cow::Owned(scrubbed) = scrub_cow(text, opts, stats) {
+                    *text = scrubbed.into();
+                }
             }
             Block::ToolUse { input, .. } => {
                 scrub_value(input, opts, stats);
@@ -100,7 +105,9 @@ pub fn redact_message(msg: &mut Message, opts: &RedactOptions, stats: &mut Redac
             Block::ToolResult {
                 content, details, ..
             } => {
-                *content = scrub(content, opts, stats).into();
+                if let Cow::Owned(scrubbed) = scrub_cow(content, opts, stats) {
+                    *content = scrubbed.into();
+                }
                 if let Some(d) = details {
                     scrub_value(d, opts, stats);
                 }
@@ -110,11 +117,15 @@ pub fn redact_message(msg: &mut Message, opts: &RedactOptions, stats: &mut Redac
     }
 }
 
-/// Recursively scrub string values inside a JSON value, leaving keys and structure intact.
-fn scrub_value(v: &mut Value, opts: &RedactOptions, stats: &mut RedactStats) {
+/// Recursively scrub string values inside a JSON value, leaving keys and structure intact. Public
+/// so per-block redacting renderers (dataset export) can scrub a tool input without going through
+/// [`redact_message`] on a cloned message.
+pub fn scrub_value(v: &mut Value, opts: &RedactOptions, stats: &mut RedactStats) {
     match v {
         Value::String(s) => {
-            *s = scrub(s, opts, stats);
+            if let Cow::Owned(scrubbed) = scrub_cow(s, opts, stats) {
+                *s = scrubbed;
+            }
         }
         Value::Array(arr) => {
             for item in arr {
@@ -143,37 +154,51 @@ fn placeholder(kind: &str) -> String {
 
 /// Walk `s` once, replacing every recognized secret span with a placeholder.
 fn scrub(s: &str, opts: &RedactOptions, stats: &mut RedactStats) -> String {
+    scrub_cow(s, opts, stats).into_owned()
+}
+
+/// [`scrub`], allocation-aware: returns `Cow::Borrowed(s)` when nothing matched (the overwhelmingly
+/// common case for ordinary transcript text), and copies clean stretches between matches in bulk
+/// rather than char-by-char. Same output as `scrub` byte-for-byte.
+pub fn scrub_cow<'a>(s: &'a str, opts: &RedactOptions, stats: &mut RedactStats) -> Cow<'a, str> {
     let bytes = s.as_bytes();
-    let mut out = String::with_capacity(s.len());
+    // The redacted output, allocated lazily on the first match; `copied` is how much of `s` has
+    // already been flushed into it.
+    let mut out: Option<String> = None;
+    let mut copied = 0usize;
     let mut i = 0usize;
 
     while i < bytes.len() {
-        // Skip over (and copy) any existing placeholder verbatim so we stay idempotent and don't
-        // recurse into already-redacted spans.
+        // Skip any existing placeholder verbatim so we stay idempotent and don't recurse into
+        // already-redacted spans (it's copied with the surrounding clean stretch).
         if let Some(end) = match_placeholder(s, i) {
-            out.push_str(&s[i..end]);
             i = end;
             continue;
         }
 
         if let Some(m) = match_at(s, i, opts) {
-            // Copy any prefix the matcher wants to preserve verbatim (e.g. `Authorization: `),
-            // then emit the placeholder for the sensitive span.
-            out.push_str(&s[i..i + m.keep_prefix]);
+            let out = out.get_or_insert_with(|| String::with_capacity(s.len()));
+            // Flush the clean stretch plus any prefix the matcher preserves verbatim (e.g.
+            // `Authorization: `), then emit the placeholder for the sensitive span.
+            out.push_str(&s[copied..i + m.keep_prefix]);
             out.push_str(&placeholder(m.kind.label()));
             m.kind.bump(stats);
             i = m.end;
+            copied = i;
             continue;
         }
 
-        // No match: copy one UTF-8 char and advance.
-        let ch_len = utf8_len(bytes[i]);
-        let next = (i + ch_len).min(bytes.len());
-        out.push_str(&s[i..next]);
-        i = next;
+        // No match: advance one UTF-8 char (copied later, in bulk).
+        i += utf8_len(bytes[i]).min(bytes.len() - i);
     }
 
-    out
+    match out {
+        None => Cow::Borrowed(s),
+        Some(mut out) => {
+            out.push_str(&s[copied..]);
+            Cow::Owned(out)
+        }
+    }
 }
 
 /// Length in bytes of a UTF-8 sequence starting with `b`.
@@ -984,6 +1009,25 @@ mod tests {
         let (_out, stats) = redact_with(&sess, &RedactOptions::default());
         assert_eq!(stats.api_keys, 1);
         assert_eq!(stats.emails, 1);
+        assert_eq!(stats.total(), 2);
+    }
+
+    /// `scrub_cow` is the zero-copy core: clean text comes back `Borrowed` (no allocation),
+    /// and dirty text produces exactly what `scrub`/`redact_text` produce.
+    #[test]
+    fn scrub_cow_borrows_clean_and_matches_scrub_when_dirty() {
+        let mut stats = RedactStats::default();
+        let clean = "ordinary prose, a commit abc123, and [REDACTED:api_key] already placed";
+        match scrub_cow(clean, &RedactOptions::default(), &mut stats) {
+            Cow::Borrowed(s) => assert_eq!(s, clean),
+            Cow::Owned(s) => panic!("clean text must not allocate, got owned {s:?}"),
+        }
+        assert_eq!(stats.total(), 0);
+
+        let dirty = "prefix sk-abcDEF1234567890ghijkl middle a@b.com suffix";
+        let cow = scrub_cow(dirty, &RedactOptions::default(), &mut stats);
+        assert!(matches!(cow, Cow::Owned(_)));
+        assert_eq!(cow.as_ref(), redact_text(dirty));
         assert_eq!(stats.total(), 2);
     }
 

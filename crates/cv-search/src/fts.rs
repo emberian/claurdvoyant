@@ -150,6 +150,10 @@ pub fn index_all(dir: &Path, rebuild: bool) -> Result<usize> {
     let mut changed = 0usize;
     let mut total = 0usize;
 
+    // One query for the whole event skip-table — the per-session `needs_ingest` opens (and runs
+    // DDL on) a fresh sqlite connection per call, which a ~2,400-session sweep pays ~2,400 times.
+    let event_sync = cv_core::events::SyncTable::load();
+
     for r in cv_core::discover_all() {
         total += 1;
         seen.insert(r.id.clone());
@@ -157,7 +161,7 @@ pub fn index_all(dir: &Path, rebuild: bool) -> Result<usize> {
         let fts_fresh = existing
             .get(&r.id)
             .is_some_and(|&mt| mt == mtime && mtime != 0);
-        let events_stale = cv_core::events::needs_ingest(&r, mtime);
+        let events_stale = event_sync.needs_ingest(&r, mtime);
         // Unchanged on both axes → skip entirely (no re-parse beyond the metadata scan).
         if fts_fresh && !events_stale {
             continue;
@@ -451,11 +455,15 @@ impl cv_core::MessageSink for ChunkSink<'_> {
         }
         // Move the resolver out so the chunk callbacks (which mutate `self`) don't conflict with it.
         let r = std::mem::replace(&mut self.resolver, cv_core::Resolver::new(None));
-        // First user text → the title fallback (resolve if it's a span; it's usually small/early).
+        // First user text → the title fallback. Only its first 72 chars are ever read
+        // (`label_from` truncates), so a span resolves just a 512-byte head, never the whole field.
         if self.first_user.is_none() && m.role == cv_core::Role::User {
             for b in &m.content {
                 if let Block::Text { text } = b {
-                    let s = text.resolve(&r);
+                    let s = match text.as_span() {
+                        Some(sp) => r.resolve_prefix(sp, 512),
+                        None => text.resolve(&r),
+                    };
                     let t = s.trim();
                     if !t.is_empty() {
                         self.first_user = Some(t.to_string());
@@ -641,8 +649,14 @@ const SNIPPET_SCAN_CAP: usize = 256 * 1024;
 
 /// Generate a snippet for a hit by re-reading **just that one session** (streamed, capped), finding
 /// the first query term, and windowing around it — instead of keeping a stored copy of every body.
+///
+/// Streams under [`ParseOptions::lazy`] and resolves span content **capped at the remaining scan
+/// budget**, so a session fronted by a giant record (e.g. a 700 MB tool dump) costs at most
+/// [`SNIPPET_SCAN_CAP`] here — the old `bulk()` + materialize path owned the whole record before
+/// the cap check could run. Trade-off: a term that only occurs *beyond* the cap inside one giant
+/// field now falls back to the head/preview snippet (it already did for terms in later messages).
 fn live_snippet(path: &str, harness: &str, query: &str) -> Option<String> {
-    use cv_core::{Flow, Message, MessageSink, ParseOptions, SessionRef};
+    use cv_core::{Block, Flow, Message, MessageSink, ParseOptions, SessionRef};
     let h = cv_core::Harness::parse(harness)?;
     let adapter = cv_core::harness::for_harness(h)?;
     let sref = SessionRef {
@@ -660,10 +674,50 @@ fn live_snippet(path: &str, harness: &str, query: &str) -> Option<String> {
         buf: String,
         resolver: cv_core::Resolver,
     }
+    impl Acc {
+        /// Append one content text: inline as-is; a span resolved to at most the remaining budget
+        /// (never materialized whole — `resolve_prefix` also keeps a truncated escaped span clean).
+        fn push_text(&mut self, text: &cv_core::Text) {
+            if let Some(sp) = text.as_span() {
+                let remaining = SNIPPET_SCAN_CAP.saturating_sub(self.buf.len()) as u64;
+                if remaining == 0 {
+                    return;
+                }
+                self.buf.push_str(&self.resolver.resolve_prefix(sp, remaining));
+            } else if let Some(s) = text.inline_str() {
+                self.buf.push_str(s);
+            }
+        }
+    }
     impl MessageSink for Acc {
-        fn message(&mut self, mut m: Message) -> Flow {
-            m.materialize(&self.resolver);
-            cv_core::stream::append_searchable(&mut self.buf, &m);
+        fn message(&mut self, m: Message) -> Flow {
+            // Same projection as `cv_core::stream::append_searchable`, but span-aware.
+            use std::fmt::Write as _;
+            for b in &m.content {
+                match b {
+                    Block::Text { text } | Block::Thinking { text, .. } => {
+                        self.push_text(text);
+                        self.buf.push('\n');
+                    }
+                    Block::ToolUse { name, input, .. } => {
+                        self.buf.push_str(name);
+                        self.buf.push(' ');
+                        let _ = write!(self.buf, "{input}");
+                        self.buf.push('\n');
+                    }
+                    Block::ToolResult { content, .. } => {
+                        self.push_text(content);
+                        self.buf.push('\n');
+                    }
+                    Block::File { path, source, .. } => {
+                        if let Some(p) = path.as_deref().or(source.as_deref()) {
+                            self.buf.push_str(p);
+                            self.buf.push('\n');
+                        }
+                    }
+                    Block::Image { .. } => {}
+                }
+            }
             if self.buf.len() >= SNIPPET_SCAN_CAP {
                 Flow::Stop
             } else {
@@ -675,7 +729,7 @@ fn live_snippet(path: &str, harness: &str, query: &str) -> Option<String> {
         buf: String::new(),
         resolver: cv_core::Resolver::new(Some(PathBuf::from(path))),
     };
-    adapter.stream(&sref, &ParseOptions::bulk(), &mut acc).ok()?;
+    adapter.stream(&sref, &ParseOptions::lazy(), &mut acc).ok()?;
     Some(make_snippet(&acc.buf, query))
 }
 
@@ -932,6 +986,30 @@ mod tests {
         assert_eq!(hits[0].title.as_deref(), Some("alpha question about tantivy"));
 
         std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&sdir).ok();
+    }
+
+    /// `live_snippet` must stay O(cap) on a session fronted by one giant field: a term within the
+    /// scan cap windows normally, a term hiding *beyond* the cap inside the same giant field falls
+    /// back to the head instead of materializing the whole record to find it.
+    #[test]
+    fn live_snippet_caps_giant_fields() {
+        let sdir = tmpdir();
+        let mut body = String::from("zqearly marker then padding ");
+        body.push_str(&"pad ".repeat(2 * SNIPPET_SCAN_CAP / 4)); // 2× the cap of filler
+        body.push_str(" zqlate");
+        assert!(body.len() > SNIPPET_SCAN_CAP);
+        let p = write_claude(&sdir, "giant", &body);
+
+        let snip = live_snippet(&p, "claude", "zqearly").expect("snippet");
+        assert!(snip.contains("zqearly"), "in-cap term should window: {snip:?}");
+
+        let snip = live_snippet(&p, "claude", "zqlate").expect("snippet");
+        assert!(
+            !snip.contains("zqlate") && snip.starts_with("zqearly"),
+            "beyond-cap term must fall back to the head, got: {snip:?}"
+        );
+
         std::fs::remove_dir_all(&sdir).ok();
     }
 

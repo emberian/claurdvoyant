@@ -15,7 +15,7 @@
 //!    `cargo build -p cv-search --no-default-features`.
 //!
 //! Both indexes live under `$CLAURDVOYANT_HOME` (or `~/.claurdvoyant`): the tantivy index in
-//! `…/tantivy/` and the embedding store in `…/embeddings.json`.
+//! `…/tantivy/` and the embedding store in `…/embeddings.bin`.
 
 use anyhow::Result;
 use std::path::PathBuf;
@@ -58,9 +58,10 @@ pub fn default_tantivy_dir() -> PathBuf {
     home_dir().join("tantivy")
 }
 
-/// Default location of the semantic embedding store.
+/// Default location of the semantic embedding store (binary; see `semantic` module docs).
+/// A legacy `embeddings.json` next to it is migrated on first query.
 pub fn default_embeddings_path() -> PathBuf {
-    home_dir().join("embeddings.json")
+    home_dir().join("embeddings.bin")
 }
 
 // ---- Convenience wrappers over the default-located indexes ---------------------------------
@@ -101,40 +102,114 @@ pub fn semantic_search(
     semantic::semantic_search(&path, query, k)
 }
 
-/// Stream the `(id, harness, cwd, title, body)` corpus by discovering + parsing every session,
-/// invoking `f` once per session and **dropping the parsed `Session` + `Doc` immediately after**.
+/// Stream the `(id, harness, cwd, title, body-head)` corpus by discovering + streaming every
+/// session, invoking `f` once per session and **dropping the `Doc` immediately after**.
 ///
-/// Peak memory is O(one session), NOT O(corpus). The previous `build_corpus() -> Vec<Doc>` held
-/// every session's searchable body in a single `Vec` (~35 GB on a real machine) and the semantic
-/// path then `.clone()`d them all again — which ballooned `cv` to ~65 GB RSS and got it OOM-killed
-/// (taking down the terminal-sibling process). Both indexers now consume this streaming driver, so
-/// they still see exactly the same searchable text but never hold the whole corpus at once.
-/// Shared by both indexers so they see exactly the same searchable text.
+/// Peak memory is O(head), NOT O(session) or O(corpus). History: `build_corpus() -> Vec<Doc>`
+/// held every session's full searchable body (~35 GB) and the semantic path `.clone()`d them all
+/// again — ~65 GB RSS, OOM-killed. The streaming driver fixed the corpus dimension; the head cap
+/// (`EMBED_HEAD_BYTES` below) fixed the per-session one, since the only consumer left is the
+/// embedder and model2vec reads ≤512 tokens anyway. (The FTS indexer doesn't use this — it
+/// streams chunk-wise into `fts::ChunkSink`.)
 #[cfg(feature = "semantic")]
 pub(crate) fn stream_corpus(mut f: impl FnMut(Doc) -> Result<()>) -> Result<usize> {
-    use cv_core::{Flow, Message, MessageSink, ParseOptions, Role};
+    use cv_core::{Block, Flow, Message, MessageSink, ParseOptions, Role};
 
-    /// Builds a [`Doc`] body as messages stream past, dropping each message immediately. Peak memory
-    /// is O(largest message) + O(body) rather than O(whole `Session`), and the fat `extra` sidecars
-    /// are never materialized (we pass `ParseOptions::bulk()`).
+    /// How much body to keep per session. The only consumer is the embedder, and model2vec
+    /// truncates each input to **512 tokens** (≈2–3 KB of text) — 64 KiB is a 20×+ safety margin,
+    /// so the resulting vectors are unchanged while a multi-GB session contributes kilobytes
+    /// instead of its whole transcript. Also bounds the `EMBED_BATCH` residency (128 heads ≈ 8 MB,
+    /// where 128 full bodies used to be gigabytes).
+    const EMBED_HEAD_BYTES: usize = 64 * 1024;
+
+    /// Raw bytes of a lazy span resolved while hunting the first user text — the label only ever
+    /// reads its first 72 chars ([`cv_core::label_from`]), so 512 bytes is plenty.
+    const FIRST_USER_HEAD: u64 = 512;
+
+    /// Builds a [`Doc`] body **head** as messages stream past, dropping each message immediately.
+    /// Streams under [`ParseOptions::lazy`]: large content arrives as spans and is resolved only
+    /// up to the remaining head budget, so a giant field is never materialized. Stops the parse
+    /// as soon as the head is full and a first-user label candidate has been seen.
     struct DocSink {
         body: String,
         first_user_text: Option<String>,
         resolver: cv_core::Resolver,
     }
     impl MessageSink for DocSink {
-        fn message(&mut self, mut m: Message) -> Flow {
-            // Resolve lazy content spans for this one message (peak = one message), then append.
-            m.materialize(&self.resolver);
+        fn message(&mut self, m: Message) -> Flow {
             if self.first_user_text.is_none() && m.role == Role::User {
-                if let Some(t) = m.text() {
-                    if !t.trim().is_empty() {
-                        self.first_user_text = Some(t);
+                // Same projection as `Message::text()` (text blocks joined by '\n'), span-aware.
+                let mut s = String::new();
+                for b in &m.content {
+                    if let Block::Text { text } = b {
+                        if !s.is_empty() {
+                            s.push('\n');
+                        }
+                        match text.as_span() {
+                            Some(sp) => s.push_str(&self.resolver.resolve_prefix(sp, FIRST_USER_HEAD)),
+                            None => {
+                                if let Some(t) = text.inline_str() {
+                                    s.push_str(t);
+                                }
+                            }
+                        }
                     }
                 }
+                if !s.trim().is_empty() {
+                    self.first_user_text = Some(s);
+                }
             }
-            cv_core::stream::append_searchable(&mut self.body, &m);
-            Flow::Continue
+            if self.body.len() < EMBED_HEAD_BYTES {
+                self.append_searchable_capped(&m);
+            }
+            if self.body.len() >= EMBED_HEAD_BYTES && self.first_user_text.is_some() {
+                Flow::Stop
+            } else {
+                Flow::Continue
+            }
+        }
+    }
+    impl DocSink {
+        /// Append one content text: inline as-is, a span resolved to at most the remaining budget.
+        fn push_text(&mut self, text: &cv_core::Text) {
+            if let Some(sp) = text.as_span() {
+                let remaining = EMBED_HEAD_BYTES.saturating_sub(self.body.len()) as u64;
+                if remaining > 0 {
+                    self.body.push_str(&self.resolver.resolve_prefix(sp, remaining));
+                }
+            } else if let Some(s) = text.inline_str() {
+                self.body.push_str(s);
+            }
+        }
+
+        /// The `cv_core::stream::append_searchable` projection, span-aware and head-capped.
+        fn append_searchable_capped(&mut self, m: &Message) {
+            use std::fmt::Write as _;
+            for b in &m.content {
+                match b {
+                    Block::Text { text } | Block::Thinking { text, .. } => {
+                        self.push_text(text);
+                        self.body.push('\n');
+                    }
+                    Block::ToolUse { name, input, .. } => {
+                        self.body.push_str(name);
+                        self.body.push(' ');
+                        let _ = write!(self.body, "{input}");
+                        self.body.push('\n');
+                    }
+                    Block::ToolResult { content, .. } => {
+                        self.push_text(content);
+                        self.body.push('\n');
+                    }
+                    Block::File { path, source, .. } => {
+                        if let Some(p) = path.as_deref().or(source.as_deref()) {
+                            self.body.push_str(p);
+                            self.body.push('\n');
+                        }
+                    }
+                    Block::Image { .. } => {}
+                }
+            }
         }
     }
 
@@ -148,7 +223,7 @@ pub(crate) fn stream_corpus(mut f: impl FnMut(Doc) -> Result<()>) -> Result<usiz
             first_user_text: None,
             resolver: cv_core::Resolver::new(Some(r.path.clone())),
         };
-        let meta = match adapter.stream(&r, &ParseOptions::bulk(), &mut sink) {
+        let meta = match adapter.stream(&r, &ParseOptions::lazy(), &mut sink) {
             Ok(m) => m,
             Err(e) => {
                 eprintln!("cv-search: parse failed for {} ({}): {e:#}", r.id, r.harness);

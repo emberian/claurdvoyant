@@ -369,6 +369,9 @@ mod db {
     /// Whether `r` needs an event (re)ingest: its file mtime differs from the `event_sync` row
     /// (or there is none). `false` when the catalog can't be opened — events degrade silently
     /// rather than re-streaming the corpus into a broken db forever.
+    ///
+    /// Opens a fresh connection per call — fine for a one-off check (`cv events <id>`), wrong for
+    /// a corpus sweep: bulk callers use [`SyncTable`] (one query for the whole skip-table).
     pub fn needs_ingest(r: &SessionRef, mtime_ns: i64) -> bool {
         let Some(conn) = open() else { return false };
         let synced: Option<i64> = conn
@@ -379,6 +382,50 @@ mod db {
             )
             .ok();
         !(synced == Some(mtime_ns) && mtime_ns != 0)
+    }
+
+    /// The whole `event_sync` skip-table, loaded with **one** connection + query, for bulk passes
+    /// that check every discovered session ([`ingest_all`], the FTS indexer's event ride-along).
+    /// The per-session [`needs_ingest`] opens a connection — and re-runs the catalog DDL — per
+    /// call, which a ~2,400-session sweep pays ~2,400 times.
+    ///
+    /// Answers exactly like [`needs_ingest`], including the degrade: when the catalog can't be
+    /// opened, every check returns `false` (don't re-stream the corpus into a broken db).
+    pub struct SyncTable {
+        /// `(harness, id, path) → mtime_ns`; `None` when the catalog is unavailable.
+        rows: Option<std::collections::HashMap<(String, String, String), i64>>,
+    }
+
+    impl SyncTable {
+        pub fn load() -> SyncTable {
+            let load = || -> Option<std::collections::HashMap<(String, String, String), i64>> {
+                let conn = open()?;
+                let mut stmt = conn
+                    .prepare("SELECT harness, id, path, mtime_ns FROM event_sync")
+                    .ok()?;
+                let rows = stmt
+                    .query_map([], |row| {
+                        Ok((
+                            (row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?),
+                            row.get::<_, i64>(3)?,
+                        ))
+                    })
+                    .ok()?;
+                Some(rows.flatten().collect())
+            };
+            SyncTable { rows: load() }
+        }
+
+        /// Same answer [`needs_ingest`] would give for `r`, from the preloaded table.
+        pub fn needs_ingest(&self, r: &SessionRef, mtime_ns: i64) -> bool {
+            let Some(rows) = &self.rows else { return false };
+            let key = (
+                r.harness.as_str().to_string(),
+                r.id.clone(),
+                r.path.to_string_lossy().into_owned(),
+            );
+            !(rows.get(&key) == Some(&mtime_ns) && mtime_ns != 0)
+        }
     }
 
     /// Persist `events` as the complete event set for session `r` (one transaction: delete prior
@@ -436,8 +483,9 @@ mod db {
     /// indexer (which otherwise ingests events as a ride-along). Returns sessions (re)ingested.
     pub fn ingest_all(force: bool) -> Result<usize> {
         let mut n = 0usize;
+        let sync = SyncTable::load();
         for r in crate::discover_all() {
-            if !force && !needs_ingest(&r, file_mtime_ns(&r.path)) {
+            if !force && !sync.needs_ingest(&r, file_mtime_ns(&r.path)) {
                 continue;
             }
             match ingest_ref(&r) {
@@ -586,7 +634,7 @@ mod db {
 #[cfg(feature = "sqlite")]
 pub use db::{
     catalog_has_events, edits_touching_file, events_for, ingest_all, ingest_ref, needs_ingest,
-    record, sessions_touching,
+    record, sessions_touching, SyncTable,
 };
 
 /// No-op fallbacks without sqlite: extraction still works (the sink is pure), persistence and
@@ -598,6 +646,16 @@ mod db_stub {
 
     pub fn needs_ingest(_r: &SessionRef, _mtime_ns: i64) -> bool {
         false
+    }
+    /// No-op twin of the sqlite [`SyncTable`]: nothing is ever stale.
+    pub struct SyncTable;
+    impl SyncTable {
+        pub fn load() -> SyncTable {
+            SyncTable
+        }
+        pub fn needs_ingest(&self, _r: &SessionRef, _mtime_ns: i64) -> bool {
+            false
+        }
     }
     pub fn record(_r: &SessionRef, _events: &[Event], _mtime_ns: i64) {}
     pub fn ingest_ref(_r: &SessionRef) -> Result<usize> {
@@ -622,7 +680,7 @@ mod db_stub {
 #[cfg(not(feature = "sqlite"))]
 pub use db_stub::{
     catalog_has_events, edits_touching_file, events_for, ingest_all, ingest_ref, needs_ingest,
-    record, sessions_touching,
+    record, sessions_touching, SyncTable,
 };
 
 #[cfg(test)]

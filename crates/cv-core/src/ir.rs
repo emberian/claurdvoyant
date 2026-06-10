@@ -9,81 +9,68 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-/// Which agent harness a session came from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Harness {
-    Claude,
-    Codex,
-    Grok,
-    OpenCode,
-    Gemini,
-    Hermes,
-    OpenClaw,
+/// Declares the [`Harness`] enum together with [`Harness::ALL`] and [`Harness::as_str`] from one
+/// variant list, so they can never drift apart (the old hand-maintained 17-element `ALL` array
+/// silently went stale whenever a variant was added). Adding a harness is now a single line here
+/// (plus its aliases in [`Harness::parse`], which a test ties back to `ALL`).
+macro_rules! harnesses {
+    ($( $(#[$meta:meta])* $name:ident => $str:literal ),+ $(,)?) => {
+        /// Which agent harness a session came from.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+        #[serde(rename_all = "lowercase")]
+        pub enum Harness {
+            $( $(#[$meta])* $name, )+
+        }
+
+        impl Harness {
+            /// How many harnesses exist (generated from the variant list).
+            pub const COUNT: usize = [$($str),+].len();
+
+            /// Every harness, in declaration order — generated from the same list as the enum
+            /// itself, so it is exhaustive by construction.
+            pub const ALL: [Harness; Harness::COUNT] = [$(Harness::$name),+];
+
+            /// The canonical lowercase name (what `--harness` accepts and listings print).
+            pub fn as_str(self) -> &'static str {
+                match self {
+                    $( Harness::$name => $str, )+
+                }
+            }
+        }
+    };
+}
+
+harnesses! {
+    Claude => "claude",
+    Codex => "codex",
+    Grok => "grok",
+    OpenCode => "opencode",
+    Gemini => "gemini",
+    Hermes => "hermes",
+    OpenClaw => "openclaw",
     /// Cursor IDE (chat/composer history in `state.vscdb`).
-    Cursor,
+    Cursor => "cursor",
     /// The Claude desktop app (macOS/Windows).
-    ClaudeApp,
+    ClaudeApp => "claude-app",
     /// The ChatGPT desktop app (macOS/Windows).
-    ChatGptApp,
+    ChatGptApp => "chatgpt-app",
     /// Kimi CLI (MoonshotAI), `~/.kimi`.
-    Kimi,
+    Kimi => "kimi",
     /// Qwen Code CLI (a gemini-cli fork), `~/.qwen`.
-    Qwen,
+    Qwen => "qwen",
     /// LM Studio desktop app, `~/.lmstudio`.
-    LmStudio,
+    LmStudio => "lmstudio",
     /// Cline (VS Code extension), per-task Anthropic-format JSON.
-    Cline,
+    Cline => "cline",
     /// Roo Code (a Cline fork).
-    Roo,
+    Roo => "roo",
     /// Continue (VS Code/JetBrains), `~/.continue/sessions`.
-    Continue,
+    Continue => "continue",
     /// Goose (Block), `~/.local/share/goose/sessions`.
-    Goose,
+    Goose => "goose",
 }
 
 impl Harness {
-    pub const ALL: [Harness; 17] = [
-        Harness::Claude,
-        Harness::Codex,
-        Harness::Grok,
-        Harness::OpenCode,
-        Harness::Gemini,
-        Harness::Hermes,
-        Harness::OpenClaw,
-        Harness::Cursor,
-        Harness::ClaudeApp,
-        Harness::ChatGptApp,
-        Harness::Kimi,
-        Harness::Qwen,
-        Harness::LmStudio,
-        Harness::Cline,
-        Harness::Roo,
-        Harness::Continue,
-        Harness::Goose,
-    ];
-
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Harness::Claude => "claude",
-            Harness::Codex => "codex",
-            Harness::Grok => "grok",
-            Harness::OpenCode => "opencode",
-            Harness::Gemini => "gemini",
-            Harness::Hermes => "hermes",
-            Harness::OpenClaw => "openclaw",
-            Harness::Cursor => "cursor",
-            Harness::ClaudeApp => "claude-app",
-            Harness::ChatGptApp => "chatgpt-app",
-            Harness::Kimi => "kimi",
-            Harness::Qwen => "qwen",
-            Harness::LmStudio => "lmstudio",
-            Harness::Cline => "cline",
-            Harness::Roo => "roo",
-            Harness::Continue => "continue",
-            Harness::Goose => "goose",
-        }
-    }
 
     pub fn parse(s: &str) -> Option<Harness> {
         Some(match s.to_ascii_lowercase().as_str() {
@@ -417,13 +404,72 @@ pub fn label_from(title: Option<&str>, first_user_text: Option<&str>) -> String 
 
 /// Flatten newlines to spaces and truncate to at most `max` chars, ending with `…` when cut.
 /// The one canonical truncation used by labels, renderers, and listings.
+///
+/// Reads at most `max + 1` chars of `s` — it never allocates a flattened copy of the whole input
+/// (labels and renderers routinely truncate multi-megabyte message bodies down to ~72 chars).
 pub fn truncate(s: &str, max: usize) -> String {
-    let s = s.replace('\n', " ");
-    if s.chars().count() <= max {
-        s
-    } else {
-        let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
-        out.push('…');
-        out
+    let mut out = String::new();
+    let mut chars = s.chars();
+    for _ in 0..max {
+        match chars.next() {
+            Some(c) => out.push(if c == '\n' { ' ' } else { c }),
+            None => return out, // shorter than max: the whole (flattened) string
+        }
+    }
+    if chars.next().is_none() {
+        return out; // exactly max chars: fits without an ellipsis
+    }
+    // Longer than max: keep the first max-1 chars and mark the cut.
+    out.pop();
+    out.push('…');
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `Harness::ALL` and `as_str` are macro-generated from one list; `parse` is hand-written
+    /// (it carries aliases). This ties them together: every harness's canonical name must parse
+    /// back to itself, so adding a variant without a `parse` arm fails here.
+    #[test]
+    fn every_harness_canonical_name_parses_back() {
+        for h in Harness::ALL {
+            assert_eq!(Harness::parse(h.as_str()), Some(h), "parse arm missing for {h:?}");
+        }
+        assert_eq!(Harness::ALL.len(), Harness::COUNT);
+    }
+
+    /// The streaming `truncate` must behave exactly like the old flatten-whole-string version.
+    #[test]
+    fn truncate_matches_flatten_then_cut_semantics() {
+        let reference = |s: &str, max: usize| -> String {
+            let s = s.replace('\n', " ");
+            if s.chars().count() <= max {
+                s
+            } else {
+                let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
+                out.push('…');
+                out
+            }
+        };
+        let cases = [
+            ("", 0),
+            ("", 5),
+            ("ab", 0),
+            ("ab", 1),
+            ("ab", 2),
+            ("ab", 3),
+            ("a\nb\nc", 3),
+            ("a\nb\nc", 10),
+            ("héllo wörld", 4),
+            ("héllo wörld", 11),
+            ("日本語のテキスト", 5),
+            ("line one\nline two\r\nline three", 72),
+            ("exactly", 7),
+        ];
+        for (s, max) in cases {
+            assert_eq!(truncate(s, max), reference(s, max), "s={s:?} max={max}");
+        }
     }
 }
