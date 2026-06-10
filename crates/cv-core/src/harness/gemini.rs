@@ -76,28 +76,7 @@ impl Adapter for Gemini {
             .collect();
         Ok(crate::par_flat_map(paths, |path| {
             crate::discover_cache::cached_scan_many(&path, || {
-                let name = path
-                    .file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_default();
-                if name == "logs.json" {
-                    if let Ok(text) = fs::read_to_string(&path) {
-                        return refs_from_logs(&text, &path);
-                    }
-                } else if is_chat_recording(&path) {
-                    if let Ok(text) = fs::read_to_string(&path) {
-                        if let Some(s) = parse_chat_recording(&text, Some(path.clone())) {
-                            return vec![session_ref(&s, &path)];
-                        }
-                    }
-                } else if is_checkpoint(&name) {
-                    if let Ok(text) = fs::read_to_string(&path) {
-                        if let Some(s) = parse_checkpoint(&text, &name, Some(path.clone())) {
-                            return vec![session_ref(&s, &path)];
-                        }
-                    }
-                }
-                Vec::new()
+                scan_session_file(&path, Harness::Gemini)
             })
         }))
     }
@@ -118,6 +97,38 @@ impl Adapter for Gemini {
     fn can_emit(&self) -> bool {
         false
     }
+}
+
+/// Discovery scan of one Gemini-format file into 0..n [`SessionRef`]s, tagged as `harness`.
+/// Shared with the [`Qwen`](crate::harness::qwen) adapter (identical on-disk format). Notably,
+/// checkpoints derive their id from the `checkpoint-<tag>` *filename* here — the same id
+/// [`stream_for`]'s bounded path produces on parse — so discover/parse/stream all agree.
+pub(crate) fn scan_session_file(path: &Path, harness: Harness) -> Vec<SessionRef> {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    if name == "logs.json" {
+        if let Ok(text) = fs::read_to_string(path) {
+            return parse_logs_str(&text, Some(path.to_path_buf()))
+                .iter()
+                .map(|s| session_ref(s, path, harness))
+                .collect();
+        }
+    } else if is_chat_recording(path) {
+        if let Ok(text) = fs::read_to_string(path) {
+            if let Some(s) = parse_chat_recording(&text, Some(path.to_path_buf())) {
+                return vec![session_ref(&s, path, harness)];
+            }
+        }
+    } else if is_checkpoint(&name) {
+        if let Ok(text) = fs::read_to_string(path) {
+            if let Some(s) = parse_checkpoint(&text, &name, Some(path.to_path_buf())) {
+                return vec![session_ref(&s, path, harness)];
+            }
+        }
+    }
+    Vec::new()
 }
 
 /// Streaming parse of any Gemini-format session file, tagged as `harness` in the returned session.
@@ -1123,17 +1134,10 @@ fn checkpoint_id(file_name: &str) -> String {
 // SessionRef helpers
 // ---------------------------------------------------------------------------
 
-fn refs_from_logs(text: &str, path: &Path) -> Vec<SessionRef> {
-    parse_logs_str(text, Some(path.to_path_buf()))
-        .iter()
-        .map(|s| session_ref(s, path))
-        .collect()
-}
-
-fn session_ref(s: &Session, path: &Path) -> SessionRef {
+fn session_ref(s: &Session, path: &Path, harness: Harness) -> SessionRef {
     SessionRef {
         id: s.id.clone(),
-        harness: Harness::Gemini,
+        harness,
         path: path.to_path_buf(),
         cwd: s.cwd.clone(),
         title: s.title.clone(),

@@ -270,6 +270,133 @@ fn real_corpus_zero_panics() {
     );
 }
 
+/// For every real session, `parse()` must equal `collect(stream())` — the streaming path and the
+/// materializing path are two implementations of the same semantics, and any divergence means one
+/// of them is wrong. (Codex's token_count usage attachment was found exactly this way.)
+///
+/// Sessions whose source file exceeds the cap are skipped: parse + stream both materialize here, and
+/// the giant rollouts are already covered by their adapters' fixture-level equivalence tests.
+#[test]
+#[ignore = "needs the local real corpus; run with --ignored --nocapture"]
+fn real_corpus_parse_equals_collected_stream() {
+    const MAX_BYTES: u64 = 64 << 20; // 64 MiB
+
+    let refs = cv_core::discover_all();
+    let mut compared = 0usize;
+    let mut skipped_big = 0usize;
+    let mut divergent: Vec<String> = Vec::new();
+
+    for r in &refs {
+        let Some(adapter) = cv_core::harness::for_harness(r.harness) else {
+            continue;
+        };
+        if std::fs::metadata(&r.path).map(|m| m.len()).unwrap_or(0) > MAX_BYTES {
+            skipped_big += 1;
+            continue;
+        }
+        // Both sides may legitimately error (live files, encrypted stores); only a *result*
+        // mismatch or a content mismatch counts as divergence.
+        let parsed = adapter.parse(r);
+        let mut sink = cv_core::stream::CollectSink::default();
+        let streamed = adapter.stream(r, &cv_core::stream::ParseOptions::full(), &mut sink);
+        match (parsed, streamed) {
+            (Ok(p), Ok(mut s)) => {
+                compared += 1;
+                s.messages = sink.messages;
+                let pj = serde_json::to_value(&p).unwrap();
+                let sj = serde_json::to_value(&s).unwrap();
+                if pj != sj {
+                    divergent.push(format!(
+                        "{} {} ({}): parse != collect(stream)",
+                        r.harness,
+                        r.id,
+                        r.path.display()
+                    ));
+                    // Pinpoint the first differing field for the report.
+                    if let (Some(po), Some(so)) = (pj.as_object(), sj.as_object()) {
+                        for (k, pv) in po {
+                            if so.get(k) != Some(pv) {
+                                eprintln!("  field `{k}` differs for {} {}", r.harness, r.id);
+                            }
+                        }
+                    }
+                }
+            }
+            (Err(_), Err(_)) => {}
+            (Ok(_), Err(e)) => divergent.push(format!(
+                "{} {} ({}): parse ok but stream errored: {e:#}",
+                r.harness,
+                r.id,
+                r.path.display()
+            )),
+            (Err(e), Ok(_)) => divergent.push(format!(
+                "{} {} ({}): stream ok but parse errored: {e:#}",
+                r.harness,
+                r.id,
+                r.path.display()
+            )),
+        }
+    }
+
+    eprintln!(
+        "\n=== parse vs collect(stream): {compared} compared, {skipped_big} skipped (> {MAX_BYTES} bytes), {} divergent ===",
+        divergent.len()
+    );
+    for d in divergent.iter().take(40) {
+        eprintln!("  {d}");
+    }
+    assert!(
+        divergent.is_empty(),
+        "{} session(s) diverge between parse() and collect(stream())",
+        divergent.len()
+    );
+}
+
+/// Discovery metadata quality over the real corpus: no `created_at > updated_at` inversions, no
+/// whitespace-only or control-character titles, no empty ids, no duplicate (harness, id, path)
+/// triples. Title *content* is not policed — a title is the user's first words and may legitimately
+/// look like JSON or markup.
+#[test]
+#[ignore = "needs the local real corpus; run with --ignored --nocapture"]
+fn real_corpus_discovery_metadata_quality() {
+    let refs = cv_core::discover_all();
+    let mut problems: Vec<String> = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+
+    for r in &refs {
+        let tag = format!("{} {} ({})", r.harness, r.id, r.path.display());
+        if r.id.trim().is_empty() {
+            problems.push(format!("{tag}: empty session id"));
+        }
+        if !seen.insert((r.harness.to_string(), r.id.clone(), r.path.clone())) {
+            problems.push(format!("{tag}: duplicate (harness, id, path) in discovery"));
+        }
+        if let (Some(c), Some(u)) = (r.created_at, r.updated_at) {
+            if c > u {
+                problems.push(format!("{tag}: created_at {c} > updated_at {u}"));
+            }
+        }
+        if let Some(t) = &r.title {
+            if t.trim().is_empty() {
+                problems.push(format!("{tag}: whitespace-only title"));
+            }
+            if t.chars().any(|c| c.is_control() && c != '\t') {
+                problems.push(format!("{tag}: control character in title {t:?}"));
+            }
+        }
+    }
+
+    eprintln!(
+        "\n=== discovery metadata quality: {} refs, {} problem(s) ===",
+        refs.len(),
+        problems.len()
+    );
+    for p in problems.iter().take(40) {
+        eprintln!("  {p}");
+    }
+    assert!(problems.is_empty(), "{} metadata problem(s)", problems.len());
+}
+
 // ------------------------------------------------------------------------------------------------
 // 2. malformed-input fuzz-lite (always runs)
 // ------------------------------------------------------------------------------------------------
@@ -351,6 +478,57 @@ fn ingest_files_never_panics() {
         let res = std::panic::catch_unwind(move || cv_core::ingest::ingest_files(files));
         assert!(res.is_ok(), "ingest_files panicked on byte blob `{label}`");
     }
+}
+
+// ------------------------------------------------------------------------------------------------
+// 2b. live-file edge cases: CRLF line endings + a truncated final line (always runs)
+// ------------------------------------------------------------------------------------------------
+
+/// A JSONL transcript that was (a) written with CRLF line endings and (b) caught mid-write — the
+/// final line is truncated JSON, exactly what reading a *live* session looks like. The complete
+/// records must still parse; the partial one is skipped, never fatal.
+#[test]
+fn crlf_and_truncated_final_line_keep_good_records() {
+    // Claude shape.
+    let claude_lines = [
+        r#"{"type":"user","uuid":"u1","parentUuid":null,"sessionId":"s1","timestamp":"2026-01-01T00:00:00Z","message":{"role":"user","content":"hello there"}}"#,
+        r#"{"type":"assistant","uuid":"u2","parentUuid":"u1","sessionId":"s1","timestamp":"2026-01-01T00:00:01Z","message":{"role":"assistant","model":"m","content":[{"type":"text","text":"hi!"}]}}"#,
+        // live-written: the writer died mid-record
+        r#"{"type":"assistant","uuid":"u3","parentUuid":"u2","message":{"role":"assistant","con"#,
+    ];
+    let crlf = claude_lines.join("\r\n");
+    let s = cv_core::harness::claude::parse_str("live", &crlf, None);
+    assert_eq!(
+        s.messages.len(),
+        2,
+        "claude: both complete records parse despite CRLF + truncated tail"
+    );
+    assert_eq!(s.messages[0].text().as_deref(), Some("hello there"));
+    assert_eq!(s.messages[1].text().as_deref(), Some("hi!"));
+
+    // Codex rollout shape.
+    let codex_lines = [
+        r#"{"timestamp":"2026-01-01T00:00:00Z","type":"session_meta","payload":{"id":"sx","cwd":"/w"}}"#,
+        r#"{"timestamp":"2026-01-01T00:00:01Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"do it"}]}}"#,
+        r#"{"timestamp":"2026-01-01T00:00:02Z","type":"response_item","payload":{"type":"mess"#,
+    ];
+    let crlf = codex_lines.join("\r\n");
+    let s = cv_core::harness::codex::parse_str("live", &crlf, true, None);
+    assert_eq!(s.id, "sx");
+    assert_eq!(s.messages.len(), 1, "codex: the complete record parses");
+    assert_eq!(s.messages[0].text().as_deref(), Some("do it"));
+
+    // Gemini modern JSONL recording shape.
+    let gem_lines = [
+        r#"{"sessionId":"g1","projectHash":"h","startTime":"2026-01-01T00:00:00Z","lastUpdated":"2026-01-01T00:00:01Z"}"#,
+        r#"{"id":"m1","type":"user","content":"question?"}"#,
+        r#"{"id":"m2","type":"gemini","content":"answ"#,
+    ];
+    let crlf = gem_lines.join("\r\n");
+    let sessions = cv_core::harness::gemini::parse_all_str(&crlf, None);
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(sessions[0].id, "g1");
+    assert_eq!(sessions[0].messages.len(), 1, "gemini: complete record kept, partial skipped");
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -491,6 +669,24 @@ fn round_trip_all_supported_targets() {
                 tool_names(&parsed),
                 vec!["run_shell"],
                 "{target}: tool name did not survive round-trip"
+            );
+        }
+
+        // Hermes stores the result-side tool name in its own column; it must round-trip too
+        // (emit used to drop it, so every ported tool turn came back nameless).
+        if target == Harness::Hermes {
+            let result_tool_name = parsed
+                .messages
+                .iter()
+                .flat_map(|m| &m.content)
+                .find_map(|b| match b {
+                    Block::ToolResult { tool_name, .. } => tool_name.clone(),
+                    _ => None,
+                });
+            assert_eq!(
+                result_tool_name.as_deref(),
+                Some("run_shell"),
+                "hermes: ToolResult.tool_name did not survive round-trip"
             );
         }
 

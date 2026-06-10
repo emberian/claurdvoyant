@@ -867,8 +867,12 @@ fn emit_grok(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<Em
     fs::write(&summary_path, serde_json::to_string_pretty(&summary)?)
         .with_context(|| format!("writing {}", summary_path.display()))?;
 
-    // chat_history.jsonl
+    // chat_history.jsonl, plus an updates.jsonl sidecar carrying each tool call's terminal status.
+    // chat_history alone cannot express a failed tool result — the Grok parser derives
+    // `ToolResult.is_error`/`status` ONLY from `updates.jsonl` `tool_call_update` entries — so
+    // without the sidecar every ported failure came back as a success.
     let mut lines: Vec<Value> = Vec::new();
+    let mut updates: Vec<Value> = Vec::new();
     for msg in &session.messages {
         match msg.role {
             Role::System => {
@@ -932,6 +936,8 @@ fn emit_grok(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<Em
                     if let Block::ToolResult {
                         tool_use_id,
                         content,
+                        is_error,
+                        status,
                         ..
                     } = b
                     {
@@ -940,6 +946,23 @@ fn emit_grok(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<Em
                             "tool_call_id": tool_use_id,
                             "content": content,
                         }));
+                        // ACP-style status entry: the source status verbatim when it has one,
+                        // else derived from `is_error` (Grok's own terminal states).
+                        let status = status
+                            .clone()
+                            .unwrap_or_else(|| if *is_error { "failed" } else { "completed" }.into());
+                        updates.push(json!({
+                            "timestamp": epoch_ms(msg.timestamp.or(session.updated_at)),
+                            "method": "session/update",
+                            "params": {
+                                "sessionId": new_id,
+                                "update": {
+                                    "sessionUpdate": "tool_call_update",
+                                    "toolCallId": tool_use_id,
+                                    "status": status,
+                                },
+                            },
+                        }));
                     }
                 }
             }
@@ -947,6 +970,9 @@ fn emit_grok(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<Em
     }
     let chat_path = session_dir.join("chat_history.jsonl");
     write_jsonl(&chat_path, &lines)?;
+    if !updates.is_empty() {
+        write_jsonl(&session_dir.join("updates.jsonl"), &updates)?;
+    }
 
     Ok(EmitResult {
         path: session_dir,
@@ -1875,13 +1901,16 @@ fn emit_hermes(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<
                 if let Block::ToolResult {
                     tool_use_id,
                     content,
+                    tool_name,
                     ..
                 } = b
                 {
+                    // `tool_name` matters: Hermes's own reader (and our adapter) surfaces it, so
+                    // dropping it here made every ported tool turn come back nameless.
                     conn.execute(
-                        "INSERT INTO messages (session_id, role, content, tool_call_id, timestamp) \
-                         VALUES (?1, 'tool', ?2, ?3, ?4)",
-                        params![new_id, content.to_string(), tool_use_id, ts],
+                        "INSERT INTO messages (session_id, role, content, tool_call_id, tool_name, timestamp) \
+                         VALUES (?1, 'tool', ?2, ?3, ?4, ?5)",
+                        params![new_id, content.to_string(), tool_use_id, tool_name, ts],
                     )
                     .context("inserting hermes tool message")?;
                 }
@@ -2252,6 +2281,56 @@ mod tests {
         } else {
             panic!("expected tool result");
         }
+    }
+
+    #[test]
+    fn grok_round_trip_preserves_tool_failure() {
+        // chat_history.jsonl can't express a failed tool result; the Grok parser derives
+        // is_error/status from updates.jsonl. Emit must therefore write the status sidecar, or
+        // every ported failure silently becomes a success.
+        let mut s = sample_session(Harness::Grok);
+        let mut failed = Message::new(Role::Tool);
+        failed.content.push(Block::ToolResult {
+            tool_use_id: "call_2".into(),
+            content: "command not found: frobnicate".into(),
+            is_error: true,
+            tool_name: None,
+            status: None,
+            details: None,
+        });
+        s.messages.push(failed);
+
+        let out = temp_dir();
+        let res = emit(&s, Harness::Grok, &out, &EmitOptions::default()).unwrap();
+        assert!(res.path.join("updates.jsonl").exists(), "status sidecar written");
+
+        let r = SessionRef {
+            id: res.new_id.clone(),
+            harness: Harness::Grok,
+            path: res.path.clone(),
+            cwd: None,
+            title: None,
+            created_at: None,
+            updated_at: None,
+            message_count: 0,
+        };
+        let parsed = Grok::new().parse(&r).unwrap();
+        let mut results: Vec<(String, bool, Option<String>)> = Vec::new();
+        for m in parsed.messages.iter().filter(|m| m.role == Role::Tool) {
+            for b in &m.content {
+                if let Block::ToolResult { tool_use_id, is_error, status, .. } = b {
+                    results.push((tool_use_id.clone(), *is_error, status.clone()));
+                }
+            }
+        }
+        assert_eq!(
+            results,
+            vec![
+                ("call_1".to_string(), false, Some("completed".to_string())),
+                ("call_2".to_string(), true, Some("failed".to_string())),
+            ],
+            "is_error/status must survive a port into grok"
+        );
     }
 
     #[test]

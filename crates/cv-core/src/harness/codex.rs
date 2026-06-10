@@ -183,24 +183,21 @@ pub fn parse_str(id: &str, text: &str, is_jsonl: bool, source_path: Option<PathB
     };
 
     if is_jsonl {
-        // `has_events` is a whole-file property, so detect it in a cheap first pass (no per-line
-        // `Value`s are retained) instead of materializing every record up front.
-        let mut has_events = false;
-        super::for_each_json_line_str(text, |v| {
-            if is_nl_event(&v) {
-                has_events = true;
-                return Flow::Stop;
-            }
-            Flow::Continue
-        });
+        // Detect `has_events` in a cheap, bounded first pass (no per-line `Value`s are retained)
+        // instead of materializing every record up front. Same detector as `stream`'s pre-pass, so
+        // the two paths can never disagree on a file.
+        let mut det = EventDetector::default();
+        super::for_each_json_line_str(text, |v| det.feed(&v));
+        let has_events = det.found;
         // Accumulate into one vec across all lines so a `token_count` event can attach usage to
         // the assistant message it trails. Using a separate `out` (not `&mut s.messages`) avoids
         // borrowing `s` twice in `dispatch_line`.
         let mut out: Vec<Message> = Vec::new();
-        super::for_each_json_line_str(text, |v| {
+        let skipped = super::for_each_json_line_str(text, |v| {
             dispatch_line(&mut s, &mut out, &v, has_events);
             Flow::Continue
         });
+        super::note_skipped_lines(&mut s, skipped);
         s.messages = out;
     } else if let Ok(root) = serde_json::from_str::<Value>(text) {
         apply_meta(&mut s, root.get("session"));
@@ -222,7 +219,7 @@ pub fn parse_str(id: &str, text: &str, is_jsonl: bool, source_path: Option<PathB
 }
 
 /// Does this record carry natural-language text via `event_msg` (vs. `response_item`)? The
-/// whole-file `has_events` flag is `any()` of this over the records.
+/// `has_events` flag is decided from these by [`EventDetector`].
 fn is_nl_event(v: &Value) -> bool {
     v.get("type").and_then(Value::as_str) == Some("event_msg")
         && matches!(
@@ -260,17 +257,65 @@ fn dispatch_line(s: &mut Session, scratch: &mut Vec<Message>, v: &Value, has_eve
     }
 }
 
-/// Cheap first pass over a rollout: are NL messages carried as `event_msg`s? (See [`is_nl_event`].)
-fn detect_has_events<R: BufRead>(reader: R) -> bool {
-    let mut found = false;
-    super::for_each_json_line(reader, |v| {
-        if is_nl_event(&v) {
-            found = true;
+/// Does this record carry natural-language text via a `response_item` message (the old-format
+/// counterpart of [`is_nl_event`])? Used by [`EventDetector`] to bound the pre-pass.
+fn is_nl_response_message(v: &Value) -> bool {
+    v.get("type").and_then(Value::as_str) == Some("response_item")
+        && v.pointer("/payload/type").and_then(Value::as_str) == Some("message")
+        && matches!(
+            v.pointer("/payload/role").and_then(Value::as_str),
+            Some("user") | Some("assistant")
+        )
+}
+
+/// Bounded `has_events` detection: does this rollout carry its natural-language text as
+/// `event_msg`s (modern) or only as `response_item` messages (old format)?
+///
+/// In modern rollouts the `event_msg` duplicate *trails* its `response_item` by a couple of
+/// records (the user's prompt is recorded as a `response_item message` first, then echoed as an
+/// `event_msg user_message`), so the first NL record alone can't decide. Instead we keep scanning
+/// for [`LOOKAHEAD`] records past the first NL `response_item`; if no NL `event_msg` shows up by
+/// then, the file is old-format. Measured over the full 620-rollout local corpus the worst
+/// observed gap is **5 records** (LOOKAHEAD is >6× that), and the first NL event always lands
+/// within the first 15 records — so this is byte-identical to the previous whole-file scan on
+/// every real file, while old-format files (which used to force a full extra read, twice for a
+/// multi-hundred-MB rollout) now stop after the head.
+#[derive(Default)]
+struct EventDetector {
+    /// Records seen since the first NL `response_item` message, once one has been seen.
+    past_first_nl_resp: Option<u32>,
+    /// The verdict: NL text comes from `event_msg`s.
+    found: bool,
+}
+
+impl EventDetector {
+    /// How many records past the first NL `response_item` to keep looking for its `event_msg` twin.
+    const LOOKAHEAD: u32 = 32;
+
+    /// Feed one record; returns [`Flow::Stop`] once the verdict is decided.
+    fn feed(&mut self, v: &Value) -> Flow {
+        if is_nl_event(v) {
+            self.found = true;
             return Flow::Stop;
         }
+        if let Some(n) = self.past_first_nl_resp.as_mut() {
+            *n += 1;
+            if *n > Self::LOOKAHEAD {
+                return Flow::Stop; // old format: NL response_item with no event_msg echo
+            }
+        } else if is_nl_response_message(v) {
+            self.past_first_nl_resp = Some(0);
+        }
         Flow::Continue
-    });
-    found
+    }
+}
+
+/// Bounded first pass over a rollout: are NL messages carried as `event_msg`s? (See
+/// [`EventDetector`] for the bounding rule and its corpus-measured safety margin.)
+fn detect_has_events<R: BufRead>(reader: R) -> bool {
+    let mut det = EventDetector::default();
+    super::for_each_json_line(reader, |v| det.feed(&v));
+    det.found
 }
 
 /// Flush `scratch` to `sink` — except a trailing assistant message that has no usage yet, which is
@@ -319,7 +364,7 @@ pub fn stream_jsonl<R: BufRead>(
     let mut scratch: Vec<Message> = Vec::new();
     let mut meta_sent = false;
     let mut stopped = false;
-    super::for_each_json_line(reader, |v| {
+    let skipped = super::for_each_json_line(reader, |v| {
         dispatch_line(&mut s, &mut scratch, &v, has_events);
         // Hand the session metadata to the sink as soon as the model is known (session_meta /
         // turn_context land in the first records, before any message), so header-rendering sinks
@@ -332,6 +377,7 @@ pub fn stream_jsonl<R: BufRead>(
         stopped = flow == Flow::Stop;
         flow
     });
+    super::note_skipped_lines(&mut s, skipped);
     if !stopped {
         // EOF: emit the held trailing message, if any (no token_count followed it).
         for m in scratch.drain(..) {
@@ -376,6 +422,7 @@ pub fn stream_jsonl_spans(
     };
     let mut scratch: Vec<Message> = Vec::new();
     let mut meta_sent = false;
+    let mut skipped = 0u64;
     let mut off = 0u64;
     'outer: for raw_line in data.split(|&b| b == b'\n') {
         let line_off = off;
@@ -394,6 +441,7 @@ pub fn stream_jsonl_spans(
         } else if let Ok(v) = serde_json::from_slice::<Value>(slice) {
             dispatch_line(&mut s, &mut scratch, &v, has_events);
         } else {
+            skipped += 1; // corrupt line — tolerated, but counted (see note_skipped_lines)
             continue;
         }
         if !meta_sent && s.model.is_some() {
@@ -412,6 +460,7 @@ pub fn stream_jsonl_spans(
             break;
         }
     }
+    super::note_skipped_lines(&mut s, skipped);
     if s.id.is_empty() {
         s.id = id.to_string();
     }
@@ -1549,6 +1598,97 @@ mod tests {
         // function_call ToolUse msg attached nothing (it has its own pending usage slot untouched);
         // the stale snapshot became a carrier; the trailing assistant survived the EOF flush.
         assert_eq!(parsed.messages.last().unwrap().text().as_deref(), Some("bye"));
+    }
+
+    #[test]
+    fn event_detector_modern_old_and_bounded() {
+        let resp_user = |text: &str| {
+            format!(
+                r#"{{"timestamp":"2026-01-01T00:00:00Z","type":"response_item","payload":{{"type":"message","role":"user","content":[{{"type":"input_text","text":"{text}"}}]}}}}"#
+            )
+        };
+        let event_user =
+            r#"{"timestamp":"2026-01-01T00:00:01Z","type":"event_msg","payload":{"type":"user_message","message":"hi"}}"#;
+        let filler =
+            r#"{"timestamp":"2026-01-01T00:00:02Z","type":"event_msg","payload":{"type":"token_count","info":null}}"#;
+
+        // Modern shape: preamble response_items, the real user response_item, then its event_msg
+        // echo a few records later (codex writes the response_item FIRST) → has_events.
+        let mut modern = vec![resp_user("<environment_context>…"), resp_user("real question")];
+        modern.extend(std::iter::repeat_n(filler.to_string(), 5));
+        modern.push(event_user.to_string());
+        let text = modern.join("\n");
+        assert!(detect_has_events(std::io::Cursor::new(text.as_bytes())));
+
+        // Old format: NL response_items, no event echo ever → not has_events.
+        let old = [resp_user("q"), resp_user("a")].join("\n");
+        assert!(!detect_has_events(std::io::Cursor::new(old.as_bytes())));
+
+        // The pass is bounded: it commits to "old format" LOOKAHEAD records past the first NL
+        // response_item instead of scanning to EOF (the old whole-file pre-pass read a
+        // multi-hundred-MB rollout twice). Verified by feeding records by hand and watching for
+        // the Stop verdict.
+        let mut det = EventDetector::default();
+        let resp: Value = serde_json::from_str(&resp_user("q")).unwrap();
+        assert_eq!(det.feed(&resp), Flow::Continue);
+        let fill: Value = serde_json::from_str(filler).unwrap();
+        let mut fed = 0u32;
+        loop {
+            fed += 1;
+            assert!(fed <= EventDetector::LOOKAHEAD + 1, "detector must stop within the window");
+            if det.feed(&fill) == Flow::Stop {
+                break;
+            }
+        }
+        assert!(!det.found);
+
+        // …and an event_msg inside the window still wins.
+        let mut det = EventDetector::default();
+        det.feed(&resp);
+        for _ in 0..EventDetector::LOOKAHEAD {
+            assert_eq!(det.feed(&fill), Flow::Continue);
+        }
+        let ev: Value = serde_json::from_str(event_user).unwrap();
+        assert_eq!(det.feed(&ev), Flow::Stop);
+        assert!(det.found);
+    }
+
+    #[test]
+    fn corrupt_lines_are_counted_identically_on_both_paths() {
+        // A live/damaged rollout: one corrupt line amid good records. Both paths must (a) keep the
+        // good records, (b) surface the same `skipped_lines` count in Session.extra, and (c) stay
+        // byte-identical to each other. Clean files get NO `skipped_lines` key (see the other
+        // tests' sessions, which assert exact JSON equality without it).
+        let lines = [
+            r#"{"timestamp":"2026-01-01T00:00:00Z","type":"event_msg","payload":{"type":"user_message","message":"hi"}}"#,
+            r#"{"timestamp":"2026-01-01T00:00:01Z","type":"event_msg","payload":{"type":"agent_mess"#, // truncated mid-write
+            r#"{"timestamp":"2026-01-01T00:00:02Z","type":"event_msg","payload":{"type":"agent_message","message":"hello"}}"#,
+        ];
+        let text = lines.join("\n");
+        let parsed = parse_str("s", &text, true, None);
+        assert_eq!(parsed.messages.len(), 2);
+        assert_eq!(
+            parsed.extra.get("skipped_lines").and_then(Value::as_u64),
+            Some(1),
+            "the corrupt line is tolerated but counted"
+        );
+
+        let mut sink = crate::stream::CollectSink::default();
+        let has_events = detect_has_events(std::io::Cursor::new(text.as_bytes()));
+        let mut streamed = stream_jsonl(
+            "s",
+            std::io::Cursor::new(text.as_bytes()),
+            None,
+            has_events,
+            &ParseOptions::full(),
+            &mut sink,
+        );
+        streamed.messages = sink.messages;
+        assert_eq!(
+            serde_json::to_value(&parsed).unwrap(),
+            serde_json::to_value(&streamed).unwrap(),
+            "skip accounting must not diverge parse from stream"
+        );
     }
 
     #[test]

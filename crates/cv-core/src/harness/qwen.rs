@@ -16,8 +16,7 @@
 use super::Adapter;
 use crate::ir::*;
 use crate::stream::{MessageSink, ParseOptions};
-use anyhow::{Context, Result};
-use std::fs;
+use anyhow::Result;
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
@@ -53,36 +52,28 @@ impl Adapter for Qwen {
         let Some(root) = &self.root else {
             return Ok(vec![]);
         };
-        let mut out = Vec::new();
-        for entry in WalkDir::new(root).into_iter().filter_map(|e| e.ok()) {
-            if !entry.file_type().is_file() {
-                continue;
-            }
-            let path = entry.path();
-            if !is_session_file(path) {
-                continue;
-            }
-            if let Ok(text) = fs::read_to_string(path) {
-                for s in parse_qwen_str(&text, Some(path.to_path_buf())) {
-                    out.push(session_ref(&s, path));
-                }
-            }
-        }
-        Ok(out)
+        // Same per-file scan Gemini uses (shared machinery, re-tagged Qwen) — crucially including
+        // the filename-derived `checkpoint-<tag>` ids, so discover ids match what `parse`/`stream`
+        // produce. (The old path scanned via the filename-blind pure parser, which gave every
+        // checkpoint the same generic id "checkpoint".)
+        let paths: Vec<_> = WalkDir::new(root)
+            .into_iter()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_type().is_file())
+            .map(|e| e.into_path())
+            .filter(|p| is_session_file(p))
+            .collect();
+        Ok(crate::par_flat_map(paths, |path| {
+            crate::discover_cache::cached_scan_many(&path, || {
+                crate::harness::gemini::scan_session_file(&path, Harness::Qwen)
+            })
+        }))
     }
 
     fn parse(&self, r: &SessionRef) -> Result<Session> {
-        let text = fs::read_to_string(&r.path)
-            .with_context(|| format!("reading {}", r.path.display()))?;
-        let sessions = parse_qwen_str(&text, Some(r.path.clone()));
-        // logs.json holds many sessions; chat recordings / checkpoints hold one.
-        if let Some(s) = sessions.iter().find(|s| s.id == r.id).cloned() {
-            return Ok(s);
-        }
-        if let Some(s) = sessions.into_iter().next() {
-            return Ok(s);
-        }
-        anyhow::bail!("could not parse Qwen session {} from {}", r.id, r.path.display())
+        // The whole-session parse is "stream into a CollectSink" — the shared Gemini machinery
+        // (see `stream`) handles every shape, so `parse` and `collect(stream)` cannot diverge.
+        crate::stream::collect(self, r)
     }
 
     fn stream(
@@ -101,16 +92,6 @@ impl Adapter for Qwen {
     fn can_emit(&self) -> bool {
         false
     }
-}
-
-/// Parse Qwen session text by delegating to the (identical) Gemini parser, then re-tag every
-/// resulting session as [`Harness::Qwen`].
-fn parse_qwen_str(text: &str, source_path: Option<PathBuf>) -> Vec<Session> {
-    let mut sessions = crate::harness::gemini::parse_all_str(text, source_path);
-    for s in &mut sessions {
-        s.harness = Harness::Qwen;
-    }
-    sessions
 }
 
 /// Whether a file under `~/.qwen/tmp` is one of the shapes we parse: `logs.json`, a chat recording
@@ -133,22 +114,21 @@ fn is_session_file(path: &Path) -> bool {
         )
 }
 
-fn session_ref(s: &Session, path: &Path) -> SessionRef {
-    SessionRef {
-        id: s.id.clone(),
-        harness: Harness::Qwen,
-        path: path.to_path_buf(),
-        cwd: s.cwd.clone(),
-        title: s.title.clone(),
-        created_at: s.created_at,
-        updated_at: s.updated_at,
-        message_count: s.messages.len(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+
+    /// Parse Qwen session text by delegating to the (identical) Gemini parser, then re-tag every
+    /// resulting session as [`Harness::Qwen`] — the pure-text mirror of what the adapter's on-disk
+    /// paths do, used here to cross-check them.
+    fn parse_qwen_str(text: &str, source_path: Option<PathBuf>) -> Vec<Session> {
+        let mut sessions = crate::harness::gemini::parse_all_str(text, source_path);
+        for s in &mut sessions {
+            s.harness = Harness::Qwen;
+        }
+        sessions
+    }
 
     fn fixture(name: &str) -> String {
         // Reuse the Gemini fixtures — Qwen shares the on-disk format.
@@ -227,6 +207,37 @@ mod tests {
     fn tolerates_garbage() {
         assert!(parse_qwen_str("not json", None).is_empty());
         assert!(parse_qwen_str("{}", None).is_empty());
+    }
+
+    #[test]
+    fn checkpoint_ids_are_filename_derived_and_distinct() {
+        // Two checkpoint files must discover under DISTINCT filename-derived ids, and parse must
+        // return that same id. (The old discover/parse went through the filename-blind pure parser,
+        // which gave every checkpoint the generic id "checkpoint" — colliding across files and
+        // disagreeing with the streaming path's "checkpoint-<tag>".)
+        let text = fixture("checkpoint.json");
+        let dir = std::env::temp_dir().join(format!("cv-qwen-ckpt-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let p1 = dir.join("checkpoint-alpha.json");
+        let p2 = dir.join("checkpoint-beta%20tag.json");
+        fs::write(&p1, &text).unwrap();
+        fs::write(&p2, &text).unwrap();
+
+        let refs1 = crate::harness::gemini::scan_session_file(&p1, Harness::Qwen);
+        let refs2 = crate::harness::gemini::scan_session_file(&p2, Harness::Qwen);
+        assert_eq!(refs1.len(), 1);
+        assert_eq!(refs2.len(), 1);
+        assert_eq!(refs1[0].id, "checkpoint-alpha");
+        assert_eq!(refs2[0].id, "checkpoint-beta tag", "percent-decoded tag");
+        assert!(refs1.iter().all(|r| r.harness == Harness::Qwen));
+
+        // parse() (= collect(stream)) agrees with the discovered id and re-tags as Qwen.
+        let s = Qwen { root: None }.parse(&refs1[0]).expect("parse checkpoint");
+        assert_eq!(s.id, "checkpoint-alpha");
+        assert_eq!(s.harness, Harness::Qwen);
+        assert!(!s.messages.is_empty());
+
+        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

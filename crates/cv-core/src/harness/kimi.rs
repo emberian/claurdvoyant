@@ -154,23 +154,7 @@ impl Adapter for Kimi {
     }
 
     fn parse(&self, r: &SessionRef) -> Result<Session> {
-        // Collect the streamed message body, then run the whole-vec wire post-passes that can't run
-        // on the streaming path (they need the full `messages` slice — see `stream`). This keeps
-        // `parse()` output byte-identical while `stream` stays O(largest message).
-        let mut s = crate::stream::collect(self, r)?;
-
-        // Re-read the wire sidecar to apply the positional post-passes over the collected messages.
-        let (_transcript, wire) = locate_transcript(&r.path, &r.id);
-        let enrich = wire.as_ref().map(read_wire_enrichment).unwrap_or_default();
-
-        // Attach StatusUpdate usage / message_id to assistant turns in order. wire emits one
-        // StatusUpdate per assistant step; we zip them onto assistant messages positionally.
-        attach_status_updates(&mut s.messages, &enrich);
-
-        // Per-message timestamps from wire (best-effort, positional over recognized turns).
-        attach_timestamps(&mut s.messages, &enrich);
-
-        Ok(s)
+        crate::stream::collect(self, r)
     }
 
     fn stream(
@@ -200,11 +184,10 @@ impl Adapter for Kimi {
         };
 
         // Sidecar enrichment from wire.jsonl (tolerant: absent/empty/malformed ⇒ empty). The
-        // per-message `tool_results` map (keyed by tool_call_id) is a per-line enrichment, so it's
-        // safe on the streaming path. The WHOLE-VEC post-passes (`attach_status_updates` /
-        // `attach_timestamps`) zip positionally over the full `messages` slice and therefore CANNOT
-        // run here — they're applied only in the full `parse` path. Bulk consumers
-        // (index/search/dataset) don't read usage/timestamps.
+        // per-message `tool_results` map (keyed by tool_call_id) is a per-line enrichment; the
+        // positional passes (StatusUpdate usage/message_id zipped onto assistant turns, the first
+        // wire timestamp stamped onto the first user turn) only ever walk *forward* with O(1)
+        // state, so they run inline here too — `parse()` is exactly `collect(stream())`.
         let enrich = wire.as_ref().map(read_wire_enrichment).unwrap_or_default();
 
         // Note archived compaction segments (context_1.jsonl…), if any, for fidelity bookkeeping.
@@ -225,12 +208,39 @@ impl Adapter for Kimi {
         let Ok(file) = fs::File::open(&transcript) else {
             return Ok(s);
         };
-        super::for_each_json_line(BufReader::new(file), |v| {
+        // Positional wire enrichment, streamed: one StatusUpdate per assistant step (in wire
+        // order) and the first wire timestamp for the first user turn. Forward-only, O(1) state.
+        let mut statuses = enrich.statuses.iter();
+        let first_wire_ts = enrich.msg_timestamps.first().copied();
+        let mut first_user_seen = false;
+        let skipped = super::for_each_json_line(BufReader::new(file), |v| {
             match context_message(&v, &enrich) {
-                Some(m) => sink.message(m),
+                Some(mut m) => {
+                    match m.role {
+                        Role::Assistant => {
+                            if let Some(st) = statuses.next() {
+                                if m.usage.is_none() {
+                                    m.usage = st.usage.clone();
+                                }
+                                if m.id.is_none() {
+                                    m.id = st.message_id.clone();
+                                }
+                            }
+                        }
+                        Role::User if !first_user_seen => {
+                            first_user_seen = true;
+                            if m.timestamp.is_none() {
+                                m.timestamp = first_wire_ts;
+                            }
+                        }
+                        _ => {}
+                    }
+                    sink.message(m)
+                }
                 None => Flow::Continue,
             }
         });
+        super::note_skipped_lines(&mut s, skipped);
 
         Ok(s)
     }
@@ -993,40 +1003,6 @@ fn wire_usage(tu: &Value) -> Usage {
     }
 }
 
-/// Attach wire StatusUpdate usage / message_id to assistant messages positionally (one StatusUpdate
-/// per assistant step in wire order).
-fn attach_status_updates(messages: &mut [Message], enrich: &WireEnrich) {
-    if enrich.statuses.is_empty() {
-        return;
-    }
-    let mut it = enrich.statuses.iter();
-    for m in messages.iter_mut() {
-        if m.role != Role::Assistant {
-            continue;
-        }
-        let Some(st) = it.next() else { break };
-        if m.usage.is_none() {
-            m.usage = st.usage.clone();
-        }
-        if m.id.is_none() {
-            m.id = st.message_id.clone();
-        }
-    }
-}
-
-/// Best-effort: stamp the session's first user turn with the first wire timestamp, since per-message
-/// alignment across compaction is unreliable. We set the first user message's timestamp only.
-fn attach_timestamps(messages: &mut [Message], enrich: &WireEnrich) {
-    let Some(first) = enrich.msg_timestamps.first().copied() else {
-        return;
-    };
-    if let Some(m) = messages.iter_mut().find(|m| m.role == Role::User) {
-        if m.timestamp.is_none() {
-            m.timestamp = Some(first);
-        }
-    }
-}
-
 /// First and last event timestamps in a wire file (epoch floats), for created/updated bounds.
 fn wire_time_bounds(wire: &Path) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
     let text = fs::read_to_string(wire).ok()?;
@@ -1291,6 +1267,56 @@ mod tests {
         let m = context_message(&sp, &WireEnrich::default()).unwrap();
         assert_eq!(m.role, Role::System);
         assert_eq!(m.text().as_deref(), Some("You are Kimi."));
+    }
+
+    #[test]
+    fn stream_matches_parse_on_modern_fixture() {
+        // parse() is collect(stream()); the streamed messages must carry the same wire enrichment
+        // (StatusUpdate usage/message_id on assistant turns, first wire timestamp on the first user
+        // turn) that the full parse reports. This was a real divergence: the positional passes used
+        // to run only in parse(), so streaming consumers saw assistant turns without usage.
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/kimi/modern/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/11111111-1111-1111-1111-111111111111");
+        if !dir.exists() {
+            return;
+        }
+        let r = SessionRef {
+            id: "11111111-1111-1111-1111-111111111111".into(),
+            harness: Harness::Kimi,
+            path: dir.clone(),
+            cwd: Some(PathBuf::from("/proj")),
+            title: None,
+            created_at: None,
+            updated_at: None,
+            message_count: 0,
+        };
+        let adapter = Kimi { sessions: None, root: None };
+        let parsed = adapter.parse(&r).unwrap();
+
+        let mut sink = crate::stream::CollectSink::default();
+        let mut streamed = adapter
+            .stream(&r, &crate::stream::ParseOptions::full(), &mut sink)
+            .unwrap();
+        streamed.messages = sink.messages;
+
+        assert_eq!(
+            serde_json::to_value(&parsed).unwrap(),
+            serde_json::to_value(&streamed).unwrap(),
+            "kimi parse() and collect(stream()) must agree"
+        );
+        // And the enrichment is actually present on the streamed side (not just both-empty).
+        let asst = streamed
+            .messages
+            .iter()
+            .find(|m| m.role == Role::Assistant)
+            .unwrap();
+        assert_eq!(asst.usage.as_ref().and_then(|u| u.output_tokens), Some(42));
+        assert_eq!(asst.id.as_deref(), Some("chatcmpl-abc"));
+        let first_user = streamed.messages.iter().find(|m| m.role == Role::User).unwrap();
+        assert!(
+            first_user.timestamp.is_some(),
+            "first user turn gets the first wire timestamp on the streaming path too"
+        );
     }
 
     #[test]

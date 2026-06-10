@@ -99,7 +99,7 @@ impl Adapter for Grok {
             .and_then(|t| serde_json::from_str(&t).ok())
             .unwrap_or(Value::Null);
 
-        let s = Session {
+        let mut s = Session {
             id: r.id.clone(),
             harness: Harness::Grok,
             cwd: summary
@@ -141,12 +141,13 @@ impl Adapter for Grok {
 
         let file = fs::File::open(dir.join("chat_history.jsonl"))
             .with_context(|| format!("reading chat_history in {}", dir.display()))?;
-        super::for_each_json_line(BufReader::new(file), |v| {
+        let skipped = super::for_each_json_line(BufReader::new(file), |v| {
             match chat_message(&v, &enrich) {
                 Some(m) => sink.message(m),
                 None => Flow::Continue,
             }
         });
+        super::note_skipped_lines(&mut s, skipped);
         Ok(s)
     }
 

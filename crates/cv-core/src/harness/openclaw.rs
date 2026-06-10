@@ -130,9 +130,17 @@ impl Adapter for OpenClaw {
         sink: &mut dyn MessageSink,
     ) -> Result<Session> {
         // One record per line; stream them so peak memory is O(largest line), not O(transcript).
-        let file = fs::File::open(&r.path)
-            .with_context(|| format!("reading {}", r.path.display()))?;
-        let lines = BufReader::new(file).lines().map_while(Result::ok);
+        // `filter_map`, not `map_while`: a single undecodable line (stray non-UTF8 bytes) must be
+        // skipped like any other corrupt record — `map_while` would silently TRUNCATE the whole
+        // rest of the transcript at it. The lint's run-forever concern doesn't apply: on a regular
+        // file an invalid-UTF8 `Err` still consumes that line's bytes, so the iterator advances to
+        // EOF (same tolerance as `for_each_json_line`).
+        #[allow(clippy::lines_filter_map_ok)]
+        let lines = {
+            let file = fs::File::open(&r.path)
+                .with_context(|| format!("reading {}", r.path.display()))?;
+            BufReader::new(file).lines().filter_map(Result::ok)
+        };
         Ok(stream_core(lines, r, sink))
     }
 
@@ -629,6 +637,50 @@ mod tests {
         let text = fs::read_to_string(&r.path)
             .unwrap_or_else(|e| panic!("reading {}: {e}", r.path.display()));
         parse_text(&text, &r)
+    }
+
+    #[test]
+    fn non_utf8_line_skips_not_truncates() {
+        // A stray binary line mid-transcript must cost exactly that line — `map_while(Result::ok)`
+        // used to end the whole stream there, silently dropping every later message.
+        let dir = std::env::temp_dir().join(format!("cv-openclaw-bin-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("s1.jsonl");
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(
+            br#"{"type":"session","version":3,"id":"s1","timestamp":"2026-01-01T00:00:00Z","cwd":"/w"}"#,
+        );
+        bytes.push(b'\n');
+        bytes.extend_from_slice(
+            br#"{"type":"message","id":"a1","parentId":null,"timestamp":"2026-01-01T00:00:01Z","message":{"role":"user","content":"first"}}"#,
+        );
+        bytes.push(b'\n');
+        bytes.extend_from_slice(&[0xFF, 0xFE, 0x80, 0x81]); // undecodable garbage line
+        bytes.push(b'\n');
+        bytes.extend_from_slice(
+            br#"{"type":"message","id":"a2","parentId":"a1","timestamp":"2026-01-01T00:00:02Z","message":{"role":"user","content":"second"}}"#,
+        );
+        bytes.push(b'\n');
+        fs::write(&path, &bytes).unwrap();
+
+        let r = SessionRef {
+            id: "s1".into(),
+            harness: Harness::OpenClaw,
+            path,
+            cwd: None,
+            title: None,
+            created_at: None,
+            updated_at: None,
+            message_count: 0,
+        };
+        let s = OpenClaw { roots: vec![] }.parse(&r).unwrap();
+        let texts: Vec<_> = s.messages.iter().filter_map(|m| m.text()).collect();
+        assert_eq!(
+            texts,
+            vec!["first", "second"],
+            "messages after the binary line must survive"
+        );
+        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

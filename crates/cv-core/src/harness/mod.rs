@@ -57,34 +57,55 @@ pub(crate) fn ts_from_value(v: &Value) -> Option<DateTime<Utc>> {
 /// session over one bad record), every parsed record goes to `f`, and `Flow::Stop` ends the pass
 /// early. **Not** for offset-tracking paths (the claude/codex lazy-span readers need each line's
 /// byte offset and keep their own `read_until`/mmap loops).
-pub(crate) fn for_each_json_line<R: BufRead>(reader: R, mut f: impl FnMut(Value) -> Flow) {
+///
+/// Returns how many non-blank lines were skipped as unreadable (corrupt JSON or an undecodable
+/// read) before the pass ended — adapters surface a non-zero count via
+/// [`note_skipped_lines`] so silent corruption is at least visible in the session metadata.
+pub(crate) fn for_each_json_line<R: BufRead>(reader: R, mut f: impl FnMut(Value) -> Flow) -> u64 {
+    let mut skipped = 0u64;
     for line in reader.lines() {
         // A read error on one line (rare: invalid UTF-8 chunk) shouldn't abort the whole session.
-        let Ok(line) = line else { continue };
-        if each_json_line_inner(&line, &mut f) == Flow::Stop {
+        let Ok(line) = line else {
+            skipped += 1;
+            continue;
+        };
+        if each_json_line_inner(&line, &mut skipped, &mut f) == Flow::Stop {
             break;
         }
     }
+    skipped
 }
 
-/// [`for_each_json_line`] over already-read text (no per-line allocation).
-pub(crate) fn for_each_json_line_str(text: &str, mut f: impl FnMut(Value) -> Flow) {
+/// [`for_each_json_line`] over already-read text (no per-line allocation). Returns the skip count.
+pub(crate) fn for_each_json_line_str(text: &str, mut f: impl FnMut(Value) -> Flow) -> u64 {
+    let mut skipped = 0u64;
     for line in text.lines() {
-        if each_json_line_inner(line, &mut f) == Flow::Stop {
+        if each_json_line_inner(line, &mut skipped, &mut f) == Flow::Stop {
             break;
         }
     }
+    skipped
 }
 
-fn each_json_line_inner(line: &str, f: &mut impl FnMut(Value) -> Flow) -> Flow {
+fn each_json_line_inner(line: &str, skipped: &mut u64, f: &mut impl FnMut(Value) -> Flow) -> Flow {
     let line = line.trim();
     if line.is_empty() {
         return Flow::Continue;
     }
     let Ok(v) = serde_json::from_str::<Value>(line) else {
+        *skipped += 1;
         return Flow::Continue; // tolerate the occasional corrupt line
     };
     f(v)
+}
+
+/// Record `skipped` unreadable transcript lines in a session's `extra` (only when non-zero, so
+/// clean sessions stay byte-identical). The count is a *lower bound* when a pass stopped early.
+pub(crate) fn note_skipped_lines(s: &mut Session, skipped: u64) {
+    if skipped > 0 {
+        s.extra
+            .insert("skipped_lines".into(), Value::Number(skipped.into()));
+    }
 }
 
 /// Result of emitting an IR session into a harness's native on-disk format.
@@ -214,7 +235,7 @@ mod tests {
     fn for_each_json_line_skips_junk_and_stops() {
         let text = "{\"n\":1}\n\n   \nnot json\n{\"n\":2}\n{\"n\":3}";
         let mut seen = Vec::new();
-        for_each_json_line_str(text, |v| {
+        let skipped = for_each_json_line_str(text, |v| {
             let n = v.get("n").and_then(Value::as_i64).unwrap_or(0);
             seen.push(n);
             if n == 2 {
@@ -223,13 +244,34 @@ mod tests {
             Flow::Continue
         });
         assert_eq!(seen, vec![1, 2], "blank/junk skipped, Stop honored");
+        assert_eq!(skipped, 1, "the `not json` line counts; blank lines don't");
 
-        // The reader-driven variant sees the same records.
+        // The reader-driven variant sees the same records and the same skip count.
         let mut seen2 = Vec::new();
-        for_each_json_line(std::io::Cursor::new(text.as_bytes()), |v| {
+        let skipped2 = for_each_json_line(std::io::Cursor::new(text.as_bytes()), |v| {
             seen2.push(v.get("n").and_then(Value::as_i64).unwrap_or(0));
             Flow::Continue
         });
         assert_eq!(seen2, vec![1, 2, 3]);
+        assert_eq!(skipped2, 1);
+
+        // note_skipped_lines: zero leaves `extra` untouched (clean sessions stay byte-identical).
+        let mut s = Session {
+            id: "x".into(),
+            harness: Harness::Codex,
+            cwd: None,
+            title: None,
+            created_at: None,
+            updated_at: None,
+            model: None,
+            git: None,
+            messages: Vec::new(),
+            source_path: None,
+            extra: serde_json::Map::new(),
+        };
+        note_skipped_lines(&mut s, 0);
+        assert!(s.extra.is_empty());
+        note_skipped_lines(&mut s, 3);
+        assert_eq!(s.extra.get("skipped_lines").and_then(Value::as_u64), Some(3));
     }
 }
