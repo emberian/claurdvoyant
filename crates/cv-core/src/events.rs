@@ -335,25 +335,96 @@ mod db {
     use anyhow::Result;
     use rusqlite::{params, Connection};
 
-    /// Open the shared catalog db and ensure the event tables exist. `None` on any error.
+    /// Event-tables schema generation, stamped into the catalog's `PRAGMA user_version`.
+    ///
+    /// v1 (0.9.10) stored `(harness TEXT, session_id TEXT, …, target TEXT)` per event row plus a
+    /// dedup expression index — measured at ~3× the data size in indexes alone. v2 interns session
+    /// identity and targets into side tables and carries integers per row. The catalog is a pure
+    /// cache, so "migration" is version-stamp + drop + lazy reingest (dropping `event_sync` makes
+    /// every session look stale; the next `cv index` — or any on-the-spot `cv events <id>` —
+    /// rebuilds), exactly like the tantivy schema self-heal.
+    const EVENTS_SCHEMA_VERSION: i64 = 2;
+
+    /// Drop pre-v2 event tables (their indexes go with them) and stamp the version.
+    ///
+    /// Two triggers, both checked on every open so the schema self-heals:
+    /// * `user_version < 2` — a v1/unversioned catalog (the `sessions` table never changed shape
+    ///   and is versionless `CREATE IF NOT EXISTS`; the event tables own the version stamp);
+    /// * a v1-*shaped* `events` table (it has a `harness` column) even under a v2 stamp — an old
+    ///   0.9.10 binary re-created v1 tables in a v2 catalog. (The common old-binary case is
+    ///   harmless without this: v2 drops `idx_events_dedup`, so the old binary's
+    ///   `CREATE UNIQUE INDEX … ON events(harness,…)` DDL fails against the v2 table and it
+    ///   degrades to events-disabled — its designed no-catalog path, no corruption possible. The
+    ///   shape check covers the race where an old binary lands v1 tables *first*.)
+    fn migrate(conn: &Connection) -> Option<()> {
+        let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).ok()?;
+        let v1_shaped: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('events') WHERE name='harness')",
+                [],
+                |r| r.get(0),
+            )
+            .ok()?;
+        if version >= EVENTS_SCHEMA_VERSION && !v1_shaped {
+            return Some(());
+        }
+        conn.execute_batch(&format!(
+            "DROP TABLE IF EXISTS events;
+             DROP TABLE IF EXISTS event_sync;
+             DROP TABLE IF EXISTS event_sessions;
+             DROP TABLE IF EXISTS event_targets;
+             PRAGMA user_version = {EVENTS_SCHEMA_VERSION};"
+        ))
+        .ok()?;
+        // The drop frees most of the file's pages but SQLite never returns them to the OS on its
+        // own — reclaim once, opportunistically (a busy db just keeps its free pages for reuse).
+        let _ = conn.execute_batch("VACUUM;");
+        Some(())
+    }
+
+    /// Open the shared catalog db and ensure the (v2) event tables exist. `None` on any error.
+    ///
+    /// Schema notes:
+    /// * `event_sessions` is a dedicated intern table rather than a reuse of the `sessions`
+    ///   rowid: `sessions` rows are `INSERT OR REPLACE`d on every sync, which deletes+reinserts
+    ///   and so *changes* the rowid — events keyed on it would silently orphan. Its PK is also
+    ///   `(harness, id, path)`, so one logical session at two paths would have two rowids.
+    ///   `UNIQUE(harness, session_id)` here is stable across syncs and tiny (~2.4k rows).
+    /// * `event_targets` interns the distinct target strings (~54k of ~145k events); event rows
+    ///   carry a nullable integer. Re-ingest deletes a session's event rows but leaves its
+    ///   interned targets — orphans are unreferenced cache rows, reclaimed only by the next
+    ///   schema migration. Suffix matching scans `event_targets` instead of every event row.
+    /// * No dedup index: [`record`] is DELETE-by-session + batch INSERT in one transaction, so
+    ///   cross-session duplicates are impossible by construction, and intra-batch duplicates are
+    ///   deduped in memory there.
+    /// * `idx_events_session` serves [`events_for`] and `record`'s delete; `idx_events_target`
+    ///   joins event rows back from a matched target. v1's `idx_events_kind_ts` indexed
+    ///   `(kind, ts)` which no query ever drove with a kind-prefix lookup — dropped.
     fn open() -> Option<Connection> {
         let conn = crate::catalog::open_db()?;
+        migrate(&conn)?;
         conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS events(
+            "CREATE TABLE IF NOT EXISTS event_sessions(
+                 id         INTEGER PRIMARY KEY,
                  harness    TEXT NOT NULL,
                  session_id TEXT NOT NULL,
-                 msg_idx    INTEGER NOT NULL,
-                 ts         INTEGER,
-                 kind       TEXT NOT NULL,
-                 tool       TEXT,
-                 target     TEXT,
-                 detail     TEXT
+                 UNIQUE(harness, session_id)
              );
-             CREATE UNIQUE INDEX IF NOT EXISTS idx_events_dedup
-                 ON events(harness, session_id, msg_idx, kind, COALESCE(target,''));
-             CREATE INDEX IF NOT EXISTS idx_events_target ON events(target);
-             CREATE INDEX IF NOT EXISTS idx_events_kind_ts ON events(kind, ts);
-             CREATE INDEX IF NOT EXISTS idx_events_session ON events(session_id);
+             CREATE TABLE IF NOT EXISTS event_targets(
+                 id     INTEGER PRIMARY KEY,
+                 target TEXT NOT NULL UNIQUE
+             );
+             CREATE TABLE IF NOT EXISTS events(
+                 session   INTEGER NOT NULL,
+                 msg_idx   INTEGER NOT NULL,
+                 ts        INTEGER,
+                 kind      TEXT NOT NULL,
+                 tool      TEXT,
+                 target_id INTEGER,
+                 detail    TEXT
+             );
+             CREATE INDEX IF NOT EXISTS idx_events_session ON events(session);
+             CREATE INDEX IF NOT EXISTS idx_events_target ON events(target_id);
              CREATE TABLE IF NOT EXISTS event_sync(
                  harness  TEXT NOT NULL,
                  id       TEXT NOT NULL,
@@ -431,30 +502,72 @@ mod db {
     /// Persist `events` as the complete event set for session `r` (one transaction: delete prior
     /// rows, insert, stamp `event_sync`). Idempotent — a re-ingest of an unchanged session rewrites
     /// identical rows. Best-effort: any sqlite error leaves the previous state and returns quietly.
+    ///
+    /// Dedup invariant (what replaced v1's unique expression index): the DELETE-by-session +
+    /// batch-INSERT shape makes cross-session duplicates impossible by construction, and
+    /// duplicates *within* this batch — same `(msg_idx, kind, target)`, matching the old index's
+    /// `COALESCE(target,'')` semantics — are dropped by the in-memory set below.
     pub fn record(r: &SessionRef, events: &[Event], mtime_ns: i64) {
         let Some(mut conn) = open() else { return };
         let Ok(tx) = conn.transaction() else { return };
         let harness = r.harness.as_str();
         let _ = tx.execute(
-            "DELETE FROM events WHERE harness=?1 AND session_id=?2",
+            "INSERT OR IGNORE INTO event_sessions(harness, session_id) VALUES(?1,?2)",
             params![harness, r.id],
         );
+        let Ok(session) = tx.query_row(
+            "SELECT id FROM event_sessions WHERE harness=?1 AND session_id=?2",
+            params![harness, r.id],
+            |row| row.get::<_, i64>(0),
+        ) else {
+            return;
+        };
+        let _ = tx.execute("DELETE FROM events WHERE session=?1", params![session]);
         {
-            let Ok(mut stmt) = tx.prepare(
-                "INSERT OR IGNORE INTO events(harness,session_id,msg_idx,ts,kind,tool,target,detail)
-                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+            let Ok(mut intern) =
+                tx.prepare("INSERT OR IGNORE INTO event_targets(target) VALUES(?1)")
+            else {
+                return;
+            };
+            let Ok(mut intern_id) = tx.prepare("SELECT id FROM event_targets WHERE target=?1")
+            else {
+                return;
+            };
+            let Ok(mut insert) = tx.prepare(
+                "INSERT INTO events(session,msg_idx,ts,kind,tool,target_id,detail)
+                 VALUES(?1,?2,?3,?4,?5,?6,?7)",
             ) else {
                 return;
             };
+            let mut seen: std::collections::HashSet<(usize, &str, &str)> =
+                std::collections::HashSet::new();
+            let mut targets: std::collections::HashMap<&str, i64> =
+                std::collections::HashMap::new();
             for e in events {
-                let _ = stmt.execute(params![
-                    harness,
-                    r.id,
+                if !seen.insert((e.msg_idx, e.kind, e.target.as_deref().unwrap_or(""))) {
+                    continue;
+                }
+                let target_id: Option<i64> = match e.target.as_deref() {
+                    None => None,
+                    Some(t) => match targets.get(t) {
+                        Some(&id) => Some(id),
+                        None => {
+                            let _ = intern.execute(params![t]);
+                            let Ok(id) = intern_id.query_row(params![t], |row| row.get(0)) else {
+                                return;
+                            };
+                            targets.insert(t, id);
+                            Some(id)
+                        }
+                    },
+                };
+                let _ = insert.execute(params![
+                    session,
                     e.msg_idx as i64,
                     e.ts,
                     e.kind,
                     e.tool,
-                    e.target,
+                    target_id,
                     e.detail,
                 ]);
             }
@@ -501,9 +614,12 @@ mod db {
     pub fn events_for(harness: &str, session_id: &str, kind: Option<&str>) -> Vec<EventRow> {
         let Some(conn) = open() else { return Vec::new() };
         let Ok(mut stmt) = conn.prepare(
-            "SELECT harness,session_id,msg_idx,ts,kind,tool,target,detail FROM events
-             WHERE harness=?1 AND session_id=?2 AND (?3 IS NULL OR kind=?3)
-             ORDER BY msg_idx, kind",
+            "SELECT es.harness, es.session_id, e.msg_idx, e.ts, e.kind, e.tool, t.target, e.detail
+             FROM events e
+             JOIN event_sessions es ON es.id = e.session
+             LEFT JOIN event_targets t ON t.id = e.target_id
+             WHERE es.harness=?1 AND es.session_id=?2 AND (?3 IS NULL OR e.kind=?3)
+             ORDER BY e.msg_idx, e.kind",
         ) else {
             return Vec::new();
         };
@@ -531,6 +647,10 @@ mod db {
     /// suffix (`…/<path>`), so `cv touched src/ir.rs` finds `/repo/src/ir.rs` from anywhere.
     /// `edits_only` keeps only sessions with at least one `file_edit`. Titles come from a join
     /// against the `sessions` catalog. Empty on any error or a cold catalog.
+    ///
+    /// The leading-`%` LIKE can never use an index; since v2 it scans `event_targets` (the
+    /// distinct targets, ~⅓ of the event rows) and joins matches back through `idx_events_target`
+    /// instead of scanning every event row.
     pub fn sessions_touching(path: &str, edits_only: bool) -> Vec<TouchedSession> {
         let Some(conn) = open() else { return Vec::new() };
         let abs = absolutize(path, std::env::current_dir().ok().as_deref());
@@ -546,19 +666,23 @@ mod db {
             format!("%/{escaped}")
         };
         let having = if edits_only { "HAVING edits > 0" } else { "" };
+        // The IN-subquery (not a join) pins the plan: one scan over the distinct targets, then
+        // matching event rows through idx_events_target — never a scan of all events.
         let sql = format!(
-            "SELECT e.harness, e.session_id,
+            "SELECT es.harness, es.session_id,
                     SUM(e.kind='file_edit') AS edits,
                     SUM(e.kind='file_read') AS reads,
                     MAX(e.ts) AS last_ts,
                     MAX(s.title) AS title
              FROM events e
-             LEFT JOIN sessions s ON s.harness = e.harness AND s.id = e.session_id
+             JOIN event_sessions es ON es.id = e.session
+             LEFT JOIN sessions s ON s.harness = es.harness AND s.id = es.session_id
              WHERE e.kind IN ('file_edit','file_read')
-               AND (e.target = ?1 OR e.target LIKE ?2 ESCAPE '\\')
-             GROUP BY e.harness, e.session_id
+               AND e.target_id IN (SELECT id FROM event_targets
+                                   WHERE target = ?1 OR target LIKE ?2 ESCAPE '\\')
+             GROUP BY es.harness, es.session_id
              {having}
-             ORDER BY last_ts DESC, e.session_id"
+             ORDER BY last_ts DESC, es.session_id"
         );
         let Ok(mut stmt) = conn.prepare(&sql) else { return Vec::new() };
         let rows = stmt.query_map(params![abs, suffix], |row| {
@@ -591,14 +715,19 @@ mod db {
             .replace('%', "\\%")
             .replace('_', "\\_");
         let suffix = format!("%/{escaped}");
+        // IN-subquery for the same plan-pinning reason as [`sessions_touching`]; the extra join
+        // back to event_targets only resolves the matched rows' target strings by rowid.
         let Ok(mut stmt) = conn.prepare(
-            "SELECT e.harness, e.session_id, e.msg_idx, e.ts, e.target,
+            "SELECT es.harness, es.session_id, e.msg_idx, e.ts, t.target,
                     MAX(s.title), MAX(s.cwd), MAX(s.created_at), MAX(s.updated_at)
              FROM events e
-             LEFT JOIN sessions s ON s.harness = e.harness AND s.id = e.session_id
+             JOIN event_targets t ON t.id = e.target_id
+             JOIN event_sessions es ON es.id = e.session
+             LEFT JOIN sessions s ON s.harness = es.harness AND s.id = es.session_id
              WHERE e.kind = 'file_edit'
-               AND (e.target = ?1 OR e.target = ?2 OR e.target LIKE ?3 ESCAPE '\\')
-             GROUP BY e.harness, e.session_id, e.msg_idx, e.ts, e.target
+               AND e.target_id IN (SELECT id FROM event_targets
+                                   WHERE target = ?1 OR target = ?2 OR target LIKE ?3 ESCAPE '\\')
+             GROUP BY es.harness, es.session_id, e.msg_idx, e.ts, t.target
              ORDER BY e.ts, e.msg_idx",
         ) else {
             return Vec::new();
@@ -861,11 +990,16 @@ mod tests {
         assert!(ev[0].detail.as_ref().unwrap().chars().count() <= DETAIL_MAX);
     }
 
+    /// `CLAURDVOYANT_HOME` is process-global state — the temp-home tests serialize on this.
+    #[cfg(feature = "sqlite")]
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// End-to-end against a real temp catalog db: stream a claude JSONL fixture through
     /// `ingest_ref`, then read events back with `events_for` and `sessions_touching`.
     #[cfg(feature = "sqlite")]
     #[test]
     fn ingest_and_query_roundtrip_in_temp_catalog() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let home = std::env::temp_dir().join(format!("cv-events-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&home).unwrap();
         std::env::set_var("CLAURDVOYANT_HOME", &home);
@@ -956,6 +1090,107 @@ mod tests {
         let edits = edits_touching_file("/elsewhere/src/parser.rs", "src/parser.rs");
         assert_eq!(edits.len(), 1);
         assert!(edits_touching_file("/repo/src/other.rs", "src/other.rs").is_empty());
+
+        std::env::remove_var("CLAURDVOYANT_HOME");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// Migration e2e: a v1-shaped (0.9.10) catalog opened by v2 code is dropped wholesale —
+    /// old rows AND `event_sync` (so everything reads as stale) — then lazily reingested; the
+    /// version stamp prevents re-drops; and a v1 table snuck back in by an old binary under a
+    /// v2 stamp self-heals on the next open.
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn v1_catalog_migrates_by_drop_and_lazy_reingest() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let home = std::env::temp_dir().join(format!("cv-events-mig-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&home).unwrap();
+        std::env::set_var("CLAURDVOYANT_HOME", &home);
+
+        const V1_DDL: &str = "CREATE TABLE events(
+                 harness    TEXT NOT NULL,
+                 session_id TEXT NOT NULL,
+                 msg_idx    INTEGER NOT NULL,
+                 ts         INTEGER,
+                 kind       TEXT NOT NULL,
+                 tool       TEXT,
+                 target     TEXT,
+                 detail     TEXT
+             );
+             CREATE UNIQUE INDEX idx_events_dedup
+                 ON events(harness, session_id, msg_idx, kind, COALESCE(target,''));
+             INSERT INTO events VALUES('claude','mig-e2e',1,NULL,'file_edit','Edit','/old/v1.rs',NULL);";
+
+        // A v1-shaped catalog as 0.9.10 left it: v1 events + a fresh event_sync stamp.
+        let sdir = home.join("sessions");
+        std::fs::create_dir_all(&sdir).unwrap();
+        let path = sdir.join("mig-e2e.jsonl");
+        std::fs::write(
+            &path,
+            format!(
+                "{}\n",
+                serde_json::json!({
+                    "type": "assistant", "uuid": "a0", "sessionId": "mig-e2e",
+                    "message": {"role": "assistant", "content": [
+                        {"type": "tool_use", "id": "t1", "name": "Edit",
+                         "input": {"file_path": "src/lib.rs", "old_string": "a", "new_string": "b"}}
+                    ]}
+                })
+            ),
+        )
+        .unwrap();
+        let mtime = file_mtime_ns(&path);
+        {
+            let conn = rusqlite::Connection::open(home.join("catalog.db")).unwrap();
+            conn.execute_batch(&format!(
+                "{V1_DDL}
+                 CREATE TABLE event_sync(
+                     harness TEXT NOT NULL, id TEXT NOT NULL, path TEXT NOT NULL,
+                     mtime_ns INTEGER NOT NULL, PRIMARY KEY(harness, id, path));
+                 INSERT INTO event_sync VALUES('claude','mig-e2e','{}',{mtime});",
+                path.display()
+            ))
+            .unwrap();
+        }
+
+        let r = SessionRef {
+            id: "mig-e2e".into(),
+            harness: crate::ir::Harness::Claude,
+            path: path.clone(),
+            cwd: Some("/repo".into()),
+            title: None,
+            created_at: None,
+            updated_at: None,
+            message_count: 1,
+        };
+
+        // First v2 open (inside needs_ingest) migrates: v1 rows gone, sync stamp gone → stale.
+        assert!(needs_ingest(&r, mtime), "v1 event_sync stamps must not survive migration");
+        assert!(!catalog_has_events(), "v1 event rows must not survive migration");
+
+        // The normal lazy path then rebuilds cleanly on the v2 schema.
+        let n = ingest_ref(&r).unwrap();
+        assert_eq!(n, 1);
+        assert!(!needs_ingest(&r, mtime));
+        let rows = events_for("claude", "mig-e2e", None);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].target.as_deref(), Some("/repo/src/lib.rs"));
+        assert_eq!(sessions_touching("src/lib.rs", true).len(), 1);
+
+        // The stamp stuck, so the next open did NOT re-drop (the ingested rows are still there).
+        {
+            let conn = rusqlite::Connection::open(home.join("catalog.db")).unwrap();
+            let v: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0)).unwrap();
+            assert_eq!(v, 2);
+
+            // Now simulate an old 0.9.10 binary recreating v1 tables under the v2 stamp.
+            conn.execute_batch(&format!("DROP TABLE events; {V1_DDL}")).unwrap();
+        }
+        // Shape detection self-heals on open: full reset, stale again, reingest works.
+        assert!(!catalog_has_events(), "a v1-shaped table under a v2 stamp must be dropped");
+        assert!(needs_ingest(&r, mtime));
+        ingest_ref(&r).unwrap();
+        assert_eq!(events_for("claude", "mig-e2e", None).len(), 1);
 
         std::env::remove_var("CLAURDVOYANT_HOME");
         std::fs::remove_dir_all(&home).ok();
