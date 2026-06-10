@@ -1,5 +1,7 @@
 //! `cv` — the claurdvoyant CLI.
 
+mod blame;
+
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use cv_core::ir::*;
@@ -34,6 +36,9 @@ enum Cmd {
         /// Max rows to show.
         #[arg(long, default_value_t = 40)]
         limit: usize,
+        /// Sort key: updated (default), created, or messages.
+        #[arg(long = "sort-by", default_value = "updated", value_parser = ["updated", "created", "messages"])]
+        sort_by: String,
     },
     /// Full-text search across all session content.
     Search {
@@ -145,6 +150,8 @@ enum Cmd {
     ///
     /// Incremental by default: only changed/new sessions are re-indexed and vanished ones reaped,
     /// so routine refreshes are fast and light. Use `--rebuild` to clear and rebuild from scratch.
+    /// Tool-call events (file edits/reads, commands, errors) ride along on the same pass into the
+    /// catalog, powering `cv events` and `cv touched`.
     Index {
         /// Also build semantic embeddings (`cv search --semantic`). Downloads a small embedding
         /// model (~30MB) on first use.
@@ -153,6 +160,43 @@ enum Cmd {
         /// Clear and rebuild the index from scratch instead of incrementally updating it.
         #[arg(long)]
         rebuild: bool,
+    },
+    /// List what a session DID: its extracted events (file edits/reads, commands, errors).
+    ///
+    /// Events are ingested during `cv index`; a session that isn't cataloged yet (or whose file
+    /// changed since) is ingested on the spot — one streamed pass, large content stays on disk.
+    Events {
+        id: String,
+        #[arg(long)]
+        harness: Option<String>,
+        /// Only this kind: file_edit, file_read, command, tool, or error.
+        #[arg(long)]
+        kind: Option<String>,
+    },
+    /// Sessions that touched a file — every session with a file_edit/file_read event on its path.
+    ///
+    /// The path is matched absolutely and by suffix, so `cv touched src/ir.rs` finds sessions
+    /// that edited `/any/repo/src/ir.rs`. Run `cv index` first to (re)ingest events.
+    Touched {
+        path: String,
+        /// Only sessions that EDITED the file (drop read-only appearances).
+        #[arg(long)]
+        edits_only: bool,
+    },
+    /// Code provenance: which agent session wrote this code, and what was it thinking?
+    ///
+    /// Correlates the file's git history with the event catalog's file_edit events — an agent
+    /// edit shortly before a commit is strong evidence that session authored it. Each matched
+    /// commit gets its best sessions plus a `cv show --range` hint into the conversation around
+    /// the edit. Run `cv index` first to ingest events.
+    Blame {
+        file: String,
+        /// Only these lines: `<line>` or `<line>,<endline>` (via `git blame -L`).
+        #[arg(short = 'L', value_name = "LINE[,ENDLINE]")]
+        lines: Option<String>,
+        /// Also print the conversation window around the single best-matched edit.
+        #[arg(long)]
+        show: bool,
     },
     /// Fleet analytics over all discovered sessions.
     Stats,
@@ -381,7 +425,7 @@ enum BoardCmd {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
-        Cmd::Ls { harness, cwd, limit } => cmd_ls(harness, cwd, limit),
+        Cmd::Ls { harness, cwd, limit, sort_by } => cmd_ls(harness, cwd, limit, &sort_by),
         Cmd::Search { query, harness, limit, semantic } => cmd_search(&query, harness, limit, semantic),
         Cmd::Show { id, harness, json, range } => cmd_show(&id, harness, json, range),
         Cmd::Export { id, format, harness } => cmd_export(&id, &format, harness),
@@ -392,6 +436,9 @@ fn main() -> Result<()> {
         Cmd::Port { id, to, from, to_dir, out, no_context } => cmd_port(&id, to, from, to_dir, out, no_context),
         Cmd::Scry { harness, cwd, interval, existing } => cmd_scry(harness, cwd, interval, existing),
         Cmd::Index { semantic, rebuild } => cmd_index(semantic, rebuild),
+        Cmd::Events { id, harness, kind } => cmd_events(&id, harness, kind),
+        Cmd::Touched { path, edits_only } => cmd_touched(&path, edits_only),
+        Cmd::Blame { file, lines, show } => blame::cmd_blame(&file, lines.as_deref(), show),
         Cmd::Stats => cmd_stats(),
         Cmd::Resume { id, harness, launch } => cmd_resume(&id, harness, launch),
         Cmd::Tree { id, harness } => cmd_tree(&id, harness),
@@ -764,6 +811,90 @@ fn cmd_index(semantic: bool, rebuild: bool) -> Result<()> {
             cv_search::default_embeddings_path().display()
         );
     }
+    println!("events: extracted on the same pass → try `cv events <id>` / `cv touched <path>`");
+    Ok(())
+}
+
+// ---------- events / touched ----------
+
+fn cmd_events(id: &str, harness: Option<String>, kind: Option<String>) -> Result<()> {
+    use cv_core::events;
+    let want = parse_harness(&harness)?;
+    let (r, _adapter) =
+        cv_core::find(id, want)?.with_context(|| format!("no session matching {id:?}"))?;
+
+    // Ensure this one session's events are current (cheap: a single streamed pass); a session
+    // already cataloged at this mtime is a no-op.
+    if events::needs_ingest(&r, events::file_mtime_ns(&r.path)) {
+        events::ingest_ref(&r)?;
+    }
+
+    let rows = events::events_for(r.harness.as_str(), &r.id, kind.as_deref());
+    if rows.is_empty() {
+        match &kind {
+            Some(k) => println!("no {k:?} events in {} (try without --kind)", short_id(&r.id)),
+            None => println!("no tool events in {} (a chat-only session?)", short_id(&r.id)),
+        }
+        return Ok(());
+    }
+
+    println!(
+        "{} event(s) in {}:{}\n",
+        rows.len(),
+        r.harness.as_str(),
+        short_id(&r.id)
+    );
+    for e in &rows {
+        let time = e
+            .ts
+            .and_then(|t| chrono::DateTime::from_timestamp(t, 0))
+            .map(|d| d.format("%m-%d %H:%M").to_string())
+            .unwrap_or_else(|| "-----------".into());
+        println!(
+            "{:>5}  {:11}  {:9}  {:14}  {}",
+            e.msg_idx,
+            time,
+            e.kind,
+            e.tool.as_deref().unwrap_or("-"),
+            e.target.as_deref().map(|t| truncate(t, 90)).unwrap_or_default(),
+        );
+        if let Some(d) = &e.detail {
+            println!("       ↳ {}", truncate(d, 100));
+        }
+    }
+    Ok(())
+}
+
+fn cmd_touched(path: &str, edits_only: bool) -> Result<()> {
+    let rows = cv_core::events::sessions_touching(path, edits_only);
+    if rows.is_empty() {
+        println!(
+            "no sessions {} {path:?} — events are ingested by `cv index` (run it first?)",
+            if edits_only { "edited" } else { "touched" }
+        );
+        return Ok(());
+    }
+    println!("{} session(s) touched {path:?}:\n", rows.len());
+    for t in &rows {
+        let date = t
+            .last_ts
+            .and_then(|s| chrono::DateTime::from_timestamp(s, 0))
+            .map(|d| d.format("%Y-%m-%d").to_string())
+            .unwrap_or_else(|| "----------".into());
+        let counts = match (t.edits, t.reads) {
+            (0, n) => format!("{n} read(s)"),
+            (n, 0) => format!("{n} edit(s)"),
+            (e, r) => format!("{e} edit(s), {r} read(s)"),
+        };
+        println!(
+            "{:8}  {:8}  {:10}  {:22}  {}",
+            t.harness,
+            short_id(&t.session_id),
+            date,
+            counts,
+            t.title.as_deref().map(|s| truncate(s, 56)).unwrap_or_default(),
+        );
+    }
     Ok(())
 }
 
@@ -1050,30 +1181,42 @@ fn parse_harness(s: &Option<String>) -> Result<Option<Harness>> {
     }
 }
 
-fn cmd_ls(harness: Option<String>, cwd: Option<String>, limit: usize) -> Result<()> {
+fn cmd_ls(harness: Option<String>, cwd: Option<String>, limit: usize, sort_by: &str) -> Result<()> {
     let want = parse_harness(&harness)?;
-    let mut refs: Vec<SessionRef> = cv_core::discover_all()
+    let all = cv_core::discover_all();
+    let discovered = all.len();
+    let mut refs: Vec<SessionRef> = all
         .into_iter()
-        .filter(|r| want.map_or(true, |h| r.harness == h))
+        .filter(|r| want.is_none_or(|h| r.harness == h))
         .filter(|r| match &cwd {
             None => true,
             Some(c) => r
                 .cwd
                 .as_ref()
-                .map(|p| p.to_string_lossy().contains(c))
-                .unwrap_or(false),
+                .is_some_and(|p| p.to_string_lossy().contains(c)),
         })
         .collect();
 
-    refs.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+    match sort_by {
+        "created" => refs.sort_by_key(|r| std::cmp::Reverse(r.created_at.or(r.updated_at))),
+        "messages" => refs.sort_by_key(|r| std::cmp::Reverse(r.message_count)),
+        // "updated" (the default; clap's value_parser admits nothing else)
+        _ => refs.sort_by_key(|r| std::cmp::Reverse(r.updated_at.or(r.created_at))),
+    }
+
     let total = refs.len();
-    println!("{total} session(s)\n");
+    if total < discovered {
+        println!("{total} session(s) (of {discovered} discovered; filtered)\n");
+    } else {
+        println!("{total} session(s)\n");
+    }
     for r in refs.iter().take(limit) {
         println!(
             "{:8}  {:8}  {:10}  {:>4} msg  {}",
             r.harness.as_str(),
             short_id(&r.id),
             r.updated_at
+                .or(r.created_at)
                 .map(|d| d.format("%Y-%m-%d").to_string())
                 .unwrap_or_else(|| "----------".into()),
             r.message_count,
@@ -1100,6 +1243,17 @@ fn cmd_search(query: &str, harness: Option<String>, limit: usize, semantic: bool
         return Ok(());
     }
 
+    // A retired sqlite FTS index may still be sitting on disk from older versions; tantivy is
+    // canonical now, so let the user know it's safe to remove.
+    if let Some(legacy) = legacy_sqlite_index_path() {
+        if legacy.exists() {
+            eprintln!(
+                "(note: legacy sqlite index no longer used; safe to delete {})",
+                legacy.display()
+            );
+        }
+    }
+
     // Preferred path: the tantivy full-text index (real tokenization + BM25). Authoritative when
     // present — an empty result means "no match", not "fall back to a live scan".
     if cv_search::default_tantivy_dir().exists() {
@@ -1108,48 +1262,21 @@ fn cmd_search(query: &str, harness: Option<String>, limit: usize, semantic: bool
                 render_search_hits(&hits, want, limit, query, "index");
                 return Ok(());
             }
-            Err(e) => eprintln!("(tantivy index unavailable: {e:#}; trying sqlite/live)"),
-        }
-    }
-
-    // Fallback: a prebuilt SQLite FTS index. If it exists, it's authoritative — an empty result
-    // means "no match", not "fall back to a 90-second live scan". Only scan live if there's none.
-    let idx_path = cv_core::index::default_index_path();
-    if idx_path.exists() {
-        match cv_core::index::Index::open_or_create(idx_path)
-            .and_then(|idx| idx.search(query, limit.saturating_mul(4)))
-        {
-            Ok(found) => {
-                let rows: Vec<_> = found
-                    .into_iter()
-                    .filter(|h| want.map_or(true, |w| h.harness == w))
-                    .take(limit)
-                    .collect();
-                if rows.is_empty() {
-                    println!("no matches for {query:?} (index; try `cv index` to refresh)");
-                }
-                for h in rows {
-                    println!(
-                        "{:8}  {:8}  {:10}  {}",
-                        h.harness.as_str(),
-                        short_id(&h.id),
-                        h.updated_at
-                            .map(|d| d.format("%Y-%m-%d").to_string())
-                            .unwrap_or_else(|| "----------".into()),
-                        h.title.clone().unwrap_or_default(),
-                    );
-                    if !h.snippet.trim().is_empty() {
-                        println!("          … {}", truncate(&h.snippet, 120));
-                    }
-                }
-                return Ok(());
-            }
-            Err(e) => eprintln!("(index unavailable: {e:#}; scanning live)"),
+            Err(e) => eprintln!("(tantivy index unavailable: {e:#}; scanning live)"),
         }
     } else {
         eprintln!("(no index yet — scanning live; run `cv index` for instant search)");
     }
     cmd_search_live(query, want, limit)
+}
+
+/// Where the retired sqlite FTS index used to live: `$CLAURDVOYANT_HOME/index.sqlite` or
+/// `~/.claurdvoyant/index.sqlite`. Only used to nudge cleanup of a stale file.
+fn legacy_sqlite_index_path() -> Option<PathBuf> {
+    std::env::var_os("CLAURDVOYANT_HOME")
+        .map(PathBuf::from)
+        .or_else(|| dirs_home().map(|h| h.join(".claurdvoyant")))
+        .map(|d| d.join("index.sqlite"))
 }
 
 /// Render a slice of cv-search [`cv_search::Hit`]s with harness/short-id/date/title/snippet,
@@ -1163,7 +1290,7 @@ fn render_search_hits(
 ) {
     let rows: Vec<&cv_search::Hit> = hits
         .iter()
-        .filter(|h| want.map_or(true, |w| h.harness == w.as_str()))
+        .filter(|h| want.is_none_or(|w| h.harness == w.as_str()))
         .take(limit)
         .collect();
     if rows.is_empty() {
@@ -1227,7 +1354,7 @@ fn cmd_search_live(query: &str, want: Option<Harness>, limit: usize) -> Result<(
     }
 
     for adapter in cv_core::harness::all() {
-        if want.map_or(false, |h| adapter.harness() != h) || adapter.storage_root().is_none() {
+        if want.is_some_and(|h| adapter.harness() != h) || adapter.storage_root().is_none() {
             continue;
         }
         for r in adapter.discover()? {
@@ -1575,7 +1702,7 @@ fn cmd_timeline(harness: Option<String>, cwd: Option<String>, limit: usize) -> R
     let want = parse_harness(&harness)?;
     let mut refs: Vec<SessionRef> = cv_core::discover_all()
         .into_iter()
-        .filter(|r| want.map_or(true, |h| r.harness == h))
+        .filter(|r| want.is_none_or(|h| r.harness == h))
         .filter(|r| match &cwd {
             None => true,
             Some(c) => r
@@ -1588,7 +1715,7 @@ fn cmd_timeline(harness: Option<String>, cwd: Option<String>, limit: usize) -> R
 
     // Sort ascending by updated_at (falling back to created_at), so the feed reads oldest → newest.
     let key = |r: &SessionRef| r.updated_at.or(r.created_at);
-    refs.sort_by(|a, b| key(a).cmp(&key(b)));
+    refs.sort_by_key(key);
 
     let total = refs.len();
     // A feed shows the *most recent* window; keep the last `limit` rows but still oldest → newest.
@@ -2169,17 +2296,6 @@ fn ceil_char(s: &str, mut i: usize) -> usize {
         i += 1;
     }
     i
-}
-
-fn truncate(s: &str, max: usize) -> String {
-    let s = s.replace('\n', " ");
-    if s.chars().count() <= max {
-        s
-    } else {
-        let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
-        out.push('…');
-        out
-    }
 }
 
 fn home_rel(p: &Path) -> String {

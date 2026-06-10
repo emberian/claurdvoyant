@@ -85,6 +85,53 @@ impl<F: FnMut(Message) -> Flow> MessageSink for F {
     }
 }
 
+/// Fans one adapter pass into two sinks, so a single read of a transcript feeds multiple consumers
+/// — e.g. `cv index` driving the FTS [`ChunkSink`] and the event-catalog
+/// [`EventSink`](crate::events::EventSink) off the same `stream()`. Each message is cloned once
+/// while both sinks are live; under [`ParseOptions::lazy`] large content is a
+/// [`Span`](crate::lazy::Span) handle, so the clone stays O(small).
+///
+/// Flow semantics: the stream continues until **both** sinks have said [`Flow::Stop`], and a sink
+/// that stopped is never called again. (Stopping on the first `Stop` would silently truncate the
+/// other consumer's view — e.g. a head-only sink ending event extraction mid-session.)
+pub struct TeeSink<'a> {
+    a: &'a mut dyn MessageSink,
+    b: &'a mut dyn MessageSink,
+    a_stopped: bool,
+    b_stopped: bool,
+}
+
+impl<'a> TeeSink<'a> {
+    pub fn new(a: &'a mut dyn MessageSink, b: &'a mut dyn MessageSink) -> Self {
+        TeeSink { a, b, a_stopped: false, b_stopped: false }
+    }
+}
+
+impl MessageSink for TeeSink<'_> {
+    fn meta(&mut self, s: &Session) {
+        self.a.meta(s);
+        self.b.meta(s);
+    }
+
+    fn message(&mut self, m: Message) -> Flow {
+        match (self.a_stopped, self.b_stopped) {
+            (false, false) => {
+                let copy = m.clone();
+                self.a_stopped = self.a.message(m) == Flow::Stop;
+                self.b_stopped = self.b.message(copy) == Flow::Stop;
+            }
+            (false, true) => self.a_stopped = self.a.message(m) == Flow::Stop,
+            (true, false) => self.b_stopped = self.b.message(m) == Flow::Stop,
+            (true, true) => {}
+        }
+        if self.a_stopped && self.b_stopped {
+            Flow::Stop
+        } else {
+            Flow::Continue
+        }
+    }
+}
+
 /// A sink that retains every message — the bridge back to a whole [`Session`]. See [`collect`].
 #[derive(Default)]
 pub struct CollectSink {
@@ -122,32 +169,48 @@ pub fn collect_with(adapter: &dyn Adapter, r: &SessionRef, opts: &ParseOptions) 
 
 /// Append a message's searchable text to `out` — the same projection [`Session::searchable_text`]
 /// makes, but per-message so the bulk indexer can build a body incrementally and drop each message.
-/// Kept in sync with `Session::searchable_text`.
+/// Thin alias for [`Message::append_searchable`], the single canonical projection.
 pub fn append_searchable(out: &mut String, m: &Message) {
-    use crate::ir::Block;
-    for b in &m.content {
-        match b {
-            Block::Text { text } | Block::Thinking { text, .. } => {
-                out.push_str(text);
-                out.push('\n');
+    m.append_searchable(out);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ir::{Block, Role};
+
+    fn text_msg(t: &str) -> Message {
+        let mut m = Message::new(Role::User);
+        m.content = vec![Block::Text { text: t.into() }];
+        m
+    }
+
+    /// A sink that records the texts it saw and stops after `stop_after` messages.
+    struct Probe {
+        seen: Vec<String>,
+        stop_after: usize,
+    }
+    impl MessageSink for Probe {
+        fn message(&mut self, m: Message) -> Flow {
+            self.seen.push(m.text().unwrap_or_default());
+            if self.seen.len() >= self.stop_after {
+                Flow::Stop
+            } else {
+                Flow::Continue
             }
-            Block::ToolUse { name, input, .. } => {
-                out.push_str(name);
-                out.push(' ');
-                out.push_str(&input.to_string());
-                out.push('\n');
-            }
-            Block::ToolResult { content, .. } => {
-                out.push_str(content);
-                out.push('\n');
-            }
-            Block::File { path, source, .. } => {
-                if let Some(p) = path.as_deref().or(source.as_deref()) {
-                    out.push_str(p);
-                    out.push('\n');
-                }
-            }
-            Block::Image { .. } => {}
         }
+    }
+
+    #[test]
+    fn tee_feeds_both_until_both_stop_and_never_calls_a_stopped_sink() {
+        let mut a = Probe { seen: Vec::new(), stop_after: 1 };
+        let mut b = Probe { seen: Vec::new(), stop_after: 3 };
+        let mut tee = TeeSink::new(&mut a, &mut b);
+        // a stops after the first message; the tee keeps going for b until *it* stops.
+        assert_eq!(tee.message(text_msg("one")), Flow::Continue);
+        assert_eq!(tee.message(text_msg("two")), Flow::Continue);
+        assert_eq!(tee.message(text_msg("three")), Flow::Stop);
+        assert_eq!(a.seen, vec!["one"]);
+        assert_eq!(b.seen, vec!["one", "two", "three"]);
     }
 }

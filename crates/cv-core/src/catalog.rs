@@ -28,6 +28,13 @@ mod imp {
         Some(dir.join("catalog.db"))
     }
 
+    /// An open connection to the shared catalog db (WAL + busy timeout, `sessions` DDL applied),
+    /// for sibling catalog tables — the event catalog ([`crate::events`]) adds its own DDL on top.
+    /// `None` on any error; callers degrade.
+    pub(crate) fn open_db() -> Option<Connection> {
+        open()
+    }
+
     fn open() -> Option<Connection> {
         let conn = Connection::open(db_path()?).ok()?;
         // WAL + a busy timeout so concurrent cv/cvd processes don't error each other out.
@@ -130,6 +137,8 @@ mod imp {
 
 #[cfg(feature = "sqlite")]
 pub use imp::{lookup, sync};
+#[cfg(feature = "sqlite")]
+pub(crate) use imp::open_db;
 
 /// No-op fallbacks when sqlite is disabled — `find` simply always takes its scan path.
 #[cfg(not(feature = "sqlite"))]

@@ -11,11 +11,10 @@ pub mod catalog;
 pub mod dataset;
 pub mod discover_cache;
 pub mod emit;
+pub mod events;
 pub mod harmony;
 pub mod harness;
 pub mod html;
-#[cfg(feature = "sqlite")]
-pub mod index;
 pub mod ingest;
 pub mod ir;
 pub mod lazy;
@@ -29,7 +28,7 @@ pub use emit::{EmitOptions, emit};
 pub use harness::{Adapter, EmitResult};
 pub use ir::*;
 pub use lazy::{Resolver, Span, Text, INLINE_MAX};
-pub use stream::{collect, CollectSink, Flow, MessageSink, ParseOptions};
+pub use stream::{collect, CollectSink, Flow, MessageSink, ParseOptions, TeeSink};
 
 use anyhow::Result;
 

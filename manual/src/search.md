@@ -100,11 +100,14 @@ Here `--limit` defaults to **10**.
 ### How `cv search` resolves
 
 `cv search` prefers the tantivy index when it exists — and when present it's
-*authoritative*: an empty result means "no match", not "go scan everything." If
-there's no tantivy index, it falls back to a prebuilt SQLite index, and only if
-*nothing* is built does it scan sessions live (slow — that's what the index is
-for). When you see `(no index yet — scanning live; run cv index for instant
-search)`, build the index.
+*authoritative*: an empty result means "no match", not "go scan everything."
+Only when no index is built does it scan sessions live (slow — that's what the
+index is for). When you see `(no index yet — scanning live; run cv index for
+instant search)`, build the index.
+
+> Older releases also kept a SQLite full-text index as a middle tier; it's
+> retired (tantivy is canonical). If a stale `index.sqlite` lingers in your
+> claurdvoyant home, `cv search` prints a note that it's safe to delete.
 
 ## Semantic / meaning search
 

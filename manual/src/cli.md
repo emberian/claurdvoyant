@@ -18,7 +18,10 @@ cv <cmd> --help    # flags for any one subcommand
 | | [`stats`](#cv-stats) | fleet analytics over everything you've run |
 | **searching** | [`search`](#cv-search) | full-text (or `--semantic`) search of session content |
 | | [`recall`](#cv-recall) | the most relevant past *spans* for a query |
-| | [`index`](#cv-index) | build/refresh the search index |
+| | [`index`](#cv-index) | build/refresh the search index (events ride along) |
+| **provenance** | [`events`](#cv-events) | what a session *did*: file edits, commands, errors |
+| | [`touched`](#cv-touched) | every session that ever touched a file |
+| | [`blame`](#cv-blame) | which session's reasoning wrote this code |
 | **viewing** | [`show`](#cv-show) | print one session as a transcript (or `--json`) |
 | | [`export`](#cv-export) | render a session to `md` / `json` / `html` |
 | | [`tree`](#cv-tree) | message threading (DAG or numbered list) |
@@ -62,6 +65,7 @@ cv ls                         # 40 most-recent across all harnesses
 cv ls --harness claude        # only Claude Code sessions
 cv ls --cwd flux              # only sessions whose cwd contains "flux"
 cv ls --limit 100
+cv ls --sort-by messages      # updated (default) | created | messages
 ```
 
 ```text
@@ -196,6 +200,61 @@ embedded 2245 session(s) → ~/.cache/claurdvoyant/embeddings.bin
 ```
 
 - `--semantic` — also compute embeddings (downloads a ~30 MB model the first time).
+
+`cv index` also ingests the **event catalog** in the same streaming pass — every
+tool call is classified (`file_edit`, `file_read`, `command`, `error`, `tool`)
+and stored in `catalog.db`, powering the provenance commands below. One read per
+changed session feeds both stores.
+
+---
+
+## Provenance
+
+Search answers *what was said*; the event catalog answers *what was done*.
+
+### `cv events`
+
+List the classified events of one session — every file it edited or read, every
+command it ran, every tool error it hit.
+
+```sh
+cv events da9174f4               # everything, in message order
+cv events da9174f4 --kind error  # file_edit | file_read | command | tool | error
+```
+
+A stale or uncataloged session is ingested on the spot, so this works even
+before a full `cv index`.
+
+### `cv touched`
+
+Every session that ever touched a file — the question you actually have when
+you're staring at code wondering where it came from.
+
+```sh
+cv touched crates/cv-core/src/ir.rs       # suffix-matched, so relative paths work
+cv touched src/ir.rs --edits-only         # only sessions that *wrote* it
+```
+
+```text
+claude    1d1465fa  2026-05-31  13 edit(s), 1 read(s)  Plan architecture refactoring…
+```
+
+### `cv blame`
+
+Correlate a file's git history with the event catalog: which agent session's
+reasoning produced each commit — and jump straight into the conversation at the
+moment of the edit.
+
+```sh
+cv blame crates/cv-core/src/ir.rs         # commits ↦ matching sessions
+cv blame src/ir.rs -L 42                  # who wrote *this line*
+cv blame src/ir.rs --show                 # open the best match at the edit
+```
+
+Each matched commit prints the session, the message index of the nearest edit,
+and a copy-pasteable `cv show <id> --range` centered on it. Time-correlation is
+honest about its limits: rebases and squashes shift commit times away from the
+edits that produced them, so matches are ranked, not asserted.
 
 ---
 

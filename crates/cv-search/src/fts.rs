@@ -6,8 +6,11 @@
 //! - `cwd`        TEXT   | STORED  — tokenized so path fragments are searchable
 //! - `title`      TEXT   | STORED
 //! - `body`       TEXT             — the big searchable blob; **indexed but not stored**
-//! - `path`       STRING | STORED  — source file, so a hit can be snippeted by re-reading just that
-//!                                   one session live (no full stored body — keeps the index lean)
+//! - `path`       STRING | STORED  — source file, so a hit can be snippeted by re-reading just
+//!   that one session live (no full stored body — keeps the index lean)
+//! - `preview`    STORED (only)    — ~240-char whitespace-collapsed head of the body, written on
+//!   the session's **first** chunk doc only (~240 bytes/session): the snippet fallback when the
+//!   source file has moved/changed
 //! - `created_at`/`updated_at` i64 INDEXED | STORED — returned on hits + future sort/filter
 //! - `mtime`      i64 STORED       — incremental-index key: unchanged `(id, mtime)` is skipped
 //!
@@ -32,6 +35,7 @@ struct Fields {
     title: Field,
     body: Field,
     path: Field,
+    preview: Field,
     created_at: Field,
     updated_at: Field,
     mtime: Field,
@@ -45,6 +49,7 @@ fn build_schema() -> Schema {
     b.add_text_field("title", TEXT | STORED);
     b.add_text_field("body", TEXT);
     b.add_text_field("path", STRING | STORED);
+    b.add_text_field("preview", STORED); // stored-only: never searched, just the snippet fallback
     b.add_i64_field("created_at", INDEXED | STORED);
     b.add_i64_field("updated_at", INDEXED | STORED);
     b.add_i64_field("mtime", STORED);
@@ -60,6 +65,7 @@ fn fields_of(schema: &Schema) -> Result<Fields> {
         title: get("title")?,
         body: get("body")?,
         path: get("path")?,
+        preview: get("preview")?,
         created_at: get("created_at")?,
         updated_at: get("updated_at")?,
         mtime: get("mtime")?,
@@ -67,15 +73,17 @@ fn fields_of(schema: &Schema) -> Result<Fields> {
 }
 
 /// Open the index at `dir`, creating it if absent. If an existing index has a **stale schema**
-/// (missing the `path`/`mtime` fields from before this layout — e.g. an index built by an older
-/// `cv`), it's transparently rebuilt fresh so the binary self-heals on upgrade.
+/// (missing the `path`/`mtime`/`preview` fields from before this layout — e.g. an index built by
+/// an older `cv`), it's transparently rebuilt fresh so the binary self-heals on upgrade; the next
+/// `cv index` repopulates it.
 fn open_or_create(dir: &Path) -> Result<(Index, Fields)> {
     std::fs::create_dir_all(dir)
         .with_context(|| format!("creating tantivy dir {}", dir.display()))?;
     let index = match Index::open_in_dir(dir) {
         Ok(idx)
             if idx.schema().get_field("path").is_ok()
-                && idx.schema().get_field("mtime").is_ok() =>
+                && idx.schema().get_field("mtime").is_ok()
+                && idx.schema().get_field("preview").is_ok() =>
         {
             idx
         }
@@ -111,6 +119,13 @@ const CHUNK_BYTES: usize = 4 * 1024 * 1024;
 /// flushes a tantivy document every [`CHUNK_BYTES`], so a large session is indexed as several small
 /// docs (same id) and the indexer never holds its whole body. Commits periodically so segments flush
 /// rather than accumulating in the writer's heap.
+///
+/// **Event ride-along:** the same single adapter pass also feeds the event catalog
+/// ([`cv_core::events`] — file edits/reads, commands, errors → `cv events` / `cv touched`) via a
+/// [`cv_core::TeeSink`]. Events keep their own mtime skip-table (`event_sync`), so an FTS-only
+/// `--rebuild` doesn't force an event re-ingest and a tantivy-fresh session whose events are
+/// missing gets an events-only catch-up pass; when both are stale the session is read exactly once.
+/// Event persistence is best-effort (sqlite errors never fail indexing).
 pub fn index_all(dir: &Path, rebuild: bool) -> Result<usize> {
     use cv_core::ParseOptions;
 
@@ -139,28 +154,47 @@ pub fn index_all(dir: &Path, rebuild: bool) -> Result<usize> {
         total += 1;
         seen.insert(r.id.clone());
         let mtime = file_mtime_ns(&r.path);
-        // Unchanged since last index (real mtime) → skip entirely.
-        if let Some(&mt) = existing.get(&r.id) {
-            if mt == mtime && mtime != 0 {
-                continue;
-            }
-            // Changed: drop *all* of this session's docs (delete by the shared id term) before re-add.
-            writer.delete_term(Term::from_field_text(f.id, &r.id));
+        let fts_fresh = existing
+            .get(&r.id)
+            .is_some_and(|&mt| mt == mtime && mtime != 0);
+        let events_stale = cv_core::events::needs_ingest(&r, mtime);
+        // Unchanged on both axes → skip entirely (no re-parse beyond the metadata scan).
+        if fts_fresh && !events_stale {
+            continue;
         }
         let Some(adapter) = cv_core::harness::for_harness(r.harness) else {
             continue;
         };
-        let docs = {
-            let mut sink = ChunkSink::new(&mut writer, &f, &r, mtime);
-            // `lazy()` so adapters defer large content to spans, which the sink chunk-resolves —
-            // a giant field feeds tantivy in 4 MB pieces and is never owned whole.
-            if let Err(e) = adapter.stream(&r, &ParseOptions::lazy(), &mut sink) {
+        let mut events = events_stale.then(|| cv_core::events::EventSink::new(r.cwd.clone()));
+
+        // FTS docs current but events missing/stale (e.g. first run after upgrading, or after a
+        // catalog wipe): an events-only pass that never touches tantivy.
+        if fts_fresh {
+            let sink = events.as_mut().expect("events_stale implies a sink");
+            match adapter.stream(&r, &ParseOptions::lazy(), sink) {
+                Ok(_) => cv_core::events::record(&r, sink.events(), mtime),
+                Err(e) => eprintln!("cv-search: parse failed for {} ({}): {e:#}", r.id, r.harness),
+            }
+            continue;
+        }
+
+        if existing.contains_key(&r.id) {
+            // Changed: drop *all* of this session's docs (delete by the shared id term) before re-add.
+            writer.delete_term(Term::from_field_text(f.id, &r.id));
+        }
+        let docs = match index_session(&mut writer, &f, adapter.as_ref(), &r, mtime, events.as_mut())
+        {
+            Ok(docs) => docs,
+            Err(e) => {
                 eprintln!("cv-search: parse failed for {} ({}): {e:#}", r.id, r.harness);
                 continue;
             }
-            sink.finish()?;
-            sink.docs
         };
+        // Only stamp events after a *complete* pass — a parse error above leaves the sync row
+        // untouched so the session is retried next run.
+        if let Some(es) = events {
+            cv_core::events::record(&r, es.events(), mtime);
+        }
         changed += 1;
         since_commit += docs;
         if since_commit >= COMMIT_EVERY {
@@ -190,13 +224,33 @@ pub fn index_all(dir: &Path, rebuild: bool) -> Result<usize> {
     Ok(total)
 }
 
-fn file_mtime_ns(path: &Path) -> i64 {
-    std::fs::metadata(path)
-        .ok()
-        .and_then(|m| m.modified().ok())
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_nanos() as i64)
-        .unwrap_or(0)
+use cv_core::events::file_mtime_ns;
+
+/// Stream one session into bounded tantivy docs through [`ChunkSink`] — teeing the same pass into
+/// `events` when given, so the transcript is read once for both consumers. `lazy()` keeps large
+/// content as spans: the chunk sink chunk-resolves them and the event sink never reads them at all.
+/// Returns the number of docs written.
+fn index_session(
+    writer: &mut IndexWriter,
+    f: &Fields,
+    adapter: &dyn cv_core::Adapter,
+    r: &cv_core::SessionRef,
+    mtime: i64,
+    events: Option<&mut cv_core::events::EventSink>,
+) -> Result<usize> {
+    use cv_core::ParseOptions;
+    let mut sink = ChunkSink::new(writer, f, r, mtime);
+    match events {
+        Some(es) => {
+            let mut tee = cv_core::TeeSink::new(&mut sink, es);
+            adapter.stream(r, &ParseOptions::lazy(), &mut tee)?;
+        }
+        None => {
+            adapter.stream(r, &ParseOptions::lazy(), &mut sink)?;
+        }
+    }
+    sink.finish()?;
+    Ok(sink.docs)
 }
 
 /// Streams one session's messages into bounded-size tantivy docs (all sharing the session id), so a
@@ -217,9 +271,15 @@ struct ChunkSink<'w> {
     first_user: Option<String>,
     resolver: cv_core::Resolver,
     buf: String,
+    /// Whitespace-collapsed head of the body, capped at [`PREVIEW_CHARS`]; stored on the first doc.
+    preview: String,
     docs: usize,
     err: Option<anyhow::Error>,
 }
+
+/// Length cap (chars) of the stored head-of-body preview — the snippet fallback when a hit's
+/// source file is gone at query time. ~240 bytes/session keeps the index lean.
+const PREVIEW_CHARS: usize = 240;
 
 impl<'w> ChunkSink<'w> {
     fn new(writer: &'w mut IndexWriter, f: &'w Fields, r: &cv_core::SessionRef, mtime: i64) -> Self {
@@ -239,6 +299,7 @@ impl<'w> ChunkSink<'w> {
             first_user: None,
             resolver: cv_core::Resolver::new(Some(r.path.clone())),
             buf: String::new(),
+            preview: String::new(),
             docs: 0,
             err: None,
         }
@@ -270,6 +331,10 @@ impl<'w> ChunkSink<'w> {
         doc.add_text(self.f.title, self.title());
         doc.add_text(self.f.body, &self.buf);
         doc.add_text(self.f.path, &self.path);
+        // The preview rides only the session's first doc — one copy per session, not per chunk.
+        if self.docs == 0 && !self.preview.is_empty() {
+            doc.add_text(self.f.preview, &self.preview);
+        }
         if let Some(t) = self.created_at {
             doc.add_i64(self.f.created_at, t);
         }
@@ -297,9 +362,36 @@ impl<'w> ChunkSink<'w> {
 impl<'w> ChunkSink<'w> {
     /// Append `s` to the buffer, flushing a doc whenever it reaches a chunk.
     fn push_chunk(&mut self, s: &str) {
+        self.extend_preview(s);
         self.buf.push_str(s);
         if self.buf.len() >= CHUNK_BYTES {
             self.flush(false);
+        }
+    }
+
+    /// Grow the stored preview from the head of the body: words joined by single spaces (newlines
+    /// and runs of whitespace collapse away), truncated at [`PREVIEW_CHARS`]. No-op once full, so
+    /// the cost is bounded no matter how large the session is.
+    fn extend_preview(&mut self, s: &str) {
+        let mut n = self.preview.chars().count();
+        if n >= PREVIEW_CHARS {
+            return;
+        }
+        for word in s.split_whitespace() {
+            if n >= PREVIEW_CHARS {
+                break;
+            }
+            if !self.preview.is_empty() {
+                self.preview.push(' ');
+                n += 1;
+            }
+            for c in word.chars() {
+                if n >= PREVIEW_CHARS {
+                    break;
+                }
+                self.preview.push(c);
+                n += 1;
+            }
         }
     }
 
@@ -403,13 +495,14 @@ fn read_indexed_mtimes(index: &Index, f: &Fields) -> Result<HashMap<String, i64>
     Ok(out)
 }
 
-/// Index an explicit set of sessions through the real production [`ChunkSink`] — the same indexer
-/// [`index_all`] drives, minus only the global `discover_all()` scan. Full rebuild: clears prior
-/// contents first. Used by tests so date-field (and chunk) indexing is exercised against the code
-/// that actually ships rather than a parallel per-doc path.
+/// Index an explicit set of sessions through the real production [`index_session`] path — the same
+/// indexer [`index_all`] drives, minus only the global `discover_all()` scan. Full rebuild: clears
+/// prior contents first. Used by tests so date-field (and chunk) indexing is exercised against the
+/// code that actually ships rather than a parallel per-doc path. `events = true` additionally tees
+/// each pass into the event catalog like `index_all` does (only set it under an isolated
+/// `CLAURDVOYANT_HOME` — it writes the shared catalog db).
 #[cfg(test)]
-pub(crate) fn index_refs(dir: &Path, refs: &[cv_core::SessionRef]) -> Result<usize> {
-    use cv_core::ParseOptions;
+pub(crate) fn index_refs(dir: &Path, refs: &[cv_core::SessionRef], events: bool) -> Result<usize> {
     let (index, f) = open_or_create(dir)?;
     let mut writer: IndexWriter = index
         .writer(50_000_000)
@@ -420,12 +513,12 @@ pub(crate) fn index_refs(dir: &Path, refs: &[cv_core::SessionRef]) -> Result<usi
             continue;
         };
         let mtime = file_mtime_ns(&r.path);
-        let mut sink = ChunkSink::new(&mut writer, &f, r, mtime);
-        // `lazy()` matches `index_all` so span content is chunk-resolved, not owned whole.
-        adapter
-            .stream(r, &ParseOptions::lazy(), &mut sink)
+        let mut es = events.then(|| cv_core::events::EventSink::new(r.cwd.clone()));
+        index_session(&mut writer, &f, adapter.as_ref(), r, mtime, es.as_mut())
             .with_context(|| format!("indexing {}", r.id))?;
-        sink.finish()?;
+        if let Some(es) = es {
+            cv_core::events::record(r, es.events(), mtime);
+        }
     }
     writer.commit().context("committing index")?;
     Ok(refs.len())
@@ -433,6 +526,9 @@ pub(crate) fn index_refs(dir: &Path, refs: &[cv_core::SessionRef]) -> Result<usi
 
 /// Run a full-text query, returning up to `limit` hits ranked by BM25, each with a live snippet and
 /// its `created_at`/`updated_at` (so callers needn't re-discover the corpus just to date the rows).
+/// If the hit's source file can't be re-read (moved/changed since indexing), the snippet falls back
+/// to the head-of-body preview stored at index time, suffixed with `(source file moved)` when the
+/// file is gone entirely.
 ///
 /// The query supports tantivy's syntax: bare terms search title+body+cwd, and fielded terms like
 /// `harness:claude`, phrases `"foo bar"`, and booleans `a AND b` work too.
@@ -478,10 +574,28 @@ pub fn text_search(dir: &Path, query: &str, limit: usize) -> Result<Vec<Hit>> {
         }
         let harness = get_str(f.harness).unwrap_or_default();
         let path = get_str(f.path);
-        let snippet = path
+        let snippet = match path
             .as_deref()
             .and_then(|p| live_snippet(p, &harness, query))
-            .unwrap_or_default();
+            .filter(|s| !s.is_empty())
+        {
+            Some(s) => s,
+            // The source file is unreadable (moved/changed) or yielded nothing — fall back to the
+            // preview stored at index time. It rides the session's *first* chunk doc, which may
+            // not be the doc that scored this hit, hence the by-id lookup.
+            None => {
+                let preview = get_str(f.preview)
+                    .filter(|s| !s.is_empty())
+                    .or_else(|| stored_preview(&searcher, &f, &id))
+                    .unwrap_or_default();
+                let gone = path.as_deref().is_none_or(|p| !Path::new(p).exists());
+                match (gone, preview.is_empty()) {
+                    (true, true) => "(source file moved)".to_string(),
+                    (true, false) => format!("{preview} (source file moved)"),
+                    (false, _) => preview,
+                }
+            }
+        };
 
         hits.push(Hit {
             id,
@@ -495,6 +609,30 @@ pub fn text_search(dir: &Path, query: &str, limit: usize) -> Result<Vec<Hit>> {
         });
     }
     Ok(hits)
+}
+
+/// Fetch the stored head-of-body preview for session `id`. The preview lives only on the session's
+/// **first** chunk doc, which for a multi-chunk session is usually not the doc that produced the
+/// hit — so look it up across all of the id's docs. Only runs on the fallback path (live snippet
+/// already failed), so the extra term query costs nothing in the common case.
+fn stored_preview(searcher: &tantivy::Searcher, f: &Fields, id: &str) -> Option<String> {
+    use tantivy::collector::DocSetCollector;
+    use tantivy::query::TermQuery;
+    use tantivy::schema::IndexRecordOption;
+    let q = TermQuery::new(Term::from_field_text(f.id, id), IndexRecordOption::Basic);
+    let docs = searcher.search(&q, &DocSetCollector).ok()?;
+    for addr in docs {
+        let doc: TantivyDocument = match searcher.doc(addr) {
+            Ok(d) => d,
+            Err(_) => continue,
+        };
+        if let Some(p) = doc.get_first(f.preview).and_then(|v| v.as_str()) {
+            if !p.is_empty() {
+                return Some(p.to_string());
+            }
+        }
+    }
+    None
 }
 
 /// Most text we'll scan from a session to find a snippet window. Matches are almost always early;
@@ -690,7 +828,7 @@ mod tests {
             sref("a1", "Rust tantivy index", p1),
             sref("b2", "Python pandas", p2),
         ];
-        let n = index_refs(&dir, &refs).unwrap();
+        let n = index_refs(&dir, &refs, false).unwrap();
         assert_eq!(n, 2);
 
         // Term unique to the first doc; snippet is generated live from the session file.
@@ -728,12 +866,12 @@ mod tests {
         let sdir = tmpdir();
         let p = write_claude(&sdir, "x", "alpha beta gamma");
         // Seed the index with one session.
-        index_refs(&dir, &[sref("x", "first", p.clone())]).unwrap();
+        index_refs(&dir, &[sref("x", "first", p.clone())], false).unwrap();
         assert_eq!(text_search(&dir, "alpha", 10).unwrap().len(), 1);
 
         // A direct full-rebuild replaces contents (old doc gone).
         let p2 = write_claude(&sdir, "y", "delta epsilon");
-        index_refs(&dir, &[sref("y", "second", p2)]).unwrap();
+        index_refs(&dir, &[sref("y", "second", p2)], false).unwrap();
         assert!(text_search(&dir, "alpha", 10).unwrap().is_empty());
         assert_eq!(text_search(&dir, "delta", 10).unwrap().len(), 1);
 
@@ -754,7 +892,7 @@ mod tests {
         assert!(body.len() > CHUNK_BYTES, "fixture must exceed one chunk");
         body.push_str("zqxmarker");
         let p = write_claude(&sdir, "big", &body);
-        index_refs(&dir, &[sref("big", "huge session", p)]).unwrap();
+        index_refs(&dir, &[sref("big", "huge session", p)], false).unwrap();
 
         // Term in every chunk → multiple matching docs, but deduped to exactly one row for the id.
         let hits = text_search(&dir, "padding", 10).unwrap();
@@ -784,7 +922,7 @@ mod tests {
                 ("assistant", "beta answer mentioning bm25"),
             ],
         );
-        index_refs(&dir, &[sref_untitled("m", p)]).unwrap();
+        index_refs(&dir, &[sref_untitled("m", p)], false).unwrap();
 
         // Assistant-turn term is in the body (roles accumulate into one searchable blob).
         let hits = text_search(&dir, "bm25", 10).unwrap();
@@ -810,5 +948,163 @@ mod tests {
     fn query_terms_drops_fields_and_booleans() {
         let terms = query_terms("harness:claude Tantivy AND bm25:score NOT pandas");
         assert_eq!(terms, vec!["tantivy", "pandas"]);
+    }
+
+    /// A query made *entirely* of fielded/boolean tokens has no bare terms to window on — the
+    /// snippet must silently fall back to the head of the body, not panic or come back empty.
+    #[test]
+    fn all_fielded_query_snippets_fall_back_to_head() {
+        assert!(query_terms("harness:claude AND cwd:proj").is_empty());
+        assert_eq!(make_snippet("hello world", "harness:claude"), "hello world");
+        assert_eq!(
+            make_snippet("hello world", "harness:claude AND cwd:proj NOT id:x"),
+            "hello world"
+        );
+        // End-to-end: a purely-fielded query still produces a non-empty (head) snippet on a hit.
+        let dir = tmpdir();
+        let sdir = tmpdir();
+        let p = write_claude(&sdir, "ff", "fielded only query body text");
+        index_refs(&dir, &[sref("ff", "fielded", p)], false).unwrap();
+        let hits = text_search(&dir, "harness:claude", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert!(
+            hits[0].snippet.contains("fielded only query body"),
+            "head fallback snippet expected: {:?}",
+            hits[0].snippet
+        );
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&sdir).ok();
+    }
+
+    /// Fix for the blank-snippet hole: when a hit's source file has been deleted since indexing,
+    /// the snippet falls back to the head-of-body preview stored on the first chunk doc, with a
+    /// marker explaining why there's no live context.
+    #[test]
+    fn missing_source_falls_back_to_stored_preview_with_marker() {
+        let dir = tmpdir();
+        let sdir = tmpdir();
+        let body = "We built a full text\nsearch engine   with tantivy and BM25 scoring.";
+        let p = write_claude(&sdir, "gone", body);
+        index_refs(&dir, &[sref("gone", "doomed session", p.clone())], false).unwrap();
+
+        // While the file is present, the snippet is live (no marker).
+        let hits = text_search(&dir, "tantivy", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert!(!hits[0].snippet.contains("(source file moved)"));
+
+        std::fs::remove_file(&p).unwrap();
+
+        let hits = text_search(&dir, "tantivy", 10).unwrap();
+        assert_eq!(hits.len(), 1, "hit should survive the file vanishing");
+        // Preview is whitespace-collapsed: the newline and space-run become single spaces.
+        assert!(
+            hits[0]
+                .snippet
+                .contains("We built a full text search engine with tantivy"),
+            "stored preview expected: {:?}",
+            hits[0].snippet
+        );
+        assert!(
+            hits[0].snippet.ends_with("(source file moved)"),
+            "marker expected: {:?}",
+            hits[0].snippet
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&sdir).ok();
+    }
+
+    /// The event ride-along, end to end through the production `index_session` tee: one indexing
+    /// pass writes BOTH searchable tantivy docs and queryable event rows in the catalog db
+    /// (isolated via `CLAURDVOYANT_HOME`).
+    #[test]
+    fn indexing_tees_events_into_the_catalog() {
+        let dir = tmpdir();
+        let home = tmpdir();
+        std::env::set_var("CLAURDVOYANT_HOME", &home);
+
+        // A claude transcript whose assistant turn edits a file and runs a command.
+        let p = home.join("tee-evt.jsonl");
+        let lines = [
+            serde_json::json!({
+                "type": "user", "uuid": "u0", "sessionId": "tee-evt",
+                "message": {"role": "user", "content": "rework the indexer"}
+            }),
+            serde_json::json!({
+                "type": "assistant", "uuid": "a1", "sessionId": "tee-evt",
+                "message": {"role": "assistant", "content": [
+                    {"type": "text", "text": "on it — touching the indexer now"},
+                    {"type": "tool_use", "id": "t1", "name": "Edit",
+                     "input": {"file_path": "crates/cv-search/src/fts.rs",
+                               "old_string": "a", "new_string": "b"}},
+                    {"type": "tool_use", "id": "t2", "name": "Bash",
+                     "input": {"command": "cargo test -p cv-search"}}
+                ]}
+            }),
+        ];
+        let body: String = lines.iter().map(|l| format!("{l}\n")).collect();
+        std::fs::write(&p, body).unwrap();
+        let mut r = sref("tee-evt", "indexer rework", p.display().to_string());
+        r.cwd = Some("/repo".into());
+
+        index_refs(&dir, &[r], true).unwrap();
+
+        // The text landed in tantivy…
+        let hits = text_search(&dir, "indexer", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id, "tee-evt");
+
+        // …and the SAME pass landed events in the catalog.
+        let rows = cv_core::events::events_for("claude", "tee-evt", None);
+        let edit = rows.iter().find(|e| e.kind == "file_edit").expect("edit event");
+        assert_eq!(edit.target.as_deref(), Some("/repo/crates/cv-search/src/fts.rs"));
+        let cmd = rows.iter().find(|e| e.kind == "command").expect("command event");
+        assert_eq!(cmd.target.as_deref(), Some("cargo test -p cv-search"));
+
+        // The touched query resolves it by path suffix.
+        let touched = cv_core::events::sessions_touching("crates/cv-search/src/fts.rs", true);
+        assert_eq!(touched.len(), 1);
+        assert_eq!(touched[0].session_id, "tee-evt");
+        assert_eq!(touched[0].edits, 1);
+
+        std::env::remove_var("CLAURDVOYANT_HOME");
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// The preview rides only the session's *first* chunk doc, but a hit can score on a *later*
+    /// chunk — the fallback must still find the preview via the by-id lookup. Also caps length.
+    #[test]
+    fn preview_fallback_found_even_when_hit_is_a_late_chunk() {
+        let dir = tmpdir();
+        let sdir = tmpdir();
+        // Marker only in the trailing chunk, so the sole matching doc has no preview field.
+        let mut body = "padding ".repeat(700_000);
+        assert!(body.len() > CHUNK_BYTES, "fixture must exceed one chunk");
+        body.push_str("zqxmarker");
+        let p = write_claude(&sdir, "bigone", &body);
+        index_refs(&dir, &[sref("bigone", "huge doomed session", p.clone())], false).unwrap();
+
+        std::fs::remove_file(&p).unwrap();
+
+        let hits = text_search(&dir, "zqxmarker", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id, "bigone");
+        assert!(
+            hits[0].snippet.starts_with("padding padding"),
+            "preview from the first chunk doc expected: {:?}",
+            hits[0].snippet
+        );
+        assert!(hits[0].snippet.ends_with("(source file moved)"));
+        // The stored preview itself is capped (marker text rides on top of it).
+        let stored = hits[0]
+            .snippet
+            .trim_end_matches(" (source file moved)")
+            .chars()
+            .count();
+        assert!(stored <= PREVIEW_CHARS, "preview over cap: {stored} chars");
+
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&sdir).ok();
     }
 }
