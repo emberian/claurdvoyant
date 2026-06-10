@@ -153,22 +153,12 @@ pub(crate) fn stream_corpus(mut f: impl FnMut(Doc) -> Result<()>) -> Result<usiz
             }
         };
         let title = cv_core::label_from(meta.title.as_deref(), sink.first_user_text.as_deref());
-        let mtime_ns = std::fs::metadata(&r.path)
-            .ok()
-            .and_then(|m| m.modified().ok())
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|d| d.as_nanos() as i64)
-            .unwrap_or(0);
         let doc = Doc {
             id: r.id.clone(),
             harness: r.harness.as_str().to_string(),
             cwd: r.cwd.as_ref().map(|p| p.display().to_string()),
             title: Some(title),
-            created_at: r.created_at.map(|t| t.timestamp()),
-            updated_at: r.updated_at.map(|t| t.timestamp()),
             body: sink.body,
-            path: Some(r.path.display().to_string()),
-            mtime_ns,
         };
         f(doc)?;
         n += 1;
@@ -176,20 +166,15 @@ pub(crate) fn stream_corpus(mut f: impl FnMut(Doc) -> Result<()>) -> Result<usiz
     Ok(n)
 }
 
-/// One indexable document distilled from a parsed [`cv_core::Session`].
+/// One indexable document distilled from a parsed [`cv_core::Session`], for the **semantic** path
+/// ([`semantic::embed_all`]), which reads exactly these fields. The FTS path no longer goes through
+/// `Doc`: it streams straight into `fts::ChunkSink`, which reads dates/path/mtime off the
+/// [`cv_core::SessionRef`] instead (so they aren't duplicated here).
 #[derive(Debug, Clone)]
 pub(crate) struct Doc {
     pub id: String,
     pub harness: String,
     pub cwd: Option<String>,
     pub title: Option<String>,
-    pub created_at: Option<i64>,
-    pub updated_at: Option<i64>,
     pub body: String,
-    /// Source file path — stored (not the body), so search can snippet a hit by re-reading just that
-    /// one session live (see `fts::live_snippet`) instead of keeping a full stored copy of every body.
-    pub path: Option<String>,
-    /// File mtime in ns, the incremental-index key: an unchanged `(path, mtime)` is skipped on
-    /// reindex. `0` when the path can't be stat'd (then it's always reindexed).
-    pub mtime_ns: i64,
 }

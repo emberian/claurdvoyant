@@ -88,7 +88,7 @@ fn render_blocks_into(
     emit: &mut dyn FnMut(&str),
 ) {
     let mut started = false;
-    let mut sep = |started: &mut bool, emit: &mut dyn FnMut(&str)| {
+    let sep = |started: &mut bool, emit: &mut dyn FnMut(&str)| {
         if *started {
             emit("\n\n");
         }

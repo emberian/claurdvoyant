@@ -42,7 +42,7 @@
 
 use super::Adapter;
 use crate::ir::*;
-use crate::stream::{CollectSink, Flow, MessageSink, ParseOptions};
+use crate::stream::{Flow, MessageSink, ParseOptions};
 use anyhow::{Context, Result};
 use chrono::{DateTime, TimeZone, Utc};
 use serde_json::Value;
@@ -142,14 +142,16 @@ impl Adapter for OpenClaw {
 }
 
 /// Core parse, split out so tests can drive it from a fixture string. Full fidelity (collects).
+/// Test-only: production reads go through [`Adapter::stream`]/[`Adapter::parse`] → [`stream_core`].
+#[cfg(test)]
 fn parse_text(text: &str, r: &SessionRef) -> Session {
-    let mut sink = CollectSink::default();
+    let mut sink = crate::stream::CollectSink::default();
     let mut s = stream_core(text.lines().map(str::to_string), r, &mut sink);
     s.messages = sink.messages;
     s
 }
 
-/// Streaming core shared by the on-disk [`Adapter::stream`] and the string-driven [`parse_text`]:
+/// Streaming core shared by the on-disk [`Adapter::stream`] and the string-driven `parse_text`:
 /// fold each record's metadata into the session and emit any message to `sink`. Returns the session
 /// with empty `messages`.
 fn stream_core<I: Iterator<Item = String>>(

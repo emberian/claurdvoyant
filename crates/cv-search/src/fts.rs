@@ -16,7 +16,7 @@
 //! Snippets are generated **live** from the top hits (re-reading the session, capped) rather than
 //! from a stored copy of every body — which is what keeps the on-disk index small.
 
-use crate::{Doc, Hit};
+use crate::Hit;
 use anyhow::{Context, Result};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -403,46 +403,32 @@ fn read_indexed_mtimes(index: &Index, f: &Fields) -> Result<HashMap<String, i64>
     Ok(out)
 }
 
-/// Index an explicit set of docs (full rebuild: clears prior contents first). Used by tests.
+/// Index an explicit set of sessions through the real production [`ChunkSink`] — the same indexer
+/// [`index_all`] drives, minus only the global `discover_all()` scan. Full rebuild: clears prior
+/// contents first. Used by tests so date-field (and chunk) indexing is exercised against the code
+/// that actually ships rather than a parallel per-doc path.
 #[cfg(test)]
-pub(crate) fn index_docs(dir: &Path, docs: &[Doc]) -> Result<usize> {
+pub(crate) fn index_refs(dir: &Path, refs: &[cv_core::SessionRef]) -> Result<usize> {
+    use cv_core::ParseOptions;
     let (index, f) = open_or_create(dir)?;
     let mut writer: IndexWriter = index
         .writer(50_000_000)
         .context("creating tantivy index writer")?;
     writer.delete_all_documents().context("clearing index")?;
-    for d in docs {
-        add_doc(&mut writer, &f, d)?;
+    for r in refs {
+        let Some(adapter) = cv_core::harness::for_harness(r.harness) else {
+            continue;
+        };
+        let mtime = file_mtime_ns(&r.path);
+        let mut sink = ChunkSink::new(&mut writer, &f, r, mtime);
+        // `lazy()` matches `index_all` so span content is chunk-resolved, not owned whole.
+        adapter
+            .stream(r, &ParseOptions::lazy(), &mut sink)
+            .with_context(|| format!("indexing {}", r.id))?;
+        sink.finish()?;
     }
     writer.commit().context("committing index")?;
-    Ok(docs.len())
-}
-
-/// Add one [`Doc`] to `writer`. The body is **indexed but not stored** (we snippet live); the source
-/// `path` and `mtime` are stored to drive live snippets and incremental reindex respectively.
-fn add_doc(writer: &mut IndexWriter, f: &Fields, d: &Doc) -> Result<()> {
-    let mut doc = TantivyDocument::default();
-    doc.add_text(f.id, &d.id);
-    doc.add_text(f.harness, &d.harness);
-    if let Some(cwd) = &d.cwd {
-        doc.add_text(f.cwd, cwd);
-    }
-    if let Some(title) = &d.title {
-        doc.add_text(f.title, title);
-    }
-    doc.add_text(f.body, &d.body);
-    if let Some(path) = &d.path {
-        doc.add_text(f.path, path);
-    }
-    if let Some(t) = d.created_at {
-        doc.add_i64(f.created_at, t);
-    }
-    if let Some(t) = d.updated_at {
-        doc.add_i64(f.updated_at, t);
-    }
-    doc.add_i64(f.mtime, d.mtime_ns);
-    writer.add_document(doc).context("adding document")?;
-    Ok(())
+    Ok(refs.len())
 }
 
 /// Run a full-text query, returning up to `limit` hits ranked by BM25, each with a live snippet and
@@ -626,7 +612,6 @@ fn head(s: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Doc;
 
     fn tmpdir() -> std::path::PathBuf {
         let d = std::env::temp_dir().join(format!("cv-search-test-{}", uuid::Uuid::new_v4()));
@@ -648,18 +633,49 @@ mod tests {
         p.display().to_string()
     }
 
-    fn doc(id: &str, title: &str, body: &str, path: String) -> Doc {
-        Doc {
+    /// A [`cv_core::SessionRef`] pointing at a written Claude transcript, with the dates the index is
+    /// expected to surface (`created_at`→1s, `updated_at`→2s, as the hit assertions check). The
+    /// production `ChunkSink` reads these straight off the ref — Claude's adapter never emits a
+    /// metadata title, so `title` here is the authoritative label.
+    fn sref(id: &str, title: &str, path: String) -> cv_core::SessionRef {
+        cv_core::SessionRef {
             id: id.into(),
-            harness: "claude".into(),
+            harness: cv_core::Harness::Claude,
+            path: path.into(),
             cwd: Some("/home/u/proj".into()),
             title: Some(title.into()),
-            created_at: Some(1),
-            updated_at: Some(2),
-            body: body.into(),
-            path: Some(path),
-            mtime_ns: 1,
+            created_at: chrono::DateTime::from_timestamp(1, 0),
+            updated_at: chrono::DateTime::from_timestamp(2, 0),
+            message_count: 1,
         }
+    }
+
+    /// Like [`sref`] but with no discovery-time title — so the indexed label falls back to the first
+    /// user message's text (the path Claude sessions without an `ai-title` line take).
+    fn sref_untitled(id: &str, path: String) -> cv_core::SessionRef {
+        cv_core::SessionRef {
+            title: None,
+            ..sref(id, "", path)
+        }
+    }
+
+    /// Write a multi-message Claude transcript (one JSONL record per `(role, content)`), returning its
+    /// path. `role` is `"user"` or `"assistant"`; content is a bare string.
+    fn write_claude_msgs(dir: &Path, id: &str, msgs: &[(&str, &str)]) -> String {
+        let p = dir.join(format!("{id}.jsonl"));
+        let mut out = String::new();
+        for (i, (role, content)) in msgs.iter().enumerate() {
+            let line = serde_json::json!({
+                "type": role,
+                "uuid": format!("{id}-{i}"),
+                "sessionId": id,
+                "message": { "role": role, "content": content }
+            });
+            out.push_str(&line.to_string());
+            out.push('\n');
+        }
+        std::fs::write(&p, out).unwrap();
+        p.display().to_string()
     }
 
     #[test]
@@ -670,11 +686,11 @@ mod tests {
         let b2 = "Loading dataframes and grouping by columns in pandas.";
         let p1 = write_claude(&sdir, "a1", b1);
         let p2 = write_claude(&sdir, "b2", b2);
-        let docs = vec![
-            doc("a1", "Rust tantivy index", b1, p1),
-            doc("b2", "Python pandas", b2, p2),
+        let refs = vec![
+            sref("a1", "Rust tantivy index", p1),
+            sref("b2", "Python pandas", p2),
         ];
-        let n = index_docs(&dir, &docs).unwrap();
+        let n = index_refs(&dir, &refs).unwrap();
         assert_eq!(n, 2);
 
         // Term unique to the first doc; snippet is generated live from the session file.
@@ -711,17 +727,88 @@ mod tests {
         let dir = tmpdir();
         let sdir = tmpdir();
         let p = write_claude(&sdir, "x", "alpha beta gamma");
-        // Seed the index with one doc at mtime 1.
-        index_docs(&dir, &[doc("x", "first", "alpha beta gamma", p.clone())]).unwrap();
+        // Seed the index with one session.
+        index_refs(&dir, &[sref("x", "first", p.clone())]).unwrap();
         assert_eq!(text_search(&dir, "alpha", 10).unwrap().len(), 1);
 
         // A direct full-rebuild replaces contents (old doc gone).
         let p2 = write_claude(&sdir, "y", "delta epsilon");
-        index_docs(&dir, &[doc("y", "second", "delta epsilon", p2)]).unwrap();
+        index_refs(&dir, &[sref("y", "second", p2)]).unwrap();
         assert!(text_search(&dir, "alpha", 10).unwrap().is_empty());
         assert_eq!(text_search(&dir, "delta", 10).unwrap().len(), 1);
 
         std::fs::remove_dir_all(&dir).ok();
         std::fs::remove_dir_all(&sdir).ok();
+    }
+
+    /// The core invariant of `ChunkSink`: a body larger than [`CHUNK_BYTES`] is flushed into several
+    /// tantivy docs that all share the session id. Search must (a) still find a term living only in a
+    /// late chunk, and (b) dedup a term present in *every* chunk back to a single row per id.
+    #[test]
+    fn oversized_body_is_chunked_yet_dedups_to_one_hit() {
+        let dir = tmpdir();
+        let sdir = tmpdir();
+        // ~5.6 MB of a repeated common token (lands in every chunk) with a unique marker at the very
+        // end (lands only in the final chunk) — forcing ≥2 docs for the one session.
+        let mut body = "padding ".repeat(700_000);
+        assert!(body.len() > CHUNK_BYTES, "fixture must exceed one chunk");
+        body.push_str("zqxmarker");
+        let p = write_claude(&sdir, "big", &body);
+        index_refs(&dir, &[sref("big", "huge session", p)]).unwrap();
+
+        // Term in every chunk → multiple matching docs, but deduped to exactly one row for the id.
+        let hits = text_search(&dir, "padding", 10).unwrap();
+        assert_eq!(hits.len(), 1, "chunks of one session must dedup to a single hit");
+        assert_eq!(hits[0].id, "big");
+
+        // Term only in the trailing chunk → still indexed and findable (proves later chunks are added).
+        let hits = text_search(&dir, "zqxmarker", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id, "big");
+
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&sdir).ok();
+    }
+
+    /// A session with no discovery title labels itself from the first user message, and the body
+    /// accumulates across roles — so an assistant-only term is searchable too.
+    #[test]
+    fn title_falls_back_to_first_user_and_body_spans_roles() {
+        let dir = tmpdir();
+        let sdir = tmpdir();
+        let p = write_claude_msgs(
+            &sdir,
+            "m",
+            &[
+                ("user", "alpha question about tantivy"),
+                ("assistant", "beta answer mentioning bm25"),
+            ],
+        );
+        index_refs(&dir, &[sref_untitled("m", p)]).unwrap();
+
+        // Assistant-turn term is in the body (roles accumulate into one searchable blob).
+        let hits = text_search(&dir, "bm25", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id, "m");
+        // No ai-title → label is the first user message's text.
+        assert_eq!(hits[0].title.as_deref(), Some("alpha question about tantivy"));
+
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&sdir).ok();
+    }
+
+    #[test]
+    fn make_snippet_windows_match_then_falls_back_to_head() {
+        let body = "the quick brown fox jumps over the lazy dog";
+        let snip = make_snippet(body, "brown");
+        assert!(snip.contains("brown"), "snippet should window the match: {snip:?}");
+        // No term matches → fall back to the head of the body.
+        assert_eq!(make_snippet("hello world", "kubernetes"), "hello world");
+    }
+
+    #[test]
+    fn query_terms_drops_fields_and_booleans() {
+        let terms = query_terms("harness:claude Tantivy AND bm25:score NOT pandas");
+        assert_eq!(terms, vec!["tantivy", "pandas"]);
     }
 }
