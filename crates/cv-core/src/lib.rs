@@ -12,6 +12,7 @@ pub mod dataset;
 pub mod discover_cache;
 pub mod emit;
 pub mod events;
+pub mod offsets;
 pub mod harmony;
 pub mod harness;
 pub mod html;

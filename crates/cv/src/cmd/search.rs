@@ -1,0 +1,304 @@
+//! `cv search` / `cv recall` / `cv index` — full-text and semantic search.
+
+use crate::util::{dirs_home, home_rel, parse_harness, short_id};
+use anyhow::{Context, Result};
+use cv_core::ir::{truncate, Harness};
+use std::path::{Path, PathBuf};
+
+pub(crate) fn cmd_search(query: &str, harness: Option<String>, limit: usize, semantic: bool) -> Result<()> {
+    let want = parse_harness(&harness)?;
+
+    // Semantic search: embed the query and rank stored vectors. Requires `cv index --semantic`.
+    if semantic {
+        let hits = cv_search::semantic_search(None, query, limit.saturating_mul(4))
+            .context("semantic search failed (run `cv index --semantic` first?)")?;
+        render_search_hits(&hits, want, limit, query, "semantic");
+        return Ok(());
+    }
+
+    // A retired sqlite FTS index may still be sitting on disk from older versions; tantivy is
+    // canonical now, so let the user know it's safe to remove.
+    if let Some(legacy) = legacy_sqlite_index_path() {
+        if legacy.exists() {
+            eprintln!(
+                "(note: legacy sqlite index no longer used; safe to delete {})",
+                legacy.display()
+            );
+        }
+    }
+
+    // Preferred path: the tantivy full-text index (real tokenization + BM25). Authoritative when
+    // present — an empty result means "no match", not "fall back to a live scan".
+    if cv_search::default_tantivy_dir().exists() {
+        match cv_search::text_search(None, query, limit.saturating_mul(4)) {
+            Ok(hits) => {
+                render_search_hits(&hits, want, limit, query, "index");
+                return Ok(());
+            }
+            Err(e) => eprintln!("(tantivy index unavailable: {e:#}; scanning live)"),
+        }
+    } else {
+        eprintln!("(no index yet — scanning live; run `cv index` for instant search)");
+    }
+    cmd_search_live(query, want, limit)
+}
+
+/// Where the retired sqlite FTS index used to live: `$CLAURDVOYANT_HOME/index.sqlite` or
+/// `~/.claurdvoyant/index.sqlite`. Only used to nudge cleanup of a stale file.
+fn legacy_sqlite_index_path() -> Option<PathBuf> {
+    std::env::var_os("CLAURDVOYANT_HOME")
+        .map(PathBuf::from)
+        .or_else(|| dirs_home().map(|h| h.join(".claurdvoyant")))
+        .map(|d| d.join("index.sqlite"))
+}
+
+/// Render a slice of cv-search [`cv_search::Hit`]s with harness/short-id/date/title/snippet,
+/// applying the `--harness` filter and `--limit`. `source` labels the empty-result hint.
+fn render_search_hits(
+    hits: &[cv_search::Hit],
+    want: Option<Harness>,
+    limit: usize,
+    query: &str,
+    source: &str,
+) {
+    let rows: Vec<&cv_search::Hit> = hits
+        .iter()
+        .filter(|h| want.is_none_or(|w| h.harness == w.as_str()))
+        .take(limit)
+        .collect();
+    if rows.is_empty() {
+        let hint = if source == "semantic" {
+            "(semantic; run `cv index --semantic` to (re)build embeddings)"
+        } else {
+            "(index; try `cv index` to refresh)"
+        };
+        println!("no matches for {query:?} {hint}");
+        return;
+    }
+    for h in rows {
+        // Dates ride on the hit straight from the index (FTS); semantic hits carry none.
+        let date = h
+            .updated_at
+            .or(h.created_at)
+            .and_then(|t| chrono::DateTime::from_timestamp(t, 0))
+            .map(|d| d.format("%Y-%m-%d").to_string())
+            .unwrap_or_else(|| "----------".into());
+        println!(
+            "{:8}  {:8}  {:10}  {}",
+            h.harness,
+            short_id(&h.id),
+            date,
+            h.title.clone().unwrap_or_default(),
+        );
+        if !h.snippet.trim().is_empty() {
+            println!("          … {}", truncate(&h.snippet, 120));
+        }
+    }
+}
+
+fn cmd_search_live(query: &str, want: Option<Harness>, limit: usize) -> Result<()> {
+    use cv_core::{Flow, Message, MessageSink, ParseOptions, Role};
+    let needle = query.to_lowercase();
+    let mut hits = 0;
+
+    // A sink that builds one session's lowercased searchable haystack as messages stream past (each
+    // dropped immediately), and grabs the first user text for the label fallback. Peak per session is
+    // O(haystack) instead of O(whole Session) + a separate searchable_text copy + a lowercase copy.
+    struct HaySink {
+        hay: String,
+        first_user: Option<String>,
+        resolver: cv_core::Resolver,
+    }
+    impl MessageSink for HaySink {
+        fn message(&mut self, mut m: Message) -> Flow {
+            m.materialize(&self.resolver);
+            if self.first_user.is_none() && m.role == Role::User {
+                if let Some(t) = m.text() {
+                    if !t.trim().is_empty() {
+                        self.first_user = Some(t);
+                    }
+                }
+            }
+            let mut piece = String::new();
+            cv_core::stream::append_searchable(&mut piece, &m);
+            self.hay.push_str(&piece.to_lowercase());
+            Flow::Continue
+        }
+    }
+
+    for adapter in cv_core::harness::all() {
+        if want.is_some_and(|h| adapter.harness() != h) || adapter.storage_root().is_none() {
+            continue;
+        }
+        for r in adapter.discover()? {
+            let mut sink = HaySink { hay: String::new(), first_user: None, resolver: cv_core::Resolver::new(Some(r.path.clone())) };
+            let meta = match adapter.stream(&r, &ParseOptions::bulk(), &mut sink) {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            if let Some(pos) = sink.hay.find(&needle) {
+                hits += 1;
+                let label = cv_core::label_from(meta.title.as_deref(), sink.first_user.as_deref());
+                println!(
+                    "{:8}  {:8}  {:10}  {}",
+                    r.harness.as_str(),
+                    short_id(&r.id),
+                    r.updated_at
+                        .map(|d| d.format("%Y-%m-%d").to_string())
+                        .unwrap_or_else(|| "----------".into()),
+                    label,
+                );
+                println!("          … {}", snippet(&sink.hay, pos, needle.len()));
+                if hits >= limit {
+                    println!("\n(stopped at {limit} hits; use --limit)");
+                    return Ok(());
+                }
+            }
+        }
+    }
+    if hits == 0 {
+        println!("no matches for {query:?}");
+    }
+    Ok(())
+}
+
+pub(crate) fn cmd_recall(query: &str, k: usize, harness: Option<String>) -> Result<()> {
+    let want = parse_harness(&harness)?;
+    let k = k.max(1);
+    // Over-fetch when filtering by harness so we can still fill `k`.
+    let fetch = if want.is_some() { (k * 4).max(20) } else { k };
+
+    let (mut hits, mode) = match cv_search::semantic_search(None, query, fetch) {
+        Ok(h) => (h, "semantic"),
+        Err(e) => {
+            eprintln!(
+                "(semantic search unavailable: {e:#}; falling back to keyword mode — run \
+                 `cv index --semantic` for semantic recall)"
+            );
+            (cv_search::text_search(None, query, fetch)?, "keyword")
+        }
+    };
+
+    if let Some(h) = want {
+        let w = h.as_str();
+        hits.retain(|hit| hit.harness == w);
+    }
+    hits.truncate(k);
+
+    if hits.is_empty() {
+        println!("no recall matches for {query:?} ({mode})");
+        return Ok(());
+    }
+
+    for hit in &hits {
+        let cwd = hit
+            .cwd
+            .as_deref()
+            .map(|c| home_rel(Path::new(c)))
+            .unwrap_or_else(|| "(no cwd)".into());
+        println!(
+            "{:8}  {:8}  {:>6.3}  {}  ·  {}",
+            hit.harness,
+            short_id(&hit.id),
+            hit.score,
+            truncate(&hit.title.clone().unwrap_or_default(), 50),
+            truncate(&cwd, 40),
+        );
+        let excerpt = recall_excerpt(hit, query);
+        for line in excerpt.lines() {
+            println!("      {line}");
+        }
+    }
+    Ok(())
+}
+
+/// Best excerpt for a recall hit: prefer the stored snippet; otherwise load the session and render
+/// a compact ~3-message window around the best textual match of `query`.
+fn recall_excerpt(hit: &cv_search::Hit, query: &str) -> String {
+    if !hit.snippet.trim().is_empty() {
+        return truncate(&hit.snippet, 200);
+    }
+    let h = Harness::parse(&hit.harness);
+    let Some((sref, adapter)) = cv_core::find(&hit.id, h).ok().flatten() else {
+        return String::new();
+    };
+    let Ok(session) = adapter.parse(&sref) else {
+        return String::new();
+    };
+    if session.messages.is_empty() {
+        return String::new();
+    }
+    // Pick the message best matching the query (most query words present), with a small window.
+    let needle = query.to_lowercase();
+    let words: Vec<&str> = needle.split_whitespace().filter(|w| w.len() > 2).collect();
+    let mut best = 0usize;
+    let mut best_score = -1i64;
+    for (i, m) in session.messages.iter().enumerate() {
+        let t = m.text().unwrap_or_default().to_lowercase();
+        if t.trim().is_empty() {
+            continue;
+        }
+        let score = words.iter().filter(|w| t.contains(**w)).count() as i64
+            + if t.contains(&needle) { 5 } else { 0 };
+        if score > best_score {
+            best_score = score;
+            best = i;
+        }
+    }
+    let lo = best.saturating_sub(1);
+    let hi = (best + 2).min(session.messages.len());
+    let mut out = String::new();
+    for m in &session.messages[lo..hi] {
+        if let Some(t) = m.text() {
+            if !t.trim().is_empty() {
+                out.push_str(cv_core::render::role_label(m.role));
+                out.push_str(": ");
+                out.push_str(&truncate(&t, 100));
+                out.push('\n');
+            }
+        }
+    }
+    out.trim_end().to_string()
+}
+
+pub(crate) fn cmd_index(semantic: bool, rebuild: bool) -> Result<()> {
+    eprintln!(
+        "✦ {} full-text index…",
+        if rebuild { "rebuilding" } else { "updating" }
+    );
+    let n = cv_search::index_all(None, rebuild)?;
+    println!(
+        "indexed {n} session(s) → {}",
+        cv_search::default_tantivy_dir().display()
+    );
+    if semantic {
+        eprintln!("✦ embedding sessions (downloads a small model on first use)…");
+        let e = cv_search::embed_all(None)?;
+        println!(
+            "embedded {e} session(s) → {}",
+            cv_search::default_embeddings_path().display()
+        );
+    }
+    println!("events: extracted on the same pass → try `cv events <id>` / `cv touched <path>`");
+    Ok(())
+}
+
+fn snippet(hay: &str, pos: usize, len: usize) -> String {
+    let start = pos.saturating_sub(40);
+    let end = (pos + len + 40).min(hay.len());
+    let s = &hay[floor_char(hay, start)..ceil_char(hay, end)];
+    truncate(&s.replace('\n', " "), 120)
+}
+
+fn floor_char(s: &str, mut i: usize) -> usize {
+    while i > 0 && !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+fn ceil_char(s: &str, mut i: usize) -> usize {
+    while i < s.len() && !s.is_char_boundary(i) {
+        i += 1;
+    }
+    i
+}

@@ -1,0 +1,321 @@
+//! `cv splice` / `cv loom` / `cv distill` / `cv dataset` — composing and distilling sessions.
+
+use crate::cmd::convert::emit_session;
+use crate::util::{parse_harness, short_id};
+use anyhow::{bail, Context, Result};
+use cv_core::ir::{Block, Harness, Message, Role, Session};
+use cv_core::EmitOptions;
+use std::fs;
+use std::path::PathBuf;
+
+// ---------- splice / loom ----------
+
+/// A parsed splice spec: which session, and a `[start, end)` window (end None → through the last).
+struct SpliceSpec {
+    id: String,
+    start: usize,
+    end: Option<usize>,
+}
+
+/// Parse `<id>:<start>-<end>` | `<id>:<start>-` | `<id>` into a [`SpliceSpec`].
+fn parse_splice_spec(spec: &str) -> Result<SpliceSpec> {
+    match spec.split_once(':') {
+        None => Ok(SpliceSpec { id: spec.to_string(), start: 0, end: None }),
+        Some((id, range)) => {
+            let (s, e) = range
+                .split_once('-')
+                .with_context(|| format!("bad spec {spec:?}: range must be <start>-<end> or <start>-"))?;
+            let start: usize = s
+                .trim()
+                .parse()
+                .with_context(|| format!("bad spec {spec:?}: start must be a number"))?;
+            let end = if e.trim().is_empty() {
+                None
+            } else {
+                Some(
+                    e.trim()
+                        .parse()
+                        .with_context(|| format!("bad spec {spec:?}: end must be a number"))?,
+                )
+            };
+            Ok(SpliceSpec { id: id.to_string(), start, end })
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn cmd_splice(
+    specs: &[String],
+    to: Option<String>,
+    out: Option<PathBuf>,
+    export: Option<String>,
+    cwd: Option<PathBuf>,
+    generate: bool,
+    gen_model: Option<String>,
+) -> Result<()> {
+    let parsed: Vec<SpliceSpec> = specs.iter().map(|s| parse_splice_spec(s)).collect::<Result<_>>()?;
+
+    // Resolve + parse each spec's session FIRST, keeping the owners alive in a Vec so the spans can
+    // borrow them. We pair each parsed session with the (start, end) it'll select.
+    let mut owned: Vec<(Session, usize, Option<usize>)> = Vec::with_capacity(parsed.len());
+    for sp in &parsed {
+        let (r, adapter) =
+            cv_core::find(&sp.id, None)?.with_context(|| format!("no session matching {:?}", sp.id))?;
+        let session = adapter.parse(&r)?;
+        owned.push((session, sp.start, sp.end));
+    }
+
+    let spans: Vec<cv_core::loom::Span<'_>> = owned
+        .iter()
+        .map(|(s, start, end)| cv_core::loom::Span { source: s, start: *start, end: *end })
+        .collect();
+
+    // Target harness: --to, else the first spec's source harness.
+    let to_h = match &to {
+        Some(s) => Harness::parse(s).with_context(|| format!("unknown target harness: {s}"))?,
+        None => owned
+            .first()
+            .map(|(s, _, _)| s.harness)
+            .context("splice needs at least one session")?,
+    };
+
+    let spliced = cv_core::loom::splice(&spans, None, to_h);
+    finish_composed(spliced, to_h, to.is_some(), out, export, cwd, generate, gen_model)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn cmd_loom(
+    base: &str,
+    at: usize,
+    graft: &str,
+    from: usize,
+    to: Option<String>,
+    out: Option<PathBuf>,
+    export: Option<String>,
+    cwd: Option<PathBuf>,
+    generate: bool,
+    gen_model: Option<String>,
+) -> Result<()> {
+    let (rb, ab) = cv_core::find(base, None)?.with_context(|| format!("no session matching {base:?}"))?;
+    let (rg, ag) = cv_core::find(graft, None)?.with_context(|| format!("no session matching {graft:?}"))?;
+    let base_s = ab.parse(&rb)?;
+    let graft_s = ag.parse(&rg)?;
+
+    let grafted = cv_core::loom::graft(&base_s, at, &graft_s, from, None);
+    // Default target harness is the base's (graft() already used it); honor --to if given.
+    let to_h = match &to {
+        Some(s) => Harness::parse(s).with_context(|| format!("unknown target harness: {s}"))?,
+        None => base_s.harness,
+    };
+    // Re-stamp the harness if --to overrode it (graft used base.harness).
+    let mut grafted = grafted;
+    grafted.harness = to_h;
+    finish_composed(grafted, to_h, to.is_some(), out, export, cwd, generate, gen_model)
+}
+
+/// Shared tail for splice/loom: emit to a harness when `--to`/`--out` is in play, otherwise print a
+/// summary and (with `--export md|json`) the composed session to stdout.
+#[allow(clippy::too_many_arguments)]
+fn finish_composed(
+    mut session: Session,
+    to_h: Harness,
+    explicit_to: bool,
+    out: Option<PathBuf>,
+    export: Option<String>,
+    cwd: Option<PathBuf>,
+    generate: bool,
+    gen_model: Option<String>,
+) -> Result<()> {
+    // The generative half of looming: grow the composed branch with an LLM-generated continuation.
+    if generate {
+        match cv_llm::available_provider() {
+            Some(prov) => eprintln!("✦ looming a continuation via {prov}…"),
+            None => bail!(
+                "--generate needs an LLM provider: set OPENROUTER_API_KEY, ANTHROPIC_API_KEY, or \
+                 LMSTUDIO_API_BASE=local (free local LM Studio)"
+            ),
+        }
+        let text = cv_llm::generate(
+            &session,
+            &cv_llm::GenerateOptions { model: gen_model, ..Default::default() },
+        )?;
+        let mut m = Message::new(Role::Assistant);
+        m.content.push(Block::Text { text: text.into() });
+        session.messages.push(m);
+        eprintln!("  ↳ grew the branch by 1 generated turn ({} msg total)", session.messages.len());
+    }
+
+    // Emit path: an explicit --to or an --out directory means "materialize this for a harness".
+    if explicit_to || out.is_some() {
+        if let Some(dir) = &cwd {
+            session.cwd = Some(dir.clone());
+        }
+        return emit_session(&session, to_h, out, EmitOptions { new_cwd: cwd, new_id: None });
+    }
+
+    // Otherwise: print a summary, and with --export, dump the composed session to stdout.
+    println!(
+        "✦ composed {} ({}) · {} msg",
+        short_id(&session.id),
+        session.harness.as_str(),
+        session.messages.len()
+    );
+    if let Some(prov) = session.extra.get("loom") {
+        if let Some(arr) = prov.as_array() {
+            for p in arr {
+                println!(
+                    "  ↳ {} {}[{}..{}]",
+                    p.get("harness").and_then(|v| v.as_str()).unwrap_or("?"),
+                    p.get("source_id").and_then(|v| v.as_str()).map(short_id).unwrap_or_default(),
+                    p.get("start").and_then(|v| v.as_u64()).unwrap_or(0),
+                    p.get("end").and_then(|v| v.as_u64()).unwrap_or(0),
+                );
+            }
+        }
+    }
+    match export.as_deref() {
+        None => {
+            println!("\n(use --export md|json to print it, or --to <harness> [--out <dir>] to emit it)");
+        }
+        Some("json") => println!("{}", serde_json::to_string_pretty(&session)?),
+        Some("md") | Some("markdown") => print!("{}", cv_core::render::to_markdown(&session)),
+        Some(other) => bail!("unknown export format {other:?} (use md or json)"),
+    }
+    Ok(())
+}
+
+// ---------- distill ----------
+
+pub(crate) fn cmd_distill(
+    id: &str,
+    harness: Option<String>,
+    model: Option<String>,
+    project: bool,
+    out: Option<PathBuf>,
+    append: bool,
+) -> Result<()> {
+    let want = parse_harness(&harness)?;
+    let (r, adapter) =
+        cv_core::find(id, want)?.with_context(|| format!("no session matching {id:?}"))?;
+    let session = adapter.parse(&r)?;
+
+    match cv_llm::available_provider() {
+        None => {
+            eprintln!(
+                "no LLM provider configured. Set one of:\n  \
+                 OPENROUTER_API_KEY=…   (OpenRouter; preferred)\n  \
+                 ANTHROPIC_API_KEY=…    (Anthropic)\n  \
+                 LMSTUDIO_API_BASE=local  (a free local LM Studio server at localhost:1234)"
+            );
+            std::process::exit(1);
+        }
+        Some(p) => eprintln!("✦ distilling via {p}…"),
+    }
+
+    let opts = cv_llm::DistillOptions { model, project };
+    let digest = cv_llm::distill(&session, &opts).context("distillation failed")?;
+
+    match out {
+        None => print!("{digest}"),
+        Some(path) => {
+            if append {
+                use std::io::Write;
+                let date = session
+                    .updated_at
+                    .or(session.created_at)
+                    .map(|d| d.format("%Y-%m-%d").to_string())
+                    .unwrap_or_else(|| "----------".into());
+                let header = format!("\n\n## {} ({})\n", session.label(), date);
+                let mut f = fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&path)
+                    .with_context(|| format!("opening {} for append", path.display()))?;
+                f.write_all(header.as_bytes())?;
+                f.write_all(digest.as_bytes())?;
+                if !digest.ends_with('\n') {
+                    f.write_all(b"\n")?;
+                }
+                eprintln!("✦ appended distillation → {}", path.display());
+            } else {
+                fs::write(&path, &digest)
+                    .with_context(|| format!("writing {}", path.display()))?;
+                eprintln!("✦ wrote distillation → {}", path.display());
+            }
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn cmd_dataset(
+    format: &str,
+    harness: Option<String>,
+    limit: Option<usize>,
+    min_messages: usize,
+    redact: bool,
+    out: Option<PathBuf>,
+) -> Result<()> {
+    use std::io::Write;
+    if !matches!(format, "chatml" | "sharegpt") {
+        bail!("unknown format {format:?} (use chatml or sharegpt)");
+    }
+    let want = parse_harness(&harness)?;
+    let mut writer: Box<dyn Write> = match &out {
+        Some(p) => Box::new(std::io::BufWriter::new(fs::File::create(p)?)),
+        None => Box::new(std::io::BufWriter::new(std::io::stdout())),
+    };
+
+    // Stream the corpus one session at a time (parse -> emit -> drop) so memory stays bounded.
+    let mut emitted = 0usize;
+    let mut skipped = 0usize;
+    for r in cv_core::discover_all() {
+        if let Some(w) = want {
+            if r.harness != w {
+                continue;
+            }
+        }
+        let Some(adapter) = cv_core::harness::for_harness(r.harness) else {
+            continue;
+        };
+        // Lazy opts: large content stays a span (held as a 16-byte ref), and `write_record` streams
+        // it straight to the writer in chunks — so even a 700 MB record never materializes. `extra`
+        // isn't read by dataset rendering, so it's skipped too.
+        let session = match cv_core::stream::collect_with(adapter.as_ref(), &r, &cv_core::ParseOptions::lazy()) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("cv dataset: skipping {} ({}): {e:#}", r.id, r.harness);
+                continue;
+            }
+        };
+        if session.messages.len() < min_messages {
+            skipped += 1;
+            continue;
+        }
+        // Stream the record directly to the writer (chunked, JSON-escaped per chunk — never holds the
+        // whole record). `--redact` scrubs one materialized message at a time inside the writer.
+        let fmt = match format {
+            "chatml" => cv_core::dataset::Format::Chatml,
+            _ => cv_core::dataset::Format::ShareGpt,
+        };
+        let redact_opts = redact.then(cv_core::redact::RedactOptions::default);
+        let wrote = cv_core::dataset::write_record(&session, &mut writer, fmt, redact_opts.as_ref())?;
+        if wrote {
+            writeln!(writer)?;
+            emitted += 1;
+            if let Some(l) = limit {
+                if emitted >= l {
+                    break;
+                }
+            }
+        } else {
+            skipped += 1;
+        }
+    }
+    writer.flush()?;
+    let dest = out
+        .as_ref()
+        .map(|p| format!(" to {}", p.display()))
+        .unwrap_or_default();
+    eprintln!("✦ {format}: wrote {emitted} record(s){dest} ({skipped} skipped)");
+    Ok(())
+}
