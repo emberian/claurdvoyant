@@ -4,6 +4,9 @@
 use crate::ir::{Harness, Session, SessionRef};
 use crate::stream::{Flow, MessageSink, ParseOptions};
 use anyhow::Result;
+use chrono::{DateTime, Utc};
+use serde_json::Value;
+use std::io::BufRead;
 use std::path::{Path, PathBuf};
 
 pub mod chatgpt_app;
@@ -26,6 +29,63 @@ pub mod lmstudio;
 pub mod opencode;
 pub mod openclaw;
 pub mod qwen;
+
+/// Parse an RFC3339 timestamp into UTC — the timestamp shape nearly every harness writes. Shared
+/// here so adapters don't each carry a copy.
+pub(crate) fn parse_ts(s: &str) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(s)
+        .ok()
+        .map(|d| d.with_timezone(&Utc))
+}
+
+/// Flexible timestamp from a JSON value: an RFC3339 string, epoch **milliseconds**, or epoch
+/// **seconds**. The ms/s split is a heuristic — magnitudes above 10^12 are milliseconds (10^12
+/// seconds is the year 33658; 10^12 ms is Sep 2001, so any modern harness timestamp disambiguates).
+pub(crate) fn ts_from_value(v: &Value) -> Option<DateTime<Utc>> {
+    if let Some(s) = v.as_str() {
+        return parse_ts(s);
+    }
+    let n = v.as_i64().or_else(|| v.as_f64().map(|f| f as i64))?;
+    if n.abs() > 1_000_000_000_000 {
+        DateTime::from_timestamp_millis(n)
+    } else {
+        DateTime::from_timestamp(n, 0)
+    }
+}
+
+/// Drive a tolerant JSONL pass over `reader`: blank and malformed lines are skipped (never fail a
+/// session over one bad record), every parsed record goes to `f`, and `Flow::Stop` ends the pass
+/// early. **Not** for offset-tracking paths (the claude/codex lazy-span readers need each line's
+/// byte offset and keep their own `read_until`/mmap loops).
+pub(crate) fn for_each_json_line<R: BufRead>(reader: R, mut f: impl FnMut(Value) -> Flow) {
+    for line in reader.lines() {
+        // A read error on one line (rare: invalid UTF-8 chunk) shouldn't abort the whole session.
+        let Ok(line) = line else { continue };
+        if each_json_line_inner(&line, &mut f) == Flow::Stop {
+            break;
+        }
+    }
+}
+
+/// [`for_each_json_line`] over already-read text (no per-line allocation).
+pub(crate) fn for_each_json_line_str(text: &str, mut f: impl FnMut(Value) -> Flow) {
+    for line in text.lines() {
+        if each_json_line_inner(line, &mut f) == Flow::Stop {
+            break;
+        }
+    }
+}
+
+fn each_json_line_inner(line: &str, f: &mut impl FnMut(Value) -> Flow) -> Flow {
+    let line = line.trim();
+    if line.is_empty() {
+        return Flow::Continue;
+    }
+    let Ok(v) = serde_json::from_str::<Value>(line) else {
+        return Flow::Continue; // tolerate the occasional corrupt line
+    };
+    f(v)
+}
 
 /// Result of emitting an IR session into a harness's native on-disk format.
 #[derive(Debug, Clone)]
@@ -127,4 +187,49 @@ pub fn all() -> Vec<Box<dyn Adapter>> {
 /// The adapter for a specific harness, if registered.
 pub fn for_harness(h: Harness) -> Option<Box<dyn Adapter>> {
     all().into_iter().find(|a| a.harness() == h)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ts_from_value_handles_all_shapes() {
+        // RFC3339 string.
+        let s = ts_from_value(&serde_json::json!("2026-01-02T03:04:05Z")).unwrap();
+        assert_eq!(s.timestamp(), 1_767_323_045);
+        // Epoch milliseconds (> 10^12).
+        let ms = ts_from_value(&serde_json::json!(1_767_323_045_000i64)).unwrap();
+        assert_eq!(ms, s);
+        // Epoch seconds (<= 10^12), integer and float.
+        assert_eq!(ts_from_value(&serde_json::json!(1_767_323_045i64)).unwrap(), s);
+        assert_eq!(ts_from_value(&serde_json::json!(1_767_323_045.9f64)).unwrap(), s);
+        // Junk.
+        assert!(ts_from_value(&serde_json::json!("not a time")).is_none());
+        assert!(ts_from_value(&serde_json::json!(null)).is_none());
+        assert!(ts_from_value(&serde_json::json!({"t": 1})).is_none());
+    }
+
+    #[test]
+    fn for_each_json_line_skips_junk_and_stops() {
+        let text = "{\"n\":1}\n\n   \nnot json\n{\"n\":2}\n{\"n\":3}";
+        let mut seen = Vec::new();
+        for_each_json_line_str(text, |v| {
+            let n = v.get("n").and_then(Value::as_i64).unwrap_or(0);
+            seen.push(n);
+            if n == 2 {
+                return Flow::Stop;
+            }
+            Flow::Continue
+        });
+        assert_eq!(seen, vec![1, 2], "blank/junk skipped, Stop honored");
+
+        // The reader-driven variant sees the same records.
+        let mut seen2 = Vec::new();
+        for_each_json_line(std::io::Cursor::new(text.as_bytes()), |v| {
+            seen2.push(v.get("n").and_then(Value::as_i64).unwrap_or(0));
+            Flow::Continue
+        });
+        assert_eq!(seen2, vec![1, 2, 3]);
+    }
 }

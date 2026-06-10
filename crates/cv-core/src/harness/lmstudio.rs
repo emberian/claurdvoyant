@@ -131,7 +131,7 @@ impl Adapter for LmStudio {
         let doc: Doc = serde_json::from_slice(bytes.as_ref())
             .with_context(|| format!("parsing {}", r.path.display()))?;
 
-        let created_at = doc.created_at.as_ref().and_then(ms_to_dt);
+        let created_at = doc.created_at.as_ref().and_then(super::ts_from_value);
         let updated_at = file_mtime(&r.path).or(created_at);
 
         let mut extra = serde_json::Map::new();
@@ -543,7 +543,7 @@ fn scan(path: &Path) -> Result<Option<SessionRef>> {
         .unwrap_or_default();
 
     let title = chat_title(&v);
-    let created_at = v.get("createdAt").and_then(ms_to_dt);
+    let created_at = v.get("createdAt").and_then(super::ts_from_value);
     let updated_at = file_mtime(path).or(created_at);
     let message_count = v
         .get("messages")
@@ -817,10 +817,6 @@ fn step_id_ts(id: &str) -> Option<DateTime<Utc>> {
         return None;
     }
     DateTime::from_timestamp_millis(ms)
-}
-
-fn ms_to_dt(v: &Value) -> Option<DateTime<Utc>> {
-    DateTime::from_timestamp_millis(v.as_i64()?)
 }
 
 fn file_mtime(path: &Path) -> Option<DateTime<Utc>> {

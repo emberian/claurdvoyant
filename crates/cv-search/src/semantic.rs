@@ -32,6 +32,13 @@ struct Record {
     title: Option<String>,
     /// A short preview of the body, for display in hits.
     preview: String,
+    /// Unix-seconds session dates, surfaced on hits. `serde(default)` keeps embedding stores
+    /// written before these fields loading cleanly (their hits are just dateless until the next
+    /// `embed_all`).
+    #[serde(default)]
+    created_at: Option<i64>,
+    #[serde(default)]
+    updated_at: Option<i64>,
     vector: Vec<f32>,
 }
 
@@ -72,6 +79,8 @@ pub fn embed_all(path: &Path) -> Result<usize> {
             cwd: d.cwd,
             title: d.title,
             preview: preview(&d.body, 200),
+            created_at: d.created_at,
+            updated_at: d.updated_at,
             vector: Vec::new(),
         });
         bodies.push(d.body);
@@ -127,16 +136,22 @@ pub fn semantic_search(path: &Path, query: &str, k: usize) -> Result<Vec<Hit>> {
 
     let model = load_model()?;
     let q = model.encode_single(query);
+    Ok(rank(&store, &q, k))
+}
 
+/// Brute-force cosine ranking of the store against an already-embedded query, mapping the top-`k`
+/// records to [`Hit`]s. Split from [`semantic_search`] so the record→hit projection (dates,
+/// preview-as-snippet) is testable without loading the embedding model.
+fn rank(store: &Store, q: &[f32], k: usize) -> Vec<Hit> {
     let mut scored: Vec<(f32, &Record)> = store
         .records
         .iter()
-        .map(|r| (cosine(&q, &r.vector), r))
+        .map(|r| (cosine(q, &r.vector), r))
         .collect();
     scored.sort_by(|a, b| b.0.total_cmp(&a.0));
     scored.truncate(k);
 
-    Ok(scored
+    scored
         .into_iter()
         .map(|(score, r)| Hit {
             id: r.id.clone(),
@@ -145,10 +160,10 @@ pub fn semantic_search(path: &Path, query: &str, k: usize) -> Result<Vec<Hit>> {
             title: r.title.clone(),
             score,
             snippet: r.preview.clone(),
-            created_at: None,
-            updated_at: None,
+            created_at: r.created_at,
+            updated_at: r.updated_at,
         })
-        .collect())
+        .collect()
 }
 
 /// Cosine similarity. model2vec L2-normalizes by default, so this is ~a dot product, but we
@@ -179,5 +194,65 @@ fn preview(s: &str, max_chars: usize) -> String {
         format!("{t}…")
     } else {
         t
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rec(id: &str, vector: Vec<f32>, dates: Option<(i64, i64)>) -> Record {
+        Record {
+            id: id.into(),
+            harness: "claude".into(),
+            cwd: None,
+            title: Some(format!("title-{id}")),
+            preview: format!("preview-{id}"),
+            created_at: dates.map(|(c, _)| c),
+            updated_at: dates.map(|(_, u)| u),
+            vector,
+        }
+    }
+
+    /// Dates stored on a record surface on its hit; records embedded without dates stay `None`.
+    #[test]
+    fn rank_carries_dates_onto_hits() {
+        let store = Store {
+            model: "test".into(),
+            records: vec![
+                rec("dated", vec![1.0, 0.0], Some((100, 200))),
+                rec("dateless", vec![0.0, 1.0], None),
+            ],
+        };
+        let hits = rank(&store, &[1.0, 0.0], 10);
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].id, "dated"); // cosine 1.0 ranks first
+        assert_eq!(hits[0].created_at, Some(100));
+        assert_eq!(hits[0].updated_at, Some(200));
+        assert_eq!(hits[0].snippet, "preview-dated");
+        assert_eq!(hits[1].id, "dateless");
+        assert_eq!(hits[1].created_at, None);
+        assert_eq!(hits[1].updated_at, None);
+    }
+
+    /// An embedding store written before the date fields existed must still deserialize — the
+    /// `serde(default)`s turn the absent fields into `None` instead of a parse error.
+    #[test]
+    fn old_store_without_dates_deserializes() {
+        let json = r#"{
+            "model": "minishlab/potion-base-8M",
+            "records": [{
+                "id": "old", "harness": "claude", "cwd": null, "title": "t",
+                "preview": "p", "vector": [0.5, 0.5]
+            }]
+        }"#;
+        let store: Store = serde_json::from_str(json).unwrap();
+        assert_eq!(store.records.len(), 1);
+        assert_eq!(store.records[0].created_at, None);
+        assert_eq!(store.records[0].updated_at, None);
+        // And the dateless record still ranks + maps to a (dateless) hit.
+        let hits = rank(&store, &[0.5, 0.5], 1);
+        assert_eq!(hits[0].id, "old");
+        assert_eq!(hits[0].created_at, None);
     }
 }

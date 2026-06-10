@@ -22,7 +22,7 @@
 //! `parse_all_str` (used by the wasm ingest path) handles all three readable JSON/JSONL shapes purely,
 //! with no filesystem access.
 
-use super::Adapter;
+use super::{parse_ts, Adapter};
 use crate::ir::*;
 use crate::stream::{CollectSink, Flow, MessageSink, ParseOptions};
 use anyhow::{Context, Result};
@@ -30,7 +30,7 @@ use chrono::{DateTime, Utc};
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::{BufRead, BufReader};
+use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
@@ -109,52 +109,10 @@ impl Adapter for Gemini {
     fn stream(
         &self,
         r: &SessionRef,
-        _opts: &ParseOptions,
+        opts: &ParseOptions,
         sink: &mut dyn MessageSink,
     ) -> Result<Session> {
-        // Gemini's per-message `extra` is just the `gemini_kind` marker (always emitted); there's no
-        // fat sidecar to gate, so `opts` doesn't change the materialization here.
-        let name = r
-            .path
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default();
-
-        // Chat recording (legacy whole-file .json / modern append-only .jsonl): one session per
-        // file, id authoritative. These are the only Gemini shapes large enough to OOM, so they get
-        // the native streaming paths; the bounded shapes below stay on the materializing bridge.
-        if is_chat_recording(&r.path) {
-            let ext = r.path.extension().and_then(|e| e.to_str());
-            if ext == Some("jsonl") {
-                if let Some(s) = stream_jsonl_recording(&r.path, sink)? {
-                    return Ok(s);
-                }
-            } else {
-                // Legacy `.json`: a single JSON document. Memory-map it and iterate the `messages`
-                // array as borrowed `RawValue`s so the whole-document `Value` is never built — peak
-                // is one message + the (reclaimable) mapping. If the file isn't actually the
-                // single-document shape (e.g. a `.json`-extensioned JSONL recording), fall through.
-                if let Some(s) = stream_legacy_json_recording(&r.path, sink)? {
-                    return Ok(s);
-                }
-                if let Some(s) = stream_jsonl_recording(&r.path, sink)? {
-                    return Ok(s);
-                }
-            }
-        }
-
-        // Bounded shapes (checkpoints, logs.json): a few KB–MB, never the OOM risk. Bridge through a
-        // whole-Session parse and replay its messages into the sink.
-        let session = self.parse_bounded(r, &name)?;
-        let mut session = session;
-        let messages = std::mem::take(&mut session.messages);
-        sink.meta(&session);
-        for m in messages {
-            if sink.message(m) == Flow::Stop {
-                break;
-            }
-        }
-        Ok(session)
+        stream_for(Harness::Gemini, r, opts, sink)
     }
 
     fn can_emit(&self) -> bool {
@@ -162,35 +120,94 @@ impl Adapter for Gemini {
     }
 }
 
-impl Gemini {
-    /// Whole-`Session` parse for the bounded (non-streamed) shapes: gemini-cli checkpoints and
-    /// `logs.json` (many sessions per file — picks the one matching `r.id`). These are small enough
-    /// to materialize. Also handles the rare case where a chat-recording path didn't stream.
-    fn parse_bounded(&self, r: &SessionRef, name: &str) -> Result<Session> {
-        let text = fs::read_to_string(&r.path)
-            .with_context(|| format!("reading {}", r.path.display()))?;
+/// Streaming parse of any Gemini-format session file, tagged as `harness` in the returned session.
+/// Shared with the [`Qwen`](crate::harness::qwen) adapter — Qwen Code is a gemini-cli fork with an
+/// **identical** on-disk format rooted at `~/.qwen`, so it reuses this machinery and only re-tags.
+pub(crate) fn stream_for(
+    harness: Harness,
+    r: &SessionRef,
+    _opts: &ParseOptions,
+    sink: &mut dyn MessageSink,
+) -> Result<Session> {
+    // Gemini's per-message `extra` is just the `gemini_kind` marker (always emitted); there's no
+    // fat sidecar to gate, so `opts` doesn't change the materialization here.
+    let name = r
+        .path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
 
-        // A chat recording that the streaming paths couldn't handle (shouldn't normally happen) —
-        // fall back to the pure parser so we never silently lose a session.
-        if is_chat_recording(&r.path) {
-            if let Some(s) = parse_chat_recording(&text, Some(r.path.clone())) {
+    // Chat recording (legacy whole-file .json / modern append-only .jsonl): one session per
+    // file, id authoritative. These are the only shapes large enough to OOM, so they get
+    // the native streaming paths; the bounded shapes below stay on the materializing bridge.
+    if is_chat_recording(&r.path) {
+        let ext = r.path.extension().and_then(|e| e.to_str());
+        if ext == Some("jsonl") {
+            if let Some(mut s) = stream_jsonl_recording(&r.path, sink)? {
+                s.harness = harness;
+                return Ok(s);
+            }
+        } else {
+            // Legacy `.json`: a single JSON document. Memory-map it and iterate the `messages`
+            // array as borrowed `RawValue`s so the whole-document `Value` is never built — peak
+            // is one message + the (reclaimable) mapping. If the file isn't actually the
+            // single-document shape (e.g. a `.json`-extensioned JSONL recording), fall through.
+            if let Some(mut s) = stream_legacy_json_recording(&r.path, sink)? {
+                s.harness = harness;
+                return Ok(s);
+            }
+            if let Some(mut s) = stream_jsonl_recording(&r.path, sink)? {
+                s.harness = harness;
                 return Ok(s);
             }
         }
-        // Checkpoint: one session per file.
-        if is_checkpoint(name) {
-            if let Some(s) = parse_checkpoint(&text, name, Some(r.path.clone())) {
-                return Ok(s);
-            }
+    }
+
+    // Bounded shapes (checkpoints, logs.json): a few KB–MB, never the OOM risk. Bridge through a
+    // whole-Session parse and replay its messages into the sink.
+    let mut session = parse_bounded(r, &name)?;
+    session.harness = harness;
+    let messages = std::mem::take(&mut session.messages);
+    sink.meta(&session);
+    for m in messages {
+        if sink.message(m) == Flow::Stop {
+            break;
         }
-        // logs.json: many sessions per file — pick out the one matching r.id.
-        let sessions = parse_logs_str(&text, Some(r.path.clone()));
-        if let Some(s) = sessions.into_iter().find(|s| s.id == r.id) {
+    }
+    Ok(session)
+}
+
+/// Whole-`Session` parse for the bounded (non-streamed) shapes: gemini-cli checkpoints and
+/// `logs.json` (many sessions per file — picks the one matching `r.id`). These are small enough
+/// to materialize. Also handles the rare case where a chat-recording path didn't stream.
+fn parse_bounded(r: &SessionRef, name: &str) -> Result<Session> {
+    let text = fs::read_to_string(&r.path)
+        .with_context(|| format!("reading {}", r.path.display()))?;
+
+    // A chat recording that the streaming paths couldn't handle (shouldn't normally happen) —
+    // fall back to the pure parser so we never silently lose a session.
+    if is_chat_recording(&r.path) {
+        if let Some(s) = parse_chat_recording(&text, Some(r.path.clone())) {
             return Ok(s);
         }
-
-        anyhow::bail!("could not parse Gemini session {} from {}", r.id, r.path.display())
     }
+    // Checkpoint: one session per file.
+    if is_checkpoint(name) {
+        if let Some(s) = parse_checkpoint(&text, name, Some(r.path.clone())) {
+            return Ok(s);
+        }
+    }
+    // logs.json: many sessions per file — pick out the one matching r.id.
+    let sessions = parse_logs_str(&text, Some(r.path.clone()));
+    if let Some(s) = sessions.into_iter().find(|s| s.id == r.id) {
+        return Ok(s);
+    }
+
+    anyhow::bail!(
+        "could not parse Gemini-format session {} from {}",
+        r.id,
+        r.path.display()
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -366,96 +383,25 @@ fn stream_jsonl_recording(
 ) -> Result<Option<Session>> {
     let file = fs::File::open(path)
         .with_context(|| format!("opening {}", path.display()))?;
-    let reader = BufReader::new(file);
 
-    let mut metadata = serde_json::Map::new();
-    // Preserve insertion order of message ids while allowing replacement / truncation.
-    let mut order: Vec<String> = Vec::new();
-    let mut msgs: BTreeMap<String, Value> = BTreeMap::new();
-    let mut saw_meta = false;
-
-    for line in reader.lines() {
-        // A read error on one line (rare: invalid UTF-8 chunk) shouldn't abort the whole session.
-        let Ok(line) = line else { continue };
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let Ok(rec) = serde_json::from_str::<Value>(line) else {
-            continue; // tolerate junk lines
-        };
-        let Some(obj) = rec.as_object() else { continue };
-
-        if let Some(rewind) = obj.get("$rewindTo").and_then(Value::as_str) {
-            // Drop the rewind target and everything after it.
-            if let Some(pos) = order.iter().position(|id| id == rewind) {
-                for id in order.drain(pos..) {
-                    msgs.remove(&id);
-                }
-            } else {
-                order.clear();
-                msgs.clear();
-            }
-            continue;
-        }
-        if let Some(set) = obj.get("$set").and_then(Value::as_object) {
-            for (k, v) in set {
-                if k == "messages" {
-                    // Checkpoint: rebuild the whole message list.
-                    order.clear();
-                    msgs.clear();
-                    if let Some(arr) = v.as_array() {
-                        for m in arr {
-                            if let Some(id) = m.get("id").and_then(Value::as_str) {
-                                if !msgs.contains_key(id) {
-                                    order.push(id.to_string());
-                                }
-                                msgs.insert(id.to_string(), m.clone());
-                            }
-                        }
-                    }
-                } else {
-                    metadata.insert(k.clone(), v.clone());
-                }
-            }
-            continue;
-        }
-        if let Some(id) = obj.get("id").and_then(Value::as_str) {
-            // A message record (must have an id and a type/content).
-            if obj.contains_key("type") || obj.contains_key("content") {
-                if !msgs.contains_key(id) {
-                    order.push(id.to_string());
-                }
-                msgs.insert(id.to_string(), rec.clone());
-                continue;
-            }
-            // else: junk record with an id but no message shape — ignore.
-            continue;
-        }
-        // Metadata line(s): a real recording's metadata carries BOTH sessionId and projectHash
-        // (gemini-cli's `isPartialMetadataRecord`). This guards against mistaking a `logs.json`
-        // entry (sessionId + messageId + message, no projectHash) for a recording.
-        if obj.contains_key("sessionId") && obj.contains_key("projectHash") {
-            saw_meta = true;
-            for (k, v) in obj {
-                metadata.insert(k.clone(), v.clone());
-            }
-        }
-    }
-
-    if !saw_meta && msgs.is_empty() {
+    let mut replay = RecordingReplay::default();
+    super::for_each_json_line(BufReader::new(file), |rec| {
+        replay.ingest(rec);
+        Flow::Continue
+    });
+    if !replay.saw_meta && replay.msgs.is_empty() {
         return Ok(None);
     }
 
-    let mut session = record_metadata(&metadata, Some(path.to_path_buf()));
+    let mut session = record_metadata(&replay.metadata, Some(path.to_path_buf()));
     let summary = session.title.take();
     let mut session_model: Option<String> = None;
     let mut title: Option<String> = None;
 
     // Emit retained messages in order, dropping each raw Value as we go (so we never hold the
     // reassembled array and the IR messages at the same time).
-    for id in &order {
-        let Some(rm) = msgs.remove(id) else { continue };
+    for id in &replay.order {
+        let Some(rm) = replay.msgs.remove(id) else { continue };
         let Some(obj) = rm.as_object() else { continue };
         if emit_record_message(obj, &mut session_model, &mut title, sink) == Flow::Stop {
             break;
@@ -465,6 +411,85 @@ fn stream_jsonl_recording(
     session.model = session_model;
     session.title = summary.or(title);
     Ok(Some(session))
+}
+
+/// Replays a *modern* append-only JSONL recording's records into its effective state: the metadata
+/// map plus the retained raw message records (insertion-ordered, with `$set` replacement and
+/// `$rewindTo` truncation applied). Shared by the streaming [`stream_jsonl_recording`] and the pure
+/// [`parse_chat_recording`] so both apply identical control-record semantics.
+#[derive(Default)]
+struct RecordingReplay {
+    metadata: serde_json::Map<String, Value>,
+    /// Insertion order of message ids (replacement keeps the original position).
+    order: Vec<String>,
+    msgs: BTreeMap<String, Value>,
+    /// Whether a real metadata line (sessionId + projectHash) was seen.
+    saw_meta: bool,
+}
+
+impl RecordingReplay {
+    /// Fold one JSONL record into the replay state. Non-object junk is ignored.
+    fn ingest(&mut self, rec: Value) {
+        if !rec.is_object() {
+            return;
+        }
+        if let Some(rewind) = rec.get("$rewindTo").and_then(Value::as_str) {
+            // Drop the rewind target and everything after it.
+            if let Some(pos) = self.order.iter().position(|id| id == rewind) {
+                for id in self.order.drain(pos..) {
+                    self.msgs.remove(&id);
+                }
+            } else {
+                self.order.clear();
+                self.msgs.clear();
+            }
+            return;
+        }
+        if let Some(set) = rec.get("$set").and_then(Value::as_object) {
+            for (k, v) in set {
+                if k == "messages" {
+                    // Checkpoint: rebuild the whole message list.
+                    self.order.clear();
+                    self.msgs.clear();
+                    if let Some(arr) = v.as_array() {
+                        for m in arr {
+                            if let Some(id) = m.get("id").and_then(Value::as_str) {
+                                if !self.msgs.contains_key(id) {
+                                    self.order.push(id.to_string());
+                                }
+                                self.msgs.insert(id.to_string(), m.clone());
+                            }
+                        }
+                    }
+                } else {
+                    self.metadata.insert(k.clone(), v.clone());
+                }
+            }
+            return;
+        }
+        if let Some(id) = rec.get("id").and_then(Value::as_str).map(str::to_string) {
+            // A message record (must have an id and a type/content); a junk record with an id but
+            // no message shape is ignored either way.
+            if rec.get("type").is_some() || rec.get("content").is_some() {
+                if !self.msgs.contains_key(&id) {
+                    self.order.push(id.clone());
+                }
+                self.msgs.insert(id, rec);
+            }
+            return;
+        }
+        // Metadata line(s): a real recording's metadata carries BOTH sessionId and projectHash
+        // (gemini-cli's `isPartialMetadataRecord`). This guards against mistaking a `logs.json`
+        // entry (sessionId + messageId + message, no projectHash) for a recording.
+        if rec.get("sessionId").is_some() && rec.get("projectHash").is_some() {
+            self.saw_meta = true;
+            if let Value::Object(obj) = rec {
+                for (k, v) in obj {
+                    self.metadata.insert(k, v);
+                }
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -615,85 +640,23 @@ fn parse_chat_recording(text: &str, source_path: Option<PathBuf>) -> Option<Sess
     }
 
     // Modern JSONL: replay metadata + message records + control records.
-    let mut metadata = serde_json::Map::new();
-    // Preserve insertion order of message ids while allowing replacement / truncation.
-    let mut order: Vec<String> = Vec::new();
-    let mut msgs: BTreeMap<String, Value> = BTreeMap::new();
-    let mut saw_meta = false;
+    let mut replay = RecordingReplay::default();
+    super::for_each_json_line_str(text, |rec| {
+        replay.ingest(rec);
+        Flow::Continue
+    });
 
-    for line in text.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let Ok(rec) = serde_json::from_str::<Value>(line) else {
-            continue; // tolerate junk lines
-        };
-        let Some(obj) = rec.as_object() else { continue };
-
-        if let Some(rewind) = obj.get("$rewindTo").and_then(Value::as_str) {
-            // Drop the rewind target and everything after it.
-            if let Some(pos) = order.iter().position(|id| id == rewind) {
-                for id in order.drain(pos..) {
-                    msgs.remove(&id);
-                }
-            } else {
-                order.clear();
-                msgs.clear();
-            }
-            continue;
-        }
-        if let Some(set) = obj.get("$set").and_then(Value::as_object) {
-            for (k, v) in set {
-                if k == "messages" {
-                    // Checkpoint: rebuild the whole message list.
-                    order.clear();
-                    msgs.clear();
-                    if let Some(arr) = v.as_array() {
-                        for m in arr {
-                            if let Some(id) = m.get("id").and_then(Value::as_str) {
-                                if !msgs.contains_key(id) {
-                                    order.push(id.to_string());
-                                }
-                                msgs.insert(id.to_string(), m.clone());
-                            }
-                        }
-                    }
-                } else {
-                    metadata.insert(k.clone(), v.clone());
-                }
-            }
-            continue;
-        }
-        if let Some(id) = obj.get("id").and_then(Value::as_str) {
-            // A message record (must have an id and a type/content).
-            if obj.contains_key("type") || obj.contains_key("content") {
-                if !msgs.contains_key(id) {
-                    order.push(id.to_string());
-                }
-                msgs.insert(id.to_string(), rec.clone());
-                continue;
-            }
-            // else: junk record with an id but no message shape — ignore.
-            continue;
-        }
-        // Metadata line(s): a real recording's metadata carries BOTH sessionId and projectHash
-        // (gemini-cli's `isPartialMetadataRecord`). This guards against mistaking a `logs.json`
-        // entry (sessionId + messageId + message, no projectHash) for a recording.
-        if obj.contains_key("sessionId") && obj.contains_key("projectHash") {
-            saw_meta = true;
-            for (k, v) in obj {
-                metadata.insert(k.clone(), v.clone());
-            }
-        }
-    }
-
-    if !saw_meta && msgs.is_empty() {
+    if !replay.saw_meta && replay.msgs.is_empty() {
         return None;
     }
 
     // Reassemble a ConversationRecord-shaped map.
-    let messages: Vec<Value> = order.iter().filter_map(|id| msgs.get(id).cloned()).collect();
+    let mut metadata = replay.metadata;
+    let messages: Vec<Value> = replay
+        .order
+        .iter()
+        .filter_map(|id| replay.msgs.remove(id))
+        .collect();
     metadata.insert("messages".into(), Value::Array(messages));
     Some(record_to_session(&metadata, source_path))
 }
@@ -843,10 +806,8 @@ fn emit_record_message(
                 }
             }
 
-            if !m.content.is_empty() {
-                if sink.message(m) == Flow::Stop {
-                    return Flow::Stop;
-                }
+            if !m.content.is_empty() && sink.message(m) == Flow::Stop {
+                return Flow::Stop;
             }
             // Emit tool results as a separate Tool-role turn (mirrors how Gemini feeds
             // functionResponses back as a user turn, but kept distinct in the IR).
@@ -866,10 +827,8 @@ fn emit_record_message(
             m.timestamp = ts;
             m.extra.insert("gemini_kind".into(), Value::String(mty.to_string()));
             push_content_blocks(&mut m.content, obj.get("content"));
-            if !m.content.is_empty() {
-                if sink.message(m) == Flow::Stop {
-                    return Flow::Stop;
-                }
+            if !m.content.is_empty() && sink.message(m) == Flow::Stop {
+                return Flow::Stop;
             }
         }
         _ => {
@@ -881,10 +840,8 @@ fn emit_record_message(
             if title.is_none() {
                 *title = m.text().map(|t| crate::ir::truncate(&t, 80));
             }
-            if !m.content.is_empty() {
-                if sink.message(m) == Flow::Stop {
-                    return Flow::Stop;
-                }
+            if !m.content.is_empty() && sink.message(m) == Flow::Stop {
+                return Flow::Stop;
             }
         }
     }
@@ -1184,12 +1141,6 @@ fn session_ref(s: &Session, path: &Path) -> SessionRef {
         updated_at: s.updated_at,
         message_count: s.messages.len(),
     }
-}
-
-fn parse_ts(s: &str) -> Option<DateTime<Utc>> {
-    DateTime::parse_from_rfc3339(s)
-        .ok()
-        .map(|d| d.with_timezone(&Utc))
 }
 
 #[cfg(test)]

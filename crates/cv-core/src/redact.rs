@@ -31,16 +31,10 @@ use crate::ir::{Block, Message, Session};
 use serde_json::Value;
 
 /// Knobs for [`redact_with`]. Defaults scrub everything.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct RedactOptions {
     /// If `false` (the default), email addresses are redacted. Set `true` to keep them.
     pub keep_emails: bool,
-}
-
-impl Default for RedactOptions {
-    fn default() -> Self {
-        RedactOptions { keep_emails: false }
-    }
 }
 
 /// Counts of how many spans of each class were redacted across a session.

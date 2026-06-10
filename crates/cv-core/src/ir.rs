@@ -156,6 +156,9 @@ impl Session {
     }
 
     /// All textual content concatenated — used to build a search index.
+    ///
+    /// The per-message projection lives in [`Message::append_searchable`]; this just prepends the
+    /// title and folds every message into one `String`.
     pub fn searchable_text(&self) -> String {
         let mut out = String::new();
         if let Some(t) = &self.title {
@@ -163,31 +166,7 @@ impl Session {
             out.push('\n');
         }
         for m in &self.messages {
-            for b in &m.content {
-                match b {
-                    Block::Text { text } | Block::Thinking { text, .. } => {
-                        out.push_str(text);
-                        out.push('\n');
-                    }
-                    Block::ToolUse { name, input, .. } => {
-                        out.push_str(name);
-                        out.push(' ');
-                        out.push_str(&input.to_string());
-                        out.push('\n');
-                    }
-                    Block::ToolResult { content, .. } => {
-                        out.push_str(content);
-                        out.push('\n');
-                    }
-                    Block::File { path, source, .. } => {
-                        if let Some(p) = path.as_deref().or(source.as_deref()) {
-                            out.push_str(p);
-                            out.push('\n');
-                        }
-                    }
-                    Block::Image { .. } => {}
-                }
-            }
+            m.append_searchable(&mut out);
         }
         out
     }
@@ -278,6 +257,41 @@ impl Message {
             if slot.is_span() {
                 let owned = slot.resolve(resolver).into_owned();
                 *slot = crate::lazy::Text::Inline(owned);
+            }
+        }
+    }
+
+    /// Append this message's searchable text to `out` — the single canonical projection behind
+    /// both [`Session::searchable_text`] (whole session) and
+    /// [`append_searchable`](crate::stream::append_searchable) (streaming, per message).
+    /// Writes into the caller's buffer so neither path allocates intermediates.
+    pub fn append_searchable(&self, out: &mut String) {
+        use std::fmt::Write as _;
+        for b in &self.content {
+            match b {
+                Block::Text { text } | Block::Thinking { text, .. } => {
+                    out.push_str(text);
+                    out.push('\n');
+                }
+                Block::ToolUse { name, input, .. } => {
+                    out.push_str(name);
+                    out.push(' ');
+                    // `Display` for `serde_json::Value` produces exactly `to_string()`, without
+                    // the intermediate allocation.
+                    let _ = write!(out, "{input}");
+                    out.push('\n');
+                }
+                Block::ToolResult { content, .. } => {
+                    out.push_str(content);
+                    out.push('\n');
+                }
+                Block::File { path, source, .. } => {
+                    if let Some(p) = path.as_deref().or(source.as_deref()) {
+                        out.push_str(p);
+                        out.push('\n');
+                    }
+                }
+                Block::Image { .. } => {}
             }
         }
     }
@@ -382,6 +396,13 @@ pub struct SessionRef {
     pub created_at: Option<DateTime<Utc>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub updated_at: Option<DateTime<Utc>>,
+    /// Number of conversational messages: **user + assistant turns only**.
+    ///
+    /// This is the contract every adapter must meet — do not count system/meta records, tool
+    /// results, sidecar files, or directory entries. The number a person would call "how long is
+    /// this conversation", comparable across harnesses. Adapters that can't know it cheaply
+    /// should compute it from the same records they'd parse into [`Role::User`]/[`Role::Assistant`]
+    /// messages, not from a proxy like file count.
     pub message_count: usize,
 }
 
@@ -394,7 +415,9 @@ pub fn label_from(title: Option<&str>, first_user_text: Option<&str>) -> String 
         .unwrap_or_else(|| "(untitled)".into())
 }
 
-pub(crate) fn truncate(s: &str, max: usize) -> String {
+/// Flatten newlines to spaces and truncate to at most `max` chars, ending with `…` when cut.
+/// The one canonical truncation used by labels, renderers, and listings.
+pub fn truncate(s: &str, max: usize) -> String {
     let s = s.replace('\n', " ");
     if s.chars().count() <= max {
         s

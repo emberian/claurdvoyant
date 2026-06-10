@@ -9,11 +9,13 @@
 //! - `~/.qwen/tmp/<projectHash>/checkpoint-<tag>.json` — `{history: Content[]}` or a bare `Content[]`.
 //!
 //! Because the format is identical, this adapter delegates all parsing to
-//! [`crate::harness::gemini::parse_all_str`] and then rewrites the resulting sessions'
+//! [`crate::harness::gemini::parse_all_str`] (and streaming to
+//! [`crate::harness::gemini::stream_for`]) and then rewrites the resulting sessions'
 //! `harness` to [`Harness::Qwen`]. Missing dirs degrade gracefully to empty results.
 
 use super::Adapter;
 use crate::ir::*;
+use crate::stream::{MessageSink, ParseOptions};
 use anyhow::{Context, Result};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -81,6 +83,19 @@ impl Adapter for Qwen {
             return Ok(s);
         }
         anyhow::bail!("could not parse Qwen session {} from {}", r.id, r.path.display())
+    }
+
+    fn stream(
+        &self,
+        r: &SessionRef,
+        opts: &ParseOptions,
+        sink: &mut dyn MessageSink,
+    ) -> Result<Session> {
+        // The on-disk format is identical to Gemini's, so the streaming machinery (mmap +
+        // RawValue for legacy whole-file JSON, line streaming for modern JSONL recordings) is
+        // shared; it re-tags the resulting session as Qwen — the same retag `parse_qwen_str`
+        // applies on the materializing path.
+        crate::harness::gemini::stream_for(Harness::Qwen, r, opts, sink)
     }
 
     fn can_emit(&self) -> bool {
@@ -173,6 +188,39 @@ mod tests {
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].harness, Harness::Qwen);
         assert_eq!(sessions[0].id, "11112222-3333-4444-5555-666677778888");
+    }
+
+    #[test]
+    fn streams_modern_jsonl_as_qwen() {
+        // The native streaming path (shared Gemini machinery) must re-tag the session as Qwen and
+        // emit the same messages the pure parser materializes.
+        let text = fixture("session_modern.jsonl");
+        let dir = std::env::temp_dir().join(format!("cv-qwen-stream-{}", std::process::id()));
+        // `chats/` in the path is how the shared machinery recognizes a chat recording.
+        let chats = dir.join("chats");
+        fs::create_dir_all(&chats).unwrap();
+        let path = chats.join("session-test.jsonl");
+        fs::write(&path, &text).unwrap();
+
+        let r = SessionRef {
+            id: "11112222-3333-4444-5555-666677778888".into(),
+            harness: Harness::Qwen,
+            path,
+            cwd: None,
+            title: None,
+            created_at: None,
+            updated_at: None,
+            message_count: 0,
+        };
+        let mut sink = crate::stream::CollectSink::default();
+        let s = Qwen::new()
+            .stream(&r, &crate::stream::ParseOptions::full(), &mut sink)
+            .expect("stream");
+        assert_eq!(s.harness, Harness::Qwen);
+
+        let parsed = &parse_qwen_str(&text, None)[0];
+        assert_eq!(sink.messages.len(), parsed.messages.len());
+        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

@@ -29,7 +29,6 @@ use super::Adapter;
 use crate::ir::*;
 use crate::stream::{Flow, MessageSink, ParseOptions};
 use anyhow::{Context, Result};
-use chrono::{DateTime, TimeZone, Utc};
 use serde_json::{json, Map, Value};
 use std::fs;
 use std::path::PathBuf;
@@ -94,14 +93,7 @@ impl Adapter for OpenCode {
                 .and_then(Value::as_str)
                 .unwrap_or(name.trim_end_matches(".json"))
                 .to_string();
-            let message_count = self
-                .message_dir(&id)
-                .map(|d| {
-                    fs::read_dir(&d)
-                        .map(|rd| rd.filter_map(|e| e.ok()).count())
-                        .unwrap_or(0)
-                })
-                .unwrap_or(0);
+            let message_count = self.message_dir(&id).map(|d| count_turns(&d)).unwrap_or(0);
             out.push(SessionRef {
                 id,
                 harness: Harness::OpenCode,
@@ -111,8 +103,8 @@ impl Adapter for OpenCode {
                     .get("title")
                     .and_then(Value::as_str)
                     .map(|t| crate::ir::truncate(t, 80)),
-                created_at: v.pointer("/time/created").and_then(ms_to_dt),
-                updated_at: v.pointer("/time/updated").and_then(ms_to_dt),
+                created_at: v.pointer("/time/created").and_then(super::ts_from_value),
+                updated_at: v.pointer("/time/updated").and_then(super::ts_from_value),
                 message_count,
             });
         }
@@ -150,8 +142,8 @@ impl Adapter for OpenCode {
                 .get("title")
                 .and_then(Value::as_str)
                 .map(str::to_string),
-            created_at: meta.pointer("/time/created").and_then(ms_to_dt),
-            updated_at: meta.pointer("/time/updated").and_then(ms_to_dt),
+            created_at: meta.pointer("/time/created").and_then(super::ts_from_value),
+            updated_at: meta.pointer("/time/updated").and_then(super::ts_from_value),
             model: None,
             git: None,
             messages: Vec::new(),
@@ -204,6 +196,29 @@ impl Adapter for OpenCode {
     }
 }
 
+/// Count a session's conversational turns: message records whose `role` is `user`/`assistant`.
+/// The [`SessionRef::message_count`] contract is user+assistant turns only — counting directory
+/// entries (the old behavior) also picked up system/summary records and any stray files, so the
+/// number disagreed with every other adapter. Message files are small metadata records (the heavy
+/// content lives in part files, which this never touches), so the peek stays cheap.
+fn count_turns(dir: &std::path::Path) -> usize {
+    let Ok(rd) = fs::read_dir(dir) else { return 0 };
+    rd.filter_map(|e| e.ok())
+        .filter(|e| {
+            let Ok(text) = fs::read_to_string(e.path()) else {
+                return false;
+            };
+            let Ok(v) = serde_json::from_str::<Value>(&text) else {
+                return false;
+            };
+            matches!(
+                v.get("role").and_then(Value::as_str),
+                Some("user") | Some("assistant")
+            )
+        })
+        .count()
+}
+
 impl OpenCode {
     fn load_parts(&self, mid: &str) -> Vec<Value> {
         let Some(pdir) = self.part_dir(mid) else {
@@ -241,7 +256,7 @@ fn build_messages(mv: &Value, parts: &[Value]) -> Vec<Message> {
     let mut m = Message::new(role);
     m.id = (!msg_id.is_empty()).then(|| msg_id.to_string());
     m.parent_id = mv.get("parentID").and_then(Value::as_str).map(str::to_string);
-    m.timestamp = mv.pointer("/time/created").and_then(ms_to_dt);
+    m.timestamp = mv.pointer("/time/created").and_then(super::ts_from_value);
     // Newer records carry `modelID`; user records nest it under `model.modelID`.
     m.model = mv
         .get("modelID")
@@ -519,12 +534,6 @@ fn parse_tokens(v: Option<&Value>) -> Option<Usage> {
         cache_read_tokens: v.pointer("/cache/read").and_then(Value::as_u64),
         cache_creation_tokens: v.pointer("/cache/write").and_then(Value::as_u64),
     })
-}
-
-/// OpenCode timestamps are epoch milliseconds.
-fn ms_to_dt(v: &Value) -> Option<DateTime<Utc>> {
-    let ms = v.as_i64()?;
-    Utc.timestamp_millis_opt(ms).single()
 }
 
 #[cfg(test)]

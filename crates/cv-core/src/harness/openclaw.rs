@@ -40,11 +40,11 @@
 //!   `api:"cli"` with the real provider/model. Delivery mirrors use
 //!   `provider:"openclaw", model:"delivery-mirror"` (or `gateway-injected`) — transcript-only echoes.
 
-use super::Adapter;
+use super::{parse_ts, ts_from_value, Adapter};
 use crate::ir::*;
 use crate::stream::{Flow, MessageSink, ParseOptions};
 use anyhow::{Context, Result};
-use chrono::{DateTime, TimeZone, Utc};
+use chrono::{DateTime, Utc};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::fs;
@@ -275,10 +275,7 @@ fn scan(path: &Path, index: &HashMap<String, Value>) -> Result<SessionRef> {
     let mut first_user: Option<String> = None;
     let mut message_count = 0usize;
 
-    for line in text.lines() {
-        let Ok(v) = serde_json::from_str::<Value>(line) else {
-            continue;
-        };
+    super::for_each_json_line_str(&text, |v| {
         match v.get("type").and_then(Value::as_str) {
             Some("session") => {
                 if id.is_empty() {
@@ -303,7 +300,8 @@ fn scan(path: &Path, index: &HashMap<String, Value>) -> Result<SessionRef> {
             }
             _ => {}
         }
-    }
+        Flow::Continue
+    });
 
     if id.is_empty() {
         id = session_id_from_filename(path);
@@ -320,10 +318,8 @@ fn scan(path: &Path, index: &HashMap<String, Value>) -> Result<SessionRef> {
             .and_then(Value::as_str)
             .map(PathBuf::from);
     }
-    let entry_updated = entry
-        .and_then(|e| e.get("updatedAt"))
-        .and_then(Value::as_i64)
-        .and_then(ms_to_dt);
+    // `updatedAt` in the index is epoch-ms.
+    let entry_updated = entry.and_then(|e| e.get("updatedAt")).and_then(ts_from_value);
 
     Ok(SessionRef {
         id,
@@ -342,11 +338,7 @@ fn entry_timestamp(v: &Value) -> Option<DateTime<Utc>> {
     v.get("timestamp")
         .and_then(Value::as_str)
         .and_then(parse_ts)
-        .or_else(|| {
-            v.pointer("/message/timestamp")
-                .and_then(Value::as_i64)
-                .and_then(ms_to_dt)
-        })
+        .or_else(|| v.pointer("/message/timestamp").and_then(ts_from_value))
 }
 
 fn parse_entry(v: &Value) -> Option<Message> {
@@ -610,16 +602,6 @@ fn snake(s: &str) -> String {
         }
     }
     out
-}
-
-fn parse_ts(s: &str) -> Option<DateTime<Utc>> {
-    DateTime::parse_from_rfc3339(s)
-        .ok()
-        .map(|d| d.with_timezone(&Utc))
-}
-
-fn ms_to_dt(ms: i64) -> Option<DateTime<Utc>> {
-    Utc.timestamp_millis_opt(ms).single()
 }
 
 #[cfg(test)]

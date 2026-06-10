@@ -6,6 +6,7 @@
 //!   * **Windows:** `%APPDATA%\Block\Block\goose\data\sessions\`
 //!   * `$GOOSE_PATH_ROOT/data/sessions/` overrides all of the above (test hook), and we also honour
 //!     `$XDG_DATA_HOME` directly.
+//!
 //! The dir contains a modern `sessions.db` (SQLite, since the v1.10-era rewrite) and, for older
 //! installs, legacy per-session `<name>.jsonl` files. New Goose imports the legacy files into the DB
 //! on first run, but we read whatever is on disk: we parse the DB *and* any `.jsonl` not shadowed by
@@ -288,14 +289,16 @@ fn stream_db(conn: &Connection, r: &SessionRef, sink: &mut dyn MessageSink) -> R
         provider = if has("provider_name") { "provider_name" } else { "NULL" },
         model_cfg = if has("model_config_json") { "model_config_json" } else { "NULL" },
     );
-    let (title, wd, created, updated, provider, model_cfg): (
+    /// One optional TEXT value per metadata column the query selects.
+    type MetaRow = (
         Option<String>,
         Option<String>,
         Option<String>,
         Option<String>,
         Option<String>,
         Option<String>,
-    ) = conn
+    );
+    let (title, wd, created, updated, provider, model_cfg): MetaRow = conn
         .query_row(&sel, [&r.id], |row| {
             Ok((
                 row.get(0).ok().flatten(),
@@ -342,7 +345,7 @@ fn stream_db(conn: &Connection, r: &SessionRef, sink: &mut dyn MessageSink) -> R
     let mut stmt = conn.prepare(&sql)?;
     // Stream rows lazily: build one `DbMsg` -> one `Message`, emit it, drop it before the next row,
     // so a large Goose session never fully materializes (peak = one message's content).
-    let mut rows = stmt.query_map([&r.id], |row| {
+    let rows = stmt.query_map([&r.id], |row| {
         Ok(DbMsg {
             role: row.get::<_, String>(0).unwrap_or_default(),
             content_json: row.get::<_, Option<String>>(1).ok().flatten().unwrap_or_default(),
@@ -354,7 +357,7 @@ fn stream_db(conn: &Connection, r: &SessionRef, sink: &mut dyn MessageSink) -> R
 
     // Track tool-request names so we can label later tool responses (forward-only state).
     let mut tool_names: HashMap<String, String> = HashMap::new();
-    while let Some(row) = rows.next() {
+    for row in rows {
         let Ok(row) = row else { continue };
         if let Some(m) = row.into_message(&mut tool_names) {
             if sink.message(m) == Flow::Stop {
@@ -726,8 +729,8 @@ fn parse_ts_text(s: &str) -> Option<DateTime<Utc>> {
     if s.is_empty() {
         return None;
     }
-    if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
-        return Some(dt.with_timezone(&Utc));
+    if let Some(dt) = super::parse_ts(s) {
+        return Some(dt);
     }
     // SQLite `CURRENT_TIMESTAMP` form (space separator, UTC, no offset).
     for fmt in ["%Y-%m-%d %H:%M:%S%.f", "%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S%.f"] {

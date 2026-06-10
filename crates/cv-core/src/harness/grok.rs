@@ -24,15 +24,14 @@
 //! - `session_kind: "subagent"` (under `.grok/worktrees/.../subagent-<id>/`) vs primary sessions
 //!   (no `session_kind`, an `agent_name` instead) are both handled; the kind is stashed in `extra`.
 
-use super::Adapter;
+use super::{parse_ts, Adapter};
 use crate::ir::*;
 use crate::stream::{Flow, MessageSink, ParseOptions};
 use anyhow::{Context, Result};
-use chrono::{DateTime, Utc};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::fs;
-use std::io::{BufRead, BufReader};
+use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
@@ -142,21 +141,12 @@ impl Adapter for Grok {
 
         let file = fs::File::open(dir.join("chat_history.jsonl"))
             .with_context(|| format!("reading chat_history in {}", dir.display()))?;
-        for line in BufReader::new(file).lines() {
-            let Ok(line) = line else { continue };
-            let line = line.trim();
-            if line.is_empty() {
-                continue;
+        super::for_each_json_line(BufReader::new(file), |v| {
+            match chat_message(&v, &enrich) {
+                Some(m) => sink.message(m),
+                None => Flow::Continue,
             }
-            let Ok(v) = serde_json::from_str::<Value>(line) else {
-                continue;
-            };
-            if let Some(m) = chat_message(&v, &enrich) {
-                if sink.message(m) == Flow::Stop {
-                    break;
-                }
-            }
-        }
+        });
         Ok(s)
     }
 
@@ -209,23 +199,16 @@ fn read_update_enrichment(dir: &Path) -> HashMap<String, ToolEnrich> {
     let Ok(text) = fs::read_to_string(dir.join("updates.jsonl")) else {
         return map;
     };
-    for line in text.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let Ok(v) = serde_json::from_str::<Value>(line) else {
-            continue;
-        };
+    super::for_each_json_line_str(&text, |v| {
         let Some(u) = v.pointer("/params/update") else {
-            continue;
+            return Flow::Continue;
         };
         let su = u.get("sessionUpdate").and_then(Value::as_str);
         if !matches!(su, Some("tool_call") | Some("tool_call_update")) {
-            continue;
+            return Flow::Continue;
         }
         let Some(id) = u.get("toolCallId").and_then(Value::as_str) else {
-            continue;
+            return Flow::Continue;
         };
         let e = map.entry(id.to_string()).or_default();
         // Prefer the descriptive title from tool_call_update over the bare tool name in tool_call.
@@ -249,7 +232,8 @@ fn read_update_enrichment(dir: &Path) -> HashMap<String, ToolEnrich> {
         if let Some(st) = u.get("status").and_then(Value::as_str) {
             e.status = Some(st.to_string());
         }
-    }
+        Flow::Continue
+    });
     map
 }
 
@@ -400,12 +384,6 @@ fn coerce_content(v: Option<&Value>) -> String {
     }
 }
 
-fn parse_ts(s: &str) -> Option<DateTime<Utc>> {
-    DateTime::parse_from_rfc3339(s)
-        .ok()
-        .map(|d| d.with_timezone(&Utc))
-}
-
 /// `summary_path` is `.../<sid>/summary.json`; the session dir is its parent.
 fn scan(summary_path: &Path) -> Result<Option<SessionRef>> {
     let dir = summary_path.parent().map(Path::to_path_buf);
@@ -439,18 +417,16 @@ fn scan(summary_path: &Path) -> Result<Option<SessionRef>> {
         .map(|s| crate::ir::truncate(s, 80));
     if title.is_none() {
         if let Ok(chat) = fs::read_to_string(dir.join("chat_history.jsonl")) {
-            for line in chat.lines() {
-                let Ok(v) = serde_json::from_str::<Value>(line) else {
-                    continue;
-                };
+            super::for_each_json_line_str(&chat, |v| {
                 if v.get("type").and_then(Value::as_str) == Some("user") {
                     let t = coerce_content(v.get("content"));
                     if !t.trim().is_empty() {
                         title = Some(crate::ir::truncate(&t, 80));
-                        break;
+                        return Flow::Stop;
                     }
                 }
-            }
+                Flow::Continue
+            });
         }
     }
 

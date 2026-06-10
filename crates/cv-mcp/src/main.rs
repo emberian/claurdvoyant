@@ -22,11 +22,13 @@
 //! - `search_sessions(query, harness?, cwd_contains?, limit=20)` — full-text substring search over
 //!   parsed session content, with a snippet around the first match.
 //! - `read_session(id, harness?, format="markdown"|"json")` — the full transcript.
-//! - `project_sessions(cwd, limit=20)` — sessions whose recorded cwd contains the given path; the
-//!   headline "what happened in THIS project before / what are sibling agents doing here" tool.
-//! - `recall(query, k=5, harness?)` — "have I/another agent solved this before?" Semantic search
-//!   over the whole corpus (via `cv-search`) that returns the most relevant message *spans*, not
-//!   just metadata. Needs `cv index --semantic`; degrades to keyword search otherwise.
+//! - `project_sessions(cwd, harness?, limit=20)` — sessions whose recorded cwd contains the given
+//!   path; the headline "what happened in THIS project before / what are sibling agents doing
+//!   here" tool.
+//! - `recall(query, k=5, harness?, cwd_contains?)` — "have I/another agent solved this before?"
+//!   Semantic search over the whole corpus (via `cv-search`) that returns the most relevant
+//!   message *spans*, not just metadata. Needs `cv index --semantic`; degrades to keyword search
+//!   otherwise.
 
 use anyhow::Context as _;
 use cv_core::watch::{Filter, Watcher};
@@ -201,11 +203,12 @@ fn tool_list() -> Value {
         },
         {
             "name": "project_sessions",
-            "description": "List sessions whose recorded working directory equals or contains the given path, newest first. The headline 'what happened in THIS project before / what are sibling agents doing here' tool.",
+            "description": "List sessions whose recorded working directory equals or contains the given path, newest first. Optionally filter by harness. The headline 'what happened in THIS project before / what are sibling agents doing here' tool.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "cwd": { "type": "string", "description": "Project path to match against sessions' recorded cwd." },
+                    "harness": { "type": "string", "description": "Restrict to one harness: claude, codex, grok, opencode, gemini." },
                     "limit": { "type": "number", "description": "Max results (default 20)." }
                 },
                 "required": ["cwd"]
@@ -219,7 +222,8 @@ fn tool_list() -> Value {
                 "properties": {
                     "query": { "type": "string", "description": "What you're trying to do / the problem to find prior work on." },
                     "k": { "type": "number", "description": "Max sessions to return (default 5)." },
-                    "harness": { "type": "string", "description": "Restrict results to one harness: claude, codex, grok, opencode, gemini." }
+                    "harness": { "type": "string", "description": "Restrict results to one harness: claude, codex, grok, opencode, gemini." },
+                    "cwd_contains": { "type": "string", "description": "Only sessions whose recorded cwd contains this substring." }
                 },
                 "required": ["query"]
             }
@@ -839,11 +843,13 @@ fn paths_related(a: &std::path::Path, b: &std::path::Path) -> bool {
 fn project_sessions(args: &Value) -> anyhow::Result<String> {
     let cwd = arg_str(args, "cwd")
         .ok_or_else(|| anyhow::anyhow!("missing required argument: cwd"))?;
+    let harness = parse_harness(args)?;
     let limit = arg_usize(args, "limit", 20);
 
     let query = std::path::Path::new(cwd);
     let mut refs: Vec<SessionRef> = cv_core::discover_all()
         .into_iter()
+        .filter(|r| harness.is_none_or(|h| r.harness == h))
         .filter(|r| r.cwd.as_deref().map(|p| paths_related(p, query)).unwrap_or(false))
         .collect();
 
@@ -967,9 +973,14 @@ fn recall(args: &Value) -> anyhow::Result<String> {
         .ok_or_else(|| anyhow::anyhow!("missing required argument: query"))?;
     let k = arg_usize(args, "k", 5).max(1);
     let harness = parse_harness(args)?;
+    let cwd_needle = arg_str(args, "cwd_contains");
 
-    // We may filter by harness *after* searching, so over-fetch a bit to still fill `k`.
-    let fetch = if harness.is_some() { (k * 4).max(20) } else { k };
+    // We may filter by harness/cwd *after* searching, so over-fetch a bit to still fill `k`.
+    let fetch = if harness.is_some() || cwd_needle.is_some() {
+        (k * 4).max(20)
+    } else {
+        k
+    };
 
     let (mut hits, mode) = match cv_search::semantic_search(None, query, fetch) {
         Ok(h) => (h, "semantic"),
@@ -987,6 +998,9 @@ fn recall(args: &Value) -> anyhow::Result<String> {
     if let Some(h) = harness {
         let want = h.as_str();
         hits.retain(|hit| hit.harness == want);
+    }
+    if let Some(needle) = cwd_needle {
+        hits.retain(|hit| hit.cwd.as_deref().is_some_and(|c| c.contains(needle)));
     }
     hits.truncate(k);
 

@@ -957,15 +957,16 @@ fn cwd_from_metadata(dir: &Path) -> Option<PathBuf> {
 /// - `updated`: the last event's `ts` (the caller keeps it only if it's newer than the mtime guess).
 /// - `first_user_ts`: same first `ts`, which the streaming core stamps onto the first user turn.
 ///
+/// `(created_at, updated_at, last_api_start)` extracted from a task's `ui_messages.json`.
+type UiTimes = (
+    Option<DateTime<Utc>>,
+    Option<DateTime<Utc>>,
+    Option<DateTime<Utc>>,
+);
+
 /// Small file (one entry per UI event, no transcript bodies), so a plain `from_str::<Value>` here is
 /// fine — the OOM concern is `api_conversation_history.json`, not this sidecar.
-fn ui_message_times(
-    dir: &Path,
-) -> (
-    Option<DateTime<Utc>>,
-    Option<DateTime<Utc>>,
-    Option<DateTime<Utc>>,
-) {
+fn ui_message_times(dir: &Path) -> UiTimes {
     let Ok(text) = fs::read_to_string(dir.join("ui_messages.json")) else {
         return (None, None, None);
     };

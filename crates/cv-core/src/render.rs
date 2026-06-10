@@ -108,14 +108,3 @@ pub fn role_label(r: Role) -> &'static str {
         Role::Tool => "tool",
     }
 }
-
-fn truncate(s: &str, max: usize) -> String {
-    let s = s.replace('\n', " ");
-    if s.chars().count() <= max {
-        s
-    } else {
-        let mut o: String = s.chars().take(max.saturating_sub(1)).collect();
-        o.push('…');
-        o
-    }
-}

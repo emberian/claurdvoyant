@@ -35,8 +35,10 @@ pub struct Hit {
     pub score: f32,
     /// A representative excerpt of the matching text (generated live from the hit session for FTS).
     pub snippet: String,
-    /// Unix timestamps carried straight off the index, so callers can date rows without
-    /// re-discovering the corpus. `None` when unknown / not stored (e.g. semantic hits).
+    /// Unix timestamps carried straight off the FTS index / embedding store, so callers can date
+    /// rows without re-discovering the corpus. `None` when the session itself had no parseable
+    /// dates, or for semantic hits from an embedding store written before dates were recorded
+    /// (re-run `embed_all` to backfill).
     #[serde(default)]
     pub created_at: Option<i64>,
     #[serde(default)]
@@ -108,6 +110,7 @@ pub fn semantic_search(
 /// (taking down the terminal-sibling process). Both indexers now consume this streaming driver, so
 /// they still see exactly the same searchable text but never hold the whole corpus at once.
 /// Shared by both indexers so they see exactly the same searchable text.
+#[cfg(feature = "semantic")]
 pub(crate) fn stream_corpus(mut f: impl FnMut(Doc) -> Result<()>) -> Result<usize> {
     use cv_core::{Flow, Message, MessageSink, ParseOptions, Role};
 
@@ -159,6 +162,8 @@ pub(crate) fn stream_corpus(mut f: impl FnMut(Doc) -> Result<()>) -> Result<usiz
             cwd: r.cwd.as_ref().map(|p| p.display().to_string()),
             title: Some(title),
             body: sink.body,
+            created_at: r.created_at.map(|t| t.timestamp()),
+            updated_at: r.updated_at.map(|t| t.timestamp()),
         };
         f(doc)?;
         n += 1;
@@ -170,6 +175,7 @@ pub(crate) fn stream_corpus(mut f: impl FnMut(Doc) -> Result<()>) -> Result<usiz
 /// ([`semantic::embed_all`]), which reads exactly these fields. The FTS path no longer goes through
 /// `Doc`: it streams straight into `fts::ChunkSink`, which reads dates/path/mtime off the
 /// [`cv_core::SessionRef`] instead (so they aren't duplicated here).
+#[cfg(feature = "semantic")]
 #[derive(Debug, Clone)]
 pub(crate) struct Doc {
     pub id: String,
@@ -177,4 +183,8 @@ pub(crate) struct Doc {
     pub cwd: Option<String>,
     pub title: Option<String>,
     pub body: String,
+    /// Unix-seconds session dates off the discovery [`cv_core::SessionRef`], so semantic hits
+    /// carry `created_at`/`updated_at` just like FTS hits do.
+    pub created_at: Option<i64>,
+    pub updated_at: Option<i64>,
 }

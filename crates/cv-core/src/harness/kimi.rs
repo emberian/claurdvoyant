@@ -42,6 +42,7 @@
 //! - `StatusUpdate.payload.token_usage{input_other,output,input_cache_read,input_cache_creation}`
 //!   and `message_id` (chatcmpl-…) → attached to the most recent assistant message.
 //! - `TurnBegin`/event timestamps → first/last session timestamps when no file mtime is better.
+//!
 //! We tolerate protocol_version drift (1.1–1.9) and unknown message types: anything we don't
 //! recognize is ignored.
 
@@ -53,7 +54,7 @@ use chrono::{DateTime, Utc};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::fs;
-use std::io::{BufRead, BufReader};
+use std::io::BufReader;
 use std::path::{Path, PathBuf};
 
 pub struct Kimi {
@@ -144,9 +145,8 @@ impl Adapter for Kimi {
                 } else {
                     continue;
                 };
-                match scan(&id, &transcript, &dir, cwd.clone(), default_model.clone()) {
-                    Some(r) => out.push(r),
-                    None => {}
+                if let Some(r) = scan(&id, &transcript, &dir, cwd.clone(), default_model.clone()) {
+                    out.push(r);
                 }
             }
         }
@@ -203,8 +203,8 @@ impl Adapter for Kimi {
         // per-message `tool_results` map (keyed by tool_call_id) is a per-line enrichment, so it's
         // safe on the streaming path. The WHOLE-VEC post-passes (`attach_status_updates` /
         // `attach_timestamps`) zip positionally over the full `messages` slice and therefore CANNOT
-        // run here — they're applied only in the full `parse` path (mirrors codex's `attach_usage`
-        // skip). Bulk consumers (index/search/dataset) don't read usage/timestamps.
+        // run here — they're applied only in the full `parse` path. Bulk consumers
+        // (index/search/dataset) don't read usage/timestamps.
         let enrich = wire.as_ref().map(read_wire_enrichment).unwrap_or_default();
 
         // Note archived compaction segments (context_1.jsonl…), if any, for fidelity bookkeeping.
@@ -225,22 +225,12 @@ impl Adapter for Kimi {
         let Ok(file) = fs::File::open(&transcript) else {
             return Ok(s);
         };
-        for line in BufReader::new(file).lines() {
-            // A read error on one line (rare: invalid UTF-8 chunk) shouldn't abort the session.
-            let Ok(line) = line else { continue };
-            let line = line.trim();
-            if line.is_empty() {
-                continue;
+        super::for_each_json_line(BufReader::new(file), |v| {
+            match context_message(&v, &enrich) {
+                Some(m) => sink.message(m),
+                None => Flow::Continue,
             }
-            let Ok(v) = serde_json::from_str::<Value>(line) else {
-                continue;
-            };
-            if let Some(m) = context_message(&v, &enrich) {
-                if sink.message(m) == Flow::Stop {
-                    break;
-                }
-            }
-        }
+        });
 
         Ok(s)
     }
@@ -649,14 +639,11 @@ fn scan(
     let mut title = read_custom_title(dir);
     let mut message_count = 0usize;
     let text = fs::read_to_string(transcript).unwrap_or_default();
-    for line in text.lines() {
-        let Ok(v) = serde_json::from_str::<Value>(line.trim()) else {
-            continue;
-        };
+    super::for_each_json_line_str(&text, |v| {
         let role = v.get("role").and_then(Value::as_str).unwrap_or("");
-        match role {
-            "user" | "assistant" | "tool" | "_system_prompt" => message_count += 1,
-            _ => {}
+        // SessionRef contract: user + assistant turns only (no tool / _system_prompt records).
+        if matches!(role, "user" | "assistant") {
+            message_count += 1;
         }
         if title.is_none() && role == "user" {
             let t = coerce_content_text(v.get("content"));
@@ -664,7 +651,8 @@ fn scan(
                 title = Some(crate::ir::truncate(&t, 80));
             }
         }
-    }
+        Flow::Continue
+    });
 
     // wire gives nicer first/last timestamps when present.
     let wire = wire_path_for(dir, transcript);
@@ -926,20 +914,13 @@ fn read_wire_enrichment(wire: &PathBuf) -> WireEnrich {
     let Ok(text) = fs::read_to_string(wire) else {
         return e;
     };
-    for line in text.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let Ok(v) = serde_json::from_str::<Value>(line) else {
-            continue;
-        };
+    super::for_each_json_line_str(&text, |v| {
         // header line: {"type":"metadata","protocol_version":"1.x"}
         if v.get("type").and_then(Value::as_str) == Some("metadata") {
-            continue;
+            return Flow::Continue;
         }
         let Some(msg) = v.get("message") else {
-            continue;
+            return Flow::Continue;
         };
         let mty = msg.get("type").and_then(Value::as_str).unwrap_or("");
         let payload = msg.get("payload");
@@ -997,7 +978,8 @@ fn read_wire_enrichment(wire: &PathBuf) -> WireEnrich {
                 e.msg_timestamps.push(ts);
             }
         }
-    }
+        Flow::Continue
+    });
     e
 }
 
@@ -1050,17 +1032,15 @@ fn wire_time_bounds(wire: &Path) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
     let text = fs::read_to_string(wire).ok()?;
     let mut first = None;
     let mut last = None;
-    for line in text.lines() {
-        let Ok(v) = serde_json::from_str::<Value>(line.trim()) else {
-            continue;
-        };
+    super::for_each_json_line_str(&text, |v| {
         if let Some(ts) = v.get("timestamp").and_then(Value::as_f64).and_then(epoch_to_dt) {
             if first.is_none() {
                 first = Some(ts);
             }
             last = Some(ts);
         }
-    }
+        Flow::Continue
+    });
     Some((first?, last?))
 }
 

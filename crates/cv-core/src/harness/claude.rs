@@ -4,7 +4,7 @@
 //! `cwd` is read from inside the transcript (the dir-name encoding is lossy), and the conversation is
 //! threaded via `uuid`/`parentUuid`.
 
-use super::Adapter;
+use super::{parse_ts, Adapter};
 use crate::ir::*;
 use crate::lazy::{Span, Text, INLINE_MAX};
 use crate::stream::{CollectSink, Flow, MessageSink, ParseOptions};
@@ -133,11 +133,8 @@ pub fn stream_str(
     sink: &mut dyn MessageSink,
 ) -> Session {
     let mut session = new_session(id, source_path);
-    for line in text.lines() {
-        if ingest_line(&mut session, line, opts, sink) == Flow::Stop {
-            break;
-        }
-    }
+    // Pure-string path (parse_str, tests): no file offsets, so all content stays inline.
+    super::for_each_json_line_str(text, |v| ingest_value(&mut session, &v, opts, sink, None));
     session
 }
 
@@ -232,27 +229,6 @@ fn new_session(id: &str, source_path: Option<PathBuf>) -> Session {
     }
 }
 
-/// Fold one JSONL record into `session`: update session-level metadata, and hand any conversational
-/// message to `sink`. Tolerates blank/corrupt lines (skips them). Returns the sink's [`Flow`] so the
-/// caller can stop early. `opts` gates how much of each message is materialized.
-fn ingest_line(
-    session: &mut Session,
-    line: &str,
-    opts: &ParseOptions,
-    sink: &mut dyn MessageSink,
-) -> Flow {
-    let line = line.trim();
-    if line.is_empty() {
-        return Flow::Continue;
-    }
-    let v: Value = match serde_json::from_str(line) {
-        Ok(v) => v,
-        Err(_) => return Flow::Continue, // tolerate the occasional corrupt line
-    };
-    // Pure-string path (parse_str, tests): no file offsets, so all content stays inline.
-    ingest_value(session, &v, opts, sink, None)
-}
-
 /// Shared record handler: session-level metadata + emit the conversational message to `sink`. With a
 /// [`SpanCtx`] (streaming on-disk path) large content fields become [`Span`]s; without it (string
 /// path) they're inline.
@@ -339,7 +315,7 @@ pub fn subagent_refs(parent_path: &std::path::Path) -> Vec<SessionRef> {
         }
     }
     let mut refs = crate::par_filter_map(paths, |p| scan(&p).ok());
-    refs.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+    refs.sort_by_key(|r| std::cmp::Reverse(r.created_at));
     refs
 }
 
@@ -359,19 +335,7 @@ fn scan(path: &std::path::Path) -> Result<SessionRef> {
     let mut updated_at: Option<DateTime<Utc>> = None;
     let mut message_count = 0usize;
 
-    for line in reader.lines() {
-        let line = match line {
-            Ok(l) => l,
-            Err(_) => break,
-        };
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let v: Value = match serde_json::from_str(line) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
+    super::for_each_json_line(reader, |v| {
         let ty = v.get("type").and_then(Value::as_str).unwrap_or("");
         if ty == "ai-title" {
             if let Some(t) = v.get("aiTitle").and_then(Value::as_str) {
@@ -390,7 +354,8 @@ fn scan(path: &std::path::Path) -> Result<SessionRef> {
         if matches!(ty, "user" | "assistant") {
             message_count += 1;
         }
-    }
+        Flow::Continue
+    });
 
     Ok(SessionRef {
         id,
@@ -402,12 +367,6 @@ fn scan(path: &std::path::Path) -> Result<SessionRef> {
         updated_at,
         message_count,
     })
-}
-
-fn parse_ts(s: &str) -> Option<DateTime<Utc>> {
-    DateTime::parse_from_rfc3339(s)
-        .ok()
-        .map(|d| d.with_timezone(&Utc))
 }
 
 /// Turn one record into an IR [`Message`]. Handles `user`/`assistant` (the conversation) and the
@@ -557,7 +516,7 @@ fn parse_system_message(v: &Value, opts: &ParseOptions, span: Option<&SpanCtx>) 
         role: Role::System,
         timestamp,
         model: None,
-        content: vec![Block::Text { text: text.into() }],
+        content: vec![Block::Text { text }],
         usage: None,
         extra,
     })
@@ -1104,7 +1063,7 @@ mod tests {
     fn parse_reader_matches_parse_str() {
         // The streaming on-disk path (`parse_reader`, used by `Adapter::parse` to avoid loading a
         // multi-GB transcript whole) must produce the same Session as the whole-text `parse_str`.
-        // Both delegate to `ingest_line`; this guards the OOM-fix refactor against divergence.
+        // Both delegate to `ingest_value`; this guards the OOM-fix refactor against divergence.
         let text = fixture("rich_blocks.jsonl");
         let whole = parse_str("s1", &text, None);
         let streamed = parse_reader("s1", std::io::Cursor::new(text.as_bytes()), None);

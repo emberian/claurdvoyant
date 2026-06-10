@@ -365,7 +365,7 @@ pub fn replies_to_dir(
     let mut msgs = read_from_dir(dir, channel, None, 0)?;
     msgs.retain(|m| {
         m.kind == "reply"
-            && (m.session_ref.as_deref() == Some(request_id) || m.tags.iter().any(|t| *t == want_tag))
+            && (m.session_ref.as_deref() == Some(request_id) || m.tags.contains(&want_tag))
     });
     Ok(msgs)
 }

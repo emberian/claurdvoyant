@@ -816,9 +816,7 @@ fn parse_date(v: &Value) -> Option<DateTime<Utc>> {
             if let Ok(ms) = s.parse::<i64>() {
                 return ms_to_dt(ms);
             }
-            DateTime::parse_from_rfc3339(s)
-                .ok()
-                .map(|dt| dt.with_timezone(&Utc))
+            super::parse_ts(s)
         }
         _ => None,
     }

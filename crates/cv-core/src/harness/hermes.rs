@@ -16,11 +16,11 @@
 //!   * `reasoning`         — short summary text (DeepSeek/Qwen, OpenRouter summary) → Thinking.text
 //!   * `reasoning_content` — provider-native scratchpad (Moonshot/Novita) → Thinking.text (appended)
 //!   * `reasoning_details` — `[{type:"reasoning.summary"|"reasoning.encrypted_content"|"thinking", …}]`
-//!                            (OpenRouter unified) → Thinking.text (summaries) + Thinking.encrypted
+//!     (OpenRouter unified) → Thinking.text (summaries) + Thinking.encrypted
 //!   * `codex_reasoning_items` — `[{type:"reasoning", id, encrypted_content}]` (Codex Responses API)
-//!                                → Thinking.encrypted + stashed verbatim in `extra`
+//!     → Thinking.encrypted + stashed verbatim in `extra`
 //!   * `codex_message_items`   — `[{type:"message", phase, content:[{type:"output_text",text}]}]`
-//!                                → stashed verbatim in `extra` (Codex final/commentary phases)
+//!     → stashed verbatim in `extra` (Codex final/commentary phases)
 //!
 //! Compression chains: a long conversation is split across multiple session rows linked by
 //! `parent_session_id`, where the parent has `end_reason='compression'`. `parse` walks the lineage
@@ -36,6 +36,7 @@ use chrono::{DateTime, TimeZone, Utc};
 use rusqlite::{Connection, OpenFlags};
 use serde_json::Value;
 use std::collections::HashSet;
+use std::path::Path;
 use std::path::PathBuf;
 
 const MULTIMODAL_SENTINEL: &str = "\u{0}json:";
@@ -176,11 +177,25 @@ fn session_has_col(conn: &Connection, col: &str) -> bool {
     let Ok(rows) = stmt.query_map([], |row| row.get::<_, String>(1)) else {
         return false;
     };
+    // Not a tail expression: `rows` borrows `stmt`, which must drop before the return.
+    #[allow(clippy::let_and_return)]
     let found = rows.flatten().any(|n| n == col);
     found
 }
 
-fn discover_conn(conn: &Connection, path: &PathBuf) -> Result<Vec<SessionRef>> {
+/// Row shape of the per-session metadata SELECT in [`discover_conn`] (columns guarded by
+/// `session_has_col`, absent ones selected as NULL).
+type SessionMetaRow = (
+    Option<String>,
+    Option<f64>,
+    Option<f64>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
+
+fn discover_conn(conn: &Connection, path: &Path) -> Result<Vec<SessionRef>> {
     // `title` predates several columns but has existed a long time; guard it anyway.
     let has_title = session_has_col(conn, "title");
     let title_expr = if has_title { "title" } else { "NULL" };
@@ -198,7 +213,7 @@ fn discover_conn(conn: &Connection, path: &PathBuf) -> Result<Vec<SessionRef>> {
         Ok(SessionRef {
             id,
             harness: Harness::Hermes,
-            path: path.clone(),
+            path: path.to_path_buf(),
             cwd: None,
             title: title.map(|t| crate::ir::truncate(&t, 80)),
             created_at: started.and_then(secs_to_dt),
@@ -230,15 +245,7 @@ fn stream_conn(conn: &Connection, r: &SessionRef, sink: &mut dyn MessageSink) ->
         parent = if has_parent { "parent_session_id" } else { "NULL" },
         end_reason = if has_end_reason { "end_reason" } else { "NULL" },
     );
-    let (model, started, ended, title, source, _parent, _end_reason): (
-        Option<String>,
-        Option<f64>,
-        Option<f64>,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-    ) = conn
+    let (model, started, ended, title, source, _parent, _end_reason): SessionMetaRow = conn
         .query_row(&meta_sql, [&r.id], |row| {
             Ok((
                 row.get(0).ok().flatten(),
@@ -332,7 +339,7 @@ fn stream_conn(conn: &Connection, r: &SessionRef, sink: &mut dyn MessageSink) ->
             })
         })?;
 
-        while let Some(row) = rows.next() {
+        for row in rows.by_ref() {
             let Ok(row) = row else { continue };
             if let Some(m) = row.into_message() {
                 // Dedup the replayed first user message at compression boundaries.

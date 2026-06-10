@@ -19,7 +19,7 @@
 //! shell command vectors, compaction boundaries) are stashed in `Message.extra` so conversions stay
 //! as lossless as the IR allows. Images become `Block::Image` with a reference (never inlined bytes).
 
-use super::Adapter;
+use super::{parse_ts, Adapter};
 use crate::ir::*;
 use crate::lazy::{json_string_span, RawValue, Text};
 use crate::stream::{Flow, MessageSink, ParseOptions};
@@ -183,20 +183,24 @@ pub fn parse_str(id: &str, text: &str, is_jsonl: bool, source_path: Option<PathB
     };
 
     if is_jsonl {
-        let lines: Vec<Value> = text
-            .lines()
-            .filter(|l| !l.trim().is_empty())
-            .filter_map(|l| serde_json::from_str(l).ok())
-            .collect();
-        let has_events = lines.iter().any(is_nl_event);
-        // Accumulate into one vec across all lines (NOT drained per line) so the cross-record
-        // `token_count` usage attachment can reach back to the preceding assistant message
-        // (`attach_usage = true`). Assigned to `s.messages` at the end. Using a separate `out` (not
-        // `&mut s.messages`) avoids borrowing `s` twice in `dispatch_line`.
+        // `has_events` is a whole-file property, so detect it in a cheap first pass (no per-line
+        // `Value`s are retained) instead of materializing every record up front.
+        let mut has_events = false;
+        super::for_each_json_line_str(text, |v| {
+            if is_nl_event(&v) {
+                has_events = true;
+                return Flow::Stop;
+            }
+            Flow::Continue
+        });
+        // Accumulate into one vec across all lines so a `token_count` event can attach usage to
+        // the assistant message it trails. Using a separate `out` (not `&mut s.messages`) avoids
+        // borrowing `s` twice in `dispatch_line`.
         let mut out: Vec<Message> = Vec::new();
-        for v in &lines {
-            dispatch_line(&mut s, &mut out, v, has_events, true);
-        }
+        super::for_each_json_line_str(text, |v| {
+            dispatch_line(&mut s, &mut out, &v, has_events);
+            Flow::Continue
+        });
         s.messages = out;
     } else if let Ok(root) = serde_json::from_str::<Value>(text) {
         apply_meta(&mut s, root.get("session"));
@@ -230,17 +234,10 @@ fn is_nl_event(v: &Value) -> bool {
 /// Fold one record into `s`'s metadata and push any resulting messages into `scratch`. Shared by the
 /// full [`parse_str`] and the streaming [`stream_jsonl`] so both produce identical messages.
 ///
-/// `attach_usage` controls the one cross-record behavior: `token_count` events attach usage to the
-/// *preceding* assistant message. In streaming, prior messages have already been emitted (and aren't
-/// in `scratch`), and bulk consumers don't read usage — so the streaming path passes `false` to skip
-/// it rather than synthesize a spurious carrier message. The full parse passes `true`.
-fn dispatch_line(
-    s: &mut Session,
-    scratch: &mut Vec<Message>,
-    v: &Value,
-    has_events: bool,
-    attach_usage: bool,
-) {
+/// The one cross-record behavior — `token_count` events attach usage to the assistant message they
+/// trail — works on both paths because it only ever touches the *last* entry of `scratch` (see
+/// [`apply_token_count`]), which the streaming loops hold back until the next message arrives.
+fn dispatch_line(s: &mut Session, scratch: &mut Vec<Message>, v: &Value, has_events: bool) {
     if let Some(ts) = top_ts(v) {
         s.created_at.get_or_insert(ts);
         s.updated_at = Some(ts);
@@ -256,7 +253,7 @@ fn dispatch_line(
         }
         Some("session_meta") => apply_meta(s, v.get("payload")),
         Some("turn_context") => apply_turn_context(s, scratch, v.get("payload"), top_ts(v)),
-        Some("event_msg") => handle_event(v.get("payload"), has_events, top_ts(v), scratch, attach_usage),
+        Some("event_msg") => handle_event(v.get("payload"), has_events, top_ts(v), scratch),
         Some("response_item") => handle_item(v.get("payload"), has_events, top_ts(v), scratch),
         Some("compacted") => handle_compacted(v.get("payload"), top_ts(v), scratch),
         _ => {}
@@ -265,19 +262,34 @@ fn dispatch_line(
 
 /// Cheap first pass over a rollout: are NL messages carried as `event_msg`s? (See [`is_nl_event`].)
 fn detect_has_events<R: BufRead>(reader: R) -> bool {
-    for line in reader.lines() {
-        let Ok(line) = line else { continue };
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
+    let mut found = false;
+    super::for_each_json_line(reader, |v| {
+        if is_nl_event(&v) {
+            found = true;
+            return Flow::Stop;
         }
-        if let Ok(v) = serde_json::from_str::<Value>(line) {
-            if is_nl_event(&v) {
-                return true;
-            }
+        Flow::Continue
+    });
+    found
+}
+
+/// Flush `scratch` to `sink` — except a trailing assistant message that has no usage yet, which is
+/// held back (it stays in `scratch`) so a following `token_count` record can attach usage to it.
+/// This keeps the streaming paths' usage attachment identical to [`parse_str`], where the whole
+/// message vec is still reachable when the event arrives: [`apply_token_count`] only ever targets
+/// the last message, and the last message is exactly what's held. The hold is at most one message,
+/// flushed by the next [`flush_all_but_held`] call or by the caller at EOF.
+fn flush_all_but_held(scratch: &mut Vec<Message>, sink: &mut dyn MessageSink) -> Flow {
+    let hold = scratch
+        .last()
+        .is_some_and(|m| m.role == Role::Assistant && m.usage.is_none());
+    let upto = scratch.len() - hold as usize;
+    for m in scratch.drain(..upto) {
+        if sink.message(m) == Flow::Stop {
+            return Flow::Stop;
         }
     }
-    false
+    Flow::Continue
 }
 
 /// Streaming parse of a modern `.jsonl` rollout: emit each record's messages to `sink` and drop them
@@ -306,17 +318,9 @@ pub fn stream_jsonl<R: BufRead>(
     };
     let mut scratch: Vec<Message> = Vec::new();
     let mut meta_sent = false;
-    'outer: for line in reader.lines() {
-        let Ok(line) = line else { continue };
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let Ok(v) = serde_json::from_str::<Value>(line) else {
-            continue;
-        };
-        // Streaming skips token_count usage attachment (see `dispatch_line`'s `attach_usage`).
-        dispatch_line(&mut s, &mut scratch, &v, has_events, false);
+    let mut stopped = false;
+    super::for_each_json_line(reader, |v| {
+        dispatch_line(&mut s, &mut scratch, &v, has_events);
         // Hand the session metadata to the sink as soon as the model is known (session_meta /
         // turn_context land in the first records, before any message), so header-rendering sinks
         // have it ahead of the body.
@@ -324,9 +328,15 @@ pub fn stream_jsonl<R: BufRead>(
             sink.meta(&s);
             meta_sent = true;
         }
+        let flow = flush_all_but_held(&mut scratch, sink);
+        stopped = flow == Flow::Stop;
+        flow
+    });
+    if !stopped {
+        // EOF: emit the held trailing message, if any (no token_count followed it).
         for m in scratch.drain(..) {
             if sink.message(m) == Flow::Stop {
-                break 'outer;
+                break;
             }
         }
     }
@@ -382,7 +392,7 @@ pub fn stream_jsonl_spans(
         if let Some(msg) = giant_fco_span(slice, base_off, &mut s) {
             scratch.push(msg);
         } else if let Ok(v) = serde_json::from_slice::<Value>(slice) {
-            dispatch_line(&mut s, &mut scratch, &v, has_events, false);
+            dispatch_line(&mut s, &mut scratch, &v, has_events);
         } else {
             continue;
         }
@@ -390,10 +400,16 @@ pub fn stream_jsonl_spans(
             sink.meta(&s);
             meta_sent = true;
         }
-        for m in scratch.drain(..) {
-            if sink.message(m) == Flow::Stop {
-                break 'outer;
-            }
+        if flush_all_but_held(&mut scratch, sink) == Flow::Stop {
+            // Sink asked to stop: drop any held message rather than emitting past the stop.
+            scratch.clear();
+            break 'outer;
+        }
+    }
+    // EOF: emit the held trailing message, if any (no token_count followed it).
+    for m in scratch.drain(..) {
+        if sink.message(m) == Flow::Stop {
+            break;
         }
     }
     if s.id.is_empty() {
@@ -534,7 +550,7 @@ fn apply_turn_context(
 /// Handle an `event_msg` record. These are the UI-side mirror of the model exchange. We emit
 /// natural-language `user_message`/`agent_message` text (only when `has_events`, since otherwise the
 /// `response_item message`s carry it), surface `view_image_tool_call` as an image attachment, and
-/// attach `token_count` usage/rate-limit info to the most recent assistant message. Other events
+/// attach `token_count` usage/rate-limit info to the assistant message it trails. Other events
 /// (exec_command_*, web_search_*, task_started/complete, …) are intentionally not turned into
 /// messages: their structured equivalents arrive as `response_item`s.
 fn handle_event(
@@ -542,7 +558,6 @@ fn handle_event(
     has_events: bool,
     ts: Option<DateTime<Utc>>,
     out: &mut Vec<Message>,
-    attach_usage: bool,
 ) {
     let Some(p) = payload else { return };
     match p.get("type").and_then(Value::as_str) {
@@ -583,11 +598,10 @@ fn handle_event(
             );
             out.push(m);
         }
-        Some("token_count") if attach_usage => {
-            // Usage totals + rate limits. Attach to the latest message that lacks usage so the
-            // numbers ride along with the assistant turn they belong to; otherwise drop a bare
-            // carrier message so the rate-limit snapshot isn't lost. Skipped on the streaming path
-            // (the target message is already emitted, and bulk consumers don't read usage).
+        Some("token_count") => {
+            // Usage totals + rate limits. Attach to the assistant message this event trails so the
+            // numbers ride along with the turn they belong to; otherwise drop a bare carrier
+            // message so the rate-limit snapshot isn't lost.
             apply_token_count(p, ts, out);
         }
         _ => {}
@@ -608,22 +622,23 @@ fn apply_token_count(p: &Value, ts: Option<DateTime<Utc>>, out: &mut Vec<Message
     if usage.is_none() && rate_limits.is_none() && ctx_window.is_none() {
         return;
     }
-    // Prefer attaching to the trailing assistant message of the just-finished turn.
-    let target = out
-        .iter_mut()
-        .rev()
-        .find(|m| m.role == Role::Assistant && m.usage.is_none());
-    let m = match target {
-        Some(m) => m,
-        None => {
-            let mut nm = Message::new(Role::Assistant);
-            nm.timestamp = ts;
-            nm.extra
-                .insert("codex_event".into(), Value::String("token_count".into()));
-            out.push(nm);
-            out.last_mut().unwrap()
-        }
-    };
+    // Attach to the *trailing* assistant message — the just-finished turn this event reports on.
+    // Trailing-only (no reach-back past intervening records): a `token_count` that doesn't directly
+    // follow its assistant message reports stale `last_token_usage` (e.g. the snapshot re-emitted
+    // after a user message), so attaching it further back would mislabel an older turn. It also
+    // keeps the streaming paths exact: they hold back only the trailing assistant message (see
+    // [`flush_all_but_held`]), and with this rule that's the only message ever targeted.
+    let attach = out
+        .last()
+        .is_some_and(|m| m.role == Role::Assistant && m.usage.is_none());
+    if !attach {
+        let mut nm = Message::new(Role::Assistant);
+        nm.timestamp = ts;
+        nm.extra
+            .insert("codex_event".into(), Value::String("token_count".into()));
+        out.push(nm);
+    }
+    let m = out.last_mut().unwrap();
     if let Some(u) = usage {
         m.usage = Some(u);
     }
@@ -1041,12 +1056,6 @@ fn top_ts(v: &Value) -> Option<DateTime<Utc>> {
     v.get("timestamp").and_then(Value::as_str).and_then(parse_ts)
 }
 
-fn parse_ts(s: &str) -> Option<DateTime<Utc>> {
-    DateTime::parse_from_rfc3339(s)
-        .ok()
-        .map(|d| d.with_timezone(&Utc))
-}
-
 /// Accumulates the cheap metadata `discover` needs, one record at a time. Factored out of [`scan`]
 /// so it can be fed either the whole file (small sessions) or just a head+tail sample (huge ones).
 #[derive(Default)]
@@ -1071,16 +1080,9 @@ impl CodexScan {
         }
     }
 
-    /// Ingest one `.jsonl` record line.
-    fn feed(&mut self, line: &str) {
-        let line = line.trim();
-        if line.is_empty() {
-            return;
-        }
-        let Ok(v) = serde_json::from_str::<Value>(line) else {
-            return;
-        };
-        if let Some(ts) = top_ts(&v) {
+    /// Ingest one `.jsonl` record.
+    fn feed(&mut self, v: &Value) {
+        if let Some(ts) = top_ts(v) {
             self.created_at.get_or_insert(ts);
             self.updated_at = Some(ts);
         }
@@ -1191,22 +1193,26 @@ fn scan(path: &Path) -> Result<SessionRef> {
     if is_jsonl {
         if size <= FULL_SCAN_CAP {
             let text = fs::read_to_string(path)?;
-            for line in text.lines() {
-                s.feed(line);
-            }
+            super::for_each_json_line_str(&text, |v| {
+                s.feed(&v);
+                Flow::Continue
+            });
         } else {
             // Head: id / cwd / title / created_at all live near the top.
             let head = read_head(path, SAMPLE)?;
             let head_len = head.len().max(1) as u128;
-            for line in head.lines() {
-                s.feed(line);
-            }
+            super::for_each_json_line_str(&head, |v| {
+                s.feed(&v);
+                Flow::Continue
+            });
             let head_msgs = s.message_count;
             // Tail: the last record carries the real updated_at. Skip the (likely partial) first line.
             let tail = read_tail(path, SAMPLE)?;
-            for line in tail.lines().skip(1) {
-                s.feed(line);
-            }
+            let tail = tail.split_once('\n').map(|(_, rest)| rest).unwrap_or("");
+            super::for_each_json_line_str(tail, |v| {
+                s.feed(&v);
+                Flow::Continue
+            });
             // We never read the middle, so the count is a head-density estimate — kept roughly
             // monotonic with file growth. The true count comes from a full parse on open.
             let est = (head_msgs as u128 * size as u128 / head_len) as usize;
@@ -1491,6 +1497,58 @@ mod tests {
         assert_eq!(u.cache_read_tokens, Some(10));
         assert!(m.extra.contains_key("rate_limits"));
         assert!(m.extra.contains_key("model_context_window"));
+    }
+
+    #[test]
+    fn stream_attaches_usage_like_parse() {
+        // Task-4 regression guard: the streaming path holds back the trailing assistant message so
+        // a `token_count` event can attach usage to it — and must agree with `parse_str` exactly,
+        // including the carrier message for a stale snapshot and the EOF flush of a held message.
+        let lines = [
+            r#"{"timestamp":"2026-01-01T00:00:00Z","type":"event_msg","payload":{"type":"user_message","message":"hi"}}"#,
+            r#"{"timestamp":"2026-01-01T00:00:01Z","type":"event_msg","payload":{"type":"agent_message","message":"done"}}"#,
+            r#"{"timestamp":"2026-01-01T00:00:02Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":100,"cached_input_tokens":10,"output_tokens":20,"total_tokens":120},"model_context_window":258400},"rate_limits":{"primary":{"used_percent":7.0}}}}"#,
+            // A tool exchange, then a token_count that trails the *tool result* (the re-emitted
+            // snapshot codex writes after non-assistant records) — a carrier on both paths.
+            r#"{"timestamp":"2026-01-01T00:00:03Z","type":"response_item","payload":{"type":"function_call","name":"shell","arguments":"{}","call_id":"c1"}}"#,
+            r#"{"timestamp":"2026-01-01T00:00:04Z","type":"response_item","payload":{"type":"function_call_output","call_id":"c1","output":"ok"}}"#,
+            r#"{"timestamp":"2026-01-01T00:00:05Z","type":"event_msg","payload":{"type":"token_count","rate_limits":{"primary":{"used_percent":8.0}}}}"#,
+            // Trailing assistant message with no token_count after it: held, then flushed at EOF.
+            r#"{"timestamp":"2026-01-01T00:00:06Z","type":"event_msg","payload":{"type":"agent_message","message":"bye"}}"#,
+        ];
+        let text = lines.join("\n");
+        let parsed = parse_str("s", &text, true, None);
+
+        let mut sink = crate::stream::CollectSink::default();
+        let has_events = detect_has_events(std::io::Cursor::new(text.as_bytes()));
+        let mut streamed = stream_jsonl(
+            "s",
+            std::io::Cursor::new(text.as_bytes()),
+            None,
+            has_events,
+            &ParseOptions::full(),
+            &mut sink,
+        );
+        streamed.messages = sink.messages;
+
+        assert_eq!(
+            serde_json::to_value(&parsed).unwrap(),
+            serde_json::to_value(&streamed).unwrap(),
+            "parse and stream must produce identical sessions"
+        );
+        // The first turn's usage attached to the assistant message it trails — on both paths.
+        for s in [&parsed, &streamed] {
+            let m = &s.messages[1];
+            assert_eq!(m.role, Role::Assistant);
+            let u = m.usage.as_ref().expect("usage attached");
+            assert_eq!(
+                (u.input_tokens, u.output_tokens, u.cache_read_tokens),
+                (Some(100), Some(20), Some(10))
+            );
+        }
+        // function_call ToolUse msg attached nothing (it has its own pending usage slot untouched);
+        // the stale snapshot became a carrier; the trailing assistant survived the EOF flush.
+        assert_eq!(parsed.messages.last().unwrap().text().as_deref(), Some("bye"));
     }
 
     #[test]
