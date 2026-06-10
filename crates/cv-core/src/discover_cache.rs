@@ -6,10 +6,14 @@
 //! that: a hit returns the stored [`SessionRef`]s without touching the file, so steady-state
 //! discovery costs one `stat` per file instead of a full read+parse.
 //!
-//! It's process-global and shared by `cv`, `cvd`, and the desktop app via a JSON file under the
-//! user's cache dir. Writes are atomic (temp + rename) and reads are tolerant — a missing or corrupt
-//! cache simply means everything is re-scanned (and the cache rebuilt). Correctness never depends on
-//! the cache: an entry is only reused when `(mtime, size)` match exactly, so any real change misses.
+//! It's process-global and shared by `cv`, `cvd`, and the desktop app via the `scan_cache` table in
+//! the shared catalog db (see [`crate::catalog`], which owns the DDL; the rows also feed the
+//! freshness probe's append detection). Earlier releases kept a whole-loaded `discover.json`
+//! instead — a second, redundant representation of the same facts that every command paid to parse;
+//! [`load`] leaves a "safe to delete" note if one is still lying around. Reads are tolerant — a
+//! missing or unreadable cache simply means everything is re-scanned (and the cache rebuilt).
+//! Correctness never depends on the cache: an entry is only reused when `(mtime, size)` match
+//! exactly, so any real change misses.
 
 use crate::ir::SessionRef;
 use std::collections::HashMap;
@@ -17,34 +21,67 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{OnceLock, RwLock};
 
-#[derive(serde::Serialize, serde::Deserialize, Clone)]
 struct Entry {
-    path: PathBuf,
     mtime_ns: u64,
     size: u64,
     refs: Vec<SessionRef>,
+    /// Scanned this run and not yet written back to sqlite.
+    dirty: bool,
 }
 
 struct Cache {
     entries: RwLock<HashMap<PathBuf, Entry>>,
-    dirty: AtomicBool,
+    any_dirty: AtomicBool,
 }
 
 static CACHE: OnceLock<Cache> = OnceLock::new();
 
-fn cache_path() -> Option<PathBuf> {
-    dirs::cache_dir().map(|d| d.join("claurdvoyant").join("discover.json"))
+/// One-time nudge about the pre-0.9.12 JSON cache this module replaced.
+fn note_legacy_json() {
+    let Some(path) = dirs::cache_dir().map(|d| d.join("claurdvoyant").join("discover.json")) else {
+        return;
+    };
+    if path.exists() {
+        eprintln!(
+            "cv: note: stale discover.json no longer used (the scan cache lives in catalog.db now); safe to delete {}",
+            path.display()
+        );
+    }
 }
 
+/// Bulk-load the persisted scan cache. Only ever runs on the discovery (slow) path — probe-only
+/// commands never touch this module. Unparseable rows are simply dropped (re-scanned, re-written).
 fn load() -> Cache {
-    let entries = cache_path()
-        .and_then(|p| std::fs::read(&p).ok())
-        .and_then(|b| serde_json::from_slice::<Vec<Entry>>(&b).ok())
-        .map(|v| v.into_iter().map(|e| (e.path.clone(), e)).collect())
-        .unwrap_or_default();
+    note_legacy_json();
+    #[allow(unused_mut)]
+    let mut entries: HashMap<PathBuf, Entry> = HashMap::new();
+    #[cfg(feature = "sqlite")]
+    if let Some(conn) = crate::catalog::open_db() {
+        if let Ok(mut stmt) = conn.prepare("SELECT path, mtime_ns, size, refs FROM scan_cache") {
+            let rows = stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            });
+            if let Ok(rows) = rows {
+                for (path, mtime_ns, size, refs) in rows.flatten() {
+                    let Ok(refs) = serde_json::from_str::<Vec<SessionRef>>(&refs) else {
+                        continue;
+                    };
+                    entries.insert(
+                        PathBuf::from(path),
+                        Entry { mtime_ns: mtime_ns as u64, size: size as u64, refs, dirty: false },
+                    );
+                }
+            }
+        }
+    }
     Cache {
         entries: RwLock::new(entries),
-        dirty: AtomicBool::new(false),
+        any_dirty: AtomicBool::new(false),
     }
 }
 
@@ -62,6 +99,9 @@ fn stat_key(path: &Path) -> Option<(u64, u64)> {
 
 /// Return cached refs for `path` when its `(mtime, size)` is unchanged; otherwise run `scan`, cache
 /// any non-empty result, and return it. One file may map to several sessions (e.g. Gemini logs).
+///
+/// The stat happens **before** the scan, so a write racing the scan leaves a too-old `(mtime, size)`
+/// in the cache — which misses next time and re-scans. The safe direction.
 pub(crate) fn cached_scan_many<F>(path: &Path, scan: F) -> Vec<SessionRef>
 where
     F: FnOnce() -> Vec<SessionRef>,
@@ -77,18 +117,18 @@ where
     }
     let refs = scan();
     // Only cache hits — empty results are cheap to recompute (a failed name/content check that never
-    // read the file) and caching them would bloat the file with every non-transcript path.
+    // read the file) and caching them would bloat the table with every non-transcript path.
     if !refs.is_empty() {
         cache.entries.write().unwrap().insert(
             path.to_path_buf(),
             Entry {
-                path: path.to_path_buf(),
                 mtime_ns,
                 size,
                 refs: refs.clone(),
+                dirty: true,
             },
         );
-        cache.dirty.store(true, Ordering::Relaxed);
+        cache.any_dirty.store(true, Ordering::Relaxed);
     }
     refs
 }
@@ -103,35 +143,63 @@ where
         .next()
 }
 
-/// Flush the cache to disk if it changed this run, dropping entries whose files no longer exist so
-/// it doesn't grow without bound. Cheap and a no-op when nothing was scanned. Call after a full
-/// [`crate::discover_all`].
-pub(crate) fn persist() {
+/// Flush freshly-scanned entries to the catalog db in one transaction. With `prune`, also drop
+/// rows whose files no longer exist so the table doesn't grow without bound — pass it after a
+/// *full* [`crate::discover_all`] (the stat-per-row cost belongs on the slow path; per-harness
+/// probe refreshes skip it). Best-effort: a failed flush just means a re-scan next run.
+pub(crate) fn persist(prune: bool) {
     let Some(cache) = CACHE.get() else {
         return;
     };
-    if !cache.dirty.swap(false, Ordering::Relaxed) {
+    if !cache.any_dirty.swap(false, Ordering::Relaxed) && !prune {
         return;
     }
-    let Some(path) = cache_path() else {
-        return;
-    };
-    let snapshot: Vec<Entry> = {
+    #[cfg(feature = "sqlite")]
+    {
+        let Some(mut conn) = crate::catalog::open_db() else {
+            return;
+        };
+        let Ok(tx) = conn.transaction() else { return };
         let mut g = cache.entries.write().unwrap();
-        g.retain(|p, _| p.exists());
-        g.values().cloned().collect()
-    };
-    let Some(parent) = path.parent() else {
-        return;
-    };
-    if std::fs::create_dir_all(parent).is_err() {
-        return;
-    }
-    let Ok(body) = serde_json::to_vec(&snapshot) else {
-        return;
-    };
-    let tmp = path.with_extension(format!("{}.tmp", std::process::id()));
-    if std::fs::write(&tmp, &body).is_ok() {
-        let _ = std::fs::rename(&tmp, &path);
+        {
+            let Ok(mut stmt) = tx.prepare(
+                "INSERT OR REPLACE INTO scan_cache(path,mtime_ns,size,refs) VALUES(?1,?2,?3,?4)",
+            ) else {
+                return;
+            };
+            for (path, e) in g.iter_mut().filter(|(_, e)| e.dirty) {
+                let Ok(refs) = serde_json::to_string(&e.refs) else { continue };
+                if stmt
+                    .execute(rusqlite::params![
+                        path.to_string_lossy(),
+                        e.mtime_ns as i64,
+                        e.size as i64,
+                        refs
+                    ])
+                    .is_ok()
+                {
+                    e.dirty = false;
+                }
+            }
+        }
+        if prune {
+            let vanished: Vec<String> = tx
+                .prepare("SELECT path FROM scan_cache")
+                .ok()
+                .and_then(|mut stmt| {
+                    stmt.query_map([], |r| r.get::<_, String>(0))
+                        .ok()
+                        .map(|rows| rows.flatten().filter(|p| !Path::new(p).exists()).collect())
+                })
+                .unwrap_or_default();
+            if let Ok(mut del) = tx.prepare("DELETE FROM scan_cache WHERE path=?1") {
+                for p in &vanished {
+                    let _ = del.execute(rusqlite::params![p]);
+                    g.remove(Path::new(p));
+                }
+            }
+        }
+        drop(g);
+        let _ = tx.commit();
     }
 }

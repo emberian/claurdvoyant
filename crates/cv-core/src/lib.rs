@@ -33,38 +33,121 @@ pub use stream::{collect, CollectSink, Flow, MessageSink, ParseOptions, TeeSink}
 
 use anyhow::Result;
 
-/// Discover every session from every registered harness on this machine. Adapters are queried in
-/// parallel (each is independent and `Send + Sync`), so the cost is the slowest single adapter rather
-/// than the sum. Disable the `parallel` feature (e.g. on wasm32) for an identical sequential pass.
+/// Discover every session from every registered harness on this machine — the **full scan**, and
+/// the slow path. Adapters are queried in parallel (each is independent and `Send + Sync`), so the
+/// cost is the slowest single adapter rather than the sum. Disable the `parallel` feature (e.g. on
+/// wasm32) for an identical sequential pass.
+///
+/// Side effects: flushes the per-file scan cache, replaces each successfully-scanned harness's
+/// rows + freshness watches in the catalog, and stamps the full-sync time — which is what makes
+/// [`sessions`] a trustworthy fast read afterwards. Most read-side callers want [`sessions`]
+/// instead; call this when you need a guaranteed-fresh scan (e.g. `cv ls --fresh`, indexers).
 pub fn discover_all() -> Vec<SessionRef> {
-    let adapters: Vec<Box<dyn Adapter>> = harness::all()
-        .into_iter()
-        .filter(|a| a.storage_root().is_some())
-        .collect();
+    let adapters = harness::all();
 
-    fn run(a: &dyn Adapter) -> Vec<SessionRef> {
+    // Per-adapter outcome: refs on success, `None` on error (the catalog keeps that harness's
+    // previous rows rather than wiping them over a transient failure). Rootless adapters are a
+    // successful empty scan — their catalog rows (root deleted since last sync) must clear.
+    fn run(a: &dyn Adapter) -> (Harness, Option<std::path::PathBuf>, Option<Vec<SessionRef>>) {
+        let h = a.harness();
+        let Some(root) = a.storage_root() else {
+            return (h, None, Some(Vec::new()));
+        };
         match a.discover() {
-            Ok(refs) => refs,
+            Ok(refs) => (h, Some(root), Some(refs)),
             Err(e) => {
-                eprintln!("cv: discover failed for {}: {e:#}", a.harness());
-                Vec::new()
+                eprintln!("cv: discover failed for {h}: {e:#}");
+                (h, Some(root), None)
             }
         }
     }
 
     #[cfg(feature = "parallel")]
-    let out: Vec<SessionRef> = {
+    let results: Vec<_> = {
         use rayon::prelude::*;
-        adapters.par_iter().flat_map_iter(|a| run(a.as_ref())).collect()
+        adapters.par_iter().map(|a| run(a.as_ref())).collect()
     };
     #[cfg(not(feature = "parallel"))]
-    let out: Vec<SessionRef> = adapters.iter().flat_map(|a| run(a.as_ref())).collect();
+    let results: Vec<_> = adapters.iter().map(|a| run(a.as_ref())).collect();
 
-    // Persist any freshly-scanned metadata so the next discovery reuses it, and refresh the
-    // id→session catalog so `find` can resolve an id without re-scanning the whole fleet.
-    discover_cache::persist();
-    catalog::sync(&out);
+    // Persist freshly-scanned metadata (pruning vanished files) so the next discovery reuses it.
+    discover_cache::persist(true);
+
+    // Refresh the catalog per harness so `sessions`/`find` can answer without re-scanning the
+    // fleet, recording the watch set the freshness probe stats.
+    let mut out = Vec::new();
+    for (h, root, refs) in results {
+        let Some(refs) = refs else { continue };
+        catalog::replace_harness(h, &refs, &catalog::watches_for(h, root.as_deref(), &refs));
+        out.extend(refs);
+    }
+    catalog::stamp_full_sync();
     out
+}
+
+/// Every known session, served from the catalog when it's provably fresh — the **fast read path**
+/// (~ms against a warm catalog, vs ~seconds for [`discover_all`]'s stat-the-fleet scan). This is
+/// what `cv ls`/`timeline`/`stats` read; other consumers (cvd, mcp, tui, indexers) should adopt it
+/// as they shed their need for a guaranteed full scan.
+///
+/// Freshness model, in order:
+/// 1. **Cold or overaged catalog** (never fully synced, or the last full sync is older than
+///    `CLAURDVOYANT_MAX_STALE_SECS`, default 900): transparently runs [`discover_all`] — identical
+///    results, identical cost to today.
+/// 2. **Probe** ([`catalog::probe_stale`]): re-stat the recorded watch set (session-bearing dirs +
+///    their ancestors + sqlite db files) and the top-50 most-recently-updated session files. Any
+///    change scopes a re-discovery to just the affected harnesses, then the catalog is read.
+///
+/// The result matches what [`discover_all`] would return — same (harness, id, path) set, same
+/// fields (timestamps at second precision: the catalog's storage granularity) — except for the
+/// probe's documented blind spots (see [`catalog::probe_stale`]): chiefly, an in-place append to a
+/// session outside the top-50 shows a stale `updated_at`/`message_count` until the staleness
+/// backstop, and brand-new sessions are always seen (new files change a watched dir mtime). Set
+/// `CLAURDVOYANT_MAX_STALE_SECS=0` (or pass `cv ls --fresh`) to force the full scan.
+pub fn sessions() -> Vec<SessionRef> {
+    sessions_impl().0
+}
+
+/// [`sessions`] plus whether the answer came from a full [`discover_all`] (so `find` knows not to
+/// escalate to a second full scan).
+fn sessions_impl() -> (Vec<SessionRef>, bool) {
+    let max_stale = std::env::var("CLAURDVOYANT_MAX_STALE_SECS")
+        .ok()
+        .and_then(|s| s.parse::<i64>().ok())
+        .unwrap_or(900);
+    let fresh_enough = catalog::last_full_sync()
+        .is_some_and(|t| (chrono::Utc::now().timestamp() - t) < max_stale);
+    if fresh_enough {
+        if let Some(stale) = catalog::probe_stale() {
+            if !stale.is_empty() {
+                for h in stale {
+                    refresh_harness(h);
+                }
+                discover_cache::persist(false);
+            }
+            if let Some(rows) = catalog::all_sessions() {
+                return (rows, false);
+            }
+        }
+    }
+    (discover_all(), true)
+}
+
+/// Re-discover one harness and replace its catalog rows + watches — the probe's scoped escalation.
+/// On a discover error the previous rows are kept (matching [`discover_all`]'s tolerance).
+fn refresh_harness(h: Harness) {
+    let Some(a) = harness::for_harness(h) else { return };
+    let Some(root) = a.storage_root() else {
+        // Root gone (harness uninstalled / dir deleted): its sessions vanish from the catalog.
+        catalog::replace_harness(h, &[], &[]);
+        return;
+    };
+    match a.discover() {
+        Ok(refs) => {
+            catalog::replace_harness(h, &refs, &catalog::watches_for(h, Some(&root), &refs));
+        }
+        Err(e) => eprintln!("cv: discover failed for {h}: {e:#}"),
+    }
 }
 
 /// Map `f` over `items`, keeping the `Some` results — in parallel when the `parallel` feature is on
@@ -142,8 +225,25 @@ pub fn find(id: &str, harness: Option<Harness>) -> Result<Option<(SessionRef, Bo
         }
     }
 
-    // Slow path (cold/stale catalog): a full discovery — which re-warms the catalog — then match.
-    let refs = discover_all();
+    // Slow path (cold/stale catalog): freshen via the probe first — usually a few hundred stats
+    // plus at most a scoped re-discovery, and it re-warms the catalog. Only when the id *still*
+    // isn't there (a session in one of the probe's documented blind spots) escalate to the full
+    // scan — unless the probe path already was one (cold catalog), in which case a miss is a miss.
+    let (refs, was_full) = sessions_impl();
+    match resolve_id(refs, id, harness)? {
+        Some(hit) => Ok(Some(hit)),
+        None if was_full => Ok(None),
+        None => resolve_id(discover_all(), id, harness),
+    }
+}
+
+/// Match `id` (exact first, then as a prefix) against `refs` — `find`'s matching contract.
+/// Multiple distinct prefix hits are an error rather than a silent "first one wins".
+fn resolve_id(
+    refs: Vec<SessionRef>,
+    id: &str,
+    harness: Option<Harness>,
+) -> Result<Option<(SessionRef, Box<dyn Adapter>)>> {
     let mut prefix_hits: Vec<SessionRef> = Vec::new();
     for r in refs {
         if let Some(h) = harness {

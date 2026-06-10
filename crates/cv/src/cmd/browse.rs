@@ -1,4 +1,7 @@
 //! `cv ls` / `cv timeline` / `cv stats` — browsing the discovered corpus.
+//!
+//! These read [`cv_core::sessions`] (the probed catalog — milliseconds warm, transparently a full
+//! discovery when cold/stale); `cv ls --fresh` forces [`cv_core::discover_all`]'s full scan.
 
 use crate::util::{dim_cwd, home_rel, parse_harness, short_id};
 use anyhow::Result;
@@ -9,10 +12,10 @@ pub(crate) fn cmd_ls(
     cwd: Option<String>,
     limit: usize,
     sort_by: &str,
-    _fresh: bool, // catalog-read-path lands next: forces full re-discovery past the probe
+    fresh: bool, // force a full re-discovery instead of trusting the probed catalog
 ) -> Result<()> {
     let want = parse_harness(&harness)?;
-    let all = cv_core::discover_all();
+    let all = if fresh { cv_core::discover_all() } else { cv_core::sessions() };
     let discovered = all.len();
     let mut refs: Vec<SessionRef> = all
         .into_iter()
@@ -39,7 +42,9 @@ pub(crate) fn cmd_ls(
     } else {
         println!("{total} session(s)\n");
     }
-    for r in refs.iter().take(limit) {
+    // The exists() check guards the catalog read path's one residual lie — a session deleted since
+    // the probe last looked — and is bounded by `limit`, not the fleet (it stats only listed rows).
+    for r in refs.iter().filter(|r| r.path.exists()).take(limit) {
         println!(
             "{:8}  {:8}  {:10}  {:>4} msg  {}",
             r.harness.as_str(),
@@ -66,7 +71,7 @@ pub(crate) fn cmd_ls(
 /// A unified chronological feed across all harnesses (oldest → newest, like a feed). Grouped by day.
 pub(crate) fn cmd_timeline(harness: Option<String>, cwd: Option<String>, limit: usize) -> Result<()> {
     let want = parse_harness(&harness)?;
-    let mut refs: Vec<SessionRef> = cv_core::discover_all()
+    let mut refs: Vec<SessionRef> = cv_core::sessions()
         .into_iter()
         .filter(|r| want.is_none_or(|h| r.harness == h))
         .filter(|r| match &cwd {
@@ -91,7 +96,8 @@ pub(crate) fn cmd_timeline(harness: Option<String>, cwd: Option<String>, limit: 
     }
 
     let mut last_day: Option<String> = None;
-    for r in shown {
+    // exists(): same catalog-read guard as `cmd_ls` — O(shown window), not O(fleet).
+    for r in shown.iter().filter(|r| r.path.exists()) {
         let when = key(r);
         let day = when
             .map(|d| d.format("%Y-%m-%d").to_string())
@@ -125,7 +131,7 @@ pub(crate) fn cmd_timeline(harness: Option<String>, cwd: Option<String>, limit: 
 
 pub(crate) fn cmd_stats() -> Result<()> {
     use std::collections::HashMap;
-    let refs = cv_core::discover_all();
+    let refs = cv_core::sessions();
     let total = refs.len();
     if total == 0 {
         println!("no sessions discovered.");
