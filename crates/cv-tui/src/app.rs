@@ -711,3 +711,267 @@ fn short_json(v: &impl ToString, max: usize) -> String {
         o
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cv_core::ir::{Block, Message, Role};
+
+    fn sref(id: &str, title: Option<&str>, cwd: Option<&str>) -> SessionRef {
+        SessionRef {
+            id: id.to_string(),
+            harness: Harness::Claude,
+            path: std::path::PathBuf::from(format!("/tmp/{id}.jsonl")),
+            cwd: cwd.map(Into::into),
+            title: title.map(Into::into),
+            created_at: None,
+            updated_at: None,
+            message_count: 1,
+        }
+    }
+
+    fn row(id: &str, title: Option<&str>, cwd: Option<&str>) -> Row {
+        Row { r#ref: sref(id, title, cwd), snippet: None, score: None }
+    }
+
+    fn session(messages: Vec<Message>) -> Session {
+        Session {
+            id: "s1".into(),
+            harness: Harness::Claude,
+            cwd: Some("/work/proj".into()),
+            title: Some("a test session".into()),
+            created_at: None,
+            updated_at: None,
+            model: Some("claude-test-1".into()),
+            git: None,
+            messages,
+            source_path: None,
+            extra: Default::default(),
+        }
+    }
+
+    fn text_msg(role: Role, text: &str) -> Message {
+        let mut m = Message::new(role);
+        m.content.push(Block::Text { text: text.to_string().into() });
+        m
+    }
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    // ───────────────────────── matching helpers ─────────────────────────
+
+    #[test]
+    fn subsequence_matching() {
+        assert!(is_subsequence("abc", "a1b2c3"));
+        assert!(is_subsequence("a c", "abc"), "spaces in the needle are skipped");
+        assert!(!is_subsequence("cba", "abc"), "order matters");
+        assert!(!is_subsequence("abcc", "abc"));
+        assert!(is_subsequence("", "anything"));
+    }
+
+    #[test]
+    fn row_matching_covers_every_field_and_fuzzy() {
+        let r = row("deadbeef-1234", Some("Fix The Parser"), Some("/home/em/projects/claurd"));
+        assert!(row_matches(&r, "claude"), "harness");
+        assert!(row_matches(&r, "deadbeef"), "id");
+        assert!(row_matches(&r, "fix the parser"), "title, case-folded");
+        assert!(row_matches(&r, "projects/claurd"), "cwd");
+        assert!(row_matches(&r, "ftp"), "subsequence fallback (f…t…p…)");
+        assert!(!row_matches(&r, "zzzz"), "no match");
+
+        let bare = row("id-only", None, None);
+        assert!(row_matches(&bare, "id-only"));
+        assert!(!row_matches(&bare, "title"));
+    }
+
+    // ───────────────────────── transcript rendering ─────────────────────────
+
+    #[test]
+    fn render_lines_blocks_and_kinds() {
+        let mut asst = Message::new(Role::Assistant);
+        asst.content.push(Block::Thinking {
+            text: (0..10).map(|i| format!("thought {i}")).collect::<Vec<_>>().join("\n").into(),
+            signature: None,
+            encrypted: None,
+            redacted: false,
+        });
+        asst.content.push(Block::ToolUse {
+            id: "t1".into(),
+            name: "Bash".into(),
+            input: serde_json::json!({"command": "cargo test"}),
+        });
+        let mut toolm = Message::new(Role::Tool);
+        toolm.content.push(Block::ToolResult {
+            tool_use_id: "t1".into(),
+            content: "error: it broke".to_string().into(),
+            is_error: true,
+            tool_name: None,
+            status: None,
+            details: None,
+        });
+        let s = session(vec![
+            text_msg(Role::User, "line one\nline two"),
+            asst,
+            toolm,
+        ]);
+
+        let lines = render_lines(&s);
+
+        // Header: harness · label, cwd, model.
+        assert!(lines[0].text.contains("claude"), "{}", lines[0].text);
+        assert!(lines[0].text.contains("a test session"));
+        assert_eq!(lines[0].kind, LineKind::Meta);
+        assert!(lines.iter().any(|l| l.kind == LineKind::Meta && l.text == "cwd: /work/proj"));
+        assert!(lines.iter().any(|l| l.text == "model: claude-test-1"));
+
+        // Role separators carry role kinds.
+        assert!(lines.iter().any(|l| l.text == "── user ──" && l.kind == LineKind::RoleUser));
+        assert!(lines.iter().any(|l| l.text == "── assistant ──" && l.kind == LineKind::RoleAssistant));
+        assert!(lines.iter().any(|l| l.text == "── tool ──" && l.kind == LineKind::RoleTool));
+
+        // Multiline text splits into one TLine per line.
+        assert!(lines.iter().any(|l| l.text == "line one" && l.kind == LineKind::Text));
+        assert!(lines.iter().any(|l| l.text == "line two" && l.kind == LineKind::Text));
+
+        // Thinking collapses to 6 lines + truncation marker.
+        let thinking: Vec<_> = lines.iter().filter(|l| l.kind == LineKind::Thinking).collect();
+        assert_eq!(thinking.len(), 7, "6 preview lines + truncation marker");
+        assert!(thinking.last().unwrap().text.contains("truncated"));
+
+        // Tool use + error-flavored result.
+        assert!(lines.iter().any(|l| l.kind == LineKind::ToolUse && l.text.contains("Bash")));
+        assert!(lines.iter().any(|l| l.kind == LineKind::ToolError && l.text.contains("↩ error")));
+        assert!(lines.iter().any(|l| l.kind == LineKind::ToolError && l.text.contains("it broke")));
+        assert!(
+            !lines.iter().any(|l| l.kind == LineKind::ToolResult),
+            "an error result must not also render as a plain result"
+        );
+    }
+
+    #[test]
+    fn preview_and_short_json_truncation() {
+        assert_eq!(preview_text("a\nb", 5), vec!["a", "b"]);
+        let p = preview_text("a\nb\nc\nd", 2);
+        assert_eq!(p, vec!["a", "b", "… (truncated)"]);
+
+        assert_eq!(short_json(&"short", 10), "short");
+        let long = short_json(&"x".repeat(50), 10);
+        assert_eq!(long.chars().count(), 10);
+        assert!(long.ends_with('…'));
+    }
+
+    // ───────────────────────── selection / input state machine ─────────────────────────
+
+    fn app_with_rows(n: usize) -> App {
+        let mut app = App::new();
+        app.all_rows = (0..n)
+            .map(|i| row(&format!("sess-{i:02}"), Some(&format!("title {i}")), Some("/w")))
+            .collect();
+        app.recompute_filter();
+        app
+    }
+
+    #[test]
+    fn selection_clamps_and_pages() {
+        let mut app = app_with_rows(5);
+        app.list_height = 2;
+
+        assert_eq!(app.selected, 0);
+        app.on_key(key(KeyCode::Up)); // clamp at top
+        assert_eq!(app.selected, 0);
+        app.on_key(key(KeyCode::Down));
+        assert_eq!(app.selected, 1);
+        app.on_key(key(KeyCode::Char('G'))); // End: huge delta must clamp, not overflow
+        assert_eq!(app.selected, 4);
+        app.on_key(key(KeyCode::Down)); // clamp at bottom
+        assert_eq!(app.selected, 4);
+        assert!(app.list_offset > 0, "scrolled to keep the selection visible");
+        app.on_key(key(KeyCode::Char('g'))); // Home
+        assert_eq!(app.selected, 0);
+        app.on_key(key(KeyCode::PageDown));
+        assert_eq!(app.selected, 2, "page = list_height");
+    }
+
+    #[test]
+    fn filter_mode_narrows_and_esc_restores() {
+        let mut app = app_with_rows(12);
+        app.on_key(key(KeyCode::Char('/')));
+        assert_eq!(app.mode, Mode::Filter);
+        for c in "title 1".chars() {
+            app.on_key(key(KeyCode::Char(c)));
+        }
+        // "title 1" matches title 1, 10, 11 by substring.
+        assert_eq!(app.filtered.len(), 3, "filter: {:?}", app.filter);
+        app.on_key(key(KeyCode::Backspace));
+        assert_eq!(app.filter, "title ");
+        app.on_key(key(KeyCode::Esc));
+        assert_eq!(app.mode, Mode::Normal);
+        assert!(app.filter.is_empty());
+        assert_eq!(app.filtered.len(), 12, "Esc restores the full list");
+    }
+
+    #[test]
+    fn filter_clamps_selection_when_list_shrinks() {
+        let mut app = app_with_rows(10);
+        app.selected = 9;
+        app.filter = "title 3".into();
+        app.recompute_filter();
+        assert_eq!(app.filtered.len(), 1);
+        assert_eq!(app.selected, 0, "selection clamps into the shrunken list");
+        assert!(app.current_row().is_some());
+    }
+
+    #[test]
+    fn help_overlay_swallows_one_key() {
+        let mut app = app_with_rows(3);
+        app.on_key(key(KeyCode::Char('?')));
+        assert_eq!(app.mode, Mode::Help);
+        app.on_key(key(KeyCode::Char('j'))); // dismissed, not navigation
+        assert_eq!(app.mode, Mode::Normal);
+        assert_eq!(app.selected, 0);
+    }
+
+    #[test]
+    fn quit_keys_and_release_events() {
+        let mut app = app_with_rows(1);
+        // Key *release* events must be ignored (Windows/Kitty emit them).
+        let mut release = key(KeyCode::Char('q'));
+        release.kind = KeyEventKind::Release;
+        app.on_key(release);
+        assert!(!app.should_quit);
+
+        app.on_key(key(KeyCode::Char('q')));
+        assert!(app.should_quit);
+
+        let mut app = app_with_rows(1);
+        app.on_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert!(app.should_quit, "ctrl-c quits from anywhere");
+    }
+
+    #[test]
+    fn transcript_scroll_clamps() {
+        let mut app = app_with_rows(1);
+        let s = session(vec![text_msg(Role::User, "hi"), text_msg(Role::Assistant, "yo")]);
+        let lines = render_lines(&s);
+        let max = lines.len() - 1;
+        app.open = Some(OpenSession { session: s, lines });
+        app.view = View::Transcript;
+        app.transcript_height = 4;
+
+        app.on_key(key(KeyCode::Char('G')));
+        assert_eq!(app.transcript_scroll, max, "End clamps to the last line");
+        app.on_key(key(KeyCode::Down));
+        assert_eq!(app.transcript_scroll, max);
+        app.on_key(key(KeyCode::Char('g')));
+        assert_eq!(app.transcript_scroll, 0);
+        app.on_key(key(KeyCode::Up));
+        assert_eq!(app.transcript_scroll, 0, "clamped at the top");
+
+        // Leaving the reader goes back to the list.
+        app.on_key(key(KeyCode::Esc));
+        assert_eq!(app.view, View::List);
+        assert!(!app.should_quit, "Esc in the reader must not quit the app");
+    }
+}

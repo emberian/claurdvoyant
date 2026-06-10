@@ -91,11 +91,13 @@ async fn main() -> anyhow::Result<()> {
 }
 
 async fn handle(method: &str, params: Option<Value>, id: Option<Value>) -> Option<Value> {
-    // Notifications carry no id; we never respond to them.
+    // A request without an `id` is a JSON-RPC *notification*: the method still runs (a
+    // notification tools/call may have side effects worth performing), but per spec the server
+    // MUST NOT reply — not even with `id: null`.
     let is_notification = id.is_none();
     let id = id.unwrap_or(Value::Null);
 
-    match method {
+    let response = match method {
         "initialize" => Some(ok_response(id, initialize_result())),
         "ping" => Some(ok_response(id, json!({}))),
         "notifications/initialized" | "notifications/cancelled" => None,
@@ -130,13 +132,12 @@ async fn handle(method: &str, params: Option<Value>, id: Option<Value>) -> Optio
                 )),
             }
         }
-        _ => {
-            if is_notification {
-                None
-            } else {
-                Some(error_response(id, -32601, &format!("Method not found: {method}")))
-            }
-        }
+        _ => Some(error_response(id, -32601, &format!("Method not found: {method}"))),
+    };
+    if is_notification {
+        None
+    } else {
+        response
     }
 }
 

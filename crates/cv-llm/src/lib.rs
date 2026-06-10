@@ -212,10 +212,7 @@ fn call_model(provider: &Provider, model: &str, prompt: &str) -> Result<String> 
                 .send()
                 .context("POST to OpenRouter")?;
             let v = read_json(resp, "OpenRouter")?;
-            v["choices"][0]["message"]["content"]
-                .as_str()
-                .map(str::to_string)
-                .ok_or_else(|| anyhow!("OpenRouter response missing message content: {v}"))
+            extract_openai_text(&v, "OpenRouter")
         }
         Provider::Anthropic { key } => {
             let body = json!({
@@ -234,21 +231,7 @@ fn call_model(provider: &Provider, model: &str, prompt: &str) -> Result<String> 
                 .send()
                 .context("POST to Anthropic")?;
             let v = read_json(resp, "Anthropic")?;
-            // Concatenate all text blocks in the content array.
-            let text: String = v["content"]
-                .as_array()
-                .map(|blocks| {
-                    blocks
-                        .iter()
-                        .filter_map(|b| b["text"].as_str())
-                        .collect::<Vec<_>>()
-                        .join("")
-                })
-                .unwrap_or_default();
-            if text.is_empty() {
-                bail!("Anthropic response missing text content: {v}");
-            }
-            Ok(text)
+            extract_anthropic_text(&v)
         }
         Provider::LmStudio { base } => {
             // OpenAI-compatible /chat/completions; LM Studio ignores auth, so we send none.
@@ -265,12 +248,37 @@ fn call_model(provider: &Provider, model: &str, prompt: &str) -> Result<String> 
                 .send()
                 .with_context(|| format!("POST to LM Studio at {base} (is the local server running?)"))?;
             let v = read_json(resp, "LM Studio")?;
-            v["choices"][0]["message"]["content"]
-                .as_str()
-                .map(str::to_string)
-                .ok_or_else(|| anyhow!("LM Studio response missing message content: {v}"))
+            extract_openai_text(&v, "LM Studio")
         }
     }
+}
+
+/// Pull the assistant text out of an OpenAI-shaped chat response
+/// (`choices[0].message.content`), with a clear error naming `who` when the shape is off.
+fn extract_openai_text(v: &Value, who: &str) -> Result<String> {
+    v["choices"][0]["message"]["content"]
+        .as_str()
+        .map(str::to_string)
+        .ok_or_else(|| anyhow!("{who} response missing message content: {v}"))
+}
+
+/// Pull the assistant text out of an Anthropic Messages response: all `content[].text` blocks
+/// concatenated. Empty/missing text is an error (a silent "" would read as a model refusal).
+fn extract_anthropic_text(v: &Value) -> Result<String> {
+    let text: String = v["content"]
+        .as_array()
+        .map(|blocks| {
+            blocks
+                .iter()
+                .filter_map(|b| b["text"].as_str())
+                .collect::<Vec<_>>()
+                .join("")
+        })
+        .unwrap_or_default();
+    if text.is_empty() {
+        bail!("Anthropic response missing text content: {v}");
+    }
+    Ok(text)
 }
 
 /// Read a response body as JSON, turning HTTP error statuses into clear errors.
@@ -409,49 +417,9 @@ fn call_chat(
         ),
         Provider::LmStudio { base } => openai_call(format!("{base}/chat/completions"), None),
         Provider::Anthropic { key } => {
-            // Anthropic wants `system` separate and only user/assistant roles in `messages`, which
-            // must additionally start with `user` and strictly alternate. Our IR can yield neither
-            // (a transcript may open on an assistant turn and have runs of same-role messages), so we
-            // hoist system text out, coalesce consecutive same-role turns, and guarantee a leading
-            // user message — otherwise the API 400s on the message sequence.
-            let mut sys = system.unwrap_or("").to_string();
-            let mut msgs: Vec<Value> = Vec::new();
-            for m in messages {
-                let role = m["role"].as_str().unwrap_or("user");
-                if role == "system" {
-                    if let Some(c) = m["content"].as_str() {
-                        if !sys.is_empty() {
-                            sys.push('\n');
-                        }
-                        sys.push_str(c);
-                    }
-                    continue;
-                }
-                // Normalize any non-system role to user/assistant.
-                let role = if role == "assistant" { "assistant" } else { "user" };
-                let content = m["content"].as_str().unwrap_or("").to_string();
-                match msgs.last_mut() {
-                    Some(prev) if prev["role"] == role => {
-                        // Coalesce: append onto the previous same-role turn.
-                        let merged =
-                            format!("{}\n{}", prev["content"].as_str().unwrap_or(""), content);
-                        prev["content"] = json!(merged);
-                    }
-                    _ => msgs.push(json!({ "role": role, "content": content })),
-                }
-            }
-            // Anthropic requires the first message to be `user`.
-            if msgs.first().map(|m| m["role"] == "assistant").unwrap_or(false) {
-                msgs.insert(
-                    0,
-                    json!({ "role": "user", "content": "(continue the transcript below)" }),
-                );
-            }
-            if msgs.is_empty() {
-                bail!("nothing to send to Anthropic after normalizing messages");
-            }
+            let (sys, msgs) = normalize_for_anthropic(system, messages)?;
             let mut body = json!({ "model": model, "max_tokens": max_tokens, "messages": msgs });
-            if !sys.is_empty() {
+            if let Some(sys) = sys {
                 body["system"] = json!(sys);
             }
             let resp = client
@@ -462,21 +430,63 @@ fn call_chat(
                 .send()
                 .context("POST to Anthropic")?;
             let v = read_json(resp, "Anthropic")?;
-            let text: String = v["content"]
-                .as_array()
-                .map(|bs| {
-                    bs.iter()
-                        .filter_map(|b| b["text"].as_str())
-                        .collect::<Vec<_>>()
-                        .join("")
-                })
-                .unwrap_or_default();
-            if text.is_empty() {
-                bail!("Anthropic response missing text content: {v}");
-            }
-            Ok(text)
+            extract_anthropic_text(&v)
         }
     }
+}
+
+/// Shape generic `{role, content}` chat messages for the Anthropic Messages API, whose contract
+/// is stricter than the OpenAI shape. Pure (no HTTP) so the invariants are testable:
+///
+/// 1. **System hoisting** — Anthropic takes `system` as a top-level field, not a message role.
+///    Any `role:"system"` messages are pulled out and joined (after the caller's `system`, if
+///    given) with newlines; the returned `Option<String>` is `None` only when there's no system
+///    text at all.
+/// 2. **Role coalescing** — `messages` must strictly alternate user/assistant, but our IR can
+///    carry runs of same-role turns. Consecutive same-role messages are merged with `\n`.
+///    Non-assistant roles (tool, anything unknown) normalize to `user`.
+/// 3. **Leading-user guarantee** — the first message must be `user`; a transcript opening on an
+///    assistant turn gets a small synthetic user preamble. An empty message list is an error.
+fn normalize_for_anthropic(
+    system: Option<&str>,
+    messages: &[Value],
+) -> Result<(Option<String>, Vec<Value>)> {
+    let mut sys = system.unwrap_or("").to_string();
+    let mut msgs: Vec<Value> = Vec::new();
+    for m in messages {
+        let role = m["role"].as_str().unwrap_or("user");
+        if role == "system" {
+            if let Some(c) = m["content"].as_str() {
+                if !sys.is_empty() {
+                    sys.push('\n');
+                }
+                sys.push_str(c);
+            }
+            continue;
+        }
+        // Normalize any non-system role to user/assistant.
+        let role = if role == "assistant" { "assistant" } else { "user" };
+        let content = m["content"].as_str().unwrap_or("").to_string();
+        match msgs.last_mut() {
+            Some(prev) if prev["role"] == role => {
+                // Coalesce: append onto the previous same-role turn.
+                let merged = format!("{}\n{}", prev["content"].as_str().unwrap_or(""), content);
+                prev["content"] = json!(merged);
+            }
+            _ => msgs.push(json!({ "role": role, "content": content })),
+        }
+    }
+    // Anthropic requires the first message to be `user`.
+    if msgs.first().map(|m| m["role"] == "assistant").unwrap_or(false) {
+        msgs.insert(
+            0,
+            json!({ "role": "user", "content": "(continue the transcript below)" }),
+        );
+    }
+    if msgs.is_empty() {
+        bail!("nothing to send to Anthropic after normalizing messages");
+    }
+    Ok(((!sys.is_empty()).then_some(sys), msgs))
 }
 
 #[cfg(test)]
@@ -568,6 +578,142 @@ mod tests {
         assert!(truncated);
         // Round-trips as valid UTF-8 (implicit: String construction would have panicked otherwise).
         assert!(out.contains("transcript truncated"));
+    }
+
+    // ───────────────────────── to_chat_messages (IR → chat shape) ─────────────────────────
+
+    #[test]
+    fn chat_messages_flatten_roles_and_blocks() {
+        let mut s = sample_session();
+        // A system turn, a tool turn (folds to user), an empty turn (dropped), and tool blocks.
+        let mut sysm = Message::new(Role::System);
+        sysm.content.push(Block::Text { text: "be terse".to_string().into() });
+        s.messages.insert(0, sysm);
+
+        let mut toolm = Message::new(Role::Tool);
+        toolm.content.push(Block::ToolResult {
+            tool_use_id: "t1".into(),
+            content: "exit 0".to_string().into(),
+            is_error: false,
+            tool_name: None,
+            status: None,
+            details: None,
+        });
+        s.messages.push(toolm);
+
+        s.messages.push(Message::new(Role::User)); // no content → skipped entirely
+
+        let mut asst = Message::new(Role::Assistant);
+        asst.content.push(Block::ToolUse {
+            id: "t2".into(),
+            name: "Bash".into(),
+            input: serde_json::json!({"command": "ls"}),
+        });
+        s.messages.push(asst);
+
+        let msgs = to_chat_messages(&s);
+        let roles: Vec<&str> = msgs.iter().map(|m| m["role"].as_str().unwrap()).collect();
+        // system, user, assistant, tool→user, (empty dropped), assistant(tool_use note)
+        assert_eq!(roles, ["system", "user", "assistant", "user", "assistant"]);
+        assert_eq!(msgs[0]["content"], "be terse");
+        assert!(msgs[3]["content"].as_str().unwrap().contains("[tool result] exit 0"));
+        assert!(msgs[4]["content"].as_str().unwrap().contains("[tool call: Bash"));
+    }
+
+    // ───────────────────── Anthropic normalization (the documented invariants) ─────────────────────
+
+    fn m(role: &str, content: &str) -> Value {
+        json!({ "role": role, "content": content })
+    }
+
+    #[test]
+    fn anthropic_hoists_system_messages() {
+        let msgs = [m("system", "rule one"), m("user", "hi"), m("system", "rule two")];
+        let (sys, out) = normalize_for_anthropic(Some("base"), &msgs).unwrap();
+        assert_eq!(sys.as_deref(), Some("base\nrule one\nrule two"));
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0], m("user", "hi"));
+
+        // No system text anywhere → None (so the body omits the field entirely).
+        let (sys, _) = normalize_for_anthropic(None, &[m("user", "hi")]).unwrap();
+        assert!(sys.is_none());
+    }
+
+    #[test]
+    fn anthropic_coalesces_same_role_runs() {
+        let msgs = [
+            m("user", "a"),
+            m("user", "b"),
+            m("assistant", "c"),
+            m("assistant", "d"),
+            m("user", "e"),
+        ];
+        let (_, out) = normalize_for_anthropic(None, &msgs).unwrap();
+        assert_eq!(
+            out,
+            vec![m("user", "a\nb"), m("assistant", "c\nd"), m("user", "e")],
+            "runs must merge so roles strictly alternate"
+        );
+    }
+
+    #[test]
+    fn anthropic_guarantees_leading_user() {
+        let (_, out) = normalize_for_anthropic(None, &[m("assistant", "previously…")]).unwrap();
+        assert_eq!(out[0]["role"], "user", "first message must be user");
+        assert_eq!(out[1], m("assistant", "previously…"));
+        // The synthesized preamble must not merge into the assistant turn.
+        assert_eq!(out.len(), 2);
+    }
+
+    #[test]
+    fn anthropic_normalizes_unknown_roles_to_user_and_rejects_empty() {
+        // tool/unknown roles become user (and coalesce with neighboring user turns).
+        let msgs = [m("user", "run it"), m("tool", "exit 0")];
+        let (_, out) = normalize_for_anthropic(None, &msgs).unwrap();
+        assert_eq!(out, vec![m("user", "run it\nexit 0")]);
+
+        // Nothing but system text → there is no conversation to send.
+        assert!(normalize_for_anthropic(None, &[m("system", "rules")]).is_err());
+        assert!(normalize_for_anthropic(Some("sys"), &[]).is_err());
+    }
+
+    // ───────────────────────── response extraction error paths ─────────────────────────
+
+    #[test]
+    fn openai_extraction_happy_and_sad() {
+        let good = json!({"choices": [{"message": {"role": "assistant", "content": "hi"}}]});
+        assert_eq!(extract_openai_text(&good, "X").unwrap(), "hi");
+
+        for bad in [
+            json!({}),
+            json!({"choices": []}),
+            json!({"choices": [{"message": {}}]}),
+            json!({"choices": [{"message": {"content": null}}]}),
+            json!({"choices": [{"message": {"content": 42}}]}),
+            json!({"error": {"message": "rate limited"}}),
+        ] {
+            let err = extract_openai_text(&bad, "TestProv").unwrap_err().to_string();
+            assert!(err.contains("TestProv"), "error must name the provider: {err}");
+        }
+    }
+
+    #[test]
+    fn anthropic_extraction_joins_text_blocks_and_rejects_empty() {
+        let good = json!({"content": [
+            {"type": "text", "text": "part one "},
+            {"type": "tool_use", "id": "t", "name": "x", "input": {}},
+            {"type": "text", "text": "part two"},
+        ]});
+        assert_eq!(extract_anthropic_text(&good).unwrap(), "part one part two");
+
+        for bad in [
+            json!({}),
+            json!({"content": []}),
+            json!({"content": [{"type": "tool_use", "id": "t", "name": "x", "input": {}}]}),
+            json!({"content": [{"type": "text", "text": ""}]}),
+        ] {
+            assert!(extract_anthropic_text(&bad).is_err(), "should reject: {bad}");
+        }
     }
 
     /// Real network call. Ignored by default so `cargo test` passes without API keys / network.

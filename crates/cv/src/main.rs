@@ -64,7 +64,9 @@ enum Cmd {
         /// `<start>-` (through the last), or `-<end>` (from the first). Messages outside the
         /// window are never resolved — large content stays on disk, so a windowed view of a
         /// huge session reads only the bytes it shows.
-        #[arg(long)]
+        // allow_hyphen_values: the documented `-<end>` form starts with a dash, which clap
+        // would otherwise reject as an unknown flag (`cv show id --range -5`).
+        #[arg(long, allow_hyphen_values = true)]
         range: Option<String>,
     },
     /// Export a session to markdown, JSON, or self-contained HTML (stdout).
@@ -2162,7 +2164,15 @@ fn stream_session_render<W: std::io::Write>(
         start: range.map(|(s, _)| s).unwrap_or(0),
         end: range.and_then(|(_, e)| e),
     };
-    adapter.stream(r, &ParseOptions::bulk(), &mut sink)?;
+    // Windowed: lazy spans, so out-of-window giant fields arrive as 16-byte handles and only
+    // in-window messages materialize (the sink already resolves per message). A full show reads
+    // every byte regardless — spans would only add resolve overhead there (floor = C).
+    let opts = if range.is_some() {
+        ParseOptions::lazy()
+    } else {
+        ParseOptions::bulk()
+    };
+    adapter.stream(r, &opts, &mut sink)?;
     sink.flush_header(); // short sessions (no assistant turn / < HOLDBACK msgs) flush here
     sink.result?;
     Ok(())

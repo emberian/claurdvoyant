@@ -535,6 +535,7 @@ dependencies = [
  "cv-search",
  "dirs 5.0.1",
  "ratatui",
+ "serde_json",
 ]
 
 [[package]]
