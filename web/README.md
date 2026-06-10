@@ -229,6 +229,11 @@ normalizes them automatically. Unknown block kinds are rendered gracefully.
 
 All exports are client-side `Blob` downloads — nothing leaves the page.
 
+> **Sharing a transcript?** The CLI's `cv share <id>` produces the flagship
+> artifact: one self-contained, redacted-by-default `.html` file (inline
+> CSS/JS, collapsible tool calls, keyboard nav) that anyone can open offline —
+> no wasm, no viewer, no install. See the manual's "Sharing transcripts" page.
+
 ## Preview locally
 
 No build step is needed for the JS. From the repo root:

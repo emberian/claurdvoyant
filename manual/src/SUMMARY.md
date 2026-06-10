@@ -7,6 +7,7 @@
 - [Install & quick start](getting-started.md)
 - [The CLI: `cv`](cli.md)
 - [Search (full-text & semantic)](search.md)
+- [`cv pack` — the context compiler](pack.md)
 
 # The fleet
 
@@ -17,6 +18,7 @@
 # Viewing & porting
 
 - [The desktop & web app](app.md)
+- [Sharing transcripts: `cv share`](share.md)
 - [Cross-harness conversion](conversion.md)
 - [Harnesses & where they store sessions](harnesses.md)
 - [The OpenSession standard](opensession.md)
