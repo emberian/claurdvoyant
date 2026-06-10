@@ -29,6 +29,8 @@ pub mod lmstudio;
 pub mod opencode;
 pub mod openclaw;
 pub mod qwen;
+#[cfg(feature = "sqlite")]
+pub mod zed;
 
 /// Parse an RFC3339 timestamp into UTC — the timestamp shape nearly every harness writes. Shared
 /// here so adapters don't each carry a copy.
@@ -201,6 +203,7 @@ pub fn all() -> Vec<Box<dyn Adapter>> {
         adapters.push(Box::new(hermes::Hermes::new()));
         adapters.push(Box::new(cursor::Cursor::new()));
         adapters.push(Box::new(goose::Goose::new()));
+        adapters.push(Box::new(zed::Zed::new()));
     }
     adapters
 }

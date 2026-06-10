@@ -404,6 +404,7 @@ fn harness_color(h: Harness) -> Color {
         Harness::Roo => Color::Rgb(200, 90, 140),
         Harness::Continue => Color::Rgb(120, 200, 90),
         Harness::Goose => Color::Rgb(180, 160, 90),
+        Harness::Zed => Color::Rgb(7, 81, 207), // zed accent blue
     }
 }
 

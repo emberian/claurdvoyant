@@ -167,6 +167,51 @@ decouples them via a unified IR.
   MCP-style `MessageContent` (`text`/`thinking`/`toolRequest`/`toolResponse`/…); tool results ride on `user` msgs →
   reclassified to Tool. Legacy: per-session `<name>.jsonl` (header line + one message per line).
 
+## Zed — `<data_dir>/threads/threads.db` (SQLite + zstd blobs)
+
+- **Location:** macOS `~/Library/Application Support/Zed/threads/threads.db`; Linux
+  `$XDG_DATA_HOME/zed/threads/threads.db` (default `~/.local/share/zed/…`; flatpak
+  `~/.var/app/dev.zed.Zed/data/zed/…`); Windows `%LOCALAPPDATA%\Zed\threads\threads.db`. A sibling
+  `threads-db.0.mdb/` LMDB dir is a dead pre-SQLite store (heed era) — empty on the reference machine, ignored.
+- **Schema:** one table, grown by un-gated `ALTER TABLE`s (probe `PRAGMA table_info`; old DBs lack the tail):
+  `threads(id TEXT PK, summary TEXT, updated_at TEXT, data_type TEXT, data BLOB` + later
+  `parent_id, worktree_branch, folder_paths, folder_paths_order, created_at)`. Timestamps are RFC3339
+  with offset. `folder_paths` = workspace folders, **lexicographically sorted and `\n`-joined**;
+  `folder_paths_order` = `,`-joined indices restoring the user's original order (first ordered path =
+  primary worktree). `parent_id` links a **subagent** thread to its parent (we surface it as
+  `extra.parent_thread_id`; the hierarchy itself is flattened — each thread is its own session).
+- **Blob:** `data_type` `"zstd"` → one zstd frame (level 3, written by `zstd::encode_all`) of JSON;
+  `"json"` → raw JSON (the code supports it; never observed). No message table — counting messages
+  requires decoding the blob.
+- **Blob JSON, three generations** (sniff by `version` + message shape; serde structs in
+  zed `crates/agent/src/{db,legacy_thread,thread}.rs`):
+  - **versionless** (oldest): `{summary, updated_at, messages:[{id:int, role, text, tool_uses, tool_results}]}` —
+    plain `text` instead of segments.
+  - **`0.1.0` / `0.2.0`** (agent1 `SerializedThread`): `{version, summary, updated_at,
+    messages:[{id:int, role:"user"|"assistant"|"system", segments:[{type:"text"|"thinking"(+signature)
+    |"RedactedThinking"(data)}], tool_uses:[{id,name,input}], tool_results:[{tool_use_id,is_error,
+    content,output}], context:"…", creases:[…], is_hidden}], initial_project_snapshot,
+    cumulative_token_usage, request_token_usage:[…], detailed_summary_state:{Generated:{text}},
+    model:{provider,model}, completion_mode, tool_use_limit_reached, profile}`. In 0.1.0 `tool_results`
+    rode on the **next user** message; 0.2.0 moved them onto the calling assistant message. Each agentic
+    step is its **own assistant message** (a 235-"message" thread can be ~37 user turns). `context` is the
+    rendered attached-files preamble; `creases` are editor fold ranges (UI-only).
+  - **`0.3.0`** (agent2/ACP `DbThread`, flattened `version` added at save): `{version, title, messages,
+    updated_at, detailed_summary, initial_project_snapshot, cumulative_token_usage,
+    request_token_usage:{<user-msg-id>:usage}, model, profile, imported, subagent_context:
+    {parent_thread_id, depth}, speed, thinking_enabled, thinking_effort, …}`. Messages are an
+    **externally tagged enum**: `{"User":{id, content:[{"Text":…}|{"Mention":{uri,content}}|
+    {"Image":{source,size}}]}}`, `{"Agent":{content:[{"Text":…}|{"Thinking":{text,signature}}|
+    {"RedactedThinking":"…"}|{"ToolUse":{id,name,input,raw_input,…}}], tool_results:{<id>:
+    {tool_use_id,tool_name,is_error,content,output}}, reasoning_details}}`, bare `"Resume"`, or
+    `{"Compaction":{"Summary":"…"}}`. Tool-result `content` is `{"Text":…}`/`{"Image":…}`/plain string.
+- **cwd:** `initial_project_snapshot.worktree_snapshots[0].worktree_path` (fallback: `folder_paths`
+  column). The same snapshot's `git_state{remote_url, head_sha, current_branch, diff}` → `GitInfo`.
+- **No per-message timestamps anywhere** — only thread-level created/updated.
+- **Lossy notes:** extra worktrees of a multi-root workspace, `request_token_usage`, mention bodies
+  (URI kept as a File block), and `creases` semantics aren't modeled; legacy `context` and 0.3.0
+  `reasoning_details` ride in `extra`. We decode blobs with pure-Rust `ruzstd` (no C cross-compile cost).
+
 ---
 
 ## Prior art (don't reinvent; do unify)

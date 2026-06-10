@@ -1,6 +1,6 @@
 # Harnesses & where they store sessions
 
-claurdvoyant currently understands **17 harnesses** 🔮. Every one of them couples a session to a
+claurdvoyant currently understands **18 harnesses** 🔮. Every one of them couples a session to a
 working directory — they encode the `cwd` into the path, the filename, a hash, or a DB column — which
 is exactly why your sessions feel "dir-jailed" and impossible to find later. claurdvoyant reads them
 all into one unified IR so that coupling stops mattering.
@@ -35,6 +35,7 @@ All paths are the real ones the adapters look at. `~` is your home dir; `<AppSup
 | **Qwen Code** | `~/.qwen/tmp/<projectHash>/chats/session-*.json\|jsonl` | ✓ | ✓ | A **gemini-cli fork** — byte-identical format, just rooted at `~/.qwen`. Delegates to the Gemini parser, re-tagged `Harness::Qwen`. **Sub-agents** dir-nested like Gemini. |
 | **Cursor IDE** | `<AppSupport>/Cursor/User/globalStorage/state.vscdb` (**SQLite**) | ✓ | — | Closed-source, opened read-only. Global DB holds `composerData:`/`bubbleId:` rows; per-workspace DB links composers → cwd. Schema churns (`_v` 1..=10+). |
 | **Goose (Block)** | `<AppSupport>/Block.block.goose/sessions/sessions.db` (**SQLite**) | ✓ | — | `$GOOSE_PATH_ROOT`/`$XDG_DATA_HOME` override. Modern `sessions.db` + **legacy** per-session `<name>.jsonl`. MCP-style tool content; read-only, PRAGMA-probed. |
+| **Zed (agent panel)** | `<data_dir>/Zed/threads/threads.db` (**SQLite**) | ✓ | — | One DB, one row per thread; `data` BLOB = **zstd-compressed JSON** (pure-Rust decode). Three blob generations (versionless / agent1 0.1–0.2 / agent2 0.3 tagged-enum). cwd + git from the project snapshot; **subagents** linked by `parent_id`. |
 | **Claude app** | `<AppSupport>/Claude/` | ✓\* | — | **Detected, not readable.** Transcripts are **server-side** (claude.ai); local store holds only auth/UI state. `claude-code-sessions/*.json` are stubs pointing at `~/.claude/projects/` (handled by Claude Code). |
 | **ChatGPT app** | `<AppSupport>/com.openai.chat/conversations-v3-<acct>/<uuid>.data` | ✓\* | — | **Detected, not readable.** History *is* local but **encrypted at rest** with an app-held key (not in a readable Keychain). We count conversations but can't decrypt. |
 
@@ -44,8 +45,8 @@ All paths are the real ones the adapters look at. `~` is your home dir; `<AppSup
 **13 harnesses are emit-capable** (conversion targets): Claude Code, Codex, Grok, OpenCode, OpenClaw,
 Gemini, Hermes, Kimi, LM Studio, Cline, Roo, Continue, Qwen.
 
-**4 are parse-only**: Cursor and Goose (closed-source / read-only stores we deliberately don't write
-back to), plus the two desktop apps below.
+**5 are parse-only**: Cursor, Goose, and Zed (closed-source / read-only stores we deliberately don't
+write back to), plus the two desktop apps below.
 
 ## Sub-agents
 
@@ -60,11 +61,15 @@ as a tree — see [sub-agent trees in the app](app.md).
 - **Gemini and Qwen** dir-nest subagent recordings under `chats/<parentId>/<id>.jsonl`.
 - **OpenCode** models them as `subtask` parts — a spawned sub-session with its own prompt, agent, and
   model — alongside `agent` mention parts.
+- **Zed** stores a subagent thread as its own row in `threads.db` with a `parent_id` column (and, in
+  the 0.3.0 blob, a `subagent_context{parent_thread_id, depth}`); we keep the link in
+  `Session.extra.parent_thread_id`.
 
-## The SQLite trio
+## The SQLite quartet
 
-Three harnesses keep everything in a SQLite database rather than per-session files: **Hermes**
-(`state.db`), **Cursor** (`state.vscdb`), and **Goose** (`sessions.db`). All three are opened
+Four harnesses keep everything in a SQLite database rather than per-session files: **Hermes**
+(`state.db`), **Cursor** (`state.vscdb`), **Goose** (`sessions.db`), and **Zed** (`threads.db`,
+whose rows are additionally zstd-compressed JSON blobs). All four are opened
 **read-only**, and because their schemas accrete columns across versions without a clean version gate,
 each adapter probes `PRAGMA table_info` and selects only the columns that actually exist — so an older
 database degrades gracefully instead of failing the whole import. (Codex and Grok also ship SQLite, but

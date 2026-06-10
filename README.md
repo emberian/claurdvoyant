@@ -55,7 +55,7 @@ cv scry
 - 📣 **A coordination board** (`cv board` + MCP): agents post status and hand off work to each other. With the daemon mirroring activity, it's a live feed across your whole **cloud fleet**.
 - 🌐 **A zero-install web viewer**: drag a zip of any harness folder into your browser and explore it. Nothing uploaded, all WASM.
 
-## 🪐 17 harnesses, one IR
+## 🪐 18 harnesses, one IR
 
 | | Harness | Parse | Convert *to* | | | Harness | Parse | Convert *to* |
 |---|---|:--:|:--:|---|---|---|:--:|:--:|
@@ -67,6 +67,7 @@ cv scry
 | ✅ | **Hermes** (Nous) | ✅ | ✅ | | ✅ | **Roo Code** | ✅ | ✅ |
 | ✅ | **OpenClaw** | ✅ | ✅ | | ✅ | **Continue** | ✅ | ✅ |
 | 🔒 | **Claude / ChatGPT apps** | detected¹ | — | | ✅ | **Goose** (Block) | ✅ | — |
+| ✅ | **Zed** (agent panel) | ✅ | — | | | | | |
 
 <sub>¹ The Claude app keeps transcripts server-side; the ChatGPT app keeps them locally but encrypted at rest. We detect the install and document exactly why neither is readable — see [`docs/FORMATS.md`](docs/FORMATS.md).</sub>
 
@@ -138,7 +139,7 @@ parse(any harness) → 🔮 unified IR → search · convert · port · loom · 
 
 Built in a wild few sessions, much of it by a swarm of agents working disjoint files. ✨ Honest about the edges:
 
-- **17 harnesses parse**; the 7 core ones also **emit** (N-way conversion). The newer 8 (Cursor, Kimi, Qwen, LM Studio, Cline, Roo, Continue, Goose) are parse-only for now.
+- **18 harnesses parse**; the 7 core ones also **emit** (N-way conversion). The newer 9 (Cursor, Kimi, Qwen, LM Studio, Cline, Roo, Continue, Goose, Zed) are parse-only for now.
 - **Robustness:** 2000+ real sessions parse with **0 panics**; parsers are fuzz-tested against hostile input.
 - The full-text index trades disk for speed; Gemini's protobuf `.pb` is opaque; a few sidecar tool-call streams aren't merged yet.
 - Historical format variants are an explicit goal — see [`ADDING_HARNESS.md`](ADDING_HARNESS.md), and **please send your own harness logs** (we can only test what we can see).

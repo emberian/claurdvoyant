@@ -19,6 +19,10 @@ walkdir = "2"
 rayon = "1"
 percent-encoding = "2"
 rusqlite = { version = "0.32", features = ["bundled"] }
+# Pure-Rust zstd (decode for Zed's compressed thread blobs; encode used only by tests). Chosen over
+# the C-binding `zstd` crate because this workspace cross-compiles to 7 targets via cargo-dist
+# (including windows-msvc and i686) and a C toolchain dependency would complicate every one.
+ruzstd = "0.8"
 dirs = "5"
 clap = { version = "4", features = ["derive"] }
 uuid = { version = "1", features = ["v4", "v7"] }

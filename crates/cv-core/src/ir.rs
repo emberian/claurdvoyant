@@ -68,6 +68,8 @@ harnesses! {
     Continue => "continue",
     /// Goose (Block), `~/.local/share/goose/sessions`.
     Goose => "goose",
+    /// Zed editor's agent panel (`threads.db` SQLite, zstd-compressed JSON thread blobs).
+    Zed => "zed",
 }
 
 impl Harness {
@@ -91,6 +93,7 @@ impl Harness {
             "roo" | "roo-code" | "roocode" => Harness::Roo,
             "continue" | "continuedev" => Harness::Continue,
             "goose" => Harness::Goose,
+            "zed" | "zed-editor" => Harness::Zed,
             _ => return None,
         })
     }
