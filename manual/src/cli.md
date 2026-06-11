@@ -22,6 +22,8 @@ cv <cmd> --help    # flags for any one subcommand
 | **provenance** | [`events`](#cv-events) | what a session *did*: file edits, commands, errors |
 | | [`touched`](#cv-touched) | every session that ever touched a file |
 | | [`blame`](#cv-blame) | which session's reasoning wrote this code |
+| **sharing** | [`share`](share.md) | one redacted, self-contained HTML artifact |
+| | [`pack`](pack.md) | compile past-session context for a new task |
 | **viewing** | [`show`](#cv-show) | print one session as a transcript (or `--json`) |
 | | [`export`](#cv-export) | render a session to `md` / `json` / `html` |
 | | [`tree`](#cv-tree) | message threading (DAG or numbered list) |
