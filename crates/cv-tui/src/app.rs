@@ -137,9 +137,13 @@ impl App {
 
     // ───────────────────────────── data loading ─────────────────────────────
 
-    /// (Re)discover all sessions, newest-first, and reset the list to the unfiltered set.
+    /// (Re)load all sessions, newest-first, and reset the list to the unfiltered set.
+    ///
+    /// Uses [`cv_core::sessions`] — the catalog-backed fast read (~ms when warm) — rather than
+    /// `discover_all`'s full stat-the-fleet scan (multiple seconds), so startup and `r` are
+    /// instant. The catalog probe transparently escalates to a re-scan when anything changed.
     pub fn refresh_sessions(&mut self) {
-        let mut refs = cv_core::discover_all();
+        let mut refs = cv_core::sessions();
         // Newest-first by updated_at (fall back to created_at).
         refs.sort_by(|a, b| {
             let ka = a.updated_at.or(a.created_at);
@@ -305,6 +309,13 @@ impl App {
             return;
         }
 
+        // Ctrl-C quits from *anywhere* — including while typing into the filter/search line,
+        // where it must not be swallowed as a literal 'c'.
+        if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            self.should_quit = true;
+            return;
+        }
+
         // Help overlay swallows everything until dismissed.
         if self.mode == Mode::Help {
             self.mode = Mode::Normal;
@@ -338,7 +349,7 @@ impl App {
             }
             KeyCode::Up => self.move_selection(-1),
             KeyCode::Down => self.move_selection(1),
-            KeyCode::Char(c) => {
+            KeyCode::Char(c) if is_text_input(key) => {
                 self.filter.push(c);
                 self.recompute_filter();
             }
@@ -359,7 +370,7 @@ impl App {
             KeyCode::Backspace => {
                 self.search_input.pop();
             }
-            KeyCode::Char(c) => self.search_input.push(c),
+            KeyCode::Char(c) if is_text_input(key) => self.search_input.push(c),
             _ => {}
         }
     }
@@ -367,10 +378,6 @@ impl App {
     fn on_key_normal(&mut self, key: KeyEvent) {
         // Global keys that work in any view.
         match key.code {
-            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.should_quit = true;
-                return;
-            }
             KeyCode::Char('?') => {
                 self.mode = Mode::Help;
                 return;
@@ -417,7 +424,9 @@ impl App {
     fn on_key_transcript(&mut self, key: KeyEvent) {
         let page = self.transcript_height.max(1) as isize;
         match key.code {
-            KeyCode::Char('q') | KeyCode::Esc | KeyCode::Backspace | KeyCode::Left => {
+            // The footer promises "q quit" in every view; Esc/Backspace/← are the "back" keys.
+            KeyCode::Char('q') => self.should_quit = true,
+            KeyCode::Esc | KeyCode::Backspace | KeyCode::Left => {
                 self.view = View::List;
             }
             KeyCode::Char('r') => {
@@ -455,9 +464,9 @@ impl App {
 
     fn on_key_board(&mut self, key: KeyEvent) {
         match key.code {
-            KeyCode::Char('q') | KeyCode::Esc | KeyCode::Backspace => self.view = View::List,
+            KeyCode::Char('q') => self.should_quit = true,
+            KeyCode::Esc | KeyCode::Backspace | KeyCode::Char('b') => self.view = View::List,
             KeyCode::Char('r') => self.refresh_board(),
-            KeyCode::Char('b') => self.view = View::List,
             _ => {}
         }
     }
@@ -482,6 +491,13 @@ impl App {
 }
 
 // ───────────────────────────── free helpers ─────────────────────────────
+
+/// Is this key plain typed text (no Ctrl/Alt chords)? Used by the filter/search input lines so
+/// e.g. Ctrl-R doesn't insert a literal 'r'. Shift is fine: that's just an uppercase/shifted char.
+fn is_text_input(key: KeyEvent) -> bool {
+    !key.modifiers
+        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
+}
 
 /// Load + parse a session ref into the IR via its harness adapter.
 fn load_session(r: &SessionRef) -> anyhow::Result<Session> {
@@ -910,6 +926,62 @@ mod tests {
         assert_eq!(app.mode, Mode::Normal);
         assert!(app.filter.is_empty());
         assert_eq!(app.filtered.len(), 12, "Esc restores the full list");
+    }
+
+    #[test]
+    fn slash_enters_filter_even_with_shift() {
+        // Some layouts deliver `/` shifted (e.g. Shift+7); the binding must not care.
+        let mut app = app_with_rows(3);
+        app.on_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::SHIFT));
+        assert_eq!(app.mode, Mode::Filter);
+        // Shifted chars are still text while filtering.
+        app.on_key(KeyEvent::new(KeyCode::Char('T'), KeyModifiers::SHIFT));
+        assert_eq!(app.filter, "T");
+    }
+
+    #[test]
+    fn ctrl_c_quits_mid_filter_and_mid_search() {
+        let mut app = app_with_rows(3);
+        app.on_key(key(KeyCode::Char('/')));
+        app.on_key(key(KeyCode::Char('a')));
+        app.on_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert!(app.should_quit, "Ctrl-C must quit even while typing a filter");
+        assert_eq!(app.filter, "a", "…and must not be swallowed as a literal 'c'");
+
+        let mut app = app_with_rows(3);
+        app.on_key(key(KeyCode::Char('s')));
+        assert_eq!(app.mode, Mode::Search);
+        app.on_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert!(app.should_quit, "Ctrl-C must quit even while typing a search");
+        assert!(app.search_input.is_empty());
+    }
+
+    #[test]
+    fn ctrl_and_alt_chords_are_not_text_input() {
+        let mut app = app_with_rows(3);
+        app.on_key(key(KeyCode::Char('/')));
+        app.on_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
+        app.on_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::ALT));
+        assert!(app.filter.is_empty(), "chorded keys must not type into the filter");
+        assert_eq!(app.mode, Mode::Filter);
+    }
+
+    #[test]
+    fn q_quits_from_every_view_as_the_footer_promises() {
+        // Transcript: q quits; Esc/Backspace/← go back.
+        let mut app = app_with_rows(1);
+        app.view = View::Transcript;
+        app.on_key(key(KeyCode::Char('q')));
+        assert!(app.should_quit);
+
+        let mut app = app_with_rows(1);
+        app.view = View::Board;
+        app.on_key(key(KeyCode::Esc)); // back, not quit
+        assert_eq!(app.view, View::List);
+        assert!(!app.should_quit);
+        app.view = View::Board;
+        app.on_key(key(KeyCode::Char('q')));
+        assert!(app.should_quit);
     }
 
     #[test]

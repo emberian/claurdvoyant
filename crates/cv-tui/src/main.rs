@@ -30,8 +30,15 @@ type Tui = Terminal<CrosstermBackend<Stdout>>;
 fn main() -> Result<()> {
     install_panic_hook();
 
+    // Load the session list *before* touching the terminal. Two reasons: the catalog fast path
+    // makes this near-instant, so the first frame is already populated and interactive (no blank
+    // alt-screen window where keypresses like `/` appear dead); and anything cv-core prints to
+    // stderr during a cold load lands on the normal screen instead of garbling raw mode.
+    let mut app = App::new();
+    app.refresh_sessions();
+
     let mut terminal = setup_terminal()?;
-    let res = run(&mut terminal);
+    let res = run(&mut terminal, &mut app);
     // Restore the terminal regardless of how `run` ended.
     restore_terminal(&mut terminal).ok();
 
@@ -44,12 +51,9 @@ fn main() -> Result<()> {
 }
 
 /// The core event loop: redraw, wait for input, dispatch, repeat until the app says to quit.
-fn run(terminal: &mut Tui) -> Result<()> {
-    let mut app = App::new();
-    app.refresh_sessions();
-
+fn run(terminal: &mut Tui, app: &mut App) -> Result<()> {
     while !app.should_quit {
-        terminal.draw(|f| ui::draw(f, &mut app))?;
+        terminal.draw(|f| ui::draw(f, app))?;
 
         // Poll so the loop can wake periodically (lets a future spinner animate and keeps the
         // app responsive to resizes) without busy-spinning the CPU.
@@ -87,7 +91,7 @@ fn restore_terminal(terminal: &mut Tui) -> Result<()> {
 /// Best-effort raw teardown used by the panic hook (we don't have the `Terminal` there).
 fn restore_terminal_raw() {
     let _ = disable_raw_mode();
-    let _ = execute!(io::stdout(), LeaveAlternateScreen);
+    let _ = execute!(io::stdout(), LeaveAlternateScreen, crossterm::cursor::Show);
 }
 
 /// Ensure a panic anywhere in the UI still leaves the terminal usable, then prints the panic.

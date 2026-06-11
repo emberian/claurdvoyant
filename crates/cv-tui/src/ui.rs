@@ -317,6 +317,30 @@ fn draw_board(f: &mut Frame, app: &App, area: Rect) {
 // ───────────────────────────── footer + help ─────────────────────────────
 
 fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
+    // While filtering, make the mode unmistakable: show a FILTER badge, the live match count,
+    // and the keys that apply (the input line itself lives just under the list).
+    if app.mode == Mode::Filter {
+        let line = Line::from(vec![
+            Span::styled(
+                " FILTER ",
+                Style::default()
+                    .bg(Color::Yellow)
+                    .fg(Color::Black)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!(" {}/{} match", app.filtered.len(), app.all_rows.len()),
+                Style::default().fg(Color::Yellow),
+            ),
+            Span::styled(
+                "  ·  type to narrow · ↑↓ move · Enter open · Esc clear & exit",
+                Style::default().fg(Color::Gray),
+            ),
+        ]);
+        f.render_widget(Paragraph::new(line), area);
+        return;
+    }
+
     // While typing search, the footer becomes the input line.
     if app.mode == Mode::Search {
         let line = Line::from(vec![
@@ -355,7 +379,8 @@ fn draw_help_overlay(f: &mut Frame, area: Rect) {
         Line::from("  Global"),
         Line::from("    Tab        cycle list → transcript → board"),
         Line::from("    ?          toggle this help"),
-        Line::from("    q / Esc    back / quit   ·   Ctrl-C quit"),
+        Line::from("    q          quit   ·   Ctrl-C quit (even mid-filter/search)"),
+        Line::from("    Esc        back (in the list: quit)"),
         Line::from("    r          refresh current view"),
         Line::from(""),
         Line::from("  Session list"),
