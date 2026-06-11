@@ -21,6 +21,7 @@ import "./cv-fleet.js";
 import "./cv-opensession.js";
 import { esc, normalizeSession, normalizeSessions, randomId } from "./util.js";
 import { isTauri, listen, invoke, canInvokeNative } from "../tauri.js";
+import { getMessages, PAGE } from "./hydrate.js";
 
 // A running `cvd serve` (always the case inside the desktop app) exposes the machine's real local
 // sessions. The main viewer prefers these over the bundled sample; same base URL the Fleet tab uses.
@@ -132,9 +133,31 @@ class CvApp extends HTMLElement {
     return !!(s && s._stub && !(s.messages && s.messages.length));
   }
 
-  /** Fetch and swap in the full transcript for a stub (native command in the desktop, HTTP in a
-   *  browser). Returns the hydrated session. */
+  /** Fetch and swap in the transcript for a stub. Preferred: the *windowed* endpoint — load
+   *  just the first PAGE messages so a 30k-message session opens instantly; the transcript's
+   *  "load more" pages in the rest (`_loadMoreMessages`). Falls back to the classic whole-session
+   *  fetch when the windowed path isn't available (older cvd). Returns the hydrated session. */
   async _hydrate(stub) {
+    const win = await getMessages(stub, 0, PAGE);
+    if (win) {
+      const meta = win.session || {};
+      const full = normalizeSession({
+        ...stub,
+        // The stream's parsed metadata (when delivered) beats the discovery-time stub's.
+        title: meta.title ?? stub.title,
+        model: meta.model ?? stub.model,
+        cwd: meta.cwd ?? stub.cwd,
+        messages: win.messages,
+      });
+      full._stub = false;
+      if (win.total_known) full.message_count = win.total;
+      if (win.has_more) full._paged = { next: win.end };
+      const i = this._sessions.findIndex((x) => x.id === stub.id && x.harness === stub.harness);
+      if (i >= 0) this._sessions[i] = full;
+      return full;
+    }
+
+    // Whole-session path (older cvd, or anything the windowed endpoint couldn't serve).
     let raw;
     if (canInvokeNative()) {
       raw = JSON.parse(await invoke("local_session", { harness: stub.harness, id: stub.id }));
@@ -149,6 +172,28 @@ class CvApp extends HTMLElement {
     const i = this._sessions.findIndex((x) => x.id === stub.id && x.harness === stub.harness);
     if (i >= 0) this._sessions[i] = full; // cache so we don't refetch
     return full;
+  }
+
+  /** "load more" from the transcript: fetch the next window and append it in place. */
+  async _loadMoreMessages() {
+    const s = this._transcript?.session;
+    if (!s || !s._paged) return;
+    try {
+      const win = await getMessages(s, s._paged.next, s._paged.next + PAGE);
+      if (win && win.messages.length) {
+        // Route the raw window through the session normalizer so blocks/usage match the pool.
+        const norm = normalizeSession({ id: s.id, harness: s.harness, messages: win.messages });
+        s.messages.push(...norm.messages);
+        if (win.total_known) s.message_count = win.total;
+        s._paged = win.has_more ? { next: win.end } : null;
+      } else {
+        s._paged = null; // endpoint gone or nothing left — stop offering more
+      }
+    } catch (e) {
+      console.warn("[claurdvoyant] load-more failed:", e);
+      s._paged = null;
+    }
+    this._transcript.notifyAppended();
   }
 
   /** GET JSON with a hard timeout; returns null on any failure/timeout (never throws, never hangs). */
@@ -326,6 +371,7 @@ class CvApp extends HTMLElement {
         layout.classList.add("show-transcript");
         layout.querySelector(".pane-transcript")?.scrollTo?.(0, 0);
       });
+      this._transcript.addEventListener("load-more", () => this._loadMoreMessages());
       layout.querySelector(".back-btn").addEventListener("click", () => layout.classList.remove("show-transcript"));
     }
     return this._sessionsLayout;

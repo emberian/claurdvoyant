@@ -441,6 +441,30 @@ pre code { background: none; padding: 0; }
 .sub-row-body .turns { padding: 8px 14px 14px; gap: 12px; }
 .sub-loading { padding: 12px 14px; font-size: 12.5px; }
 
+/* ---------- Events panel (what the session DID — edits/commands/errors) ---------- */
+.ev-list { padding: 2px 10px 10px; }
+.ev-row {
+  display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap;
+  padding: 4px 6px; border-radius: 6px; font-size: 12.5px;
+}
+.ev-row:hover { background: var(--bg-sunk); }
+.ev-glyph { flex: none; width: 16px; text-align: center; color: var(--fg-muted); }
+.ev-error .ev-glyph { color: var(--err, #d65a5a); }
+.ev-file_edit .ev-glyph { color: var(--accent); }
+.ev-kind { flex: none; font-size: 11px; color: var(--fg-muted); width: 62px; }
+.ev-tool { flex: none; font-size: 11px; }
+.ev-target { font-family: var(--mono); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 100%; }
+.ev-when { margin-left: auto; flex: none; font-size: 11px; white-space: nowrap; }
+.ev-detail { flex-basis: 100%; padding-left: 24px; font-size: 11.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* ---------- Paged transcript: "load more" footer ---------- */
+.load-more {
+  display: flex; align-items: center; gap: 12px;
+  margin: 4px 20px 18px; padding: 10px 14px;
+  border: 1px dashed var(--border); border-radius: 11px;
+}
+.load-more-note { font-size: 12px; }
+
 /* Thinking (collapsible) */
 .thinking {
   background: var(--thinking-bg);
@@ -725,6 +749,29 @@ cv-session-picker { position: relative; display: inline-flex; min-width: 0; }
 /* ---------- Projects view ---------- */
 /* Responsive grid: compact cards tile when there's width, collapse to one column when narrow.
    align-items:start so an expanded card grows down without stretching its row-mates. */
+/* "Touched" lookup — which sessions touched a file (cvd's event catalog). */
+.touched-box {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  margin: 0 4px 14px;
+}
+.touched-input {
+  flex: 1 1 260px; min-width: 200px;
+  padding: 8px 12px;
+  border: 1px solid var(--border); border-radius: 8px;
+  background: var(--bg-sunk); color: var(--fg); font-size: 13px;
+}
+.touched-input:focus { outline: 2px solid color-mix(in srgb, var(--accent) 50%, transparent); border-color: var(--accent); }
+.touched-edits { display: flex; align-items: center; gap: 5px; font-size: 12px; white-space: nowrap; }
+.touched-results { flex-basis: 100%; display: flex; flex-direction: column; gap: 2px; }
+.touched-row {
+  display: flex; align-items: baseline; gap: 9px;
+  padding: 6px 9px; border-radius: 8px; font-size: 13px;
+}
+.touched-row.in-pool { cursor: pointer; }
+.touched-row.in-pool:hover { background: var(--bg-sunk); }
+.touched-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.touched-meta { margin-left: auto; flex: none; font-size: 11.5px; white-space: nowrap; }
+
 .proj-list {
   display: grid; grid-template-columns: repeat(auto-fill, minmax(360px, 1fr));
   gap: 12px; align-items: start; padding: 0 4px 24px;

@@ -9,7 +9,7 @@
 //! any origin can consume them; `OPTIONS` preflight is answered with a 204.
 
 use anyhow::Result;
-use cv_core::Harness;
+use cv_core::{Flow, Harness, Message, MessageSink, ParseOptions, Session};
 use serde_json::{json, Value};
 use std::sync::Arc;
 use std::time::Duration;
@@ -85,6 +85,12 @@ fn route(segments: &[String], query: &str) -> (u16, Value) {
 
         ["api", "session", harness, id] => session(harness, id),
 
+        ["api", "session", harness, id, "messages"] => messages(harness, id, query),
+
+        ["api", "session", harness, id, "events"] => session_events(harness, id, query),
+
+        ["api", "touched"] => touched(query),
+
         ["api", "session", harness, id, "subagents"] => subagents(harness, id),
 
         ["api", "session", harness, parent, "subagent", agent] => subagent(harness, parent, agent),
@@ -120,7 +126,8 @@ fn sessions(query: &str) -> (u16, Value) {
         None => None,
     };
 
-    let mut refs = cv_core::discover_all();
+    // The fast catalog read (~ms when warm); transparently escalates to a full scan when cold.
+    let mut refs = cv_core::sessions();
     if let Some(h) = harness {
         refs.retain(|r| r.harness == h);
     }
@@ -176,6 +183,215 @@ fn session(harness: &str, id: &str) -> (u16, Value) {
         Ok(None) => err(404, "session not found"),
         Err(e) => err(500, &e.to_string()),
     }
+}
+
+/// Collects the message window `[start, end)` as serialized IR, never holding more than the
+/// window: out-of-window messages pass by as unmaterialized lazy handles, and the stream stops
+/// at `end` (after noting whether a message exists there — the `has_more` probe).
+struct WindowSink {
+    resolver: cv_core::Resolver,
+    /// Index of the next message to arrive (pre-set to `start` on the seek path, 0 on the full).
+    idx: usize,
+    start: usize,
+    /// Exclusive window end; `None` streams to EOF.
+    end: Option<usize>,
+    msgs: Vec<Value>,
+    /// A message at `end` exists (so the window isn't the tail of the session).
+    more: bool,
+    /// Session metadata the stream delivered (codex meta / the seek store's snapshot / the
+    /// parse-bridge), when any did — claude's native stream emits none.
+    meta: Option<Value>,
+    fail: Option<String>,
+}
+
+impl MessageSink for WindowSink {
+    fn meta(&mut self, s: &Session) {
+        if self.meta.is_none() {
+            self.meta = Some(json!({
+                "title": s.title,
+                "model": s.model,
+                "cwd": s.cwd.as_ref().map(|c| c.to_string_lossy()),
+            }));
+        }
+    }
+
+    fn message(&mut self, m: Message) -> Flow {
+        let idx = self.idx;
+        self.idx += 1;
+        if idx < self.start {
+            return Flow::Continue; // before the window: skip without touching content bytes
+        }
+        if self.end.is_some_and(|e| idx >= e) {
+            self.more = true;
+            return Flow::Stop; // at the window's end: note the existence, read no further
+        }
+        let mut m = m;
+        m.materialize(&self.resolver); // resolve lazy spans for just this message
+        match serde_json::to_value(&m) {
+            Ok(v) => {
+                self.msgs.push(v);
+                Flow::Continue
+            }
+            Err(e) => {
+                self.fail = Some(e.to_string());
+                Flow::Stop
+            }
+        }
+    }
+}
+
+/// `GET /api/session/{harness}/{id}/messages?start=&end=` — the window `[start, end)` of the
+/// session's messages as IR JSON, without parsing the rest of a huge transcript when possible.
+///
+/// First tries the seekable-session store ([`cv_core::offsets::stream_range`]: jump straight to
+/// message `start`'s recorded byte offset); with no/stale offsets it falls back to a full stream
+/// that still **stops at `end`** (the `cv show --range` pattern), so the tail is never read.
+/// The reply carries the window's actual indices, `total_known` (+ `total` when the stream
+/// reached EOF so the count is exact), and `has_more`.
+fn messages(harness: &str, id: &str, query: &str) -> (u16, Value) {
+    let h = match Harness::parse(harness) {
+        Some(h) => h,
+        None => return err(400, &format!("unknown harness {harness:?}")),
+    };
+    let params = Query::parse(query);
+    // Window bounds must parse cleanly — a typo'd index is a clear 400, not a silent full read.
+    let idx_param = |key: &str| -> Result<Option<usize>, (u16, Value)> {
+        match params.get(key) {
+            None => Ok(None),
+            Some(v) => v
+                .parse::<usize>()
+                .map(Some)
+                .map_err(|_| err(400, &format!("{key} must be a non-negative integer, got {v:?}"))),
+        }
+    };
+    let start = match idx_param("start") {
+        Ok(v) => v.unwrap_or(0),
+        Err(e) => return e,
+    };
+    let end = match idx_param("end") {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    if end.is_some_and(|e| e < start) {
+        return err(400, "end must be >= start");
+    }
+
+    let (r, adapter) = match cv_core::find(id, Some(h)) {
+        Ok(Some(hit)) => hit,
+        Ok(None) => return err(404, "session not found"),
+        Err(e) => return err(500, &e.to_string()),
+    };
+
+    let opts = ParseOptions::lazy();
+    let mut sink = WindowSink {
+        resolver: cv_core::Resolver::new(Some(r.path.clone())),
+        idx: start,
+        start,
+        end,
+        msgs: Vec::new(),
+        more: false,
+        meta: None,
+        fail: None,
+    };
+    // Ask the stream for one message past the window so `has_more` is known either way.
+    let probe = end.map(|e| e.saturating_add(1));
+    let seeked = if start > 0 {
+        match cv_core::offsets::stream_range(&r, start, probe, &opts, &mut sink) {
+            Ok(seeked) => seeked,
+            Err(e) => return err(500, &format!("range read failed: {e:#}")),
+        }
+    } else {
+        false
+    };
+    if !seeked {
+        sink.idx = 0; // full stream counts from the top (skipping pre-window messages cheaply)
+        if let Err(e) = adapter.stream(&r, &opts, &mut sink) {
+            return err(500, &format!("stream failed: {e:#}"));
+        }
+    }
+    if let Some(f) = sink.fail {
+        return err(500, &f);
+    }
+
+    // The count is exact when the stream ran to EOF. The one blind spot: a seek-read that
+    // delivered nothing can't distinguish "EOF exactly at start" from "start past EOF".
+    let total_known = !sink.more && (!seeked || !sink.msgs.is_empty());
+    ok(json!({
+        "harness": r.harness.as_str(),
+        "id": r.id,
+        "start": start,
+        "end": start + sink.msgs.len(),
+        "has_more": sink.more,
+        "total_known": total_known,
+        "total": total_known.then_some(sink.idx),
+        // Discovery-time count, as a hint while `total` is unknown.
+        "message_count": r.message_count,
+        "session": sink.meta,
+        "messages": sink.msgs,
+    }))
+}
+
+/// `GET /api/session/{harness}/{id}/events?kind=` — the session's extracted tool events
+/// (file edits/reads, commands, errors) from the event catalog, in transcript order. A stale
+/// or missing catalog row is (re)ingested on the spot, exactly like `cv events`.
+fn session_events(harness: &str, id: &str, query: &str) -> (u16, Value) {
+    let h = match Harness::parse(harness) {
+        Some(h) => h,
+        None => return err(400, &format!("unknown harness {harness:?}")),
+    };
+    let kind = Query::parse(query).get("kind");
+    match cv_core::find(id, Some(h)) {
+        Ok(Some((r, _))) => {
+            use cv_core::events;
+            if events::needs_ingest(&r, events::file_mtime_ns(&r.path)) {
+                if let Err(e) = events::ingest_ref(&r) {
+                    return err(500, &format!("event ingest failed: {e:#}"));
+                }
+            }
+            let out: Vec<Value> = events::events_for(r.harness.as_str(), &r.id, kind.as_deref())
+                .iter()
+                .map(|e| {
+                    json!({
+                        "msg_idx": e.msg_idx,
+                        "ts": e.ts,
+                        "kind": e.kind,
+                        "tool": e.tool,
+                        "target": e.target,
+                        "detail": e.detail,
+                    })
+                })
+                .collect();
+            ok(json!(out))
+        }
+        Ok(None) => err(404, "session not found"),
+        Err(e) => err(500, &e.to_string()),
+    }
+}
+
+/// `GET /api/touched?path=&edits_only=` — sessions whose tool events touched a file (exact or
+/// suffix path match), newest activity first. Empty on a cold catalog, like `cv touched`.
+fn touched(query: &str) -> (u16, Value) {
+    let params = Query::parse(query);
+    let Some(path) = params.get("path") else {
+        return err(400, "missing path parameter");
+    };
+    let edits_only = params
+        .get("edits_only")
+        .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
+    let out: Vec<Value> = cv_core::events::sessions_touching(&path, edits_only)
+        .iter()
+        .map(|t| {
+            json!({
+                "harness": t.harness,
+                "session_id": t.session_id,
+                "title": t.title,
+                "edits": t.edits,
+                "reads": t.reads,
+                "last_ts": t.last_ts,
+            })
+        })
+        .collect();
+    ok(json!(out))
 }
 
 /// `GET /api/session/{harness}/{id}/subagents` — lightweight refs for the sub-agents this session

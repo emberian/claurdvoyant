@@ -6,6 +6,7 @@
 // API: projects.sessions = Session[]   (setter)
 //      emits "open" CustomEvent { detail: { session } } when a session is clicked.
 import { esc, sessionLabel, sortTime, shortPath, msgCount, harnessBadge, HARNESS_LABELS } from "./util.js";
+import { getTouched } from "./hydrate.js";
 
 const DAY_MS = 86400000;
 
@@ -82,11 +83,75 @@ class CvProjects extends HTMLElement {
         <h2>◈ Projects</h2>
         <span class="muted">${projects.length} project${projects.length === 1 ? "" : "s"} · ${this._sessions.length} session${this._sessions.length === 1 ? "" : "s"}</span>
       </div>
+      <div class="touched-box">
+        <input class="touched-input" type="search"
+          placeholder="Which sessions touched a file? e.g. src/main.rs"
+          aria-label="Touched-file lookup" value="${esc(this._touchedQuery || "")}" />
+        <label class="touched-edits muted"><input type="checkbox" class="touched-edits-cb" ${this._touchedEdits ? "checked" : ""}/> edits only</label>
+        <button type="button" class="mini-btn touched-go">touched</button>
+        <div class="touched-results"></div>
+      </div>
       <div class="proj-list">${cards}</div>`;
 
     this._wire();
+    this._wireTouched();
     // Re-render any previously-expanded project bodies.
     for (const key of this._expanded) this._populate(key);
+  }
+
+  // ---- "touched" lookup ----------------------------------------------------
+  // Who touched a file, across the whole corpus — cvd's `/api/touched` (or the desktop's
+  // `local_touched`). Degrades to an explanatory note when no capable cvd is reachable.
+  _wireTouched() {
+    const input = this.querySelector(".touched-input");
+    const go = () => {
+      this._touchedQuery = input.value.trim();
+      this._touchedEdits = this.querySelector(".touched-edits-cb")?.checked || false;
+      this._runTouched();
+    };
+    this.querySelector(".touched-go")?.addEventListener("click", go);
+    input?.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); go(); } });
+    this.querySelector(".touched-results")?.addEventListener("click", (e) => {
+      const row = e.target.closest(".touched-row");
+      if (!row) return;
+      const s = this._sessions.find((x) =>
+        (x.id || "") === row.dataset.id && (x.harness || "").toLowerCase() === row.dataset.harness);
+      if (s) this.dispatchEvent(new CustomEvent("open", { detail: { session: s }, bubbles: true }));
+    });
+  }
+
+  async _runTouched() {
+    const out = this.querySelector(".touched-results");
+    if (!out) return;
+    const path = this._touchedQuery;
+    if (!path) { out.innerHTML = ""; return; }
+    out.innerHTML = `<div class="muted">Looking up ${esc(path)}…</div>`;
+    const rows = await getTouched(path, this._touchedEdits);
+    if (out !== this.querySelector(".touched-results")) return; // re-rendered meanwhile
+    if (rows === null) {
+      out.innerHTML = `<div class="muted">Touched lookup needs a local <code>cvd serve</code> (0.9.12+) — none was reachable.</div>`;
+      return;
+    }
+    if (!rows.length) {
+      out.innerHTML = `<div class="muted">No sessions ${this._touchedEdits ? "edited" : "touched"} ${esc(path)} (events are ingested by <code>cv index</code>).</div>`;
+      return;
+    }
+    out.innerHTML = rows.map((t) => {
+      const date = t.last_ts ? new Date(t.last_ts * 1000).toLocaleDateString(undefined, { year: "numeric", month: "short", day: "numeric" }) : "";
+      const counts = [
+        t.edits ? `${t.edits} edit${t.edits === 1 ? "" : "s"}` : "",
+        t.reads ? `${t.reads} read${t.reads === 1 ? "" : "s"}` : "",
+      ].filter(Boolean).join(", ");
+      const inPool = this._sessions.some((x) =>
+        (x.id || "") === t.session_id && (x.harness || "").toLowerCase() === (t.harness || "").toLowerCase());
+      return `
+        <div class="touched-row${inPool ? " in-pool" : ""}" data-id="${esc(t.session_id)}" data-harness="${esc((t.harness || "").toLowerCase())}"
+          ${inPool ? `tabindex="0" role="button" title="Open ${esc(t.title || t.session_id)}"` : ""}>
+          ${harnessBadge(t.harness)}
+          <span class="touched-title">${esc(t.title || t.session_id)}</span>
+          <span class="touched-meta muted">${esc(counts)}${date ? ` · ${esc(date)}` : ""}</span>
+        </div>`;
+    }).join("");
   }
 
   _cardHtml(key, g) {

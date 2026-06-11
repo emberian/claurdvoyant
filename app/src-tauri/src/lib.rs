@@ -158,7 +158,9 @@ fn ingest_zip_bytes(bytes: &[u8]) -> Result<String, String> {
 /// webview's cross-origin fetch to `http://localhost` is unreliable).
 #[tauri::command]
 fn local_sessions(limit: Option<usize>) -> Result<String, String> {
-    let mut refs = cv_core::discover_all();
+    // The fast catalog read (~ms when warm) — transparently escalates to a full scan when cold,
+    // so the result matches what `discover_all` would return.
+    let mut refs = cv_core::sessions();
     // Newest-first by updated_at (then created_at), missing dates sort last.
     refs.sort_by(|a, b| {
         let ka = a.updated_at.or(a.created_at);
@@ -197,6 +199,176 @@ fn local_session(harness: String, id: String) -> Result<String, String> {
         .ok_or_else(|| format!("no session {id:?} for harness {harness}"))?;
     let session = adapter.parse(&r).map_err(|e| format!("parsing session: {e:#}"))?;
     serde_json::to_string(&session).map_err(|e| format!("serializing session: {e}"))
+}
+
+/// Collects the message window `[start, end)` as serialized IR while streaming — out-of-window
+/// messages pass by as unmaterialized lazy handles, and the stream stops at `end` (after noting
+/// whether a message exists there, the `has_more` probe). The native twin of the sink inside
+/// cvd's `/messages` endpoint.
+struct WindowSink {
+    resolver: cv_core::Resolver,
+    idx: usize,
+    start: usize,
+    end: Option<usize>,
+    msgs: Vec<serde_json::Value>,
+    more: bool,
+    meta: Option<serde_json::Value>,
+    fail: Option<String>,
+}
+
+impl cv_core::MessageSink for WindowSink {
+    fn meta(&mut self, s: &Session) {
+        if self.meta.is_none() {
+            self.meta = Some(serde_json::json!({
+                "title": s.title,
+                "model": s.model,
+                "cwd": s.cwd.as_ref().map(|c| c.to_string_lossy()),
+            }));
+        }
+    }
+
+    fn message(&mut self, m: cv_core::Message) -> cv_core::Flow {
+        let idx = self.idx;
+        self.idx += 1;
+        if idx < self.start {
+            return cv_core::Flow::Continue;
+        }
+        if self.end.is_some_and(|e| idx >= e) {
+            self.more = true;
+            return cv_core::Flow::Stop;
+        }
+        let mut m = m;
+        m.materialize(&self.resolver);
+        match serde_json::to_value(&m) {
+            Ok(v) => {
+                self.msgs.push(v);
+                cv_core::Flow::Continue
+            }
+            Err(e) => {
+                self.fail = Some(e.to_string());
+                cv_core::Flow::Stop
+            }
+        }
+    }
+}
+
+/// The message window `[start, end)` of one on-disk session as JSON — the native equivalent of
+/// cvd's `/api/session/{h}/{id}/messages?start&end`, so the web UI's paged transcript works
+/// without HTTP. Tries the seekable-session store first (jump straight to message `start`'s
+/// recorded byte offset); falls back to a full stream that still stops at `end`. The reply
+/// carries the window's indices, `total_known`/`total`, and `has_more`.
+#[tauri::command]
+fn local_messages(
+    harness: String,
+    id: String,
+    start: Option<usize>,
+    end: Option<usize>,
+) -> Result<String, String> {
+    let want = cv_core::Harness::parse(&harness)
+        .ok_or_else(|| format!("unknown harness {harness:?}"))?;
+    let start = start.unwrap_or(0);
+    if end.is_some_and(|e| e < start) {
+        return Err("end must be >= start".into());
+    }
+    let (r, adapter) = cv_core::find(&id, Some(want))
+        .map_err(|e| format!("looking up session: {e:#}"))?
+        .ok_or_else(|| format!("no session {id:?} for harness {harness}"))?;
+
+    let opts = cv_core::ParseOptions::lazy();
+    let mut sink = WindowSink {
+        resolver: cv_core::Resolver::new(Some(r.path.clone())),
+        idx: start,
+        start,
+        end,
+        msgs: Vec::new(),
+        more: false,
+        meta: None,
+        fail: None,
+    };
+    // Ask for one message past the window so `has_more` is known either way.
+    let probe = end.map(|e| e.saturating_add(1));
+    let seeked = if start > 0 {
+        cv_core::offsets::stream_range(&r, start, probe, &opts, &mut sink)
+            .map_err(|e| format!("range read failed: {e:#}"))?
+    } else {
+        false
+    };
+    if !seeked {
+        sink.idx = 0;
+        adapter
+            .stream(&r, &opts, &mut sink)
+            .map_err(|e| format!("streaming session: {e:#}"))?;
+    }
+    if let Some(f) = sink.fail {
+        return Err(f);
+    }
+
+    // Exact only when the stream ran to EOF; an empty seek-read can't tell EOF-at-start from
+    // start-past-EOF (mirrors cvd's endpoint).
+    let total_known = !sink.more && (!seeked || !sink.msgs.is_empty());
+    serde_json::to_string(&serde_json::json!({
+        "harness": r.harness.as_str(),
+        "id": r.id,
+        "start": start,
+        "end": start + sink.msgs.len(),
+        "has_more": sink.more,
+        "total_known": total_known,
+        "total": total_known.then_some(sink.idx),
+        "message_count": r.message_count,
+        "session": sink.meta,
+        "messages": sink.msgs,
+    }))
+    .map_err(|e| format!("serializing window: {e}"))
+}
+
+/// The session's extracted tool events (file edits/reads, commands, errors) in transcript order,
+/// (re)ingesting a stale catalog row on the spot — native equivalent of cvd's `/events`.
+#[tauri::command]
+fn local_events(harness: String, id: String, kind: Option<String>) -> Result<String, String> {
+    use cv_core::events;
+    let want = cv_core::Harness::parse(&harness)
+        .ok_or_else(|| format!("unknown harness {harness:?}"))?;
+    let (r, _) = cv_core::find(&id, Some(want))
+        .map_err(|e| format!("looking up session: {e:#}"))?
+        .ok_or_else(|| format!("no session {id:?} for harness {harness}"))?;
+    if events::needs_ingest(&r, events::file_mtime_ns(&r.path)) {
+        events::ingest_ref(&r).map_err(|e| format!("event ingest failed: {e:#}"))?;
+    }
+    let rows: Vec<serde_json::Value> = events::events_for(r.harness.as_str(), &r.id, kind.as_deref())
+        .iter()
+        .map(|e| {
+            serde_json::json!({
+                "msg_idx": e.msg_idx,
+                "ts": e.ts,
+                "kind": e.kind,
+                "tool": e.tool,
+                "target": e.target,
+                "detail": e.detail,
+            })
+        })
+        .collect();
+    serde_json::to_string(&rows).map_err(|e| format!("serializing events: {e}"))
+}
+
+/// Sessions whose tool events touched a file (exact or suffix path match), newest first —
+/// native equivalent of cvd's `/api/touched?path=&edits_only=`.
+#[tauri::command]
+fn local_touched(path: String, edits_only: Option<bool>) -> Result<String, String> {
+    let rows: Vec<serde_json::Value> =
+        cv_core::events::sessions_touching(&path, edits_only.unwrap_or(false))
+            .iter()
+            .map(|t| {
+                serde_json::json!({
+                    "harness": t.harness,
+                    "session_id": t.session_id,
+                    "title": t.title,
+                    "edits": t.edits,
+                    "reads": t.reads,
+                    "last_ts": t.last_ts,
+                })
+            })
+            .collect();
+    serde_json::to_string(&rows).map_err(|e| format!("serializing touched rows: {e}"))
 }
 
 /// Lightweight refs for the sub-agents a session spawned (Claude Code Task sub-agents), newest
@@ -493,6 +665,9 @@ pub fn run() {
             provider_info,
             local_sessions,
             local_session,
+            local_messages,
+            local_events,
+            local_touched,
             local_subagents,
             local_subagent
         ])

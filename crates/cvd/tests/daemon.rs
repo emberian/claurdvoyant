@@ -76,6 +76,38 @@ impl World {
         c
     }
 
+    /// A third, tool-heavy session (separate from `write_fixtures` so the sync tests' "2
+    /// discovered" counts hold): 6 messages with an Edit, a failing Bash, a clean Bash, and a
+    /// closing text — the raw material for the messages/events/touched endpoint tests.
+    fn write_gamma(&self) {
+        let lines = [
+            json!({"type": "user", "uuid": "g1", "timestamp": "2026-04-01T08:00:00Z",
+                   "cwd": "/work/proj",
+                   "message": {"role": "user", "content": "please refactor the pelican module"}}),
+            json!({"type": "assistant", "uuid": "g2", "timestamp": "2026-04-01T08:01:00Z",
+                   "message": {"role": "assistant", "content": [
+                       {"type": "tool_use", "id": "t1", "name": "Edit",
+                        "input": {"file_path": "src/pelican.rs", "old_string": "a", "new_string": "b"}}]}}),
+            json!({"type": "user", "uuid": "g3", "timestamp": "2026-04-01T08:02:00Z",
+                   "message": {"role": "user", "content": [
+                       {"type": "tool_result", "tool_use_id": "t1",
+                        "content": "error[E0308]: mismatched types", "is_error": true}]}}),
+            json!({"type": "assistant", "uuid": "g4", "timestamp": "2026-04-01T08:03:00Z",
+                   "message": {"role": "assistant", "content": [
+                       {"type": "tool_use", "id": "t2", "name": "Bash",
+                        "input": {"command": "cargo test -p pelican"}}]}}),
+            json!({"type": "user", "uuid": "g5", "timestamp": "2026-04-01T08:04:00Z",
+                   "message": {"role": "user", "content": [
+                       {"type": "tool_result", "tool_use_id": "t2",
+                        "content": "all tests pass", "is_error": false}]}}),
+            json!({"type": "assistant", "uuid": "g6", "timestamp": "2026-04-01T08:05:00Z",
+                   "message": {"role": "assistant", "content": [
+                       {"type": "text", "text": "done refactoring"}]}}),
+        ];
+        let body: String = lines.iter().map(|l| format!("{l}\n")).collect();
+        fs::write(self.session_path("gammasess"), body).unwrap();
+    }
+
     /// Run a cvd subcommand to completion; returns (stdout, stderr), asserting success.
     fn cvd(&self, args: &[&str]) -> (String, String) {
         let out = self.cvd_cmd().args(args).output().expect("cvd should run");
@@ -205,10 +237,9 @@ impl Drop for Reaper {
     }
 }
 
-#[test]
-fn serve_endpoints() {
-    let w = World::new("serve");
-
+/// Spawn `cvd serve` on a free port and wait for the listener. Returns the port and the reaper
+/// keeping the child alive (drop it to kill the server).
+fn spawn_serve(w: &World) -> (u16, Reaper) {
     // A free port: bind 0, note the assignment, release it for cvd (tiny race, fine for tests).
     let port = TcpListener::bind("127.0.0.1:0")
         .unwrap()
@@ -223,7 +254,7 @@ fn serve_endpoints() {
         .stderr(Stdio::null())
         .spawn()
         .expect("cvd serve should spawn");
-    let _reaper = Reaper(child);
+    let reaper = Reaper(child);
 
     // Wait for the listener.
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -234,6 +265,13 @@ fn serve_endpoints() {
         assert!(Instant::now() < deadline, "cvd serve never came up on :{port}");
         std::thread::sleep(Duration::from_millis(50));
     }
+    (port, reaper)
+}
+
+#[test]
+fn serve_endpoints() {
+    let w = World::new("serve");
+    let (port, _reaper) = spawn_serve(&w);
 
     // health
     let (status, v) = get_json(port, "/api/health");
@@ -327,4 +365,103 @@ fn serve_endpoints() {
         raw.to_ascii_lowercase().contains("access-control-allow-origin: *"),
         "CORS header missing:\n{raw}"
     );
+}
+
+/// The Wave-2 endpoints: windowed messages (full-stream fallback that stops at the window's
+/// end), per-session events with on-the-spot ingest, and the touched lookup.
+#[test]
+fn serve_messages_events_touched() {
+    let w = World::new("window");
+    w.write_gamma();
+    let (port, _reaper) = spawn_serve(&w);
+
+    // A middle window [2, 4): exactly 2 messages, indices echoed back, more beyond it, and the
+    // total unknown (the stream stopped at the window's end without reaching EOF).
+    let (status, v) = get_json(port, "/api/session/claude/gammasess/messages?start=2&end=4");
+    assert_eq!(status, 200, "{v}");
+    assert_eq!(v["start"], 2, "{v}");
+    assert_eq!(v["end"], 4, "{v}");
+    let msgs = v["messages"].as_array().expect("messages array");
+    assert_eq!(msgs.len(), 2, "{v}");
+    assert_eq!(v["has_more"], true, "{v}");
+    assert_eq!(v["total_known"], false, "{v}");
+    assert!(v["total"].is_null(), "{v}");
+    // Message 3 (the second of the window) is the Bash tool_use turn.
+    let blocks = msgs[1]["content"].as_array().expect("content blocks");
+    assert!(
+        blocks.iter().any(|b| b["kind"] == "tool_use" && b["name"] == "Bash"),
+        "{v}"
+    );
+
+    // A tail window: the stream reaches EOF, so the total is exact and nothing more remains.
+    let (status, v) = get_json(port, "/api/session/claude/gammasess/messages?start=4");
+    assert_eq!(status, 200, "{v}");
+    assert_eq!(v["messages"].as_array().unwrap().len(), 2, "{v}");
+    assert_eq!((v["start"].as_u64(), v["end"].as_u64()), (Some(4), Some(6)), "{v}");
+    assert_eq!(v["has_more"], false, "{v}");
+    assert_eq!(v["total_known"], true, "{v}");
+    assert_eq!(v["total"], 6, "{v}");
+
+    // No bounds at all: the whole session, total exact.
+    let (status, v) = get_json(port, "/api/session/claude/gammasess/messages");
+    assert_eq!(status, 200);
+    assert_eq!(v["messages"].as_array().unwrap().len(), 6, "{v}");
+    assert_eq!(v["total"], 6, "{v}");
+
+    // A window past EOF is empty, not an error.
+    let (status, v) = get_json(port, "/api/session/claude/gammasess/messages?start=50&end=60");
+    assert_eq!(status, 200);
+    assert_eq!(v["messages"].as_array().unwrap().len(), 0, "{v}");
+    assert_eq!(v["has_more"], false, "{v}");
+
+    // Bad windows / unknowns are clear errors.
+    let (status, v) = get_json(port, "/api/session/claude/gammasess/messages?start=4&end=2");
+    assert_eq!(status, 400);
+    assert!(v["error"].as_str().unwrap().contains("end"), "{v}");
+    let (status, _) = get_json(port, "/api/session/claude/gammasess/messages?start=banana");
+    assert_eq!(status, 400);
+    let (status, _) = get_json(port, "/api/session/claude/zzz-not-here/messages");
+    assert_eq!(status, 404);
+    let (status, _) = get_json(port, "/api/session/warpdrive/gammasess/messages");
+    assert_eq!(status, 400);
+
+    // Events: ingested on the spot, classified rows in transcript order.
+    let (status, v) = get_json(port, "/api/session/claude/gammasess/events");
+    assert_eq!(status, 200);
+    let events = v.as_array().expect("events array");
+    let kind_of = |k: &str| events.iter().filter(|e| e["kind"] == k).count();
+    assert!(kind_of("file_edit") >= 1, "{v}");
+    assert!(kind_of("command") >= 1, "{v}");
+    assert!(kind_of("error") >= 1, "{v}");
+    let edit = events.iter().find(|e| e["kind"] == "file_edit").unwrap();
+    assert_eq!(edit["target"], "/work/proj/src/pelican.rs", "{v}");
+    assert_eq!(edit["tool"], "Edit", "{v}");
+    let errev = events.iter().find(|e| e["kind"] == "error").unwrap();
+    assert!(errev["detail"].as_str().unwrap().contains("E0308"), "{v}");
+
+    // Kind filter narrows; unknown session is a 404.
+    let (status, v) = get_json(port, "/api/session/claude/gammasess/events?kind=command");
+    assert_eq!(status, 200);
+    assert!(v.as_array().unwrap().iter().all(|e| e["kind"] == "command"), "{v}");
+    assert_eq!(v.as_array().unwrap().len(), 1, "{v}");
+    let (status, _) = get_json(port, "/api/session/claude/zzz-not-here/events");
+    assert_eq!(status, 404);
+
+    // Touched: suffix path match finds the session; edits_only keeps it (it has an edit);
+    // an untouched file is an empty array; a missing path param is a 400.
+    let (status, v) = get_json(port, "/api/touched?path=src%2Fpelican.rs");
+    assert_eq!(status, 200);
+    let rows = v.as_array().expect("touched array");
+    assert_eq!(rows.len(), 1, "{v}");
+    assert_eq!(rows[0]["session_id"], "gammasess", "{v}");
+    assert_eq!(rows[0]["edits"], 1, "{v}");
+    let (status, v) = get_json(port, "/api/touched?path=src%2Fpelican.rs&edits_only=true");
+    assert_eq!(status, 200);
+    assert_eq!(v.as_array().unwrap().len(), 1, "{v}");
+    let (status, v) = get_json(port, "/api/touched?path=src%2Fnobody.rs");
+    assert_eq!(status, 200);
+    assert!(v.as_array().unwrap().is_empty(), "{v}");
+    let (status, v) = get_json(port, "/api/touched");
+    assert_eq!(status, 400);
+    assert!(v["error"].as_str().unwrap().contains("path"), "{v}");
 }
