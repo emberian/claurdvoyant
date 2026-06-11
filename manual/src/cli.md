@@ -159,7 +159,7 @@ claude    da9174f4  2026-05-28  the flux inference refactor
           … so the new flux inference path replaces the old type-walker …
 ```
 
-By default `cv` uses the tantivy full-text index if you've built one (real tokenization + BM25, instant). If there's no tantivy index it falls back to an older SQLite FTS index, and if *that's* missing too it does a live scan and gently nudges you to run [`cv index`](#cv-index). When an index exists it's authoritative — no matches means no matches, not "scan harder."
+By default `cv` uses the tantivy full-text index if you've built one (real tokenization + BM25, instant). With no index it does a live scan and gently nudges you to run [`cv index`](#cv-index). When an index exists it's authoritative — no matches means no matches, not "scan harder."
 
 - `--semantic` — rank by *meaning* using stored embeddings instead of keywords. Requires `cv index --semantic` first; it downloads a small embedding model on first use.
 - `--harness <name>` — restrict to one harness.
