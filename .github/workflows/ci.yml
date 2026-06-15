@@ -19,7 +19,7 @@ jobs:
     name: build · test · clippy · fmt
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
@@ -47,12 +47,14 @@ jobs:
     name: wasm build (cv-web)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
       - name: Install wasm-pack
-        uses: jetli/wasm-pack-action@v0.4.0
+        # Official prebuilt-binary installer (Node-free) — replaces jetli/wasm-pack-action, which
+        # ran on the now-deprecated Node 20.
+        run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
       - name: Build cv-web to wasm
         run: wasm-pack build --target web --out-dir /tmp/pkg crates/cv-web -- --no-default-features
