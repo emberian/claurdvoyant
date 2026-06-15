@@ -7,6 +7,7 @@
 //   timeline   — chronological cross-harness feed (<cv-timeline>)
 //   compare    — side-by-side message diff (<cv-compare>)
 //   stats      — dashboard (<cv-stats>)
+//   forest     — session-structure explorer: agent forest, workflow lanes, tools, compaction (<cv-forest>)
 //   loom       — splice/loom composer (<cv-loom>)
 //   fleet      — live cvd serve dashboard (<cv-fleet>)
 //   opensession— the OpenSession standard (<cv-opensession>)
@@ -16,16 +17,18 @@ import "./cv-projects.js";
 import "./cv-timeline.js";
 import "./cv-compare.js";
 import "./cv-stats.js";
+import "./cv-forest.js";
 import "./cv-loom.js";
 import "./cv-fleet.js";
 import "./cv-opensession.js";
 import { esc, normalizeSession, normalizeSessions, randomId } from "./util.js";
 import { isTauri, listen, invoke, canInvokeNative } from "../tauri.js";
-import { getMessages, PAGE } from "./hydrate.js";
+import { getMessages, PAGE, CVD_BASE } from "./hydrate.js";
 
 // A running `cvd serve` (always the case inside the desktop app) exposes the machine's real local
-// sessions. The main viewer prefers these over the bundled sample; same base URL the Fleet tab uses.
-const CVD_BASE = "http://localhost:7777";
+// sessions. The main viewer prefers these over the bundled sample; `CVD_BASE` (from hydrate.js)
+// resolves to the page's own origin when the dashboard is served by `cvd serve --web`, else
+// localhost:7777 — the same base every data fetch uses.
 
 const VIEWS = [
   ["sessions", "Sessions", "🗂"],
@@ -33,6 +36,7 @@ const VIEWS = [
   ["timeline", "Timeline", "📈"],
   ["compare", "Compare", "🔍"],
   ["stats", "Stats", "📊"],
+  ["forest", "Structure", "🌳"],
   ["loom", "Loom", "✨"],
   ["fleet", "Fleet", "📡"],
   ["opensession", "OpenSession", "🧬"],
@@ -342,6 +346,7 @@ class CvApp extends HTMLElement {
       case "timeline": host.innerHTML = `<cv-timeline></cv-timeline>`; break;
       case "compare": host.innerHTML = `<cv-compare></cv-compare>`; break;
       case "stats": host.innerHTML = `<cv-stats></cv-stats>`; break;
+      case "forest": host.innerHTML = `<cv-forest></cv-forest>`; break;
       case "loom": host.innerHTML = `<cv-loom></cv-loom>`; break;
       case "fleet": host.innerHTML = `<cv-fleet></cv-fleet>`; break;
       case "opensession": host.innerHTML = `<cv-opensession></cv-opensession>`; break;
@@ -396,6 +401,7 @@ class CvApp extends HTMLElement {
     const t = this._host?.querySelector("cv-timeline"); if (t) t.sessions = this._sessions;
     const c = this._host?.querySelector("cv-compare"); if (c) c.sessions = this._sessions;
     const st = this._host?.querySelector("cv-stats"); if (st) st.sessions = this._sessions;
+    const fo = this._host?.querySelector("cv-forest"); if (fo) fo.sessions = this._sessions;
     const lo = this._host?.querySelector("cv-loom"); if (lo) lo.sessions = this._sessions;
 
     // Timeline + Projects → open a session in the sessions view.
@@ -496,7 +502,7 @@ class CvApp extends HTMLElement {
       overlay.setAttribute("aria-modal", "true");
       overlay.setAttribute("aria-label", "Keyboard shortcuts");
       const rows = [
-        ["1 – 8", "Switch view (Sessions, Projects, Timeline, …)"],
+        ["1 – 9", "Switch view (Sessions, Projects, …, Structure, Loom, Fleet)"],
         ["/", "Focus session search"],
         ["j / k  ·  ↓ / ↑", "Move selection in the session list"],
         ["Enter", "Open the focused session"],

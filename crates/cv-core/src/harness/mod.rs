@@ -12,6 +12,9 @@ use std::path::{Path, PathBuf};
 pub mod chatgpt_app;
 pub mod claude;
 pub mod claude_app;
+/// Claude Code `Workflow`-tool runs (phase tree + script), a first-class layer over the
+/// `subagents/workflows/` agent tier that [`claude`] walks.
+pub mod claude_workflow;
 pub mod cline;
 pub mod codex;
 pub mod continuedev;

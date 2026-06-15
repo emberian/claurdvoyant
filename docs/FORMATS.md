@@ -15,17 +15,63 @@ decouples them via a unified IR.
 - **cwd encoding (dir name):** leading `-`, then `/` → `-`, and `.` → `-`. **Lossy / not reversible**
   (original `-` and `.` collide). → *Do not decode the dir name; read `cwd` from inside the transcript.*
 - **Per-line `type` values:** `user`, `assistant`, `attachment`, `mode`, `permission-mode`, `ai-title`,
-  `last-prompt`, plus `summary`.
+  `last-prompt`, `queue-operation`, plus `summary` and `system` (subtyped — see below).
 - **Threading:** every `user`/`assistant`/`attachment` line has `uuid` + `parentUuid` (null at root) →
   a linked list / DAG. `last-prompt.leafUuid` points at the tail.
 - **Message line fields:** `message.role`, `message.content` (string for simple user msgs; array of blocks
-  `{type: text|tool_use|thinking}` for assistant; `tool_result` blocks for tool returns). Also `cwd`,
-  `gitBranch`, `version`, `sessionId`, `timestamp` (ISO-8601), `model` (assistant), `usage` (tokens).
+  `{type: text|thinking|redacted_thinking|tool_use|image|document}` for assistant; `tool_result` blocks
+  for tool returns). Also `cwd`, `gitBranch`, `version`, `sessionId`, `timestamp` (ISO-8601), `model`
+  (assistant), `usage` (tokens), `requestId`, `message.{id,stop_reason}`.
 - **Tool results:** carried on a `user` line as `content[].type=="tool_result"` (`tool_use_id`, `content`,
-  `is_error`) plus a richer `toolUseResult` sidecar object.
-- **Subagents:** `<sessionId>/subagents/agent-<id>.jsonl` (+ `.meta.json` with `agentType`,`description`).
+  `is_error`) plus a richer `toolUseResult` sidecar object (`structuredPatch`/`oldTodos`/`newTodos`/
+  `stdout`/`stderr`/file contents…). A user line whose content is *only* tool_results is a Tool turn.
+- **`system` records** (`subtype`): `compact_boundary` (with `compactMetadata`), `local_command` (slash
+  commands — `content` wraps `<command-name>/foo</command-name>` + `<command-args>` for the invocation,
+  or `<local-command-stdout>…</local-command-stdout>` for the output), `away_summary`, `api_error`
+  (`level:error`), `scheduled_task_fire`/`informational` (small `content` notices), `model_refusal_fallback`
+  (`content` + `{originalModel, fallbackModel, apiRefusalCategory, apiRefusalExplanation, trigger,
+  retractedMessageUuids}` — a provider safety refusal that re-routed to another model), `stop_hook_summary`
+  (no `content`; **the record of a Stop-hook firing** — `{hookCount, hookInfos:[{command,…}], hookErrors[],
+  hasOutput, hookAdditionalContext, stopReason, toolUseID}`; cv synthesizes a `⛓ stop hook` line when there
+  was output/error, else drops it), plus bodyless `turn_duration`/`agents_killed`.
+- **Compaction** (`compact_boundary`): `compactMetadata = {trigger: manual|auto, preTokens, durationMs,
+  preservedSegment:{headUuid,anchorUuid,tailUuid}, preservedMessages:{…}}`. The boundary is immediately
+  followed by a `user` message `isCompactSummary:true` whose `parentUuid == boundary.uuid` and whose body
+  is the **generated summary that seeds the next context window** (the lost pre-compaction context). A
+  session compacts repeatedly (the reference transcript: 11×).
+- **Subagents (two tiers):**
+  - *Directly-spawned* (`Agent`/`Task` tool): `<sessionId>/subagents/agent-<agentId>.jsonl` +
+    `agent-<agentId>.meta.json` = `{agentType, description, toolUseId}`. **`toolUseId` links the child
+    back to the exact `Agent`/`Task` tool_use in the parent transcript.** The child's records carry
+    `isSidechain:true` + `agentId`; its *return value* is the last assistant text turn (surfaced in the
+    parent's tool_result).
+  - *Workflow* (`Workflow` tool): TWO sidecar locations per run.
+    - `<sessionId>/subagents/workflows/<wf_runId>/agent-<agentId>.jsonl` (+ meta
+      `{agentType:"workflow-subagent"}`) **plus `journal.jsonl`** = the orchestrator's structured log:
+      `{type:started|result, agentId, key, result}`. **`result` is the agent's real return value**, in one
+      of two shapes: an object `{status, summary, …}` (status vocab is per-workflow:
+      `done`/`partial`/`GREEN`/`proven`/`blocked`/`welded`/…) or a plain string (the whole freeform return).
+    - `<sessionId>/workflows/wf_<runId>.json` = the **run STATE** (first-class): `{workflowName, status
+      (completed|killed), summary, error, defaultModel, agentCount, totalTokens, totalToolCalls, durationMs,
+      scriptPath, script (inline), phases:[{title,detail}], workflowProgress:[…]}`. `workflowProgress`
+      interleaves `{type:workflow_phase, index, title}` headers with `{type:workflow_agent, index, label,
+      phaseIndex, agentId, model, state (done|error|progress|start), tokens, toolCalls, durationMs,
+      promptPreview, resultPreview, error, cached}` — the phase tree with every agent's telemetry+outcome
+      under its phase. The driving script also lives at `<sessionId>/workflows/scripts/<name>-wf_<runId>.js`.
+- **Attribution:** assistant/user turns may carry `attributionAgent` / `attributionMcpServer` /
+  `attributionMcpTool` / `attributionSkill` (MCP tool_use `name`s are `mcp__<server>__<tool>`; skill
+  invocations use the `Skill` tool). `attachment` records carry side-band UI deltas (`deferred_tools_delta`
+  with `addedNames`/`removedNames`, etc.) — non-conversational.
 - **Indexes/sidecars:** `~/.claude/history.jsonl` (`{display,timestamp(ms),project,sessionId}`),
-  `~/.claude/sessions/<pid>.json` (live process state), `~/.claude/tasks/<sessionId>/<n>.json` (todos).
+  `~/.claude/sessions/<pid>.json` (live process state), `~/.claude/tasks/<sessionId>/<n>.json` (todos),
+  `<sessionId>/tool-results/<id>.txt` (deferred large tool-result bodies).
+- **cv surfacing:** `cv tree <id>` appends the sub-agent forest (direct + per-workflow, with journaled
+  outcomes); `cv show <id> --subagents` lists every agent with its return; `cv show <id> --agent <aid>`
+  renders one sub-agent transcript; `cv events <id> --subagents` extracts the whole forest's tool activity,
+  attributed per agent. **`cv workflow <id> [<runId>]`** renders a run's phase tree → agents → outcomes (+
+  `--script`); **`cv tools <id>`** is the cross-agent tool-analytics surface (aggregate / `--agent` /
+  `--tool` / `--workflow` / `--across` / `--timeline`); **`cv compaction <id>`** lists every boundary +
+  summary (`--summaries` for full text); **`cv show <id> --pre-compaction <N>`** reads the lost pre-span.
 
 ## Codex CLI — `~/.codex/`
 

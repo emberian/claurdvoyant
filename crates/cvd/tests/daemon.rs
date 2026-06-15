@@ -108,6 +108,53 @@ impl World {
         fs::write(self.session_path("gammasess"), body).unwrap();
     }
 
+    /// A session with a compaction boundary (a `compact_boundary` system record carrying
+    /// `compactMetadata`), so the `/compactions` endpoint has a boundary to surface.
+    fn write_compacted(&self) {
+        let lines = [
+            json!({"type": "user", "uuid": "c1", "timestamp": "2026-05-01T08:00:00Z",
+                   "message": {"role": "user", "content": "long conversation begins"}}),
+            json!({"type": "assistant", "uuid": "c2", "timestamp": "2026-05-01T08:01:00Z",
+                   "message": {"role": "assistant", "content": [{"type": "text", "text": "working"}]}}),
+            json!({"type": "system", "uuid": "c3", "subtype": "compact_boundary",
+                   "timestamp": "2026-05-01T08:02:00Z", "content": "Conversation compacted",
+                   "compactMetadata": {"trigger": "manual", "preTokens": 900000, "postTokens": 12000,
+                                       "durationMs": 120000, "preCompactDiscoveredTools": ["Bash", "Read"]}}),
+            // The seed of the next window: an `isCompactSummary` message whose parentUuid is the
+            // boundary's uuid — its body is the summary detect() pairs and keeps.
+            json!({"type": "user", "uuid": "c4", "parentUuid": "c3", "isCompactSummary": true,
+                   "timestamp": "2026-05-01T08:03:00Z",
+                   "message": {"role": "user", "content": "Summary: the user asked for X; we did Y."}}),
+            json!({"type": "assistant", "uuid": "c5", "timestamp": "2026-05-01T08:04:00Z",
+                   "message": {"role": "assistant", "content": [{"type": "text", "text": "resumed"}]}}),
+        ];
+        let body: String = lines.iter().map(|l| format!("{l}\n")).collect();
+        fs::write(self.session_path("compactsess"), body).unwrap();
+    }
+
+    /// Plant a workflow driving-script sidecar for `alphasess` so the `/workflow/{wf}/script`
+    /// endpoint has something to serve: `<session>/workflows/scripts/<slug>-<wf>.js`.
+    fn write_workflow_script(&self, wf: &str, body: &str) {
+        let dir = self
+            .home
+            .join(".claude/projects/-work-proj/alphasess/workflows/scripts");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join(format!("my-cool-flow-{wf}.js")), body).unwrap();
+    }
+
+    /// Build a tiny static web root (mirroring the repo's `web/`) so `serve --web` can be tested:
+    /// an `index.html`, a JS asset under a subdir, and a "secret" file *outside* the root that a
+    /// path-traversal attempt must never reach.
+    fn write_web_root(&self) -> PathBuf {
+        let web = self.base.join("web");
+        fs::create_dir_all(web.join("components")).unwrap();
+        fs::write(web.join("index.html"), "<!doctype html><title>cv dash</title>").unwrap();
+        fs::write(web.join("components/cv-forest.js"), "export const FOREST = 1;\n").unwrap();
+        // A file a `../` escape would try to read; it lives beside (not under) the web root.
+        fs::write(self.base.join("secret.txt"), "TOP SECRET").unwrap();
+        web
+    }
+
     /// Run a cvd subcommand to completion; returns (stdout, stderr), asserting success.
     fn cvd(&self, args: &[&str]) -> (String, String) {
         let out = self.cvd_cmd().args(args).output().expect("cvd should run");
@@ -240,6 +287,11 @@ impl Drop for Reaper {
 /// Spawn `cvd serve` on a free port and wait for the listener. Returns the port and the reaper
 /// keeping the child alive (drop it to kill the server).
 fn spawn_serve(w: &World) -> (u16, Reaper) {
+    spawn_serve_with(w, &[])
+}
+
+/// Like [`spawn_serve`] but with extra `serve` args (e.g. `["--web", dir]`).
+fn spawn_serve_with(w: &World, extra: &[&str]) -> (u16, Reaper) {
     // A free port: bind 0, note the assignment, release it for cvd (tiny race, fine for tests).
     let port = TcpListener::bind("127.0.0.1:0")
         .unwrap()
@@ -247,9 +299,11 @@ fn spawn_serve(w: &World) -> (u16, Reaper) {
         .unwrap()
         .port();
 
+    let mut args: Vec<String> = vec!["serve".into(), "--port".into(), port.to_string()];
+    args.extend(extra.iter().map(|s| s.to_string()));
     let child = w
         .cvd_cmd()
-        .args(["serve", "--port", &port.to_string()])
+        .args(&args)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -464,4 +518,143 @@ fn serve_messages_events_touched() {
     let (status, v) = get_json(port, "/api/touched");
     assert_eq!(status, 400);
     assert!(v["error"].as_str().unwrap().contains("path"), "{v}");
+}
+
+/// The workflow driving-script endpoint: matches a run id by filename suffix, 404s for an absent
+/// run, and rejects a path-y run id.
+#[test]
+fn serve_workflow_script() {
+    let w = World::new("wfscript");
+    w.write_workflow_script("wf_abc123", "// drive the swarm\nconst phases = ['plan','build'];\n");
+    let (port, _reaper) = spawn_serve(&w);
+
+    // Found by run-id suffix (filename is `my-cool-flow-wf_abc123.js`).
+    let (status, v) = get_json(port, "/api/session/claude/alphasess/workflow/wf_abc123/script");
+    assert_eq!(status, 200, "{v}");
+    assert_eq!(v["workflow"], "wf_abc123", "{v}");
+    assert_eq!(v["name"], "my-cool-flow-wf_abc123.js", "{v}");
+    assert!(v["source"].as_str().unwrap().contains("drive the swarm"), "{v}");
+
+    // A run with no recorded script → 404.
+    let (status, v) = get_json(port, "/api/session/claude/alphasess/workflow/wf_missing/script");
+    assert_eq!(status, 404, "{v}");
+    assert!(v["error"].is_string(), "{v}");
+
+    // A path-y / traversal run id is a clean 400, never a filesystem read.
+    let (status, v) = http(port, "GET", "/api/session/claude/alphasess/workflow/..%2F..%2Fetc/script");
+    assert_eq!(status, 400, "{v}");
+
+    // Unknown session id is a 404.
+    let (status, _) = get_json(port, "/api/session/claude/zzz-nope/workflow/wf_abc123/script");
+    assert_eq!(status, 404);
+}
+
+/// The `/compactions` scan: every boundary with its metadata, plus `extra=1` on `/messages`
+/// surfacing the boundary's `compactMetadata` in-band.
+#[test]
+fn serve_compactions() {
+    let w = World::new("compact");
+    w.write_compacted();
+    let (port, _reaper) = spawn_serve(&w);
+
+    // The dedicated scan (built on cv_core::compaction::detect) finds the one boundary, pairs it
+    // with its summary, and reports the pre-compaction span — all in `/messages` index order.
+    let (status, v) = get_json(port, "/api/session/claude/compactsess/compactions");
+    assert_eq!(status, 200, "{v}");
+    let arr = v["compactions"].as_array().expect("compactions array");
+    assert_eq!(arr.len(), 1, "{v}");
+    let c = &arr[0];
+    assert_eq!(c["index"], 2, "boundary is the 3rd message (idx 2): {v}");
+    assert_eq!(c["trigger"], "manual", "{v}");
+    assert_eq!(c["pre_tokens"], 900000, "{v}");
+    assert_eq!(c["duration_ms"], 120000, "{v}");
+    // The summary that seeded the next window is paired and kept.
+    assert_eq!(c["summary_index"], 3, "summary is the 4th message: {v}");
+    assert!(c["summary"].as_str().unwrap().contains("the user asked for X"), "{v}");
+    // The pre-compaction span is [0, boundary) — what was compacted away.
+    assert_eq!(c["pre_span"], json!([0, 2]), "{v}");
+    assert!(c["headline"].as_str().unwrap().contains("compaction #1"), "{v}");
+
+    // A session with no compaction → empty list, not an error.
+    let (status, v) = get_json(port, "/api/session/claude/alphasess/compactions");
+    assert_eq!(status, 200, "{v}");
+    assert!(v["compactions"].as_array().unwrap().is_empty(), "{v}");
+    let (status, _) = get_json(port, "/api/session/claude/zzz-nope/compactions");
+    assert_eq!(status, 404);
+
+    // `extra=1` on the windowed read keeps the boundary's subtype + compactMetadata in-band;
+    // without it the lean read omits them.
+    let (status, v) = get_json(port, "/api/session/claude/compactsess/messages?extra=1");
+    assert_eq!(status, 200, "{v}");
+    let m = &v["messages"].as_array().unwrap()[2];
+    assert_eq!(m["extra"]["subtype"], "compact_boundary", "{v}");
+    assert_eq!(m["extra"]["compactMetadata"]["trigger"], "manual", "{v}");
+
+    let (status, v) = get_json(port, "/api/session/claude/compactsess/messages");
+    assert_eq!(status, 200);
+    let m = &v["messages"].as_array().unwrap()[2];
+    // Lean read: no `extra` populated (the map is absent or empty for the boundary).
+    let extra_empty = m["extra"].is_null() || m["extra"].as_object().map(|o| o.is_empty()).unwrap_or(true);
+    assert!(extra_empty, "lean read should omit extra: {m}");
+}
+
+/// `serve --web <dir>` hosts the dashboard from `/` while keeping the JSON API at `/api/*`, with
+/// path-traversal confined to the web root and an SPA `index.html` fallback for unknown paths.
+#[test]
+fn serve_static_web_hub() {
+    let w = World::new("webhub");
+    let web = w.write_web_root();
+    let (port, _reaper) = spawn_serve_with(&w, &["--web", web.to_str().unwrap()]);
+
+    // `/` serves index.html with an HTML content type.
+    let (status, body) = http(port, "GET", "/");
+    assert_eq!(status, 200, "{body}");
+    assert!(body.contains("cv dash"), "index served at /: {body}");
+
+    // A nested asset is served verbatim with a JS content type (check the raw headers).
+    let (status, body) = http(port, "GET", "/components/cv-forest.js");
+    assert_eq!(status, 200);
+    assert!(body.contains("FOREST = 1"), "{body}");
+    let raw = raw_get(port, "/components/cv-forest.js");
+    assert!(
+        raw.to_ascii_lowercase().contains("content-type: text/javascript"),
+        "JS content-type missing:\n{raw}"
+    );
+
+    // The JSON API still works under the same server, and *does* carry CORS.
+    let (status, v) = get_json(port, "/api/health");
+    assert_eq!(status, 200);
+    assert_eq!(v["ok"], true, "{v}");
+    let raw = raw_get(port, "/api/health");
+    assert!(
+        raw.to_ascii_lowercase().contains("access-control-allow-origin: *"),
+        "API CORS missing:\n{raw}"
+    );
+
+    // An unknown (non-asset) path falls back to the SPA index, not a 404.
+    let (status, body) = http(port, "GET", "/forest/some/deep/link");
+    assert_eq!(status, 200, "SPA fallback: {body}");
+    assert!(body.contains("cv dash"), "{body}");
+
+    // Path traversal cannot escape the web root: the sibling secret is unreachable.
+    let (status, body) = http(port, "GET", "/../secret.txt");
+    assert!(status == 403 || status == 200, "status {status}");
+    assert!(!body.contains("TOP SECRET"), "traversal leaked the secret:\n{body}");
+    // Encoded traversal too.
+    let (status, body) = http(port, "GET", "/%2e%2e/secret.txt");
+    assert!(!body.contains("TOP SECRET"), "encoded traversal leaked:\n{body} (status {status})");
+}
+
+/// Raw GET returning the full response text (headers + body) — for content-type / CORS assertions.
+fn raw_get(port: u16, path: &str) -> String {
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    stream.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    write!(
+        stream,
+        "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
+    )
+    .unwrap();
+    let mut s = String::new();
+    stream.read_to_string(&mut s).unwrap();
+    s
 }

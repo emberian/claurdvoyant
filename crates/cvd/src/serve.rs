@@ -1,34 +1,56 @@
 //! `cvd serve` — a tiny local HTTP server exposing the fleet's state as JSON.
 //!
-//! A static browser dashboard (served elsewhere) polls these endpoints live, turning `cvd` into the
-//! fleet's live hub. We deliberately use a lightweight *synchronous* server ([`tiny_http`]) with a
-//! small worker-thread pool rather than an async stack — the workload is a handful of pollers, and
-//! simplicity wins.
+//! A static browser dashboard polls these endpoints live, turning `cvd` into the fleet's live hub.
+//! Point `--web <dir>` at the `web/` frontend and `cvd serve` *also* hosts that dashboard from `/`,
+//! so a single command is a complete, self-contained hub (API at `/api/*`, UI everywhere else). We
+//! deliberately use a lightweight *synchronous* server ([`tiny_http`]) with a small worker-thread
+//! pool rather than an async stack — the workload is a handful of pollers, and simplicity wins.
 //!
-//! All responses are JSON with permissive CORS (`Access-Control-Allow-Origin: *`) so a dashboard on
-//! any origin can consume them; `OPTIONS` preflight is answered with a 204.
+//! All `/api/*` responses are JSON with permissive CORS (`Access-Control-Allow-Origin: *`) so a
+//! dashboard on any origin can consume them; `OPTIONS` preflight is answered with a 204.
 
 use anyhow::Result;
 use cv_core::{Flow, Harness, Message, MessageSink, ParseOptions, Session};
 use serde_json::{json, Value};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use tiny_http::{Header, Method, Request, Response, Server};
 
 /// Run the HTTP server until the process is killed. Never returns under normal operation.
-pub fn run(host: &str, port: u16) -> Result<()> {
+///
+/// When `web_root` is `Some(dir)`, any request that doesn't match an `/api/*` route is served as a
+/// static file from `dir` (with `index.html` for `/`), so the same process hosts both the JSON API
+/// and the browser dashboard.
+pub fn run(host: &str, port: u16, web_root: Option<PathBuf>) -> Result<()> {
     let server = Server::http((host, port))
         .map_err(|e| anyhow::anyhow!("failed to bind {host}:{port}: {e}"))?;
-    eprintln!("cvd serve on http://{host}:{port}");
+    // Canonicalize the web root once so per-request path-traversal checks are cheap and robust.
+    let web_root = web_root.and_then(|d| match d.canonicalize() {
+        Ok(c) => Some(c),
+        Err(e) => {
+            eprintln!("cvd serve: --web {} is unreadable ({e}); serving API only", d.display());
+            None
+        }
+    });
+    match &web_root {
+        Some(dir) => eprintln!(
+            "cvd serve on http://{host}:{port} — dashboard at /, API at /api/* (web root {})",
+            dir.display()
+        ),
+        None => eprintln!("cvd serve on http://{host}:{port} — API at /api/* (no --web; JSON only)"),
+    }
 
     let server = Arc::new(server);
+    let web_root = Arc::new(web_root);
     let mut workers = Vec::new();
     // A handful of workers is plenty for dashboard polling; they share the listener.
     for _ in 0..4 {
         let server = Arc::clone(&server);
+        let web_root = Arc::clone(&web_root);
         workers.push(std::thread::spawn(move || {
             for request in server.incoming_requests() {
-                handle(request);
+                handle(request, &web_root);
             }
         }));
     }
@@ -40,7 +62,7 @@ pub fn run(host: &str, port: u16) -> Result<()> {
 }
 
 /// Handle one request, never panicking: any error becomes a JSON error response.
-fn handle(request: Request) {
+fn handle(request: Request, web_root: &Option<PathBuf>) {
     let method = request.method().clone();
     let raw_url = request.url().to_string();
 
@@ -68,6 +90,15 @@ fn handle(request: Request) {
         return;
     }
 
+    // Anything outside `/api/*` is a static-dashboard request when a web root is configured.
+    let is_api = segments.first().map(|s| s == "api").unwrap_or(false);
+    if !is_api {
+        if let Some(root) = web_root {
+            let _ = request.respond(static_file(root, &segments));
+            return;
+        }
+    }
+
     let (status, body) = route(&segments, query);
     let _ = request.respond(json_response(status, &body));
 }
@@ -89,11 +120,15 @@ fn route(segments: &[String], query: &str) -> (u16, Value) {
 
         ["api", "session", harness, id, "events"] => session_events(harness, id, query),
 
+        ["api", "session", harness, id, "compactions"] => compactions(harness, id),
+
         ["api", "touched"] => touched(query),
 
         ["api", "session", harness, id, "subagents"] => subagents(harness, id),
 
         ["api", "session", harness, parent, "subagent", agent] => subagent(harness, parent, agent),
+
+        ["api", "session", harness, id, "workflow", wf, "script"] => workflow_script(harness, id, wf),
 
         ["api", "board", channel] => board(channel, query),
 
@@ -240,7 +275,7 @@ impl MessageSink for WindowSink {
     }
 }
 
-/// `GET /api/session/{harness}/{id}/messages?start=&end=` — the window `[start, end)` of the
+/// `GET /api/session/{harness}/{id}/messages?start=&end=&extra=` — the window `[start, end)` of the
 /// session's messages as IR JSON, without parsing the rest of a huge transcript when possible.
 ///
 /// First tries the seekable-session store ([`cv_core::offsets::stream_range`]: jump straight to
@@ -248,6 +283,9 @@ impl MessageSink for WindowSink {
 /// that still **stops at `end`** (the `cv show --range` pattern), so the tail is never read.
 /// The reply carries the window's actual indices, `total_known` (+ `total` when the stream
 /// reached EOF so the count is exact), and `has_more`.
+///
+/// `extra=1` additionally keeps each message's harness `extra` map (e.g. `compactMetadata` on a
+/// compaction boundary) — the structure view pages through with this on to find the seams.
 fn messages(harness: &str, id: &str, query: &str) -> (u16, Value) {
     let h = match Harness::parse(harness) {
         Some(h) => h,
@@ -275,6 +313,12 @@ fn messages(harness: &str, id: &str, query: &str) -> (u16, Value) {
     if end.is_some_and(|e| e < start) {
         return err(400, "end must be >= start");
     }
+    // `extra=1` keeps each message's harness-specific `extra` map (subtype, compactMetadata, the
+    // toolUseResult sidecar, …). Off by default — the lean windowed read is for bulk transcript
+    // paging — but a structure view (compaction boundaries live in `extra.compactMetadata`) opts in.
+    let want_extra = params
+        .get("extra")
+        .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
 
     let (r, adapter) = match cv_core::find(id, Some(h)) {
         Ok(Some(hit)) => hit,
@@ -282,7 +326,8 @@ fn messages(harness: &str, id: &str, query: &str) -> (u16, Value) {
         Err(e) => return err(500, &e.to_string()),
     };
 
-    let opts = ParseOptions::lazy();
+    // Lazy spans (so unread giant fields aren't materialized) plus, when asked, the `extra` maps.
+    let opts = ParseOptions { extra: want_extra, ..ParseOptions::lazy() };
     let mut sink = WindowSink {
         resolver: cv_core::Resolver::new(Some(r.path.clone())),
         idx: start,
@@ -368,6 +413,57 @@ fn session_events(harness: &str, id: &str, query: &str) -> (u16, Value) {
     }
 }
 
+/// `GET /api/session/{harness}/{id}/compactions` — every compaction boundary in the session, in
+/// transcript order, each as
+/// `{ index, summary_index, ts, trigger, pre_tokens, duration_ms, summary, pre_span: [start,end] }`.
+///
+/// Built on [`cv_core::compaction::detect`], which streams the whole transcript (complete coverage,
+/// memory-safe even on a multi-GB session) and — crucially — pairs each `compact_boundary` with the
+/// `isCompactSummary` message that seeds the next window, keeping that **summary text** (the
+/// load-bearing artifact: how a continued agent recovers the context it can no longer see). The
+/// `pre_span` is the `[start, boundary)` message range that was compacted away — what to read to
+/// retrieve the pre-compaction context. `index`/`summary_index` are in the same numbering
+/// `/messages` uses.
+fn compactions(harness: &str, id: &str) -> (u16, Value) {
+    let h = match Harness::parse(harness) {
+        Some(h) => h,
+        None => return err(400, &format!("unknown harness {harness:?}")),
+    };
+    let r = match cv_core::find(id, Some(h)) {
+        Ok(Some((r, _))) => r,
+        Ok(None) => return err(404, "session not found"),
+        Err(e) => return err(500, &e.to_string()),
+    };
+    // Keep the summary text — it's the whole point of surfacing compaction (retrieving the
+    // pre-compaction context). `detect` holds only the small per-boundary rows + bounded summaries.
+    let boundaries = match cv_core::compaction::detect(&r, true) {
+        Ok(b) => b,
+        Err(e) => return err(500, &format!("compaction scan failed: {e:#}")),
+    };
+    let out: Vec<Value> = boundaries
+        .iter()
+        .enumerate()
+        .map(|(n, c)| {
+            let span = cv_core::compaction::pre_compaction_span(&boundaries, n);
+            json!({
+                "index": c.boundary_msg_idx,
+                "summary_index": c.summary_msg_idx,
+                "trigger": c.trigger,
+                "pre_tokens": c.pre_tokens,
+                "duration_ms": c.duration_ms,
+                "summary": c.summary,
+                "headline": c.headline(n + 1),
+                "pre_span": span.map(|(s, e)| json!([s, e])),
+            })
+        })
+        .collect();
+    ok(json!({
+        "harness": r.harness.as_str(),
+        "id": r.id,
+        "compactions": out,
+    }))
+}
+
 /// `GET /api/touched?path=&edits_only=` — sessions whose tool events touched a file (exact or
 /// suffix path match), newest activity first. Empty on a cold catalog, like `cv touched`.
 fn touched(query: &str) -> (u16, Value) {
@@ -403,17 +499,27 @@ fn subagents(harness: &str, id: &str) -> (u16, Value) {
     };
     match cv_core::find(id, Some(h)) {
         Ok(Some((r, _))) => {
-            let out: Vec<Value> = cv_core::subagents_of(&r)
+            // The full forest (directly-spawned + Workflow sub-agents), each enriched with its
+            // meta sidecar (agent type / task / spawning tool_use) and the workflow's journaled
+            // outcome — the flat `subagents_of` would miss the entire workflow tier.
+            let out: Vec<Value> = cv_core::subagent_tree_of(&r)
                 .iter()
                 .map(|s| {
                     json!({
-                        "id": s.id,
-                        "harness": s.harness.as_str(),
-                        "cwd": s.cwd.as_ref().map(|c| c.to_string_lossy()),
-                        "title": s.title,
-                        "updated_at": s.updated_at,
-                        "created_at": s.created_at,
-                        "message_count": s.message_count,
+                        "id": s.session.id,
+                        "agent_id": s.agent_id(),
+                        "harness": s.session.harness.as_str(),
+                        "cwd": s.session.cwd.as_ref().map(|c| c.to_string_lossy()),
+                        "title": s.session.title,
+                        "updated_at": s.session.updated_at,
+                        "created_at": s.session.created_at,
+                        "message_count": s.session.message_count,
+                        "agent_type": s.agent_type,
+                        "description": s.description,
+                        "tool_use_id": s.tool_use_id,
+                        "workflow": s.workflow,
+                        "result_status": s.result_status,
+                        "result_summary": s.result_summary,
                     })
                 })
                 .collect();
@@ -433,7 +539,12 @@ fn subagent(harness: &str, parent: &str, agent: &str) -> (u16, Value) {
     };
     match cv_core::find(parent, Some(h)) {
         Ok(Some((r, adapter))) => {
-            match cv_core::subagents_of(&r).into_iter().find(|s| s.id == agent) {
+            // Resolve across the whole forest (incl. Workflow agents) by full id or bare agentId.
+            match cv_core::subagent_tree_of(&r)
+                .into_iter()
+                .find(|s| s.session.id == agent || s.agent_id() == agent)
+                .map(|s| s.session)
+            {
                 Some(sr) => match adapter.parse(&sr) {
                     Ok(session) => match serde_json::to_value(&session) {
                         Ok(v) => ok(v),
@@ -446,6 +557,56 @@ fn subagent(harness: &str, parent: &str, agent: &str) -> (u16, Value) {
         }
         Ok(None) => err(404, "parent session not found"),
         Err(e) => err(500, &e.to_string()),
+    }
+}
+
+/// `GET /api/session/{harness}/{id}/workflow/{wf}/script` — the driving script Claude Code recorded
+/// for a workflow run, as `{ workflow, name, source }`. Scripts live in the session's sidecar tree
+/// at `<session>/workflows/scripts/<slug>-<wf>.js`; we match the run id (`wf_…`) as the filename
+/// suffix (the slug prefix varies per workflow). 404 if there's no script for that run.
+fn workflow_script(harness: &str, id: &str, wf: &str) -> (u16, Value) {
+    let h = match Harness::parse(harness) {
+        Some(h) => h,
+        None => return err(400, &format!("unknown harness {harness:?}")),
+    };
+    // Reject a path-y run id up front — it's only ever a `wf_…` token, never a path component.
+    if wf.contains('/') || wf.contains("..") || wf.is_empty() {
+        return err(400, "invalid workflow id");
+    }
+    let r = match cv_core::find(id, Some(h)) {
+        Ok(Some((r, _))) => r,
+        Ok(None) => return err(404, "session not found"),
+        Err(e) => return err(500, &e.to_string()),
+    };
+    // `<dir>/<stem>/workflows/scripts/` next to the transcript file.
+    let Some(stem) = r.path.file_stem().and_then(|s| s.to_str()) else {
+        return err(404, "session has no sidecar tree");
+    };
+    let scripts_dir = match r.path.parent() {
+        Some(d) => d.join(stem).join("workflows").join("scripts"),
+        None => return err(404, "session has no sidecar tree"),
+    };
+    // The filename is `<some-slug>-<wf>.js`; match by the run-id suffix.
+    let found = std::fs::read_dir(&scripts_dir).ok().and_then(|rd| {
+        rd.flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("js"))
+            .find(|p| {
+                p.file_stem()
+                    .and_then(|s| s.to_str())
+                    .is_some_and(|s| s == wf || s.ends_with(&format!("-{wf}")))
+            })
+    });
+    let Some(path) = found else {
+        return err(404, "no script recorded for that workflow run");
+    };
+    match std::fs::read_to_string(&path) {
+        Ok(source) => ok(json!({
+            "workflow": wf,
+            "name": path.file_name().and_then(|n| n.to_str()),
+            "source": source,
+        })),
+        Err(e) => err(500, &format!("could not read script: {e}")),
     }
 }
 
@@ -526,6 +687,73 @@ impl Query {
 
 fn ok(value: Value) -> (u16, Value) {
     (200, value)
+}
+
+/// Serve a static file from the configured web root for a non-`/api` request.
+///
+/// `segments` is the already-decoded path (so `["web", "components", "cv-forest.js"]`). An empty
+/// path maps to `index.html`. The resolved path is canonicalized and must stay inside the (already
+/// canonical) root — any traversal (`..`, symlink escape, absolute injection) yields a 403. A
+/// missing file falls back to `index.html` (so client-side deep links work), and only a missing
+/// index is a 404. The `Content-Type` is inferred from the extension; static assets are not
+/// CORS-tagged (same-origin) — only the JSON API is.
+fn static_file(root: &Path, segments: &[String]) -> Response<std::io::Cursor<Vec<u8>>> {
+    let index = root.join("index.html");
+    let resolved = if segments.is_empty() {
+        index.clone()
+    } else {
+        // Reject obviously hostile components before touching the filesystem.
+        if segments.iter().any(|s| s == ".." || s.contains('\0')) {
+            return text_response(403, "text/plain; charset=utf-8", b"forbidden".to_vec());
+        }
+        let mut p = root.to_path_buf();
+        for s in segments {
+            p.push(s);
+        }
+        p
+    };
+
+    // Canonicalize and confine to the root (defeats symlink escapes too). On a miss, serve the SPA
+    // index so deep links resolve client-side.
+    let serve_path = match resolved.canonicalize() {
+        Ok(c) if c.starts_with(root) && c.is_file() => c,
+        _ => match index.canonicalize() {
+            Ok(c) if c.starts_with(root) && c.is_file() => c,
+            _ => return text_response(404, "text/plain; charset=utf-8", b"not found".to_vec()),
+        },
+    };
+
+    match std::fs::read(&serve_path) {
+        Ok(bytes) => text_response(200, content_type_for(&serve_path), bytes),
+        Err(_) => text_response(404, "text/plain; charset=utf-8", b"not found".to_vec()),
+    }
+}
+
+/// Guess a `Content-Type` from a file extension — enough for the dashboard's asset set.
+fn content_type_for(path: &Path) -> &'static str {
+    match path.extension().and_then(|e| e.to_str()).map(str::to_ascii_lowercase).as_deref() {
+        Some("html") => "text/html; charset=utf-8",
+        Some("js") | Some("mjs") => "text/javascript; charset=utf-8",
+        Some("css") => "text/css; charset=utf-8",
+        Some("json") => "application/json; charset=utf-8",
+        Some("wasm") => "application/wasm",
+        Some("svg") => "image/svg+xml",
+        Some("png") => "image/png",
+        Some("jpg") | Some("jpeg") => "image/jpeg",
+        Some("gif") => "image/gif",
+        Some("ico") => "image/x-icon",
+        Some("woff2") => "font/woff2",
+        Some("woff") => "font/woff",
+        Some("map") => "application/json; charset=utf-8",
+        _ => "application/octet-stream",
+    }
+}
+
+/// A raw-bytes response with a `Content-Type` and no CORS headers (static assets are same-origin).
+fn text_response(status: u16, content_type: &str, body: Vec<u8>) -> Response<std::io::Cursor<Vec<u8>>> {
+    let mut resp = Response::from_data(body).with_status_code(status);
+    resp.add_header(header("Content-Type", content_type));
+    resp
 }
 
 fn err(status: u16, msg: &str) -> (u16, Value) {

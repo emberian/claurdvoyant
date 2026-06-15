@@ -8,6 +8,7 @@
 
 pub mod board;
 pub mod catalog;
+pub mod compaction;
 pub mod dataset;
 pub mod discover_cache;
 pub mod emit;
@@ -24,6 +25,7 @@ pub mod query;
 pub mod redact;
 pub mod render;
 pub mod stream;
+pub mod tools;
 pub mod watch;
 
 pub use emit::{EmitOptions, emit};
@@ -193,10 +195,49 @@ where
 
 /// The sub-agent sessions a given session spawned (lazily; not part of the main pool — there can be
 /// thousands). Currently Claude Code's Task sub-agents; other harnesses return empty for now.
+///
+/// This is the *flat* view (top-level `subagents/*.jsonl` only). For the full forest — including
+/// `Workflow` sub-agents and the meta/journal sidecars that carry each agent's purpose and outcome —
+/// use [`subagent_tree_of`].
 pub fn subagents_of(r: &SessionRef) -> Vec<SessionRef> {
     match r.harness {
         Harness::Claude => harness::claude::subagent_refs(&r.path),
         _ => Vec::new(),
+    }
+}
+
+pub use harness::claude::SubagentInfo;
+
+/// The full sub-agent **forest** a session spawned: directly-spawned (`Agent`/`Task`) sub-agents
+/// *and* `Workflow` sub-agents (which live a tier deeper), each enriched with its `*.meta.json`
+/// sidecar (agent type / task description / spawning tool_use) and, for workflow agents, the
+/// orchestrator's journaled result (`status` + `summary`). Newest first. Non-Claude harnesses
+/// return empty for now.
+pub fn subagent_tree_of(r: &SessionRef) -> Vec<SubagentInfo> {
+    match r.harness {
+        Harness::Claude => harness::claude::subagent_tree(&r.path),
+        _ => Vec::new(),
+    }
+}
+
+pub use harness::claude_workflow::{Workflow, WorkflowAgent, WorkflowPhase};
+
+/// Every `Workflow`-tool run a session launched, as first-class [`Workflow`] objects (phase tree →
+/// agents → outcomes + the driving script), newest first. Read from the session's
+/// `workflows/wf_*.json` state files. Non-Claude harnesses return empty.
+pub fn workflows_of(r: &SessionRef) -> Vec<Workflow> {
+    match r.harness {
+        Harness::Claude => harness::claude_workflow::workflows(&r.path),
+        _ => Vec::new(),
+    }
+}
+
+/// One workflow run of a session by its `runId` (with or without the `wf_` prefix, or a unique
+/// prefix). `None` if the session has no such run.
+pub fn workflow_of(r: &SessionRef, run_id: &str) -> Option<Workflow> {
+    match r.harness {
+        Harness::Claude => harness::claude_workflow::workflow(&r.path, run_id),
+        _ => None,
     }
 }
 

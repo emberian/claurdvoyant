@@ -57,6 +57,10 @@ A tab bar (`<cv-app>`) switches between views, all reading from the merged pool:
 - **📊 Stats** (`<cv-stats>`) — totals, per-harness / per-role / per-block-kind
   bars, top working directories, token sums, date range, and an activity
   histogram. Hand-rolled CSS bars + inline SVG — no chart library.
+- **🌳 Structure** (`<cv-forest>`) — the session-structure explorer for one root
+  session: the sub-agent **forest** (direct + workflow agents), **workflow phase
+  lanes**, **tool** histograms + a phase×tool **heatmap**, and the **compaction**
+  seams (with the carried-forward summaries). See **Structure explorer** below.
 - **✨ Loom** (`<cv-loom>`) — the headline. A three-pane composer: pick a source
   session, click **＋ loom** on any message to collect it, then reorder (▲ ▼ or
   drag), remove (✕), or **fork from here** (⑂). A live preview renders the
@@ -105,6 +109,44 @@ re-parents its children so the tree stays connected.
 
 Implementation: `components/cv-loom.js` plus the dependency-free helper
 `openrouter.js` (credential storage, IR→chat conversion, streaming request).
+
+## 🌳 Structure explorer
+
+`<cv-forest>` turns one session inside-out. A claude-code session isn't a flat
+transcript — it fans out into a **forest** of sub-agents, its tool use has shape,
+and its history is punctuated by compaction seams. The view has a **root picker**
+and a strip of sub-views:
+
+- **◉ Overview** — stat tiles (messages, agents `direct/in-workflows`, workflows,
+  tool kinds, compactions, tokens), the session header, and a **timeline strip**:
+  message-density bars (tool turns tinted separately) with every compaction
+  marked as an amber ✂ cut, placed along the *full* session length (the sampled
+  region is shaded when the transcript is larger than the loaded window).
+- **🌳 Forest** — the agent tree: the root → **directly-spawned** (`Agent`/`Task`)
+  sub-agents, each with its agent-type chip and journaled-outcome badge → then
+  **workflows** as collapsible groups (the header carries a status-pip strip — the
+  whole run's health at a glance). Click any agent to expand its **full transcript
+  inline** (a nested `<cv-transcript>`).
+- **🧬 Workflows** — each run as a **phase-lane** card grid: agents are columns by
+  outcome (done / partial / open / blocked / no-status), colored, showing the
+  journaled result summary. **⌗ view driving script** opens the orchestrating
+  `.js` the harness recorded for that run.
+- **🔧 Tools** — a **histogram** of tool calls by name across the session, plus a
+  **phase × tool heatmap** (amethyst cells, opacity = intensity) showing *when*
+  each tool was reached for.
+- **✂ Compaction** — every boundary with its `trigger`, the context size rebuilt,
+  duration, the compacted-away message span, and — collapsibly — the **summary
+  that carried the context forward** (the load-bearing artifact for retrieving
+  pre-compaction context). In-window boundaries get **↥ before / ↧ after** span
+  previews.
+
+The outcome vocabulary across workflows is wild (`done`, `GREEN`, `welded`,
+`partial`, `YELLOW`, `blocked`, plain strings, nothing) — it's folded onto five
+semantic buckets (good · warn · bad · open · neutral) so the whole forest reads at
+a glance. Data comes from cvd's `/subagents`, `/messages`, `/compactions`, and
+`/workflow/<wf>/script` endpoints (or the desktop's native commands); the heavy
+work (the full-transcript compaction scan) is server-side, so even a
+12k-message / 940-agent session stays responsive.
 
 ## 📡 Fleet dashboard
 
@@ -244,8 +286,23 @@ python3 -m http.server --directory web 8080
 ```
 
 It starts in demo mode (sample dataset, which includes an OpenSession-format
-session to exercise the normalizer) unless you've built the WASM module into
-`./pkg/`. To build the WASM:
+session to exercise the normalizer) unless a local **`cvd serve`** is reachable
+on `http://localhost:7777` (then the viewer loads your real on-disk sessions).
+
+**One-command hub.** `cvd serve --web` hosts *both* the dashboard and the JSON API
+from a single origin — your real sessions, the live **Fleet** view, and the
+**Structure** explorer with zero extra setup:
+
+```sh
+cvd serve --web ./web        # UI at http://localhost:7777/ , API at /api/*
+```
+
+Served this way, the frontend talks to the API at its own origin automatically
+(so any `--port` works); a static deploy / `file://` / the desktop app fall back
+to `http://localhost:7777`, overridable via `window.__CVD_BASE__`.
+
+To build the WASM (only needed for client-side `.zip` ingest in demo/static
+mode):
 
 ```sh
 wasm-pack build crates/cv-web --target web --out-dir ../../web/pkg --no-default-features

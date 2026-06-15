@@ -54,6 +54,10 @@ enum Command {
         /// Host/interface to bind.
         #[arg(long, default_value = "127.0.0.1")]
         host: String,
+        /// Also host the browser dashboard from this directory (the repo's `web/`), so a single
+        /// `cvd serve --web ./web` is a complete hub: UI at `/`, JSON API at `/api/*`.
+        #[arg(long, value_name = "DIR")]
+        web: Option<PathBuf>,
     },
     /// List what's in the archive.
     Ls,
@@ -72,7 +76,7 @@ fn main() -> Result<()> {
             harness,
             cwd,
         } => cmd_watch(&archive, interval, harness, cwd),
-        Command::Serve { port, host } => serve::run(&host, port),
+        Command::Serve { port, host, web } => serve::run(&host, port, web),
         Command::Ls => cmd_ls(&archive),
         Command::Path => {
             println!("{}", archive.home().display());

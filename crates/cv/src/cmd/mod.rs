@@ -10,3 +10,4 @@ pub(crate) mod query;
 pub(crate) mod search;
 pub(crate) mod share;
 pub(crate) mod view;
+pub(crate) mod workflow;

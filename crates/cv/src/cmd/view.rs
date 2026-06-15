@@ -7,10 +7,52 @@ use cv_core::ir::{truncate, Block, Harness, Message, Role, Session, SessionRef};
 use cv_core::Adapter;
 use std::path::PathBuf;
 
-pub(crate) fn cmd_show(id: &str, harness: Option<String>, json: bool, range: Option<String>) -> Result<()> {
+pub(crate) fn cmd_show(
+    id: &str,
+    harness: Option<String>,
+    json: bool,
+    range: Option<String>,
+    subagents: bool,
+    agent: Option<String>,
+    pre_compaction: Option<usize>,
+) -> Result<()> {
     let want = parse_harness(&harness)?;
     let (r, adapter) = cv_core::find(id, want)?.with_context(|| format!("no session matching {id:?}"))?;
-    let range = range.as_deref().map(parse_msg_range).transpose()?;
+    let mut range = range.as_deref().map(parse_msg_range).transpose()?;
+
+    // `--pre-compaction <N>`: resolve the Nth (1-based) compaction's pre-span into a window. This
+    // reads the context the continued agent lost — the whole point is to retrieve it by message
+    // range without the user computing offsets by hand.
+    if let Some(n) = pre_compaction {
+        let comps = cv_core::compaction::detect(&r, false)?;
+        if comps.is_empty() {
+            anyhow::bail!("{} never compacted — nothing pre-compaction to show", short_id(&r.id));
+        }
+        let idx = n.saturating_sub(1);
+        let (start, end) = cv_core::compaction::pre_compaction_span(&comps, idx).with_context(|| {
+            format!(
+                "{} compacted {} time(s); no compaction #{n} (use 1..={})",
+                short_id(&r.id),
+                comps.len(),
+                comps.len(),
+            )
+        })?;
+        eprintln!(
+            "✦ pre-compaction #{n} of {}: messages {start}-{end} (the span before boundary @msg {})",
+            comps.len(),
+            comps[idx].boundary_msg_idx,
+        );
+        range = Some((start, Some(end)));
+    }
+
+    // `--agent <id>`: render one specific sub-agent's transcript (resolved through this parent,
+    // since sub-agents aren't in the main pool). `--subagents`: list the whole forest with results.
+    if let Some(agent_id) = &agent {
+        return show_one_subagent(&r, adapter.as_ref(), agent_id, json, range);
+    }
+    if subagents {
+        return show_subagents(&r, json);
+    }
 
     // JSON wants the whole IR (incl. `extra`), so it materializes; the rendered transcript streams.
     if json {
@@ -26,6 +68,137 @@ pub(crate) fn cmd_show(id: &str, harness: Option<String>, json: bool, range: Opt
 
     let mut out = std::io::BufWriter::new(std::io::stdout().lock());
     stream_session_render(adapter.as_ref(), &r, &mut out, show_header, show_message, range)?;
+    use std::io::Write;
+    out.flush()?;
+    Ok(())
+}
+
+/// List the sub-agent forest a session spawned (the `--subagents` view): every direct/`Workflow`
+/// sub-agent with its type, journaled outcome, and final return value. `json` emits the structured
+/// [`SubagentInfo`] forest (each annotated with its return) for machine consumption.
+fn show_subagents(r: &SessionRef, json: bool) -> Result<()> {
+    let subs = cv_core::subagent_tree_of(r);
+
+    if json {
+        // Enrich each with its final return value (direct agents report via the parent tool_result;
+        // workflow agents via the journal summary already on the struct).
+        let enriched: Vec<serde_json::Value> = subs
+            .iter()
+            .map(|s| {
+                let mut v = serde_json::to_value(s).unwrap_or(serde_json::Value::Null);
+                if let Some(obj) = v.as_object_mut() {
+                    // Surface the bare agentId (the journal/transcript key) so consumers don't have
+                    // to know the `agent-` stripping convention.
+                    obj.insert("agent_id".into(), serde_json::Value::String(s.agent_id().to_string()));
+                    // Direct agents have no journaled summary — attach their final return value.
+                    if s.result_summary.is_none() {
+                        if let Some(ret) = cv_core::harness::claude::subagent_return(&s.session.path) {
+                            obj.insert("return".into(), serde_json::Value::String(ret));
+                        }
+                    }
+                }
+                v
+            })
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&enriched)?);
+        return Ok(());
+    }
+
+    if subs.is_empty() {
+        println!("no sub-agents spawned by {}", short_id(&r.id));
+        return Ok(());
+    }
+
+    println!("# sub-agents of {}\n", short_id(&r.id));
+    for s in &subs {
+        let wf = s.workflow.as_deref().map(|w| format!("  ⟐{w}")).unwrap_or_default();
+        let status = s.result_status.as_deref().map(|st| format!(" [{st}]")).unwrap_or_default();
+        println!(
+            "── {}  {}{}{} · {} msg ──",
+            short_id(s.agent_id()),
+            s.agent_type.as_deref().unwrap_or("agent"),
+            status,
+            wf,
+            s.session.message_count,
+        );
+        if let Some(d) = &s.description {
+            println!("  task: {}", truncate(d, 200));
+        }
+        // The real return value: the journaled summary (workflow) or the agent's last text turn.
+        let ret = s
+            .result_summary
+            .clone()
+            .or_else(|| cv_core::harness::claude::subagent_return(&s.session.path));
+        if let Some(ret) = ret {
+            println!("  ↩ {}", truncate(&ret, 400));
+        }
+        println!();
+    }
+    Ok(())
+}
+
+/// Render one specific sub-agent's transcript (`--agent <id>`), resolved by id-prefix relative to
+/// its parent session. Honors `--json` and `--range` exactly as a top-level `cv show` would.
+fn show_one_subagent(
+    parent: &SessionRef,
+    adapter: &dyn Adapter,
+    agent_id: &str,
+    json: bool,
+    range: Option<(usize, Option<usize>)>,
+) -> Result<()> {
+    let subs = cv_core::subagent_tree_of(parent);
+    // Match on the full session id (`agent-…`), the bare agentId, or a prefix of either.
+    let matches: Vec<&cv_core::SubagentInfo> = subs
+        .iter()
+        .filter(|s| {
+            s.session.id == agent_id
+                || s.agent_id() == agent_id
+                || s.session.id.starts_with(agent_id)
+                || s.agent_id().starts_with(agent_id)
+        })
+        .collect();
+    let sub = match matches.as_slice() {
+        [one] => *one,
+        [] => bail!(
+            "no sub-agent matching {agent_id:?} under {} ({} sub-agent(s); try `cv show {} --subagents`)",
+            short_id(&parent.id),
+            subs.len(),
+            short_id(&parent.id),
+        ),
+        many => bail!(
+            "{} sub-agents match {agent_id:?} — disambiguate with a longer id ({})",
+            many.len(),
+            many.iter().map(|s| short_id(s.agent_id())).collect::<Vec<_>>().join(", "),
+        ),
+    };
+
+    if json {
+        let mut session = adapter.parse(&sub.session)?;
+        if let Some((start, end)) = range {
+            let end = end.unwrap_or(session.messages.len()).min(session.messages.len());
+            let start = start.min(end);
+            session.messages = session.messages.drain(start..end).collect();
+        }
+        println!("{}", serde_json::to_string_pretty(&session)?);
+        return Ok(());
+    }
+
+    // A small provenance banner so the reader knows which agent (and outcome) this is.
+    if let Some(d) = &sub.description {
+        println!("# sub-agent: {}", truncate(d, 120));
+    }
+    let wf = sub.workflow.as_deref().map(|w| format!(" · workflow {w}")).unwrap_or_default();
+    let status = sub.result_status.as_deref().map(|st| format!(" · {st}")).unwrap_or_default();
+    println!(
+        "{} · {}{}{}\n",
+        sub.agent_type.as_deref().unwrap_or("agent"),
+        sub.agent_id(),
+        status,
+        wf,
+    );
+
+    let mut out = std::io::BufWriter::new(std::io::stdout().lock());
+    stream_session_render(adapter, &sub.session, &mut out, show_header, show_message, range)?;
     use std::io::Write;
     out.flush()?;
     Ok(())
@@ -110,7 +283,71 @@ pub(crate) fn cmd_tree(id: &str, harness: Option<String>) -> Result<()> {
             println!("{:>4}. {}", i + 1, tree_line(m));
         }
     }
+
+    // The second dimension: the sub-agent forest this session spawned. Claude sessions fan out
+    // into directly-spawned (`Agent`/`Task`) sub-agents and `Workflow` sub-agents (grouped by run
+    // id, with the orchestrator's journaled outcome) — invisible to flat message threading.
+    render_subagent_forest(&r);
     Ok(())
+}
+
+/// Print the sub-agent forest under a session: directly-spawned sub-agents, then each workflow's
+/// agents grouped together with the journaled `status: summary` outcome. Reads only the cheap
+/// metadata/journal sidecars (no transcript bodies).
+fn render_subagent_forest(r: &SessionRef) {
+    use std::collections::BTreeMap;
+    let subs = cv_core::subagent_tree_of(r);
+    if subs.is_empty() {
+        return;
+    }
+
+    let direct: Vec<&cv_core::SubagentInfo> = subs.iter().filter(|s| s.workflow.is_none()).collect();
+    // Workflow agents grouped by run id (BTreeMap → stable run order).
+    let mut by_wf: BTreeMap<&str, Vec<&cv_core::SubagentInfo>> = BTreeMap::new();
+    for s in subs.iter().filter(|s| s.workflow.is_some()) {
+        by_wf.entry(s.workflow.as_deref().unwrap_or("")).or_default().push(s);
+    }
+
+    println!();
+    println!(
+        "## sub-agents ({} direct, {} workflow agent(s) across {} workflow(s))",
+        direct.len(),
+        subs.len() - direct.len(),
+        by_wf.len()
+    );
+
+    if !direct.is_empty() {
+        println!();
+        for s in &direct {
+            println!("• {}", subagent_line(s));
+        }
+    }
+    for (wf, agents) in &by_wf {
+        println!("\n  ⟐ workflow {wf}  ({} agent(s))", agents.len());
+        for s in agents {
+            println!("    • {}", subagent_line(s));
+        }
+    }
+}
+
+/// One line describing a sub-agent for the forest view: its short id, type, the journaled status
+/// (workflow agents), and the human task description — capped.
+fn subagent_line(s: &cv_core::SubagentInfo) -> String {
+    let id = short_id(s.agent_id());
+    let kind = s.agent_type.as_deref().unwrap_or("agent");
+    let status = s
+        .result_status
+        .as_deref()
+        .map(|st| format!(" [{st}]"))
+        .unwrap_or_default();
+    // Prefer the journaled summary (the real outcome); fall back to the task description.
+    let blurb = s
+        .result_summary
+        .as_deref()
+        .or(s.description.as_deref())
+        .map(|t| truncate(t, 88))
+        .unwrap_or_default();
+    format!("{id}  {kind}{status}  {} msg  {blurb}", s.session.message_count)
 }
 
 /// Render messages as an indented DAG by `parent_id`. Roots (no/unknown parent) sit at depth 0.

@@ -79,6 +79,7 @@ cv scry
 - **🧠 Distill** — `cv distill <id>` turns a session into a durable `MEMORY.md` digest (decisions, gotchas, where things live). Your archive *compounds* instead of rotting.
 - **🔮 Recall** — semantic "have I solved this before?" — as a `cv recall` command *and* an MCP tool that hands a running agent the relevant past span.
 - **🧬 Provenance** — search answers what was *said*; the **event catalog** answers what was *done*. Every tool call across every session is classified and queryable: `cv touched <file>` lists every session that ever edited a file, and **`cv blame <file>`** ties a file's git history back to the agent conversation that wrote it — "why does this code exist?", answered by the actual reasoning that produced it (with a `cv show --range` jump to the moment of the edit).
+- **🌳 Anatomy of a run** — a deep agent session isn't a flat transcript, it's a *forest*. **`cv workflow <id>`** renders a `Workflow`-tool run as its real shape — the phase tree, the agents under each phase, their journaled outcomes/tokens/tool-calls, and the driving script. **`cv tools <id>`** is cross-agent tool analytics over the whole orchestrator+sub-agent forest (per-agent histograms, *which agent used what*, a wall-clock timeline). **`cv compaction <id>`** finds every context-compaction seam — trigger, pre-compaction size, and the summary that seeded the next window — and `cv show --pre-compaction` reads back the span the continued agent *lost*. (`cv dataset --subagents` pulls the whole forest into a training set.)
 - **🔒 Redact** — `cv redact <id>` scrubs secrets/PII so a transcript is safe to share.
 - **🎁 Share** — `cv share <id>` → one self-contained, redacted-by-default HTML artifact: dark crystal-ball theme, collapsible thinking/tool folds, opens offline in any browser, uploads nothing (CSP-pinned so it *can't*).
 - **📦 Pack** — `cv pack "<task>"` compiles a context bundle from your whole corpus: relevant past spans + what files those sessions actually touched (event catalog), as a CLAUDE.md digest, a system prompt, or a synthetic *resumable session* in any harness. Never explain your codebase to an agent twice.
@@ -87,7 +88,8 @@ cv scry
   - a **Projects** lens — every repo, every agent that touched it, over time;
   - a GitHub-style **activity heatmap** timeline (a constellation of your working days);
   - side-by-side **Compare**, a **Stats** dashboard, a visual **loom composer** (OpenRouter *or* free local LM Studio generation), and a live **fleet dashboard**;
-  - **sub-agent trees** — a Claude Task session's children, nested and lazy-loaded inline, each labeled with its task prompt.
+  - **sub-agent trees** — a Claude Task session's children, nested and lazy-loaded inline, each labeled with its task prompt;
+  - a **Structure** explorer (`<cv-forest>`) — Overview / Forest / Workflows / Tools / Compaction tabs that turn a run's anatomy into something you can drill through.
 
   The browser build is zero-install — drop a harness zip, nothing uploaded (all WASM).
 - **🔌 Harness integrations** — plug claurdvoyant into the agents' own hooks/MCP/plugins ([`integrations/`](integrations/)): SessionEnd → archive + distill, SessionStart → recall, events → the board.

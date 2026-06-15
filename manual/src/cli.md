@@ -22,8 +22,13 @@ cv <cmd> --help    # flags for any one subcommand
 | **provenance** | [`events`](#cv-events) | what a session *did*: file edits, commands, errors |
 | | [`touched`](#cv-touched) | every session that ever touched a file |
 | | [`blame`](#cv-blame) | which session's reasoning wrote this code |
+| **anatomy** | [`workflow`](#cv-workflow) | a `Workflow` run's phase tree → agents → outcomes (+ script) |
+| | [`tools`](#cv-tools) | cross-agent tool analytics over the whole sub-agent forest |
+| | [`compaction`](#cv-compaction) | every context-compaction seam + the summary it left |
+| **selecting** | [`query`](#cv-query) | the `-q` query-calculus reference (fields, operators, schema) |
 | **sharing** | [`share`](share.md) | one redacted, self-contained HTML artifact |
 | | [`pack`](pack.md) | compile past-session context for a new task |
+| | [`dataset`](#cv-dataset) | export the corpus as a fine-tuning dataset (JSONL) |
 | **viewing** | [`show`](#cv-show) | print one session as a transcript (or `--json`) |
 | | [`export`](#cv-export) | render a session to `md` / `json` / `html` |
 | | [`tree`](#cv-tree) | message threading (DAG or numbered list) |
@@ -53,6 +58,8 @@ cv show da91 --harness codex
 ```
 
 A couple of commands ([`diff`](#cv-diff) most notably) also accept an inline `harness:id` prefix on each id, so you can mix harnesses in a single invocation.
+
+**`-q`, the query calculus.** [`ls`](#cv-ls), [`timeline`](#cv-timeline), [`stats`](#cv-stats), and [`dataset`](#cv-dataset) take a `-q`/`--query` selector — one small boolean language for picking sessions: `harness:claude (model:fable OR model:opus) msgs>=50 -title:test`. Run [`cv query`](#cv-query) for the full field/operator reference, or `cv query --json` for a machine schema. See [Selecting](#cv-query) below.
 
 ---
 
@@ -260,6 +267,97 @@ edits that produced them, so matches are ranked, not asserted.
 
 ---
 
+## Anatomy of a run
+
+A deep agent session isn't a flat transcript — it's a *forest* of sub-agents, punctuated by context-compaction seams and shaped by tool use. These three commands read that structure. They're richest on Claude Code sessions (which record sub-agent transcripts, `Workflow` runs, and compaction boundaries); other harnesses return what they can.
+
+### `cv workflow`
+
+A [`Workflow`](https://docs.claude.com/en/docs/claude-code)-tool run, first-class: its phase tree, the agents under each phase (with state, tokens, tool-calls, duration, and a result preview), run totals, and the driving script. Without a `<run_id>`, it lists the session's runs.
+
+```sh
+cv workflow 3b829648                  # list every workflow run in the session
+cv workflow 3b829648 wf_ab915970      # render one run (run-id prefix is enough)
+cv workflow 3b829648 wf_ab915970 --script   # print the driving JS instead
+cv workflow 3b829648 wf_ab915970 --json     # the structured Workflow IR
+```
+
+Runs are read from the session's `workflows/wf_*.json` state files; the per-agent transcripts live a tier deeper under `subagents/workflows/<run>/` (see [`cv tools`](#cv-tools) and [`cv show --subagents`](#cv-show)).
+
+### `cv tools`
+
+Cross-agent tool analytics across the orchestrator **and** its whole sub-agent forest: per-agent histograms, which-agent-used-what, aggregate usage, and a wall-clock tool-call timeline.
+
+```sh
+cv tools 3b829648                 # aggregate histogram (orchestrator + forest)
+cv tools 3b829648 --across        # one row per agent
+cv tools 3b829648 --agent af19c2f1   # one agent's histogram
+cv tools 3b829648 --tool Bash     # which agents used Bash, ranked
+cv tools 3b829648 --workflow wf_ab915970   # restrict to one run's agents
+cv tools 3b829648 --timeline      # chronological tool-call feed, tagged by agent
+cv tools 3b829648 --json          # structured output for any of the above
+```
+
+### `cv compaction`
+
+Every context-compaction boundary in a session: each `/compact` (or auto-compaction), its trigger, the pre-compaction context size, and the summary that seeded the next window. `--summaries` prints each full summary.
+
+```sh
+cv compaction 77230e3d            # list boundaries (trigger · pre-size · summary)
+cv compaction 77230e3d --summaries   # print each summary in full
+cv compaction 77230e3d --json     # boundaries + each one's pre-compaction span
+```
+
+To *read* the span a compaction discarded, jump straight to it with [`cv show --pre-compaction`](#cv-show) — it sets the message window to the messages before the boundary for you.
+
+---
+
+## Selecting
+
+### `cv query`
+
+Not a session command — the **reference for the `-q` query calculus** that [`ls`](#cv-ls), [`timeline`](#cv-timeline), [`stats`](#cv-stats), and [`dataset`](#cv-dataset) accept. Run it bare for the human reference (every field, operator, and example); `--json` emits a machine-readable schema an agent can crawl.
+
+```sh
+cv query           # the full language reference
+cv query --json    # fields, types, operators, costs — as JSON
+```
+
+The language is a boolean conjunction of terms — implicit `AND`, plus `OR`/`|`, `NOT`/`-`, and `( )` grouping:
+
+```sh
+cv ls -q "harness:claude model:fable"                 # fable sessions from Claude
+cv ls -q "(model:fable OR model:opus) -title:test"    # either model, excluding tests
+cv ls -q "msgs>=50 after:2026-01-01 tool:Bash"        # big recent sessions that ran Bash
+cv ls -q 'title~"fly\.?io|aws"'                       # ~ is case-insensitive regex
+cv stats -q "touched:src/ir.rs has:errors"            # analytics over a slice
+```
+
+Fields: `harness`, `model`, `cwd`, `title`, `id`, `msgs`, `created`, `updated` (`before:`/`after:` are sugar), `git`, `text` (full-text, needs `cv index`), `tool`/`touched`/`has` (events catalog). Operators: `:` (contains), `=` (exact), `~` (regex), and `> >= < <=` for numbers/dates; values can be comma-OR-lists (`a,b`) or ranges (`lo..hi`). Catalog-cheap terms prune before the costlier ones force a parse, so pair a `model:`/`text:` term with a `harness:`/`cwd:` term to stay fast.
+
+---
+
+## Exporting datasets
+
+### `cv dataset`
+
+Export the corpus as a fine-tuning dataset — JSONL, one session per line. `chatml` (default) emits `{"messages":[…]}`; `sharegpt` emits `{"conversations":[…]}`. Both import directly into Unsloth Studio / TRL / HuggingFace `datasets` with no adapter. Streamed one session at a time, so memory stays flat even over a multi-GB corpus.
+
+```sh
+cv dataset --out corpus.jsonl                      # whole corpus, chatml
+cv dataset --format sharegpt --harness claude      # one harness, ShareGPT shape
+cv dataset -q "model:fable" --subagents --out fable.jsonl   # a queried slice + its forest
+cv dataset -q "harness:claude" --redact-only private_key    # strip PEM keys, keep the rest
+```
+
+- `-q`/`--query <calculus>` — only sessions matching the [query calculus](#cv-query).
+- `--subagents` — also emit each (Claude) session's sub-agent transcripts. A parent on one model often spawns sub-agents on another, and most model usage lives in the forest, so a `model:` query usually wants this.
+- `--min-messages <n>` — drop sessions with fewer than `n` messages (default 2).
+- `--redact` — scrub every secret/PII class before emitting. `--redact-only <classes>` scopes it to a comma list (`private_key`, `api_key`, `jwt`, `email`, `blob`, `assignment`) — e.g. strip PEM blocks while keeping identities intact.
+- `--limit <n>` — stop after `n` emitted records. `--out <file>` — write to a file instead of stdout.
+
+---
+
 ## Viewing
 
 ### `cv show`
@@ -276,6 +374,9 @@ The header line gives you harness, full id, cwd (home-relative), and model; then
 
 - `--harness <name>` — disambiguate the prefix.
 - `--json` — emit the unified IR as pretty JSON instead of a transcript. This is the same shape every adapter parses into — handy for piping into `jq` or feeding another tool.
+- `--range <start>-<end>` — render only that 0-based, end-exclusive message window (`<start>-`, `-<end>`, and negative `-N` from the end all work). Messages outside the window are never resolved, so a windowed view of a huge session reads only the bytes it shows.
+- `--pre-compaction [N]` — read the span *before* a compaction boundary (the context a continued agent lost); defaults to the first boundary, `--pre-compaction 2` for the Nth. It sets `--range` for you. Pair with [`cv compaction`](#cv-compaction) to see where the seams are.
+- `--subagents` — instead of the transcript, list the sub-agent forest this session spawned (each child's type, journaled outcome, and return value). `--agent <agent-id>` renders one specific sub-agent's transcript, resolved through this parent.
 
 ### `cv export`
 

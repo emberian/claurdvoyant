@@ -346,6 +346,224 @@ pub fn subagent_refs(parent_path: &std::path::Path) -> Vec<SessionRef> {
     refs
 }
 
+/// A sub-agent transcript enriched with the metadata Claude Code records *around* it: the
+/// `*.meta.json` sidecar (agent type / human description / the spawning tool_use id), the workflow
+/// it belongs to (when spawned by a `Workflow`), and — for workflow agents — the structured result
+/// the orchestrator journaled (`status` + `summary`, the agent's *real* return value).
+///
+/// This is the second dimension of a Claude session that flat parsing misses entirely: a deep
+/// session fans out into hundreds of these, and the meta/journal sidecars are where their *purpose*
+/// and *outcome* live.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SubagentInfo {
+    /// The transcript itself (id = `agent-<agentId>`), parseable like any other session.
+    pub session: SessionRef,
+    /// `agentType` from the sidecar: the subagent kind (`general-purpose`, `Explore`,
+    /// `workflow-subagent`, a named custom agent, …).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_type: Option<String>,
+    /// `description` from the sidecar: the human one-line task the parent gave it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// `toolUseId` from the sidecar: the `Agent`/`Task` tool_use in the *parent* transcript that
+    /// spawned this agent. Links the child back to the exact turn that launched it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_use_id: Option<String>,
+    /// The workflow run id (`wf_…`) this agent belongs to, or `None` for a directly-spawned
+    /// (`Agent`/`Task`) sub-agent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workflow: Option<String>,
+    /// For workflow agents: the journaled outcome status (`done` / `partial` / `failed` / …).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result_status: Option<String>,
+    /// For workflow agents: the journaled result summary — the agent's structured return value.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result_summary: Option<String>,
+}
+
+impl SubagentInfo {
+    /// `agentId` (the `agent-<id>` stem with the `agent-` prefix stripped) — the key the workflow
+    /// journal and the transcript records use.
+    pub fn agent_id(&self) -> &str {
+        self.session.id.strip_prefix("agent-").unwrap_or(&self.session.id)
+    }
+}
+
+/// The full sub-agent forest a Claude session spawned: every directly-spawned (`Agent`/`Task`)
+/// sub-agent **and** every `Workflow` sub-agent (which live one level deeper, under
+/// `subagents/workflows/<wf>/`), each enriched with its `*.meta.json` sidecar and — for workflow
+/// agents — the orchestrator's journaled result.
+///
+/// Flat [`subagent_refs`] only sees the top-level `subagents/*.jsonl`, so it misses the entire
+/// workflow tier (which on a heavy session is the *majority* of the agents) and drops the
+/// meta/journal sidecars that carry each agent's purpose and outcome. Newest first.
+pub fn subagent_tree(parent_path: &std::path::Path) -> Vec<SubagentInfo> {
+    let Some(stem) = parent_path.file_stem().and_then(|s| s.to_str()) else {
+        return vec![];
+    };
+    let Some(base) = parent_path.parent().map(|d| d.join(stem).join("subagents")) else {
+        return vec![];
+    };
+
+    let mut out: Vec<SubagentInfo> = Vec::new();
+
+    // Tier 1: directly-spawned sub-agents at `subagents/agent-*.jsonl`.
+    out.extend(agents_in_dir(&base, None));
+
+    // Tier 2: workflow sub-agents at `subagents/workflows/<wf>/agent-*.jsonl`, grouped by run id,
+    // each annotated with the result the workflow `journal.jsonl` recorded for its agentId.
+    let wf_root = base.join("workflows");
+    if let Ok(rd) = fs::read_dir(&wf_root) {
+        let wf_dirs: Vec<PathBuf> = rd
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.is_dir())
+            .collect();
+        let groups = crate::par_flat_map(wf_dirs, |wf_dir| {
+            let run_id = wf_dir
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("")
+                .to_string();
+            let journal = read_workflow_journal(&wf_dir.join("journal.jsonl"));
+            agents_in_dir(&wf_dir, Some((&run_id, &journal)))
+        });
+        out.extend(groups);
+    }
+
+    out.sort_by_key(|s| std::cmp::Reverse(s.session.created_at));
+    out
+}
+
+/// A workflow `journal.jsonl` reduced to `agentId → (status, summary)` — the orchestrator's
+/// journaled result per agent (both fields optional: string results carry no separate status).
+type JournalResults = std::collections::HashMap<String, (Option<String>, Option<String>)>;
+
+/// Scan one directory for `agent-*.jsonl` transcripts, pairing each with its `*.meta.json` sidecar
+/// and (for workflow dirs) the journaled result for its agentId. `wf` is `Some((run_id, journal))`
+/// for a workflow dir, `None` for the top-level `subagents/` dir.
+fn agents_in_dir(
+    dir: &std::path::Path,
+    wf: Option<(&str, &JournalResults)>,
+) -> Vec<SubagentInfo> {
+    let mut paths: Vec<PathBuf> = Vec::new();
+    if let Ok(rd) = fs::read_dir(dir) {
+        for e in rd.flatten() {
+            let p = e.path();
+            // Only `agent-*.jsonl`; skip `journal.jsonl` and the `.meta.json` sidecars.
+            let is_agent = p.extension().and_then(|x| x.to_str()) == Some("jsonl")
+                && p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with("agent-"));
+            if is_agent {
+                paths.push(p);
+            }
+        }
+    }
+    crate::par_filter_map(paths, |p| {
+        let session = scan(&p).ok()?;
+        let meta = read_meta(&p.with_extension("meta.json"));
+        let agent_id = session.id.strip_prefix("agent-").unwrap_or(&session.id).to_string();
+        let (status, summary) = wf
+            .and_then(|(_, j)| j.get(&agent_id).cloned())
+            .unwrap_or((None, None));
+        Some(SubagentInfo {
+            session,
+            agent_type: meta.0,
+            description: meta.1,
+            tool_use_id: meta.2,
+            workflow: wf.map(|(id, _)| id.to_string()),
+            result_status: status,
+            result_summary: summary,
+        })
+    })
+}
+
+/// Read an `agent-*.meta.json` sidecar → `(agentType, description, toolUseId)`. Any read/parse
+/// failure (or an absent file) is a clean `(None, None, None)`.
+fn read_meta(path: &std::path::Path) -> (Option<String>, Option<String>, Option<String>) {
+    let Ok(txt) = fs::read_to_string(path) else {
+        return (None, None, None);
+    };
+    let Ok(v) = serde_json::from_str::<Value>(&txt) else {
+        return (None, None, None);
+    };
+    let s = |k: &str| v.get(k).and_then(Value::as_str).map(str::to_string);
+    (s("agentType"), s("description"), s("toolUseId"))
+}
+
+/// Parse a workflow `journal.jsonl` into a map from `agentId` → `(status, summary)`, taking the
+/// last `result` record for each agent (a `result` supersedes the earlier `started`). The journal
+/// is the orchestrator's structured-output log — the sub-agent's real return value, which never
+/// appears in the parent transcript.
+///
+/// The `result` payload comes in two shapes across workflows: a **structured object**
+/// `{status, summary, …}` (status vocabularies are per-workflow: `done`/`partial`/`GREEN`/
+/// `proven`/`blocked`/…), or a **plain string** (the agent's whole freeform return, with no
+/// separate status). Both are normalized here.
+fn read_workflow_journal(path: &std::path::Path) -> JournalResults {
+    let mut map = std::collections::HashMap::new();
+    let Ok(file) = fs::File::open(path) else {
+        return map;
+    };
+    super::for_each_json_line(BufReader::new(file), |v| {
+        if v.get("type").and_then(Value::as_str) == Some("result") {
+            if let Some(agent_id) = v.get("agentId").and_then(Value::as_str) {
+                let (status, summary) = match v.get("result") {
+                    // Structured form: pull status + summary; if there's no `summary` key fall back
+                    // to the object's compact JSON so the outcome isn't lost.
+                    Some(obj @ Value::Object(_)) => {
+                        let status = obj.get("status").and_then(Value::as_str).map(str::to_string);
+                        let summary = obj
+                            .get("summary")
+                            .and_then(Value::as_str)
+                            .map(str::to_string)
+                            .or_else(|| Some(obj.to_string()));
+                        (status, summary)
+                    }
+                    // Plain-string form: the whole string is the summary, no separate status.
+                    Some(Value::String(s)) => (None, Some(s.clone())),
+                    _ => (None, None),
+                };
+                map.insert(agent_id.to_string(), (status, summary));
+            }
+        }
+        Flow::Continue
+    });
+    map
+}
+
+/// The sub-agent's final return value as text: the last assistant text turn in its transcript
+/// (what a `general-purpose`/`Explore` agent hands back to its parent, surfaced in the parent's
+/// `Agent` tool_result). Reads only the small text fields, never materializing large content.
+/// `None` for an empty/unreadable transcript or one whose final turn carried no text.
+pub fn subagent_return(path: &std::path::Path) -> Option<String> {
+    let file = fs::File::open(path).ok()?;
+    let mut last: Option<String> = None;
+    super::for_each_json_line(BufReader::new(file), |v| {
+        if v.get("type").and_then(Value::as_str) == Some("assistant") {
+            if let Some(Value::Array(items)) = v.get("message").and_then(|m| m.get("content")) {
+                let mut buf = String::new();
+                for it in items {
+                    if it.get("type").and_then(Value::as_str) == Some("text") {
+                        if let Some(t) = it.get("text").and_then(Value::as_str) {
+                            if !buf.is_empty() {
+                                buf.push('\n');
+                            }
+                            buf.push_str(t);
+                        }
+                    }
+                }
+                if !buf.trim().is_empty() {
+                    last = Some(buf);
+                }
+            }
+        }
+        Flow::Continue
+    });
+    last
+}
+
 /// Cheap metadata-only scan for `discover`.
 fn scan(path: &std::path::Path) -> Result<SessionRef> {
     let id = path
@@ -487,13 +705,33 @@ fn parse_system_message(v: &Value, opts: &ParseOptions, span: Option<&SpanCtx>) 
     // Body text lives either at top-level `content` (a string) or, for compaction, is implied.
     let content = v.get("content").and_then(Value::as_str);
 
+    // `stop_hook_summary` carries no `content`, but it IS the record of a Stop-hook firing — its
+    // `hookInfos`/`hookErrors` are the actual hook activity (a hook's command + output, or its
+    // error). Surface it as a readable line when there's something to show (output or an error), so
+    // hooks are visible rather than silently dropped; a no-op hook summary still leaves the stream.
+    if subtype == "stop_hook_summary" {
+        if let Some(body) = render_hook_summary(v) {
+            return system_msg(v, Text::Inline(body), subtype, opts);
+        }
+        return None;
+    }
+
     // Subtypes with no human-readable body — keep them out of the message stream.
-    let bodyless = matches!(
-        subtype,
-        "turn_duration" | "agents_killed" | "stop_hook_summary"
-    );
+    let bodyless = matches!(subtype, "turn_duration" | "agents_killed");
     if bodyless || (content.is_none() && subtype != "compact_boundary") {
         return None;
+    }
+
+    // Slash-command records (`subtype == "local_command"`) wrap their payload in pseudo-XML tags
+    // (`<command-name>/foo</command-name>`, `<command-args>`, `<local-command-stdout>`). Rendering
+    // the raw tag soup is noise — distill it to a readable one/two-liner, but keep it inline (these
+    // are always small, so no span path is needed).
+    if subtype == "local_command" {
+        if let Some(c) = content {
+            if let Some(rendered) = render_slash_command(c) {
+                return system_msg(v, Text::Inline(rendered), subtype, opts);
+            }
+        }
     }
 
     let text: Text = match content {
@@ -508,6 +746,13 @@ fn parse_system_message(v: &Value, opts: &ParseOptions, span: Option<&SpanCtx>) 
         None => Text::Inline("[conversation compacted]".to_string()),
     };
 
+    system_msg(v, text, subtype, opts)
+}
+
+/// Build a [`Role::System`] [`Message`] from a system record `v` with its already-resolved body
+/// `text`. The shared tail of [`parse_system_message`] (and the slash-command path), so both keep
+/// identical id/parent/timestamp/`extra` handling.
+fn system_msg(v: &Value, text: Text, subtype: &str, opts: &ParseOptions) -> Option<Message> {
     let id = v.get("uuid").and_then(Value::as_str).map(str::to_string);
     let parent_id = v
         .get("parentUuid")
@@ -530,6 +775,22 @@ fn parse_system_message(v: &Value, opts: &ParseOptions, span: Option<&SpanCtx>) 
             "agentId",
             "slug",
             "logicalParentUuid",
+            // Hook activity (Stop/PreToolUse/… hook firings): the command, its output, and errors.
+            "hookCount",
+            "hookInfos",
+            "hookErrors",
+            "stopReason",
+            "preventedContinuation",
+            "toolUseID",
+            // Model-refusal fallback (a provider safety refusal that re-routed to another model):
+            // which models, the refusal category/explanation, and what got retracted.
+            "originalModel",
+            "fallbackModel",
+            "apiRefusalCategory",
+            "apiRefusalExplanation",
+            "retractedMessageUuids",
+            "trigger",
+            "direction",
         ] {
             if let Some(val) = v.get(key) {
                 extra.insert(key.to_string(), val.clone());
@@ -547,6 +808,77 @@ fn parse_system_message(v: &Value, opts: &ParseOptions, span: Option<&SpanCtx>) 
         usage: None,
         extra,
     })
+}
+
+/// Distill a `stop_hook_summary` record into a readable one-liner, or `None` when the hook did
+/// nothing worth surfacing (no output and no error). The record has no `content`; its activity lives
+/// in `hookInfos[]` (each a fired hook, often with a `command` + captured output) and `hookErrors[]`.
+fn render_hook_summary(v: &Value) -> Option<String> {
+    let count = v.get("hookCount").and_then(Value::as_u64).unwrap_or(0);
+    let errors = v.get("hookErrors").and_then(Value::as_array);
+    let has_errors = errors.is_some_and(|e| !e.is_empty());
+    let has_output = v.get("hasOutput").and_then(Value::as_bool).unwrap_or(false)
+        || v.get("hookAdditionalContext").and_then(Value::as_str).is_some_and(|s| !s.is_empty());
+    if !has_errors && !has_output {
+        return None;
+    }
+    let label = if count == 1 { "hook".to_string() } else { format!("{count} hooks") };
+    let mut s = format!("⛓ stop {label}");
+    if let Some(infos) = v.get("hookInfos").and_then(Value::as_array) {
+        // Name each fired hook by the head of its command (the most legible identifier).
+        let names: Vec<String> = infos
+            .iter()
+            .filter_map(|i| i.get("command").and_then(Value::as_str))
+            .map(|c| truncate(c.lines().next().unwrap_or(c).trim(), 60))
+            .collect();
+        if !names.is_empty() {
+            s.push_str(&format!(": {}", names.join(" · ")));
+        }
+    }
+    if let Some(ctx) = v.get("hookAdditionalContext").and_then(Value::as_str).filter(|c| !c.is_empty()) {
+        s.push_str(&format!("\n  ↳ {}", truncate(ctx.trim(), 200)));
+    }
+    if let Some(errs) = errors.filter(|e| !e.is_empty()) {
+        let joined: Vec<String> = errs
+            .iter()
+            .map(|e| truncate(e.as_str().unwrap_or(&e.to_string()).trim(), 100))
+            .collect();
+        s.push_str(&format!("\n  ✗ {}", joined.join("; ")));
+    }
+    Some(s)
+}
+
+/// Distill a slash-command `system`/`local_command` body to readable text. Two shapes occur:
+/// the *invocation* (`<command-name>/foo</command-name>` + optional `<command-args>`) renders as
+/// `/foo args`; the *output* (`<local-command-stdout>…</local-command-stdout>`) renders as the
+/// captured stdout. Returns `None` when no recognizable tag is present (caller keeps the raw body).
+fn render_slash_command(c: &str) -> Option<String> {
+    if let Some(name) = tag_inner(c, "command-name") {
+        let name = name.trim();
+        let args = tag_inner(c, "command-args").map(|a| a.trim().to_string());
+        return Some(match args.as_deref().filter(|a| !a.is_empty()) {
+            Some(a) => format!("⌘ {name} {a}"),
+            None => format!("⌘ {name}"),
+        });
+    }
+    if let Some(out) = tag_inner(c, "local-command-stdout") {
+        let out = out.trim();
+        return Some(if out.is_empty() {
+            "⌘ (no output)".to_string()
+        } else {
+            format!("⌘ stdout:\n{out}")
+        });
+    }
+    None
+}
+
+/// Extract the inner text of the first `<tag>…</tag>` pair in `s`, if present.
+fn tag_inner<'a>(s: &'a str, tag: &str) -> Option<&'a str> {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    let start = s.find(&open)? + open.len();
+    let end = s[start..].find(&close)? + start;
+    Some(&s[start..end])
 }
 
 /// Preserve Claude-specific record/sidecar fields that the IR has no first-class home for, so
@@ -939,6 +1271,40 @@ mod tests {
     }
 
     #[test]
+    fn stop_hook_summary_with_output_surfaces_and_keeps_hook_metadata() {
+        // A Stop-hook that fired with output (and a sibling that did nothing): the first surfaces
+        // as a readable ⛓ line carrying its hook command + context; the no-op one stays dropped.
+        let text = [
+            // Hook with output + a command name → surfaced.
+            r#"{"type":"system","subtype":"stop_hook_summary","uuid":"h1","timestamp":"2026-06-11T00:00:00Z","hookCount":1,"hasOutput":true,"hookAdditionalContext":"keep working all night","hookInfos":[{"command":"alright well i'm going to bed. so.... best of luck"}],"hookErrors":[],"stopReason":"hook","toolUseID":"tu1"}"#,
+            // No output, no error → dropped from the stream (a no-op hook summary).
+            r#"{"type":"system","subtype":"stop_hook_summary","uuid":"h2","timestamp":"2026-06-11T00:01:00Z","hookCount":1,"hasOutput":false,"hookInfos":[{"command":"noop"}],"hookErrors":[]}"#,
+            // A model_refusal_fallback: has content AND rich metadata that must ride in extra.
+            r#"{"type":"system","subtype":"model_refusal_fallback","uuid":"r1","timestamp":"2026-06-11T00:02:00Z","content":"Fable 5's safety measures flagged this message.","originalModel":"claude-fable-5[1m]","fallbackModel":"claude-opus-4-8","trigger":"refusal"}"#,
+        ]
+        .join("\n");
+        let s = parse_str("hooks", &text, None);
+        let systems: Vec<_> = s.messages.iter().filter(|m| m.role == Role::System).collect();
+        // The hook-with-output and the refusal surface; the no-op hook does not.
+        assert_eq!(systems.len(), 2, "got {:?}", systems.iter().map(|m| m.text()).collect::<Vec<_>>());
+
+        let hook = systems.iter().find(|m| m.extra.get("subtype").and_then(Value::as_str) == Some("stop_hook_summary")).unwrap();
+        let body = hook.text().unwrap();
+        assert!(body.starts_with("⛓ stop hook"), "hook body: {body:?}");
+        assert!(body.contains("best of luck"), "hook command surfaced: {body:?}");
+        assert!(body.contains("keep working all night"), "hook context surfaced: {body:?}");
+        // Hook metadata preserved in extra.
+        assert_eq!(hook.extra.get("hookCount").unwrap(), 1);
+        assert!(hook.extra.get("hookInfos").is_some());
+        assert_eq!(hook.extra.get("stopReason").unwrap(), "hook");
+
+        // Refusal-fallback metadata preserved.
+        let refusal = systems.iter().find(|m| m.extra.get("subtype").and_then(Value::as_str) == Some("model_refusal_fallback")).unwrap();
+        assert_eq!(refusal.extra.get("originalModel").unwrap(), "claude-fable-5[1m]");
+        assert_eq!(refusal.extra.get("fallbackModel").unwrap(), "claude-opus-4-8");
+    }
+
+    #[test]
     fn sidechain_subagent_variant() {
         let s = parse_str("sub1", &fixture("sidechain_subagent.jsonl"), None);
         // progress / started / result are non-conversational and skipped.
@@ -965,6 +1331,100 @@ mod tests {
         let tool = s.messages.iter().find(|m| m.role == Role::Tool).unwrap();
         let tur = tool.extra.get("toolUseResult").unwrap();
         assert!(tur.get("newTodos").is_some());
+    }
+
+    #[test]
+    fn slash_command_records_render_readably() {
+        // The invocation record (`<command-name>` + `<command-args>`) and the output record
+        // (`<local-command-stdout>`) both distill to clean text, not raw pseudo-XML.
+        let text = [
+            r#"{"type":"system","subtype":"local_command","uuid":"c1","timestamp":"2026-06-01T00:00:00Z","content":"<command-name>/usage</command-name>\n  <command-message>usage</command-message>\n  <command-args>--verbose</command-args>"}"#,
+            r#"{"type":"system","subtype":"local_command","uuid":"c2","timestamp":"2026-06-01T00:00:01Z","content":"<local-command-stdout>Settings dialog dismissed</local-command-stdout>"}"#,
+        ]
+        .join("\n");
+        let s = parse_str("slash", &text, None);
+        let bodies: Vec<String> = s.messages.iter().filter_map(|m| m.text()).collect();
+        assert!(bodies.iter().any(|b| b == "⌘ /usage --verbose"), "got {bodies:?}");
+        assert!(bodies.iter().any(|b| b.starts_with("⌘ stdout:") && b.contains("Settings dialog dismissed")), "got {bodies:?}");
+        // The raw tag text must NOT survive into the rendered body.
+        assert!(!bodies.iter().any(|b| b.contains("<command-name>")), "raw tag leaked: {bodies:?}");
+    }
+
+    #[test]
+    fn workflow_journal_handles_object_and_string_results() {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join(format!("cv-wfj-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let jpath = dir.join("journal.jsonl");
+        let mut f = std::fs::File::create(&jpath).unwrap();
+        // Object form (status + summary), a started-only agent (no result), and a string form.
+        writeln!(f, r#"{{"type":"started","key":"k1","agentId":"aaa"}}"#).unwrap();
+        writeln!(f, r#"{{"type":"result","key":"k1","agentId":"aaa","result":{{"status":"done","summary":"closed the lane"}}}}"#).unwrap();
+        writeln!(f, r#"{{"type":"started","key":"k2","agentId":"bbb"}}"#).unwrap();
+        writeln!(f, r#"{{"type":"result","key":"k3","agentId":"ccc","result":"freeform return text"}}"#).unwrap();
+        drop(f);
+
+        let map = read_workflow_journal(&jpath);
+        assert_eq!(map.get("aaa"), Some(&(Some("done".to_string()), Some("closed the lane".to_string()))));
+        // started-only agent has no journaled result.
+        assert!(!map.contains_key("bbb"));
+        // string result becomes the summary, with no status.
+        assert_eq!(map.get("ccc"), Some(&(None, Some("freeform return text".to_string()))));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn subagent_tree_discovers_both_tiers_with_meta_and_journal() {
+        use std::io::Write;
+        // Lay out a parent session with one directly-spawned sub-agent and one workflow holding
+        // two agents (one journaled done, one a string return), mirroring the real on-disk shape.
+        let root = std::env::temp_dir().join(format!("cv-subtree-{}", uuid::Uuid::new_v4()));
+        let proj = root.join("projects").join("-enc");
+        std::fs::create_dir_all(&proj).unwrap();
+        let parent = proj.join("sess.jsonl");
+        std::fs::write(&parent, "{\"type\":\"user\",\"uuid\":\"u\",\"message\":{\"role\":\"user\",\"content\":\"go\"}}\n").unwrap();
+
+        let subs = proj.join("sess").join("subagents");
+        std::fs::create_dir_all(&subs).unwrap();
+        // Tier 1: a direct Agent sub-agent + its meta sidecar.
+        let a1 = subs.join("agent-a111.jsonl");
+        std::fs::write(&a1, "{\"type\":\"user\",\"uuid\":\"x\",\"message\":{\"role\":\"user\",\"content\":\"task one\"}}\n{\"type\":\"assistant\",\"uuid\":\"y\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"done one\"}]}}\n").unwrap();
+        std::fs::write(subs.join("agent-a111.meta.json"), r#"{"agentType":"general-purpose","description":"do task one","toolUseId":"toolu_77"}"#).unwrap();
+
+        // Tier 2: a workflow dir with two agents and a journal.
+        let wf = subs.join("workflows").join("wf_abc-123");
+        std::fs::create_dir_all(&wf).unwrap();
+        std::fs::write(wf.join("agent-a222.jsonl"), "{\"type\":\"user\",\"uuid\":\"p\",\"message\":{\"role\":\"user\",\"content\":\"wtask\"}}\n").unwrap();
+        std::fs::write(wf.join("agent-a222.meta.json"), r#"{"agentType":"workflow-subagent","description":"wf task"}"#).unwrap();
+        std::fs::write(wf.join("agent-a333.jsonl"), "{\"type\":\"user\",\"uuid\":\"q\",\"message\":{\"role\":\"user\",\"content\":\"wtask2\"}}\n").unwrap();
+        std::fs::write(wf.join("agent-a333.meta.json"), r#"{"agentType":"workflow-subagent"}"#).unwrap();
+        let mut jf = std::fs::File::create(wf.join("journal.jsonl")).unwrap();
+        writeln!(jf, r#"{{"type":"result","agentId":"a222","result":{{"status":"GREEN","summary":"wf agent did it"}}}}"#).unwrap();
+        writeln!(jf, r#"{{"type":"result","agentId":"a333","result":"string return"}}"#).unwrap();
+        drop(jf);
+
+        let tree = subagent_tree(&parent);
+        assert_eq!(tree.len(), 3, "two tiers: 1 direct + 2 workflow");
+
+        let direct = tree.iter().find(|s| s.agent_id() == "a111").expect("direct agent");
+        assert_eq!(direct.agent_type.as_deref(), Some("general-purpose"));
+        assert_eq!(direct.description.as_deref(), Some("do task one"));
+        assert_eq!(direct.tool_use_id.as_deref(), Some("toolu_77"));
+        assert!(direct.workflow.is_none());
+        assert_eq!(direct.result_status, None); // direct agents report via parent tool_result
+        // its return value = the last assistant text turn.
+        assert_eq!(subagent_return(&direct.session.path).as_deref(), Some("done one"));
+
+        let w1 = tree.iter().find(|s| s.agent_id() == "a222").expect("wf agent 1");
+        assert_eq!(w1.workflow.as_deref(), Some("wf_abc-123"));
+        assert_eq!(w1.result_status.as_deref(), Some("GREEN"));
+        assert_eq!(w1.result_summary.as_deref(), Some("wf agent did it"));
+
+        let w2 = tree.iter().find(|s| s.agent_id() == "a333").expect("wf agent 2");
+        assert_eq!(w2.result_status, None);
+        assert_eq!(w2.result_summary.as_deref(), Some("string return"));
+
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]

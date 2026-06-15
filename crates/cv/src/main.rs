@@ -15,7 +15,7 @@ pub(crate) use util::short_id;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use cmd::live::BoardCmd;
-use cmd::{browse, compose, convert, live, pack, provenance, query, search, share, view};
+use cmd::{browse, compose, convert, live, pack, provenance, query, search, share, view, workflow};
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -40,7 +40,7 @@ enum Cmd {
         #[arg(long)]
         cwd: Option<String>,
         /// Query calculus to filter rows, e.g. `model:fable`, `harness:codex msgs>=50`,
-        /// `after:2026-06-01 widget` (implicit AND; see `cv query`). A `model:` term forces a
+        /// `after:2026-06-01 widget` (implicit AND; see `cv_core::query`). A `model:` term forces a
         /// parse of each candidate (the catalog doesn't store the model), so pair it with cheap
         /// terms like `harness:`/`cwd:` to keep it fast.
         #[arg(long, short = 'q')]
@@ -83,6 +83,21 @@ enum Cmd {
         // would otherwise reject as an unknown flag (`cv show id --range -5`).
         #[arg(long, allow_hyphen_values = true)]
         range: Option<String>,
+        /// Instead of the transcript, list the sub-agent forest this session spawned — each
+        /// direct/`Workflow` sub-agent with its type, journaled outcome (workflow agents), and
+        /// final return value. The second dimension of a Claude session.
+        #[arg(long)]
+        subagents: bool,
+        /// Render one specific sub-agent's transcript by its `agent-…` id (or id-prefix), resolved
+        /// relative to this parent session. Sub-agents aren't in the main pool, so they're read
+        /// through their parent.
+        #[arg(long)]
+        agent: Option<String>,
+        /// Read the pre-compaction span: the messages before a compaction boundary (the context a
+        /// continued agent lost). Defaults to the FIRST boundary; pass `--pre-compaction <N>` for
+        /// the Nth (1-based). Combine with nothing else — it sets the range for you.
+        #[arg(long, value_name = "N", num_args = 0..=1, default_missing_value = "1")]
+        pre_compaction: Option<usize>,
     },
     /// Export a session to markdown, JSON, or self-contained HTML (stdout).
     Export {
@@ -103,7 +118,7 @@ enum Cmd {
         #[arg(long)]
         harness: Option<String>,
         /// Query calculus selecting which sessions to include, e.g. `model:fable`,
-        /// `harness:claude msgs>=20`, `after:2026-01-01 cwd:/pug` (implicit AND; see `cv query`).
+        /// `harness:claude msgs>=20`, `after:2026-01-01 cwd:/pug` (implicit AND; see `cv_core::query`).
         #[arg(long, short = 'q')]
         query: Option<String>,
         /// Also emit each Claude session's sub-agent forest (directly- and `Workflow`-spawned
@@ -203,6 +218,11 @@ enum Cmd {
         /// Only this kind: file_edit, file_read, command, tool, or error.
         #[arg(long)]
         kind: Option<String>,
+        /// Also extract events from every sub-agent this session spawned (the forest), attributed
+        /// to each agent — so a session's *full* activity (incl. what its Task/Workflow agents did)
+        /// is visible, not just the orchestrator's own tool calls.
+        #[arg(long)]
+        subagents: bool,
     },
     /// Sessions that touched a file — every session with a file_edit/file_read event on its path.
     ///
@@ -286,6 +306,59 @@ enum Cmd {
         id: String,
         #[arg(long)]
         harness: Option<String>,
+    },
+    /// A `Workflow`-tool run, first-class: its phase tree, the agents under each phase with their
+    /// outcomes, run totals, and the driving script. Without `<run_id>`, lists the session's runs.
+    Workflow {
+        /// The session that launched the workflow.
+        id: String,
+        /// The workflow run id (`wf_…`, or a unique prefix). Omit to list all runs.
+        run_id: Option<String>,
+        #[arg(long)]
+        harness: Option<String>,
+        /// Emit the structured workflow (phases → agents → outcomes) as JSON.
+        #[arg(long)]
+        json: bool,
+        /// Also print the driving workflow script (the JS that fanned out the agents).
+        #[arg(long)]
+        script: bool,
+    },
+    /// Cross-agent tool analytics: per-agent histograms, which-agent-used-what, aggregate usage,
+    /// and a tool-call timeline — across the orchestrator and its whole sub-agent forest.
+    Tools {
+        id: String,
+        #[arg(long)]
+        harness: Option<String>,
+        /// One agent's histogram ("which tools did agent X use"). `<orchestrator>` for the parent.
+        #[arg(long)]
+        agent: Option<String>,
+        /// Which agents used this tool, across the forest (ranked by count).
+        #[arg(long)]
+        tool: Option<String>,
+        /// Restrict the analytics to one workflow run's agents.
+        #[arg(long)]
+        workflow: Option<String>,
+        /// Per-agent breakdown (one row per agent) instead of the aggregate histogram.
+        #[arg(long)]
+        across: bool,
+        /// The time-ordered tool-call timeline (optionally narrowed with `--agent`).
+        #[arg(long)]
+        timeline: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Compaction boundaries in a session: every `/compact` (or auto-compaction), its trigger,
+    /// pre-compaction context size, and the summary that seeded the next window. `--summaries`
+    /// prints each full summary; `cv show <id> --pre-compaction` reads the lost pre-span.
+    Compaction {
+        id: String,
+        #[arg(long)]
+        harness: Option<String>,
+        /// Print each compaction's full summary text (not just the head).
+        #[arg(long)]
+        summaries: bool,
+        #[arg(long)]
+        json: bool,
     },
     /// Post to / read from the agent coordination board.
     Board {
@@ -408,7 +481,9 @@ fn main() -> Result<()> {
     match cli.cmd {
         Cmd::Ls { harness, cwd, query, limit, sort_by, fresh } => browse::cmd_ls(harness, cwd, query, limit, &sort_by, fresh),
         Cmd::Search { query, harness, limit, semantic } => search::cmd_search(&query, harness, limit, semantic),
-        Cmd::Show { id, harness, json, range } => view::cmd_show(&id, harness, json, range),
+        Cmd::Show { id, harness, json, range, subagents, agent, pre_compaction } => {
+            view::cmd_show(&id, harness, json, range, subagents, agent, pre_compaction)
+        }
         Cmd::Export { id, format, harness } => view::cmd_export(&id, &format, harness),
         Cmd::Dataset { format, harness, query, subagents, limit, min_messages, redact, redact_only, out } => {
             compose::cmd_dataset(&format, harness, query, subagents, limit, min_messages, redact, redact_only, out)
@@ -417,7 +492,7 @@ fn main() -> Result<()> {
         Cmd::Port { id, to, from, to_dir, out, no_context } => convert::cmd_port(&id, to, from, to_dir, out, no_context),
         Cmd::Scry { harness, cwd, interval, existing } => live::cmd_scry(harness, cwd, interval, existing),
         Cmd::Index { semantic, rebuild } => search::cmd_index(semantic, rebuild),
-        Cmd::Events { id, harness, kind } => provenance::cmd_events(&id, harness, kind),
+        Cmd::Events { id, harness, kind, subagents } => provenance::cmd_events(&id, harness, kind, subagents),
         Cmd::Touched { path, edits_only } => provenance::cmd_touched(&path, edits_only),
         Cmd::Blame { file, lines, show } => blame::cmd_blame(&file, lines.as_deref(), show),
         Cmd::Share { id, harness, out, no_redact } => share::cmd_share(&id, harness, out, no_redact),
@@ -426,6 +501,15 @@ fn main() -> Result<()> {
         Cmd::Query { json } => query::cmd_query(json),
         Cmd::Resume { id, harness, launch } => convert::cmd_resume(&id, harness, launch),
         Cmd::Tree { id, harness } => view::cmd_tree(&id, harness),
+        Cmd::Workflow { id, run_id, harness, json, script } => {
+            workflow::cmd_workflow(&id, run_id, harness, json, script)
+        }
+        Cmd::Tools { id, harness, agent, tool, workflow: wf, across, timeline, json } => {
+            workflow::cmd_tools(&id, harness, agent, tool, wf, across, timeline, json)
+        }
+        Cmd::Compaction { id, harness, summaries, json } => {
+            workflow::cmd_compaction(&id, harness, summaries, json)
+        }
         Cmd::Board { action } => live::cmd_board(action),
         Cmd::Timeline { harness, cwd, query, limit } => browse::cmd_timeline(harness, cwd, query, limit),
         Cmd::Diff { a, b, harness } => view::cmd_diff(&a, &b, harness),
