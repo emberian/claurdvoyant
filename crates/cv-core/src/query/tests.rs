@@ -229,6 +229,55 @@ fn forest_fields_classify_and_resolve() {
 }
 
 #[test]
+fn thread_matches_message_path() {
+    use crate::ir::{Block, Message, Role};
+    let msg = |id: &str, parent: Option<&str>, role: Role, blocks: Vec<Block>| Message {
+        id: Some(id.into()),
+        parent_id: parent.map(str::to_string),
+        role,
+        timestamp: None,
+        model: None,
+        content: blocks,
+        usage: None,
+        extra: serde_json::Map::new(),
+    };
+    let text = |t: &str| Block::Text { text: t.into() };
+    // u1("please refactor") -> a1(assistant) -> t1(tool Bash)
+    let s = Session {
+        id: "s".into(),
+        harness: Harness::Claude,
+        cwd: None,
+        title: None,
+        created_at: None,
+        updated_at: None,
+        model: None,
+        git: None,
+        messages: vec![
+            msg("u1", None, Role::User, vec![text("please refactor this")]),
+            msg("a1", Some("u1"), Role::Assistant, vec![text("on it")]),
+            msg("t1", Some("a1"), Role::Tool, vec![Block::ToolUse { id: "x".into(), name: "Bash".into(), input: serde_json::json!({}) }]),
+        ],
+        source_path: None,
+        extra: serde_json::Map::new(),
+    };
+
+    assert!(q(r#"thread:"text:refactor > assistant""#).matches_session(&s));
+    assert!(q(r#"thread:"user > assistant > tool:Bash""#).matches_session(&s));
+    assert!(q(r#"thread:"refactor > assistant > tool:bash""#).matches_session(&s)); // bare word=text, case-insens
+    // wrong child role
+    assert!(!q(r#"thread:"user > tool""#).matches_session(&s)); // a1 is assistant, not tool
+    // tool not present as a child of user
+    assert!(!q(r#"thread:"user > tool:Grep""#).matches_session(&s));
+    // single step still works
+    assert!(q(r#"thread:"tool:Bash""#).matches_session(&s));
+
+    assert!(SessionQuery::parse(r#"thread:"user > > assistant""#).unwrap_err().contains("empty step"));
+    assert!(SessionQuery::parse(r#"thread:"role:bogus""#).unwrap_err().contains("role"));
+    assert!(SessionQuery::parse("thread~x").unwrap_err().contains("thread"));
+    assert!(q("thread:\"user\"").needs_parse());
+}
+
+#[test]
 fn errors_teach() {
     assert!(SessionQuery::parse("bogus:1").unwrap_err().contains("unknown field"));
     assert!(SessionQuery::parse("harness:nope").unwrap_err().contains("harness"));

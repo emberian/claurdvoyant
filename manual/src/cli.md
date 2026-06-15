@@ -337,7 +337,7 @@ cv ls -q "harness:claude agent:Explore subtool:Bash"  # a forest query (see belo
 Fields, by what they cost to answer:
 
 - **catalog** (free, no parse): `harness`, `cwd`, `title`, `id`, `msgs`, `created`, `updated` (`before:`/`after:` are sugar).
-- **parse** (reads the transcript): `model` (any turn's model), `git` (branch/remote).
+- **parse** (reads the transcript): `model` (any turn's model), `git` (branch/remote), `thread` (a message-tree path — see below).
 - **index** (needs `cv index`): `text` — full-text over content.
 - **events**: `tool` (a tool *this session* ran), `touched` (a file it read/edited), `has` (flags: `subagents`, `errors`, `tools`, `images`, `compacted`, `workflows`).
 - **forest** (walks the [sub-agent forest / workflows / compaction seams](#cv-workflow) — the priciest): `subtool` (a tool a *sub-agent* ran), `agent` (spawned a sub-agent of this type), `agents` (forest size), `workflow` (ran a matching `Workflow`), `workflows` (run count), `compactions` (boundary count).
@@ -348,6 +348,15 @@ Operators: `:` (contains), `=` (exact), `~` (case-insensitive regex, local strin
 cv ls -q "harness:claude agents>=5 subtool:Bash compactions>=1"   # deep, tool-heavy, compacted runs
 cv ls -q "workflow:census OR workflows>=3"                        # ran a census workflow, or 3+ runs
 ```
+
+**`thread:` — a CSS-y message-tree path.** Match a parent→child chain through the session's message DAG (the loom/threading dimension), using the CSS child combinator `>`. Each step matches one message; a step is a role (`user`/`assistant`/`tool`/`system`), `tool:NAME` (a turn with that tool-use), `text:WORD` (or a bare word — content contains). Quote the whole value so the spaces and `>` belong to the path, not the outer query:
+
+```sh
+cv ls -q 'harness:claude thread:"text:refactor > assistant"'   # a "refactor" turn whose reply is an assistant turn
+cv ls -q 'thread:"user > assistant > tool:Bash"'               # a user turn that led to a Bash tool-use
+```
+
+Each `>` is a *direct* child (a reply), resolved via `parent_id`, so it follows the real threading — including loom branches and sidechains. (Harnesses that don't record message ids can't thread, so `thread:` simply won't match there.)
 
 ---
 
