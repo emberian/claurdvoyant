@@ -187,6 +187,48 @@ fn regex_errors_and_restrictions() {
 }
 
 #[test]
+fn forest_fields_classify_and_resolve() {
+    let query = q("agent:Explore subtool:Bash agents>=3 workflows>=1 compactions>=2 workflow:census has:compacted");
+    assert!(query.needs_forest());
+    // forest leaves are Unknown in the cheap prefilter → must not exclude
+    assert!(query.prefilter(&refx("a", Harness::Claude, None, None, 1)));
+
+    struct Fx;
+    impl ExtFacts for Fx {
+        fn subtool(&self, n: &str) -> Tri {
+            Tri::of(n == "bash")
+        }
+        fn agent_type(&self, n: &str) -> Tri {
+            Tri::of(n == "explore")
+        }
+        fn workflow(&self, n: &str) -> Tri {
+            Tri::of(n == "census")
+        }
+        fn has(&self, f: &str) -> Tri {
+            Tri::of(f == "compacted")
+        }
+        fn count(&self, field: FieldId) -> Option<u64> {
+            Some(match field {
+                FieldId::Agents => 4,
+                FieldId::Workflows => 1,
+                FieldId::Compactions => 2,
+                _ => return None,
+            })
+        }
+    }
+    let r = refx("a", Harness::Claude, None, None, 1);
+    let facts = Facts { r: &r, session: None, ext: &Fx };
+    assert!(query.matches(&facts));
+
+    // a count that fails the comparison flips it false
+    let q2 = q("agents>=10");
+    assert!(!q2.matches(&facts)); // Fx says 4
+    // regex is rejected on forest fields
+    assert!(SessionQuery::parse("agent~explore").unwrap_err().contains("regex"));
+    assert!(SessionQuery::parse("subtool~bash").unwrap_err().contains("regex"));
+}
+
+#[test]
 fn errors_teach() {
     assert!(SessionQuery::parse("bogus:1").unwrap_err().contains("unknown field"));
     assert!(SessionQuery::parse("harness:nope").unwrap_err().contains("harness"));

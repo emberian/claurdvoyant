@@ -13,7 +13,7 @@ use cv_core::ir::{truncate, SessionRef};
 fn apply_query(refs: &mut Vec<SessionRef>, query: &Option<cv_core::SessionQuery>) {
     let Some(q) = query else { return };
     refs.retain(|r| q.prefilter(r));
-    if q.needs_parse() || q.needs_index() || q.needs_events() {
+    if q.needs_parse() || q.needs_index() || q.needs_events() || q.needs_forest() {
         let text_sets = crate::cmd::query::TextSets::resolve(q);
         refs.retain(|r| {
             cv_core::harness::for_harness(r.harness)

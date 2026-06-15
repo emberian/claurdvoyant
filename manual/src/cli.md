@@ -331,9 +331,23 @@ cv ls -q "(model:fable OR model:opus) -title:test"    # either model, excluding 
 cv ls -q "msgs>=50 after:2026-01-01 tool:Bash"        # big recent sessions that ran Bash
 cv ls -q 'title~"fly\.?io|aws"'                       # ~ is case-insensitive regex
 cv stats -q "touched:src/ir.rs has:errors"            # analytics over a slice
+cv ls -q "harness:claude agent:Explore subtool:Bash"  # a forest query (see below)
 ```
 
-Fields: `harness`, `model`, `cwd`, `title`, `id`, `msgs`, `created`, `updated` (`before:`/`after:` are sugar), `git`, `text` (full-text, needs `cv index`), `tool`/`touched`/`has` (events catalog). Operators: `:` (contains), `=` (exact), `~` (regex), and `> >= < <=` for numbers/dates; values can be comma-OR-lists (`a,b`) or ranges (`lo..hi`). Catalog-cheap terms prune before the costlier ones force a parse, so pair a `model:`/`text:` term with a `harness:`/`cwd:` term to stay fast.
+Fields, by what they cost to answer:
+
+- **catalog** (free, no parse): `harness`, `cwd`, `title`, `id`, `msgs`, `created`, `updated` (`before:`/`after:` are sugar).
+- **parse** (reads the transcript): `model` (any turn's model), `git` (branch/remote).
+- **index** (needs `cv index`): `text` — full-text over content.
+- **events**: `tool` (a tool *this session* ran), `touched` (a file it read/edited), `has` (flags: `subagents`, `errors`, `tools`, `images`, `compacted`, `workflows`).
+- **forest** (walks the [sub-agent forest / workflows / compaction seams](#cv-workflow) — the priciest): `subtool` (a tool a *sub-agent* ran), `agent` (spawned a sub-agent of this type), `agents` (forest size), `workflow` (ran a matching `Workflow`), `workflows` (run count), `compactions` (boundary count).
+
+Operators: `:` (contains), `=` (exact), `~` (case-insensitive regex, local string fields only), and `> >= < <=` for numbers/dates; values can be comma-OR-lists (`a,b`) or ranges (`lo..hi`). The evaluator prunes with the catalog-cheap terms **first**, so a forest/parse/index term only ever runs on what survives — always pair one with a `harness:`/`cwd:`/`msgs` term to stay fast.
+
+```sh
+cv ls -q "harness:claude agents>=5 subtool:Bash compactions>=1"   # deep, tool-heavy, compacted runs
+cv ls -q "workflow:census OR workflows>=3"                        # ran a census workflow, or 3+ runs
+```
 
 ---
 

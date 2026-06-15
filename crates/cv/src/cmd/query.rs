@@ -66,16 +66,32 @@ impl TextSets {
 }
 
 /// The external-predicate resolver for one parsed session: `text:` from the precomputed [`TextSets`],
-/// and `tool:`/`touched:`/`has:` from the session's events (extracted in-memory, lazily, once).
+/// `tool:`/`touched:`/`has:` from the session's events (extracted in-memory), and the forest-tier
+/// predicates (`subtool:`/`agent:`/`agents`/`workflow(s)`/`compactions`) from the sub-agent forest /
+/// workflow state / compaction scan. Every expensive walk is memoized so it runs at most once.
 pub(crate) struct SessionFacts<'a> {
+    r: &'a SessionRef,
     session: &'a Session,
     text_sets: &'a TextSets,
     events: OnceCell<Vec<Event>>,
+    forest: OnceCell<cv_core::tools::ForestTools>,
+    tree: OnceCell<Vec<cv_core::SubagentInfo>>,
+    workflows: OnceCell<Vec<cv_core::Workflow>>,
+    compactions: OnceCell<usize>,
 }
 
 impl<'a> SessionFacts<'a> {
-    pub(crate) fn new(session: &'a Session, text_sets: &'a TextSets) -> Self {
-        SessionFacts { session, text_sets, events: OnceCell::new() }
+    pub(crate) fn new(r: &'a SessionRef, session: &'a Session, text_sets: &'a TextSets) -> Self {
+        SessionFacts {
+            r,
+            session,
+            text_sets,
+            events: OnceCell::new(),
+            forest: OnceCell::new(),
+            tree: OnceCell::new(),
+            workflows: OnceCell::new(),
+            compactions: OnceCell::new(),
+        }
     }
 
     fn events(&self) -> &[Event] {
@@ -88,6 +104,27 @@ impl<'a> SessionFacts<'a> {
                 .flat_map(|(i, m)| events::extract(m, i, cwd))
                 .collect()
         })
+    }
+
+    /// Per-agent tool histograms across the orchestrator + forest (parses every sub-agent — pricey).
+    fn forest(&self) -> &cv_core::tools::ForestTools {
+        self.forest
+            .get_or_init(|| cv_core::tools::forest_tools(self.r).unwrap_or(cv_core::tools::ForestTools { agents: vec![] }))
+    }
+
+    /// The sub-agent forest as lightweight infos (type + ref + journaled outcome).
+    fn tree(&self) -> &[cv_core::SubagentInfo] {
+        self.tree.get_or_init(|| cv_core::subagent_tree_of(self.r))
+    }
+
+    fn workflows(&self) -> &[cv_core::Workflow] {
+        self.workflows.get_or_init(|| cv_core::workflows_of(self.r))
+    }
+
+    fn compaction_count(&self) -> usize {
+        *self
+            .compactions
+            .get_or_init(|| cv_core::compaction::detect(self.r, false).map(|c| c.len()).unwrap_or(0))
     }
 }
 
@@ -130,7 +167,39 @@ impl ExtFacts for SessionFacts<'_> {
                         .as_deref()
                         .is_some_and(|p| !cv_core::harness::claude::subagent_refs(p).is_empty())
             }
+            "compacted" => self.compaction_count() > 0,
+            "workflows" => !self.workflows().is_empty(),
             _ => false,
+        })
+    }
+
+    fn subtool(&self, name: &str) -> Tri {
+        // A tool used by any *sub-agent* (skip the orchestrator sentinel).
+        Tri::of(self.forest().agents.iter().any(|a| {
+            a.agent != cv_core::tools::ORCHESTRATOR
+                && a.histogram.tools.keys().any(|t| t.to_lowercase().contains(name))
+        }))
+    }
+
+    fn agent_type(&self, needle: &str) -> Tri {
+        Tri::of(self.tree().iter().any(|info| {
+            info.agent_type.as_deref().is_some_and(|t| t.to_lowercase().contains(needle))
+        }))
+    }
+
+    fn workflow(&self, needle: &str) -> Tri {
+        Tri::of(self.workflows().iter().any(|w| {
+            w.run_id.to_lowercase().contains(needle)
+                || w.name.as_deref().is_some_and(|n| n.to_lowercase().contains(needle))
+        }))
+    }
+
+    fn count(&self, field: FieldId) -> Option<u64> {
+        Some(match field {
+            FieldId::Agents => self.tree().len() as u64,
+            FieldId::Workflows => self.workflows().len() as u64,
+            FieldId::Compactions => self.compaction_count() as u64,
+            _ => return None,
         })
     }
 }
@@ -142,6 +211,6 @@ pub(crate) fn matches_full(
     session: &Session,
     text_sets: &TextSets,
 ) -> bool {
-    let facts = SessionFacts::new(session, text_sets);
+    let facts = SessionFacts::new(r, session, text_sets);
     query.matches(&Facts { r, session: Some(session), ext: &facts })
 }

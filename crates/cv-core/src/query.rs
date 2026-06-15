@@ -48,6 +48,13 @@ pub enum FieldId {
     Tool,
     Touched,
     Has,
+    // Forest-tier: reach into the sub-agent forest / workflow runs / compaction seams.
+    Subtool,
+    Agent,
+    Agents,
+    Workflow,
+    Workflows,
+    Compactions,
 }
 
 /// What kind of value a field takes — drives value parsing and which operators are legal.
@@ -75,6 +82,9 @@ pub enum Cost {
     Parse,
     Index,
     Events,
+    /// Walks the sub-agent forest / workflow runs / compaction seams — the priciest tier (reads many
+    /// sidecar files), so always pair a forest term with a cheap one.
+    Forest,
 }
 
 /// One row of the language: a field, how to spell it, what it takes, and what it costs to answer.
@@ -94,6 +104,8 @@ pub const HAS_FLAGS: &[(&str, &str)] = &[
     ("errors", "has at least one error event"),
     ("tools", "used at least one tool"),
     ("images", "contains an image block"),
+    ("compacted", "context was compacted at least once"),
+    ("workflows", "ran at least one Workflow-tool run"),
 ];
 
 /// The language. One row per field; everything else is generated from this.
@@ -123,12 +135,35 @@ pub const FIELDS: &[FieldDef] = &[
     FieldDef { id: FieldId::Touched, name: "touched", aliases: &["file"], kind: Kind::Path, cost: Cost::Events,
         desc: "Read or edited a file at this path (events catalog).", example: "touched:src/ir.rs" },
     FieldDef { id: FieldId::Has, name: "has", aliases: &[], kind: Kind::Flag, cost: Cost::Events,
-        desc: "A capability flag (subagents, errors, tools, images).", example: "has:subagents" },
+        desc: "A capability flag (subagents, errors, tools, images, compacted, workflows).", example: "has:subagents" },
+    FieldDef { id: FieldId::Subtool, name: "subtool", aliases: &[], kind: Kind::Str, cost: Cost::Forest,
+        desc: "A tool used by a *sub-agent* (not the orchestrator). Walks the forest.", example: "subtool:Bash" },
+    FieldDef { id: FieldId::Agent, name: "agent", aliases: &["subagent"], kind: Kind::Str, cost: Cost::Forest,
+        desc: "Spawned a sub-agent of this type (substring): Explore, general-purpose, …", example: "agent:Explore" },
+    FieldDef { id: FieldId::Agents, name: "agents", aliases: &["subagents"], kind: Kind::Num, cost: Cost::Forest,
+        desc: "Sub-agent forest size.", example: "agents>=5" },
+    FieldDef { id: FieldId::Workflow, name: "workflow", aliases: &["wf"], kind: Kind::Str, cost: Cost::Forest,
+        desc: "Ran a `Workflow` matching this name/run-id (substring).", example: "workflow:census" },
+    FieldDef { id: FieldId::Workflows, name: "workflows", aliases: &[], kind: Kind::Num, cost: Cost::Forest,
+        desc: "Number of `Workflow`-tool runs.", example: "workflows>=1" },
+    FieldDef { id: FieldId::Compactions, name: "compactions", aliases: &["compacts"], kind: Kind::Num, cost: Cost::Forest,
+        desc: "Number of context-compaction boundaries.", example: "compactions>=2" },
 ];
 
 fn field_for(key: &str) -> Option<&'static FieldDef> {
     let k = key.to_ascii_lowercase();
     FIELDS.iter().find(|f| f.name == k || f.aliases.contains(&k.as_str()))
+}
+
+/// The one-word cost label shown in the reference + machine schema.
+fn cost_label(c: Cost) -> &'static str {
+    match c {
+        Cost::Catalog => "catalog",
+        Cost::Parse => "parse",
+        Cost::Index => "index",
+        Cost::Events => "events",
+        Cost::Forest => "forest",
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -266,6 +301,23 @@ pub trait ExtFacts {
     fn has(&self, _flag: &str) -> Tri {
         Tri::Unknown
     }
+    /// A tool used by a sub-agent (not the orchestrator) — `subtool:`.
+    fn subtool(&self, _name: &str) -> Tri {
+        Tri::Unknown
+    }
+    /// Spawned a sub-agent whose type matches — `agent:`.
+    fn agent_type(&self, _needle: &str) -> Tri {
+        Tri::Unknown
+    }
+    /// Ran a `Workflow` matching this name/run-id — `workflow:`.
+    fn workflow(&self, _needle: &str) -> Tri {
+        Tri::Unknown
+    }
+    /// A forest-derived count for a numeric forest field (`agents`/`workflows`/`compactions`).
+    /// `None` ⇒ couldn't compute (treated as `Unknown`).
+    fn count(&self, _field: FieldId) -> Option<u64> {
+        None
+    }
 }
 
 /// The do-nothing resolver (everything `Unknown`) — used in the cheap prefilter phase.
@@ -336,6 +388,12 @@ impl SessionQuery {
     /// Whether it reads the events catalog (`tool:`/`touched:`/`has:`).
     pub fn needs_events(&self) -> bool {
         self.costs.contains(&Cost::Events)
+    }
+
+    /// Whether it walks the sub-agent forest / workflows / compaction (`subtool:`/`agent:`/`agents`/
+    /// `workflow(s)`/`compactions`) — the priciest tier.
+    pub fn needs_forest(&self) -> bool {
+        self.costs.contains(&Cost::Forest)
     }
 
     /// Every value-needle used with a given field, anywhere in the expression — so a caller can
@@ -466,6 +524,16 @@ fn eval_term(t: &Term, f: &Facts) -> Tri {
         FieldId::Tool => or_over(&t.val, |n| f.ext.tool(n)),
         FieldId::Touched => or_over(&t.val, |n| f.ext.touched(n)),
         FieldId::Has => or_over(&t.val, |n| f.ext.has(n)),
+        // Forest (sub-agents / workflows / compaction).
+        FieldId::Subtool => or_over(&t.val, |n| f.ext.subtool(n)),
+        FieldId::Agent => or_over(&t.val, |n| f.ext.agent_type(n)),
+        FieldId::Workflow => or_over(&t.val, |n| f.ext.workflow(n)),
+        FieldId::Agents | FieldId::Workflows | FieldId::Compactions => {
+            match f.ext.count(t.field) {
+                Some(n) => num_match(t.op, &t.val, n),
+                None => Tri::Unknown,
+            }
+        }
     }
 }
 
@@ -707,7 +775,7 @@ fn parse_term(w: &str) -> Result<Expr, String> {
             // `~` (regex): only on local (catalog/parse) string fields — the external resolvers
             // (`text:`/`tool:`/`touched:`) take plain needles, not patterns.
             if op == Op::Match {
-                if !matches!(def.kind, Kind::Str | Kind::Path) || matches!(def.cost, Cost::Index | Cost::Events) {
+                if !matches!(def.kind, Kind::Str | Kind::Path) || matches!(def.cost, Cost::Index | Cost::Events | Cost::Forest) {
                     return Err(format!("`~` (regex) isn't valid on {} — see `cv query`", def.name));
                 }
                 let re = regex::RegexBuilder::new(value)
@@ -855,12 +923,7 @@ pub fn reference() -> String {
     s.push_str("FIELDS\n");
     let w = FIELDS.iter().map(|f| f.name.len()).max().unwrap_or(7);
     for f in FIELDS {
-        let cost = match f.cost {
-            Cost::Catalog => "catalog",
-            Cost::Parse => "parse",
-            Cost::Index => "index",
-            Cost::Events => "events",
-        };
+        let cost = cost_label(f.cost);
         s.push_str(&format!("  {:<w$}  [{:<7}] {}\n      e.g. {}\n", f.name, cost, f.desc, f.example, w = w));
         if !f.aliases.is_empty() {
             s.push_str(&format!("      aliases: {}\n", f.aliases.join(", ")));
@@ -899,12 +962,7 @@ pub fn schema_json() -> serde_json::Value {
         } else {
             vec![":", "="]
         };
-        let cost = match f.cost {
-            Cost::Catalog => "catalog",
-            Cost::Parse => "parse",
-            Cost::Index => "index",
-            Cost::Events => "events",
-        };
+        let cost = cost_label(f.cost);
         json!({
             "name": f.name, "aliases": f.aliases, "type": kind, "ops": ops,
             "cost": cost, "desc": f.desc, "example": f.example,
