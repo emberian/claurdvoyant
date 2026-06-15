@@ -15,7 +15,7 @@ pub(crate) use util::short_id;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use cmd::live::BoardCmd;
-use cmd::{browse, compose, convert, live, pack, provenance, search, share, view};
+use cmd::{browse, compose, convert, live, pack, provenance, query, search, share, view};
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -39,6 +39,12 @@ enum Cmd {
         /// Only sessions whose cwd contains this substring.
         #[arg(long)]
         cwd: Option<String>,
+        /// Query calculus to filter rows, e.g. `model:fable`, `harness:codex msgs>=50`,
+        /// `after:2026-06-01 widget` (implicit AND; see `cv query`). A `model:` term forces a
+        /// parse of each candidate (the catalog doesn't store the model), so pair it with cheap
+        /// terms like `harness:`/`cwd:` to keep it fast.
+        #[arg(long, short = 'q')]
+        query: Option<String>,
         /// Max rows to show.
         #[arg(long, default_value_t = 40)]
         limit: usize,
@@ -96,6 +102,15 @@ enum Cmd {
         /// Only this harness (claude, codex, hermes, …); omit for all.
         #[arg(long)]
         harness: Option<String>,
+        /// Query calculus selecting which sessions to include, e.g. `model:fable`,
+        /// `harness:claude msgs>=20`, `after:2026-01-01 cwd:/pug` (implicit AND; see `cv query`).
+        #[arg(long, short = 'q')]
+        query: Option<String>,
+        /// Also emit each Claude session's sub-agent forest (directly- and `Workflow`-spawned
+        /// transcripts in sidecar files). These are first-class training data — and a parent on one
+        /// model often spawns sub-agents on another, so `model:` queries need this to catch them.
+        #[arg(long)]
+        subagents: bool,
         /// Stop after N emitted records.
         #[arg(long)]
         limit: Option<usize>,
@@ -105,6 +120,11 @@ enum Cmd {
         /// Scrub secrets/PII from every session before emitting (cv_core::redact).
         #[arg(long)]
         redact: bool,
+        /// Scrub only these secret classes (comma list: `private_key`, `api_key`, `jwt`, `email`,
+        /// `blob`, `assignment`), leaving everything else intact — e.g. `--redact-only private_key`
+        /// to strip PEM blocks but keep identities. Implies redaction; overrides `--redact`.
+        #[arg(long, value_name = "CLASSES")]
+        redact_only: Option<String>,
         /// Write to this file instead of stdout.
         #[arg(long)]
         out: Option<PathBuf>,
@@ -239,7 +259,19 @@ enum Cmd {
         show: bool,
     },
     /// Fleet analytics over all discovered sessions.
-    Stats,
+    Stats {
+        /// Restrict the analytics to sessions matching this query (see `cv query`).
+        #[arg(long, short = 'q')]
+        query: Option<String>,
+    },
+    /// The query-calculus reference: every field, operator, and example. `--json` emits the machine
+    /// schema. The `-q` flag on ls/dataset/timeline/stats speaks this language.
+    Query {
+        /// Emit the machine-readable schema (fields, types, operators) as JSON instead of the
+        /// human reference.
+        #[arg(long)]
+        json: bool,
+    },
     /// Print (or with --launch, run) the resume incantation for a session in its native harness.
     Resume {
         id: String,
@@ -267,6 +299,9 @@ enum Cmd {
         /// Only sessions whose cwd contains this substring.
         #[arg(long)]
         cwd: Option<String>,
+        /// Restrict the feed to sessions matching this query (see `cv query`).
+        #[arg(long, short = 'q')]
+        query: Option<String>,
         #[arg(long, default_value_t = 60)]
         limit: usize,
     },
@@ -371,12 +406,12 @@ enum Cmd {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
-        Cmd::Ls { harness, cwd, limit, sort_by, fresh } => browse::cmd_ls(harness, cwd, limit, &sort_by, fresh),
+        Cmd::Ls { harness, cwd, query, limit, sort_by, fresh } => browse::cmd_ls(harness, cwd, query, limit, &sort_by, fresh),
         Cmd::Search { query, harness, limit, semantic } => search::cmd_search(&query, harness, limit, semantic),
         Cmd::Show { id, harness, json, range } => view::cmd_show(&id, harness, json, range),
         Cmd::Export { id, format, harness } => view::cmd_export(&id, &format, harness),
-        Cmd::Dataset { format, harness, limit, min_messages, redact, out } => {
-            compose::cmd_dataset(&format, harness, limit, min_messages, redact, out)
+        Cmd::Dataset { format, harness, query, subagents, limit, min_messages, redact, redact_only, out } => {
+            compose::cmd_dataset(&format, harness, query, subagents, limit, min_messages, redact, redact_only, out)
         }
         Cmd::Convert { id, to, from, out, cwd } => convert::cmd_convert(&id, &to, from, out, cwd),
         Cmd::Port { id, to, from, to_dir, out, no_context } => convert::cmd_port(&id, to, from, to_dir, out, no_context),
@@ -387,11 +422,12 @@ fn main() -> Result<()> {
         Cmd::Blame { file, lines, show } => blame::cmd_blame(&file, lines.as_deref(), show),
         Cmd::Share { id, harness, out, no_redact } => share::cmd_share(&id, harness, out, no_redact),
         Cmd::Pack { task, format, to, limit, out } => pack::cmd_pack(&task, &format, to, limit, out),
-        Cmd::Stats => browse::cmd_stats(),
+        Cmd::Stats { query } => browse::cmd_stats(query),
+        Cmd::Query { json } => query::cmd_query(json),
         Cmd::Resume { id, harness, launch } => convert::cmd_resume(&id, harness, launch),
         Cmd::Tree { id, harness } => view::cmd_tree(&id, harness),
         Cmd::Board { action } => live::cmd_board(action),
-        Cmd::Timeline { harness, cwd, limit } => browse::cmd_timeline(harness, cwd, limit),
+        Cmd::Timeline { harness, cwd, query, limit } => browse::cmd_timeline(harness, cwd, query, limit),
         Cmd::Diff { a, b, harness } => view::cmd_diff(&a, &b, harness),
         Cmd::Splice { specs, to, out, export, cwd, generate, gen_model } => compose::cmd_splice(&specs, to, out, export, cwd, generate, gen_model),
         Cmd::Distill { id, harness, model, project, out, append } => {

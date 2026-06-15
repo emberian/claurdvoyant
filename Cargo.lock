@@ -475,6 +475,7 @@ dependencies = [
  "memmap2",
  "percent-encoding",
  "rayon",
+ "regex",
  "rusqlite",
  "ruzstd",
  "serde",

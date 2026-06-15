@@ -7,14 +7,32 @@ use crate::util::{dim_cwd, home_rel, parse_harness, short_id};
 use anyhow::Result;
 use cv_core::ir::{truncate, SessionRef};
 
+/// Apply a parsed query to a ref list in place: prune with the catalog-cheap prefilter, then — if
+/// the query has any parse/index/events term — parse each survivor and keep only full matches. Used
+/// by `ls`/`timeline`/`stats` so they all speak the same `-q`.
+fn apply_query(refs: &mut Vec<SessionRef>, query: &Option<cv_core::SessionQuery>) {
+    let Some(q) = query else { return };
+    refs.retain(|r| q.prefilter(r));
+    if q.needs_parse() || q.needs_index() || q.needs_events() {
+        let text_sets = crate::cmd::query::TextSets::resolve(q);
+        refs.retain(|r| {
+            cv_core::harness::for_harness(r.harness)
+                .and_then(|a| cv_core::stream::collect_with(a.as_ref(), r, &cv_core::ParseOptions::lazy()).ok())
+                .is_some_and(|s| crate::cmd::query::matches_full(q, r, &s, &text_sets))
+        });
+    }
+}
+
 pub(crate) fn cmd_ls(
     harness: Option<String>,
     cwd: Option<String>,
+    query: Option<String>,
     limit: usize,
     sort_by: &str,
     fresh: bool, // force a full re-discovery instead of trusting the probed catalog
 ) -> Result<()> {
     let want = parse_harness(&harness)?;
+    let query = crate::cmd::query::build(query)?;
     let all = if fresh { cv_core::discover_all() } else { cv_core::sessions() };
     let discovered = all.len();
     let mut refs: Vec<SessionRef> = all
@@ -28,6 +46,7 @@ pub(crate) fn cmd_ls(
                 .is_some_and(|p| p.to_string_lossy().contains(c)),
         })
         .collect();
+    apply_query(&mut refs, &query);
 
     match sort_by {
         "created" => refs.sort_by_key(|r| std::cmp::Reverse(r.created_at.or(r.updated_at))),
@@ -69,8 +88,9 @@ pub(crate) fn cmd_ls(
 // ---------- timeline ----------
 
 /// A unified chronological feed across all harnesses (oldest → newest, like a feed). Grouped by day.
-pub(crate) fn cmd_timeline(harness: Option<String>, cwd: Option<String>, limit: usize) -> Result<()> {
+pub(crate) fn cmd_timeline(harness: Option<String>, cwd: Option<String>, query: Option<String>, limit: usize) -> Result<()> {
     let want = parse_harness(&harness)?;
+    let query = crate::cmd::query::build(query)?;
     let mut refs: Vec<SessionRef> = cv_core::sessions()
         .into_iter()
         .filter(|r| want.is_none_or(|h| r.harness == h))
@@ -83,6 +103,7 @@ pub(crate) fn cmd_timeline(harness: Option<String>, cwd: Option<String>, limit: 
                 .unwrap_or(false),
         })
         .collect();
+    apply_query(&mut refs, &query);
 
     // Sort ascending by updated_at (falling back to created_at), so the feed reads oldest → newest.
     let key = |r: &SessionRef| r.updated_at.or(r.created_at);
@@ -129,12 +150,15 @@ pub(crate) fn cmd_timeline(harness: Option<String>, cwd: Option<String>, limit: 
 
 // ---------- stats ----------
 
-pub(crate) fn cmd_stats() -> Result<()> {
+pub(crate) fn cmd_stats(query: Option<String>) -> Result<()> {
     use std::collections::HashMap;
-    let refs = cv_core::sessions();
+    let query = crate::cmd::query::build(query)?;
+    let mut refs = cv_core::sessions();
+    apply_query(&mut refs, &query);
     let total = refs.len();
     if total == 0 {
-        println!("no sessions discovered.");
+        let scope = if query.is_some() { " match the query" } else { " discovered" };
+        println!("no sessions{scope}.");
         return Ok(());
     }
 

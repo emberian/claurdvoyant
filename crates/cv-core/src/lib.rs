@@ -20,6 +20,7 @@ pub mod ingest;
 pub mod ir;
 pub mod lazy;
 pub mod loom;
+pub mod query;
 pub mod redact;
 pub mod render;
 pub mod stream;
@@ -29,6 +30,7 @@ pub use emit::{EmitOptions, emit};
 pub use harness::{Adapter, EmitResult};
 pub use ir::*;
 pub use lazy::{Resolver, Span, Text, INLINE_MAX};
+pub use query::SessionQuery;
 pub use stream::{collect, CollectSink, Flow, MessageSink, ParseOptions, TeeSink};
 
 use anyhow::Result;

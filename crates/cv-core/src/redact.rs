@@ -36,6 +36,68 @@ use std::borrow::Cow;
 pub struct RedactOptions {
     /// If `false` (the default), email addresses are redacted. Set `true` to keep them.
     pub keep_emails: bool,
+    /// Which classes of secret to scrub. Defaults to all of them; narrow it to scrub only some
+    /// (e.g. only PEM private keys while leaving identities/fixtures intact).
+    pub classes: RedactClasses,
+}
+
+/// A toggle per secret class. `Default` enables every class (so `RedactOptions::default()` scrubs
+/// everything, unchanged); use [`RedactClasses::none`]/[`RedactClasses::parse_only`] to scope it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RedactClasses {
+    pub api_keys: bool,
+    pub private_keys: bool,
+    pub jwts: bool,
+    pub emails: bool,
+    pub blobs: bool,
+    pub assignments: bool,
+}
+
+impl Default for RedactClasses {
+    fn default() -> Self {
+        RedactClasses {
+            api_keys: true,
+            private_keys: true,
+            jwts: true,
+            emails: true,
+            blobs: true,
+            assignments: true,
+        }
+    }
+}
+
+impl RedactClasses {
+    /// No class enabled (a base to turn specific ones on).
+    pub fn none() -> Self {
+        RedactClasses {
+            api_keys: false,
+            private_keys: false,
+            jwts: false,
+            emails: false,
+            blobs: false,
+            assignments: false,
+        }
+    }
+
+    /// Parse a comma-separated class list into an "only these" set, accepting singular/plural and the
+    /// placeholder labels: `api_key`, `private_key`, `jwt`, `email`, `blob`/`secret`, `assignment`.
+    pub fn parse_only(spec: &str) -> Result<Self, String> {
+        let mut c = RedactClasses::none();
+        for raw in spec.split(',') {
+            let name = raw.trim().trim_end_matches('s').to_ascii_lowercase();
+            match name.as_str() {
+                "api_key" | "apikey" | "key" => c.api_keys = true,
+                "private_key" | "privatekey" | "pem" => c.private_keys = true,
+                "jwt" => c.jwts = true,
+                "email" => c.emails = true,
+                "blob" | "secret" => c.blobs = true,
+                "assignment" => c.assignments = true,
+                "" => {}
+                other => return Err(format!("unknown redaction class {other:?}")),
+            }
+        }
+        Ok(c)
+    }
 }
 
 /// Counts of how many spans of each class were redacted across a session.
@@ -269,32 +331,44 @@ fn m(kind: Kind, end: usize) -> Option<Match> {
 /// Try every recognizer at byte offset `i`. Returns the first match.
 fn match_at(s: &str, i: usize, opts: &RedactOptions) -> Option<Match> {
     // Order matters: private keys first (they swallow a big block), then assignments / headers
-    // (which keep a prefix), then bare tokens, JWTs, emails, then conservative blobs.
-    if let Some(end) = match_private_key(s, i) {
-        return m(Kind::PrivateKey, end);
+    // (which keep a prefix), then bare tokens, JWTs, emails, then conservative blobs. Each class is
+    // gated by `opts.classes` so redaction can be scoped (e.g. PEM keys only).
+    let c = &opts.classes;
+    if c.private_keys {
+        if let Some(end) = match_private_key(s, i) {
+            return m(Kind::PrivateKey, end);
+        }
     }
-    if let Some(hit) = match_assignment(s, i) {
-        return Some(hit);
+    if c.assignments {
+        if let Some(hit) = match_assignment(s, i) {
+            return Some(hit);
+        }
     }
-    if let Some(hit) = match_authorization_header(s, i) {
-        return Some(hit);
+    if c.api_keys {
+        if let Some(hit) = match_authorization_header(s, i) {
+            return Some(hit);
+        }
+        if let Some(end) = match_bearer(s, i) {
+            return m(Kind::ApiKey, end);
+        }
+        if let Some(end) = match_token_prefix(s, i) {
+            return m(Kind::ApiKey, end);
+        }
     }
-    if let Some(end) = match_bearer(s, i) {
-        return m(Kind::ApiKey, end);
+    if c.jwts {
+        if let Some(end) = match_jwt(s, i) {
+            return m(Kind::Jwt, end);
+        }
     }
-    if let Some(end) = match_token_prefix(s, i) {
-        return m(Kind::ApiKey, end);
-    }
-    if let Some(end) = match_jwt(s, i) {
-        return m(Kind::Jwt, end);
-    }
-    if !opts.keep_emails {
+    if c.emails && !opts.keep_emails {
         if let Some(end) = match_email(s, i) {
             return m(Kind::Email, end);
         }
     }
-    if let Some(end) = match_keyworded_blob(s, i) {
-        return m(Kind::Blob, end);
+    if c.blobs {
+        if let Some(end) = match_keyworded_blob(s, i) {
+            return m(Kind::Blob, end);
+        }
     }
     None
 }
@@ -836,9 +910,36 @@ mod tests {
             text: "ping a@b.com".into(),
         });
         sess.messages.push(m);
-        let (out, _stats) = redact_with(&sess, &RedactOptions { keep_emails: true });
+        let (out, _stats) = redact_with(&sess, &RedactOptions { keep_emails: true, ..Default::default() });
         let t = out.messages[0].text().unwrap();
         assert!(t.contains("a@b.com"), "got: {t}");
+    }
+
+    #[test]
+    fn scoped_classes_only_private_keys() {
+        // The exact ask: scrub PEM blocks, leave email/identity and api-key fixtures untouched.
+        let opts = RedactOptions {
+            classes: RedactClasses::parse_only("private_key").unwrap(),
+            ..Default::default()
+        };
+        let text = "mail me@example.com key sk-abcDEF1234567890ghijkl\n-----BEGIN PRIVATE KEY-----\nMIIBVgIBADANBgkqhkiG9w0BAQEFAASC\n-----END PRIVATE KEY-----\ndone";
+        let mut stats = RedactStats::default();
+        let out = scrub_cow(text, &opts, &mut stats);
+        assert!(out.contains("[REDACTED:private_key]"), "got: {out}");
+        assert!(out.contains("me@example.com"), "email must survive: {out}");
+        assert!(out.contains("sk-abcDEF1234567890ghijkl"), "api key must survive: {out}");
+        assert_eq!(stats.private_keys, 1);
+        assert_eq!(stats.emails, 0);
+        assert_eq!(stats.api_keys, 0);
+    }
+
+    #[test]
+    fn parse_only_rejects_garbage_and_trims_plurals() {
+        assert_eq!(
+            RedactClasses::parse_only("private_keys, emails").unwrap(),
+            RedactClasses { private_keys: true, emails: true, ..RedactClasses::none() }
+        );
+        assert!(RedactClasses::parse_only("nope").is_err());
     }
 
     #[test]

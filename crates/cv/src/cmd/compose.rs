@@ -247,12 +247,16 @@ pub(crate) fn cmd_distill(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn cmd_dataset(
     format: &str,
     harness: Option<String>,
+    query: Option<String>,
+    subagents: bool,
     limit: Option<usize>,
     min_messages: usize,
     redact: bool,
+    redact_only: Option<String>,
     out: Option<PathBuf>,
 ) -> Result<()> {
     use std::io::Write;
@@ -260,6 +264,25 @@ pub(crate) fn cmd_dataset(
         bail!("unknown format {format:?} (use chatml or sharegpt)");
     }
     let want = parse_harness(&harness)?;
+    let query = match query {
+        Some(q) => Some(cv_core::SessionQuery::parse(&q).map_err(|e| anyhow::anyhow!(e))?),
+        None => None,
+    };
+    let fmt = match format {
+        "chatml" => cv_core::dataset::Format::Chatml,
+        _ => cv_core::dataset::Format::ShareGpt,
+    };
+    // `--redact-only <classes>` scopes redaction to specific secret classes (and implies it);
+    // plain `--redact` scrubs every class.
+    let redact_opts = match &redact_only {
+        Some(spec) => Some(cv_core::redact::RedactOptions {
+            classes: cv_core::redact::RedactClasses::parse_only(spec).map_err(|e| anyhow::anyhow!(e))?,
+            ..Default::default()
+        }),
+        None => redact.then(cv_core::redact::RedactOptions::default),
+    };
+    // Pre-resolve any `text:` predicates against the full-text index (one search per needle).
+    let text_sets = query.as_ref().map(crate::cmd::query::TextSets::resolve).unwrap_or_else(crate::cmd::query::TextSets::empty);
     let mut writer: Box<dyn Write> = match &out {
         Some(p) => Box::new(std::io::BufWriter::new(fs::File::create(p)?)),
         None => Box::new(std::io::BufWriter::new(std::io::stdout())),
@@ -268,47 +291,27 @@ pub(crate) fn cmd_dataset(
     // Stream the corpus one session at a time (parse -> emit -> drop) so memory stays bounded.
     let mut emitted = 0usize;
     let mut skipped = 0usize;
-    for r in cv_core::discover_all() {
+    let mut ctx = EmitCtx { writer: writer.as_mut(), query: query.as_ref(), text_sets: &text_sets, fmt, redact_opts: redact_opts.as_ref(), min_messages, limit, emitted: &mut emitted, skipped: &mut skipped };
+
+    'outer: for r in cv_core::discover_all() {
         if let Some(w) = want {
             if r.harness != w {
                 continue;
             }
         }
-        let Some(adapter) = cv_core::harness::for_harness(r.harness) else {
-            continue;
-        };
-        // Lazy opts: large content stays a span (held as a 16-byte ref), and `write_record` streams
-        // it straight to the writer in chunks — so even a 700 MB record never materializes. `extra`
-        // isn't read by dataset rendering, so it's skipped too.
-        let session = match cv_core::stream::collect_with(adapter.as_ref(), &r, &cv_core::ParseOptions::lazy()) {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("cv dataset: skipping {} ({}): {e:#}", r.id, r.harness);
-                continue;
-            }
-        };
-        if session.messages.len() < min_messages {
-            skipped += 1;
-            continue;
+        if ctx.emit_ref(&r)? == Flow::LimitHit {
+            break;
         }
-        // Stream the record directly to the writer (chunked, JSON-escaped per chunk — never holds the
-        // whole record). `--redact` scrubs one materialized message at a time inside the writer.
-        let fmt = match format {
-            "chatml" => cv_core::dataset::Format::Chatml,
-            _ => cv_core::dataset::Format::ShareGpt,
-        };
-        let redact_opts = redact.then(cv_core::redact::RedactOptions::default);
-        let wrote = cv_core::dataset::write_record(&session, &mut writer, fmt, redact_opts.as_ref())?;
-        if wrote {
-            writeln!(writer)?;
-            emitted += 1;
-            if let Some(l) = limit {
-                if emitted >= l {
-                    break;
+        // `--subagents`: a Claude session fans out into sub-agent transcripts that live in sidecar
+        // files `discover_all` never lists. For a distillation corpus those agent transcripts are
+        // first-class training data — and a parent on one model often spawns sub-agents on another,
+        // so a `model:` query that misses them misses most of the matching turns. Emit each match.
+        if subagents {
+            for sub in cv_core::subagents_of(&r) {
+                if ctx.emit_ref(&sub)? == Flow::LimitHit {
+                    break 'outer;
                 }
             }
-        } else {
-            skipped += 1;
         }
     }
     writer.flush()?;
@@ -316,6 +319,79 @@ pub(crate) fn cmd_dataset(
         .as_ref()
         .map(|p| format!(" to {}", p.display()))
         .unwrap_or_default();
-    eprintln!("✦ {format}: wrote {emitted} record(s){dest} ({skipped} skipped)");
+    let forest = if subagents { " (incl. sub-agent forest)" } else { "" };
+    eprintln!("✦ {format}: wrote {emitted} record(s){dest}{forest} ({skipped} skipped)");
     Ok(())
+}
+
+/// Whether the emit loop should keep going or stop because `--limit` was reached.
+#[derive(PartialEq, Eq)]
+enum Flow {
+    Continue,
+    LimitHit,
+}
+
+/// The shared state for emitting one session ref as a dataset record — so the top-level corpus walk
+/// and the per-session sub-agent forest walk run identical parse → filter → write logic.
+struct EmitCtx<'a> {
+    writer: &'a mut dyn std::io::Write,
+    query: Option<&'a cv_core::SessionQuery>,
+    text_sets: &'a crate::cmd::query::TextSets,
+    fmt: cv_core::dataset::Format,
+    redact_opts: Option<&'a cv_core::redact::RedactOptions>,
+    min_messages: usize,
+    limit: Option<usize>,
+    emitted: &'a mut usize,
+    skipped: &'a mut usize,
+}
+
+impl EmitCtx<'_> {
+    /// Parse one ref and stream it as a record if it passes the filters. Returns [`Flow::LimitHit`]
+    /// once `--limit` records have been emitted.
+    fn emit_ref(&mut self, r: &cv_core::ir::SessionRef) -> Result<Flow> {
+        // Catalog-cheap prefilter (everything but `model:`) prunes before we pay to parse.
+        if let Some(q) = self.query {
+            if !q.prefilter(r) {
+                return Ok(Flow::Continue);
+            }
+        }
+        let Some(adapter) = cv_core::harness::for_harness(r.harness) else {
+            return Ok(Flow::Continue);
+        };
+        // Lazy opts: large content stays a span (held as a 16-byte ref), and `write_record` streams
+        // it straight to the writer in chunks — so even a 700 MB record never materializes. `extra`
+        // isn't read by dataset rendering, so it's skipped too.
+        let session = match cv_core::stream::collect_with(adapter.as_ref(), r, &cv_core::ParseOptions::lazy()) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("cv dataset: skipping {} ({}): {e:#}", r.id, r.harness);
+                return Ok(Flow::Continue);
+            }
+        };
+        if session.messages.len() < self.min_messages {
+            *self.skipped += 1;
+            return Ok(Flow::Continue);
+        }
+        // Full evaluation now that we have the parsed session (resolves model/git/text/tool/… that
+        // the catalog-cheap prefilter left as Unknown).
+        if let Some(q) = self.query {
+            if !crate::cmd::query::matches_full(q, r, &session, self.text_sets) {
+                *self.skipped += 1;
+                return Ok(Flow::Continue);
+            }
+        }
+        // Stream the record directly to the writer (chunked, JSON-escaped per chunk — never holds the
+        // whole record). `--redact` scrubs one materialized message at a time inside the writer.
+        let wrote = cv_core::dataset::write_record(&session, &mut self.writer, self.fmt, self.redact_opts)?;
+        if wrote {
+            writeln!(self.writer)?;
+            *self.emitted += 1;
+            if self.limit.is_some_and(|l| *self.emitted >= l) {
+                return Ok(Flow::LimitHit);
+            }
+        } else {
+            *self.skipped += 1;
+        }
+        Ok(Flow::Continue)
+    }
 }

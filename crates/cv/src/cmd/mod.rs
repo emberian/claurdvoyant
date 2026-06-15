@@ -6,6 +6,7 @@ pub(crate) mod convert;
 pub(crate) mod live;
 pub(crate) mod provenance;
 pub(crate) mod pack;
+pub(crate) mod query;
 pub(crate) mod search;
 pub(crate) mod share;
 pub(crate) mod view;

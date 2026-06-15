@@ -20,6 +20,7 @@ ruzstd = { workspace = true, optional = true }
 rayon = { workspace = true, optional = true }
 dirs.workspace = true
 uuid.workspace = true
+regex.workspace = true
 memmap2 = { version = "0.9", optional = true }
 
 [features]
