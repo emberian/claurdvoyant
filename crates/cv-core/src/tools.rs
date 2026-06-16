@@ -307,7 +307,7 @@ mod tests {
 
     #[test]
     fn histogram_tallies_kinds_and_ranks() {
-        let msgs = vec![
+        let msgs = [
             asst(vec![
                 tool_use("Edit", json!({"file_path": "a.rs", "old_string": "x", "new_string": "y"})),
                 tool_use("Read", json!({"file_path": "b.rs"})),

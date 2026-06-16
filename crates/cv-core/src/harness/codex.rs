@@ -1247,12 +1247,12 @@ impl CodexScan {
                     self.message_count += 1;
                 }
             }
-            Some("response_item") => {
-                if v.pointer("/payload/type").and_then(Value::as_str) == Some("message") {
-                    self.message_count += 1;
-                    if v.pointer("/payload/role").and_then(Value::as_str) == Some("user") {
-                        self.consider_title(&coerce_content(v.pointer("/payload/content")));
-                    }
+            Some("response_item")
+                if v.pointer("/payload/type").and_then(Value::as_str) == Some("message") =>
+            {
+                self.message_count += 1;
+                if v.pointer("/payload/role").and_then(Value::as_str) == Some("user") {
+                    self.consider_title(&coerce_content(v.pointer("/payload/content")));
                 }
             }
             _ => {}
