@@ -101,6 +101,32 @@ project name matches by trailing components.
 *When to use:* the headline tool — "what happened in THIS project before, and what are
 sibling agents doing here?"
 
+## Pruning — custom lossless compaction
+
+### `prune_session`
+
+Compact a Claude session into a **new, resumable** one by snipping bulky *old* tool payloads into a sidecar (see [`cv prune`](cli.md#cv-prune)). The source is never modified; resume the new id with `claude --resume`.
+
+| Argument | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `id` | string | **required** | Source session id (or unique prefix). |
+| `min_size` | number | `2048` | Only snip a tool payload larger than this many bytes. |
+| `keep_last` | number | `25` | Keep the last N conversational turns' payloads verbatim. |
+| `to` | string | — | New session id (default: a fresh UUID). |
+| `drop` | boolean | `false` | Hard-drop payloads (no sidecar, irreversible). |
+| `dry_run` | boolean | `false` | Report what would happen without writing. |
+
+Returns JSON with the new id, paths, counts, byte/token savings, and the `claude --resume` line.
+
+### `prune_retrieve`
+
+Fetch a stashed original back out of a pruned session's sidecar.
+
+| Argument | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `session` | string | **required** | The pruned session id the `[PRUNED id=…]` marker names. |
+| `tool_use_id` | string | **required** | The id from the marker (e.g. `toolu_…` or `…#tur`). |
+
 ## Recall — semantic prior-work search
 
 ### `recall`

@@ -8,6 +8,93 @@ use cv_core::EmitOptions;
 use std::fs;
 use std::path::PathBuf;
 
+// ---------- prune ----------
+
+/// `cv prune <id>` — compact a Claude session into a new resumable one (see [`cv_core::prune`]); or
+/// `cv prune <id> --retrieve <tool_use_id>` to fetch a stashed original back out of the sidecar.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn cmd_prune(
+    id: &str,
+    harness: Option<String>,
+    retrieve: Option<String>,
+    min_size: usize,
+    keep_last: usize,
+    to: Option<String>,
+    drop: bool,
+    dry_run: bool,
+) -> Result<()> {
+    let want = parse_harness(&harness)?;
+    let (r, _adapter) = cv_core::find(id, want)?.with_context(|| format!("no session matching {id:?}"))?;
+    let dir = r.path.parent().unwrap_or(std::path::Path::new("."));
+    let stem = r.path.file_stem().and_then(|s| s.to_str()).unwrap_or(id);
+
+    // Retrieval mode: read a stashed original from <id>.flat.jsonl and print it.
+    if let Some(tool_use_id) = retrieve {
+        let sidecar = dir.join(format!("{stem}.flat.jsonl"));
+        if !sidecar.exists() {
+            bail!("no prune sidecar at {} — is {} a pruned session?", sidecar.display(), short_id(&r.id));
+        }
+        let value = cv_core::prune::retrieve(&sidecar, &tool_use_id)?;
+        // Print raw text verbatim; pretty-print structured payloads.
+        match value.as_str() {
+            Some(s) => println!("{s}"),
+            None => println!("{}", serde_json::to_string_pretty(&value)?),
+        }
+        return Ok(());
+    }
+
+    if r.harness != Harness::Claude {
+        bail!("cv prune currently supports Claude Code sessions only (got {})", r.harness);
+    }
+
+    let opts = cv_core::prune::PruneOptions { min_size, keep_last, drop, new_id: to, dry_run };
+    let res = cv_core::prune::prune_session(&r.path, &opts)?;
+
+    let pct = if res.original_size > 0 {
+        100.0 * res.bytes_saved() as f64 / res.original_size as f64
+    } else {
+        0.0
+    };
+    let tag = if dry_run { " (dry run — nothing written)" } else { "" };
+    eprintln!("✦ pruned {} → {}{tag}", short_id(&res.source_id), short_id(&res.new_id));
+    eprintln!(
+        "  {} payload(s) snipped ({} image(s)) · {} → {} on disk (−{:.0}%) · ~{} context tokens freed",
+        res.pruned_count,
+        res.image_blocks,
+        human_bytes(res.original_size),
+        human_bytes(res.new_size),
+        pct,
+        res.est_context_tokens_saved,
+    );
+    if !dry_run {
+        eprintln!("  new session: {}", res.new_path.display());
+        if let Some(sc) = &res.sidecar_path {
+            eprintln!("  sidecar:     {} (retrieve: cv prune {} --retrieve <tool_use_id>)", sc.display(), short_id(&res.new_id));
+        }
+        if let Some(rc) = &res.copied_resources {
+            eprintln!("  resources:   copied subagents/workflows → {}", rc.display());
+        }
+        eprintln!("  resume with: claude --resume {}", res.new_id);
+    }
+    Ok(())
+}
+
+/// Group-separate + unit a byte count (`5242880` → `5.0 MB`).
+fn human_bytes(n: u64) -> String {
+    const U: [&str; 4] = ["B", "KB", "MB", "GB"];
+    let mut f = n as f64;
+    let mut i = 0;
+    while f >= 1024.0 && i < U.len() - 1 {
+        f /= 1024.0;
+        i += 1;
+    }
+    if i == 0 {
+        format!("{n} B")
+    } else {
+        format!("{f:.1} {}", U[i])
+    }
+}
+
 // ---------- splice / loom ----------
 
 /// A parsed splice spec: which session, and a `[start, end)` window (end None → through the last).

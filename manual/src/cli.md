@@ -34,6 +34,7 @@ cv <cmd> --help    # flags for any one subcommand
 | | [`tree`](#cv-tree) | message threading (DAG or numbered list) |
 | | [`diff`](#cv-diff) | compare two sessions message-by-message |
 | | [`redact`](#cv-redact) | scrub secrets/PII, then export (safe to share) |
+| | [`prune`](#cv-prune) | custom lossless compaction → a new, smaller resumable session |
 | **converting / porting** | [`convert`](#cv-convert) | rewrite a session into another harness's format |
 | | [`port`](#cv-port) | rehome a session to a new directory (carries context files) |
 | | [`resume`](#cv-resume) | print (or run) the native resume incantation |
@@ -264,6 +265,35 @@ Each matched commit prints the session, the message index of the nearest edit,
 and a copy-pasteable `cv show <id> --range` centered on it. Time-correlation is
 honest about its limits: rebases and squashes shift commit times away from the
 edits that produced them, so matches are ranked, not asserted.
+
+---
+
+## Pruning
+
+### `cv prune`
+
+*Custom, lossless compaction* of a Claude Code session into a **new, resumable** session. The standard answer to a full context window is compaction — the model rewrites your whole history into a shorter summary, which is lossy by construction. `cv prune` does the opposite: it changes *nothing* about what was said, and instead lifts the **bulky old tool payloads** (large file reads, command logs, base64 screenshots) out of the conversation into a sidecar, leaving a small `[PRUNED id=…]` marker in their place. Prompts and the chronological flow are preserved verbatim; the most recent turns are kept untouched so the model stays sharp on the task at hand.
+
+The output is a brand-new session (fresh id stamped across every line, sidecar resources copied under the new id) — resume it with `claude --resume <new-id>`. Nothing is ever lost: each snipped original stays in `<new-id>.flat.jsonl` and comes back with `--retrieve`.
+
+```sh
+cv prune 3b829648                                  # default: snip >2KB payloads, keep the last 25 turns
+cv prune 3b829648 --keep-last 40 --min-size 4096   # spare more recent context; only snip bigger payloads
+cv prune 3b829648 --dry-run                        # report the savings without writing
+cv prune 3b829648 --to my-tidy-session             # choose the new id
+cv prune 3b829648 --drop                           # hard-drop payloads (no sidecar, irreversible)
+
+cv prune <new-id> --retrieve toolu_abc123          # fetch a stashed original back out
+```
+
+- `--min-size <bytes>` — only snip a tool payload larger than this (default 2048).
+- `--keep-last <N>` — keep the last N conversational turns' payloads verbatim (default 25).
+- `--to <id>` — the new session id (default: a fresh UUID).
+- `--drop` — discard payloads entirely instead of stashing them (smallest output, irreversible; the source session is never touched regardless).
+- `--dry-run` — compute and report without writing.
+- `--retrieve <tool_use_id>` — instead of pruning, print the stashed original for that id from `<id>.flat.jsonl`.
+
+Claude Code only for now (it operates on the raw JSONL to stay byte-faithful). The source session is never modified — prune only ever *writes a new one*. Also available as the `prune_session` / `prune_retrieve` MCP tools.
 
 ---
 

@@ -401,6 +401,34 @@ fn tool_list() -> Value {
                 },
                 "required": ["channel", "message_id"]
             }
+        },
+        {
+            "name": "prune_session",
+            "description": "Custom, lossless compaction of a Claude Code session into a NEW resumable session: snip bulky OLD tool payloads (large file reads, command logs, screenshots) into a sidecar, leaving a small marker — prompts and chronological flow are preserved verbatim, and the most recent turns are kept untouched. Resume the new id with `claude --resume`. Originals stay retrievable via prune_retrieve. Claude harness only.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string", "description": "Source session id (or unique prefix)." },
+                    "min_size": { "type": "number", "description": "Snip a tool payload only if larger than this many bytes (default 2048)." },
+                    "keep_last": { "type": "number", "description": "Keep the last N conversational turns' payloads verbatim (default 25)." },
+                    "to": { "type": "string", "description": "New session id (default: a fresh UUID)." },
+                    "drop": { "type": "boolean", "description": "Hard-drop payloads (no sidecar, irreversible) instead of stashing them." },
+                    "dry_run": { "type": "boolean", "description": "Report what would happen without writing." }
+                },
+                "required": ["id"]
+            }
+        },
+        {
+            "name": "prune_retrieve",
+            "description": "Fetch a stashed original payload back out of a pruned session's sidecar by its tool_use_id (the id printed inside a [PRUNED id=…] marker). Returns the verbatim content.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "session": { "type": "string", "description": "The pruned session id the marker names." },
+                    "tool_use_id": { "type": "string", "description": "The id from the [PRUNED id=…] marker (e.g. toolu_… or …#tur)." }
+                },
+                "required": ["session", "tool_use_id"]
+            }
         }
     ])
 }
@@ -455,7 +483,59 @@ fn call_tool(name: &str, args: &Value) -> anyhow::Result<String> {
         "board_who" => board_who(args),
         "board_heartbeat" => board_heartbeat(args),
         "board_ack" => board_ack(args),
+        "prune_session" => prune_session(args),
+        "prune_retrieve" => prune_retrieve(args),
         other => anyhow::bail!("unknown tool: {other}"),
+    }
+}
+
+/// Compact a Claude session into a new resumable one (see `cv_core::prune`).
+fn prune_session(args: &Value) -> anyhow::Result<String> {
+    let id = arg_str(args, "id").ok_or_else(|| anyhow::anyhow!("missing required argument: id"))?;
+    let harness = parse_harness(args)?;
+    let (sref, _adapter) =
+        cv_core::find(id, harness)?.ok_or_else(|| anyhow::anyhow!("no session found for id {id:?}"))?;
+    if sref.harness != Harness::Claude {
+        anyhow::bail!("prune currently supports Claude Code sessions only (got {})", sref.harness);
+    }
+    let opts = cv_core::prune::PruneOptions {
+        min_size: arg_usize(args, "min_size", 2048),
+        keep_last: arg_usize(args, "keep_last", 25),
+        drop: args.get("drop").and_then(Value::as_bool).unwrap_or(false),
+        new_id: arg_str(args, "to").map(String::from),
+        dry_run: args.get("dry_run").and_then(Value::as_bool).unwrap_or(false),
+    };
+    let r = cv_core::prune::prune_session(&sref.path, &opts)?;
+    Ok(serde_json::to_string_pretty(&json!({
+        "source_id": r.source_id,
+        "new_id": r.new_id,
+        "new_path": r.new_path,
+        "sidecar_path": r.sidecar_path,
+        "copied_resources": r.copied_resources,
+        "pruned_count": r.pruned_count,
+        "image_blocks": r.image_blocks,
+        "original_size": r.original_size,
+        "new_size": r.new_size,
+        "bytes_saved": r.bytes_saved(),
+        "est_context_tokens_saved": r.est_context_tokens_saved,
+        "dry_run": r.dry_run,
+        "resume": format!("claude --resume {}", r.new_id),
+    }))?)
+}
+
+/// Fetch a stashed original out of a pruned session's sidecar by tool_use_id.
+fn prune_retrieve(args: &Value) -> anyhow::Result<String> {
+    let session = arg_str(args, "session").ok_or_else(|| anyhow::anyhow!("missing required argument: session"))?;
+    let tool_use_id = arg_str(args, "tool_use_id").ok_or_else(|| anyhow::anyhow!("missing required argument: tool_use_id"))?;
+    let (sref, _adapter) =
+        cv_core::find(session, None)?.ok_or_else(|| anyhow::anyhow!("no session found for id {session:?}"))?;
+    let dir = sref.path.parent().unwrap_or(std::path::Path::new("."));
+    let stem = sref.path.file_stem().and_then(|s| s.to_str()).unwrap_or(session);
+    let sidecar = dir.join(format!("{stem}.flat.jsonl"));
+    let value = cv_core::prune::retrieve(&sidecar, tool_use_id)?;
+    match value.as_str() {
+        Some(s) => Ok(s.to_string()),
+        None => Ok(serde_json::to_string_pretty(&value)?),
     }
 }
 

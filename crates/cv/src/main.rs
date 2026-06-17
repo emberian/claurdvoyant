@@ -284,6 +284,34 @@ enum Cmd {
         #[arg(long, short = 'q')]
         query: Option<String>,
     },
+    /// Custom, lossless compaction of a Claude session into a NEW resumable session: snip bulky old
+    /// tool payloads (large reads/logs/screenshots) into a sidecar, leaving a small `[PRUNED]` marker
+    /// — your prompts and flow stay verbatim, the recent turns stay sharp. Resume with
+    /// `claude --resume <new-id>`. Use `--retrieve <tool_use_id>` to fetch a stashed original back.
+    Prune {
+        /// Source session id (or, with `--retrieve`, the *pruned* session to read from).
+        id: String,
+        #[arg(long)]
+        harness: Option<String>,
+        /// Fetch a stashed original by its `tool_use_id` from `<id>`'s sidecar (prints it; no prune).
+        #[arg(long, value_name = "TOOL_USE_ID")]
+        retrieve: Option<String>,
+        /// Snip a tool payload only if it's larger than this many bytes.
+        #[arg(long, default_value_t = 2048)]
+        min_size: usize,
+        /// Keep the last N conversational turns' payloads verbatim (recent context stays sharp).
+        #[arg(long, default_value_t = 25)]
+        keep_last: usize,
+        /// New session id (default: a fresh UUID).
+        #[arg(long)]
+        to: Option<String>,
+        /// Hard-drop payloads (no sidecar, irreversible) instead of stashing them for retrieval.
+        #[arg(long)]
+        drop: bool,
+        /// Report what would be pruned without writing anything.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// The query-calculus reference: every field, operator, and example. `--json` emits the machine
     /// schema. The `-q` flag on ls/dataset/timeline/stats speaks this language.
     Query {
@@ -498,6 +526,9 @@ fn main() -> Result<()> {
         Cmd::Share { id, harness, out, no_redact } => share::cmd_share(&id, harness, out, no_redact),
         Cmd::Pack { task, format, to, limit, out } => pack::cmd_pack(&task, &format, to, limit, out),
         Cmd::Stats { query } => browse::cmd_stats(query),
+        Cmd::Prune { id, harness, retrieve, min_size, keep_last, to, drop, dry_run } => {
+            compose::cmd_prune(&id, harness, retrieve, min_size, keep_last, to, drop, dry_run)
+        }
         Cmd::Query { json } => query::cmd_query(json),
         Cmd::Resume { id, harness, launch } => convert::cmd_resume(&id, harness, launch),
         Cmd::Tree { id, harness } => view::cmd_tree(&id, harness),

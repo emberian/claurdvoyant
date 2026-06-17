@@ -21,6 +21,7 @@ pub mod ingest;
 pub mod ir;
 pub mod lazy;
 pub mod loom;
+pub mod prune;
 pub mod query;
 pub mod redact;
 pub mod render;
