@@ -43,6 +43,17 @@ pub struct Hit {
     pub created_at: Option<i64>,
     #[serde(default)]
     pub updated_at: Option<i64>,
+    /// Sub-agent provenance: when this hit is a folded-in sub-agent transcript (indexed with
+    /// `cv index --subagents`), the top-level session that spawned it, the agent's own id, and the
+    /// workflow run it belonged to (if any). All `None` for an ordinary top-level session, and for
+    /// any hit from an index built before subagent folding (the fields default-absent on the
+    /// stored doc and on deserialization of older serialized hits).
+    #[serde(default)]
+    pub parent_id: Option<String>,
+    #[serde(default)]
+    pub agent_id: Option<String>,
+    #[serde(default)]
+    pub workflow: Option<String>,
 }
 
 /// Root directory for cv-search's on-disk state: `$CLAURDVOYANT_HOME` or `~/.claurdvoyant`.
@@ -69,9 +80,13 @@ pub fn default_embeddings_path() -> PathBuf {
 /// Discover, parse, and update the full-text index at its default location. Incremental by default
 /// (only changed/new sessions are rewritten; vanished ones are reaped); `rebuild = true` clears and
 /// rebuilds from scratch. Returns the number of sessions discovered.
-pub fn index_all(dir: impl Into<Option<PathBuf>>, rebuild: bool) -> Result<usize> {
+pub fn index_all(
+    dir: impl Into<Option<PathBuf>>,
+    rebuild: bool,
+    subagents: bool,
+) -> Result<usize> {
     let dir = dir.into().unwrap_or_else(default_tantivy_dir);
-    fts::index_all(&dir, rebuild)
+    fts::index_all(&dir, rebuild, subagents)
 }
 
 /// Run a full-text query against the index at its default location.

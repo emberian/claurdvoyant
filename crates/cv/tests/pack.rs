@@ -198,7 +198,7 @@ fn pack_uses_index_when_present_and_respects_limit() {
     pack_corpus(&w);
 
     let (out, _) = w.cv_ok(&["index"]);
-    assert!(out.contains("indexed 3 session(s)"), "{out}");
+    assert!(out.contains("indexed 3 top-level session(s)"), "{out}");
 
     // Indexed recall: no live-scan note.
     let (out, err) = w.cv_ok(&["pack", "wombat caching layer"]);

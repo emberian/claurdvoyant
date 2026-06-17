@@ -353,6 +353,10 @@ fn rank(store: &Store, q: &[f32], k: usize) -> Vec<Hit> {
                 snippet: r.preview.clone(),
                 created_at: r.created_at,
                 updated_at: r.updated_at,
+                // Semantic store doesn't fold the sub-agent forest (yet); no provenance to carry.
+                parent_id: None,
+                agent_id: None,
+                workflow: None,
             }
         })
         .collect()

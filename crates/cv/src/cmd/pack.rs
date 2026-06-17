@@ -361,6 +361,9 @@ fn live_scan(task: &str, fetch: usize) -> Result<Vec<cv_search::Hit>> {
                     snippet,
                     created_at: r.created_at.map(|t| t.timestamp()),
                     updated_at: r.updated_at.map(|t| t.timestamp()),
+                    parent_id: None,
+                    agent_id: None,
+                    workflow: None,
                 },
             ));
         }
@@ -939,6 +942,9 @@ mod tests {
             snippet: snippet.into(),
             created_at: None,
             updated_at: None,
+            parent_id: None,
+            agent_id: None,
+            workflow: None,
         }
     }
 

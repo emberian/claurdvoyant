@@ -708,6 +708,11 @@ fn parse_message(ty: &str, v: &Value, opts: &ParseOptions, span: Option<&SpanCtx
     if opts.extra {
         collect_extra(v, msg, &mut extra);
     }
+    // Format-complete: capture EVERY remaining top-level + message-level field (beyond the
+    // first-classed ones) so `parse → emit` reproduces the record with no dropped keys.
+    if opts.complete {
+        collect_extra_complete(v, msg, &mut extra);
+    }
 
     Some(Message {
         id,
@@ -725,6 +730,15 @@ fn parse_message(ty: &str, v: &Value, opts: &ParseOptions, span: Option<&SpanCtx
 /// as a [`Role::System`] message; the rest (timing, hook bookkeeping, killed-agent notices) have no
 /// body and are dropped. We preserve `subtype`/`level`/metadata in `extra` either way.
 fn parse_system_message(v: &Value, opts: &ParseOptions, span: Option<&SpanCtx>) -> Option<Message> {
+    // Format-complete: `system` records are carried verbatim. The lean passes *render* them
+    // (slash-command distillation, the synthesized `[conversation compacted]` marker, the ⛓ hook
+    // one-liner), which is lossy — the rendered body can't reconstruct the original `content`/
+    // structured fields. Carrying the raw record (system bodies are small notices, never large tool
+    // payloads) is the only way `parse → emit` reproduces it. The non-complete passes are untouched.
+    if opts.complete {
+        return Some(carrier_record(v));
+    }
+
     let subtype = v.get("subtype").and_then(Value::as_str).unwrap_or("");
     // Body text lives either at top-level `content` (a string) or, for compaction, is implied.
     let content = v.get("content").and_then(Value::as_str);
@@ -949,6 +963,42 @@ fn collect_extra(v: &Value, msg: &Value, extra: &mut Map<String, Value>) {
     for key in ["id", "stop_reason", "stop_sequence", "stop_details"] {
         if let Some(val) = msg.get(key).filter(|val| !val.is_null()) {
             extra.insert(format!("message.{key}"), val.clone());
+        }
+    }
+}
+
+/// Top-level record fields the IR first-classes (so they must NOT be duplicated into `extra` —
+/// the emitter reconstructs them from the [`Message`]'s own fields).
+const CLAUDE_FIRSTCLASS_TOP: &[&str] = &["type", "uuid", "parentUuid", "timestamp", "message"];
+/// `message.*` fields the IR first-classes (reconstructed from `content`/`usage`/`model`/role).
+const CLAUDE_FIRSTCLASS_MSG: &[&str] = &["content", "usage", "role", "model"];
+/// Prefix under which a captured `message.<key>` sub-field is stashed in `extra`, so the emitter can
+/// route it back inside the `message` object on replay.
+pub const MESSAGE_EXTRA_PREFIX: &str = "message.";
+
+/// Format-complete capture (only under [`ParseOptions::complete`]): mirror EVERY top-level and
+/// `message.*` field that the IR doesn't already first-class into `extra`, so a `parse → emit`
+/// round-trip reproduces the record's full key set + values. Runs *after* [`collect_extra`], so the
+/// already-captured fields (`toolUseResult`, `requestId`, `message.stop_reason`, …) are simply
+/// re-confirmed (same key, same value) rather than dropped. Large content lives in `content`/`usage`
+/// and is first-classed, so nothing big is duplicated here.
+fn collect_extra_complete(v: &Value, msg: &Value, extra: &mut Map<String, Value>) {
+    if let Some(obj) = v.as_object() {
+        for (k, val) in obj {
+            if CLAUDE_FIRSTCLASS_TOP.contains(&k.as_str()) {
+                continue;
+            }
+            extra.entry(k.clone()).or_insert_with(|| val.clone());
+        }
+    }
+    if let Some(mobj) = msg.as_object() {
+        for (k, val) in mobj {
+            if CLAUDE_FIRSTCLASS_MSG.contains(&k.as_str()) {
+                continue;
+            }
+            extra
+                .entry(format!("{MESSAGE_EXTRA_PREFIX}{k}"))
+                .or_insert_with(|| val.clone());
         }
     }
 }

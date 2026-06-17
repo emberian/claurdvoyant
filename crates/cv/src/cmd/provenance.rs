@@ -155,6 +155,17 @@ pub(crate) fn cmd_touched(path: &str, edits_only: bool) -> Result<()> {
             counts,
             t.title.as_deref().map(|s| truncate(s, 56)).unwrap_or_default(),
         );
+        // Folded-in sub-agent rows (`cv index --subagents`) carry attribution: surface which agent
+        // of which workflow of which parent the touch came from.
+        if t.parent_id.is_some() || t.agent_id.is_some() || t.workflow.is_some() {
+            let wf = t.workflow.as_deref().map(|w| format!(" ⟐{w}")).unwrap_or_default();
+            println!(
+                "          ↳ sub-agent {} of {}{}",
+                t.agent_id.as_deref().map(short_id).unwrap_or_else(|| "?".into()),
+                t.parent_id.as_deref().map(short_id).unwrap_or_else(|| "?".into()),
+                wf,
+            );
+        }
     }
     Ok(())
 }

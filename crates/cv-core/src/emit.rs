@@ -392,25 +392,43 @@ fn emit_claude(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<
         .unwrap_or_else(Utc::now)
         .to_rfc3339_opts(SecondsFormat::Millis, true);
 
-    // ai-title line (so the title round-trips).
+    // ai-title line (so the title round-trips) — unless a format-complete carrier already replays the
+    // original ai-title record verbatim (emitting both would duplicate it).
+    let has_title_carrier = session
+        .messages
+        .iter()
+        .any(|m| carrier_record_of(m).is_some_and(|r| r.get("type").and_then(Value::as_str) == Some("ai-title")));
     if let Some(title) = &session.title {
-        lines.push(json!({
-            "type": "ai-title",
-            "aiTitle": title,
-            "sessionId": new_id,
-            "cwd": cwd_str,
-            "timestamp": ts0,
-        }));
+        if !has_title_carrier {
+            lines.push(json!({
+                "type": "ai-title",
+                "aiTitle": title,
+                "sessionId": new_id,
+                "cwd": cwd_str,
+                "timestamp": ts0,
+            }));
+        }
     }
 
     // Thread the conversation by uuid / parentUuid.
     let mut parent: Option<String> = None;
     for msg in &session.messages {
-        // Claude transcripts have no standalone system turn; skip to avoid polluting user text.
+        // Format-complete carrier (a meta/system record carried verbatim under
+        // `ParseOptions::complete`): replay it byte-for-byte and skip envelope reconstruction. These
+        // are non-conversational, so they don't participate in uuid/parentUuid threading.
+        if let Some(record) = carrier_record_of(msg) {
+            lines.push(record.clone());
+            continue;
+        }
+        // Claude transcripts have no standalone system turn; skip to avoid polluting user text. (A
+        // *carrier* System message was already handled above; this is a synthetic/rendered one.)
         if msg.role == Role::System {
             continue;
         }
-        let uuid = Uuid::new_v4().to_string();
+        // Preserve the source uuid/parentUuid/timestamp when the message carries them (a
+        // format-complete round-trip), else generate fresh threading (cross-harness convert/port).
+        let uuid = msg.id.clone().unwrap_or_else(|| Uuid::new_v4().to_string());
+        let parent_uuid = msg.parent_id.clone().or_else(|| parent.clone());
         let ts = msg
             .timestamp
             .map(|t| t.to_rfc3339_opts(SecondsFormat::Millis, true))
@@ -419,7 +437,7 @@ fn emit_claude(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<
         // Common envelope fields present on every threaded line.
         let mut line = Map::new();
         line.insert("uuid".into(), json!(uuid));
-        line.insert("parentUuid".into(), json!(parent));
+        line.insert("parentUuid".into(), json!(parent_uuid));
         line.insert("sessionId".into(), json!(new_id));
         line.insert("cwd".into(), json!(cwd_str));
         line.insert("timestamp".into(), json!(ts));
@@ -445,6 +463,14 @@ fn emit_claude(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<
                 if let Some(model) = msg.model.as_ref().or(session.model.as_ref()) {
                     message.insert("model".into(), json!(model));
                 }
+                // Reconstruct the API `usage` block from the first-classed [`Usage`] (the parser
+                // pulls it out of `message.usage`), so a complete round-trip keeps the token counts.
+                // Same-harness only, so cross-harness convert output is unchanged.
+                if session.harness == Harness::Claude {
+                    if let Some(usage) = claude_usage(msg.usage.as_ref()) {
+                        message.insert("usage".into(), usage);
+                    }
+                }
                 message.insert("content".into(), Value::Array(blocks));
                 line.insert("message".into(), Value::Object(message));
             }
@@ -457,7 +483,18 @@ fn emit_claude(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<
                     json!({ "role": "user", "content": Value::Array(blocks) }),
                 );
             }
-            Role::System => unreachable!("system turns are skipped above"),
+            Role::System => unreachable!("system turns are carried/skipped above"),
+        }
+
+        // Format-complete / same-harness port: fold every captured `extra` field back onto the
+        // record — top-level keys directly, `message.<k>` keys inside the `message` object — so the
+        // emitted line carries the same key set + values as the source. (`toolUseResult`,
+        // `requestId`, `version`, `userType`, `message.id`, `message.stop_reason`, … all ride here.)
+        // Internal sidecar keys (lazy offset stamp, the carrier key) are never emitted. Only for a
+        // Claude→Claude session: a foreign source's `extra` holds *that* harness's fields, which
+        // aren't valid Claude record keys, so cross-harness convert keeps its prior lean output.
+        if session.harness == Harness::Claude {
+            apply_claude_extra(&mut line, &msg.extra);
         }
 
         lines.push(Value::Object(line));
@@ -475,6 +512,70 @@ fn emit_claude(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<
         new_id,
         resume_hint: Some(resume),
     })
+}
+
+/// The verbatim meta record a format-complete carrier message stashed (an object under
+/// `extra["_record"]`), or `None` for an ordinary message. See
+/// [`claude::carrier_record`](crate::harness::claude::CARRIER_KEY).
+fn carrier_record_of(m: &crate::ir::Message) -> Option<&Value> {
+    m.extra
+        .get(crate::harness::claude::CARRIER_KEY)
+        .filter(|v| v.is_object())
+}
+
+/// Internal `extra` keys the IR adds for its own bookkeeping — never part of the source record, so
+/// they must NOT be replayed into an emitted Claude line.
+fn is_internal_extra_key(k: &str) -> bool {
+    k == crate::harness::claude::CARRIER_KEY || k == crate::offsets::OFFSET_KEY
+}
+
+/// Fold a message's captured `extra` back onto an emitted Claude record (format-complete replay): a
+/// `message.<k>` key is routed inside the `message` object; any other key is a top-level field. The
+/// captured value is the source-of-truth for that key (it IS the original record's value), so it
+/// overrides the envelope reconstruction — e.g. the original `sessionId`/`cwd`/`gitBranch`/`version`
+/// win over the emit-time params. The IR-first-classed keys (uuid/parentUuid/timestamp/type and
+/// `message.content`) are never present in `extra` (the parser excludes them), so they're untouched
+/// and the [`Message`]'s own fields remain authoritative.
+fn apply_claude_extra(line: &mut Map<String, Value>, extra: &Map<String, Value>) {
+    use crate::harness::claude::MESSAGE_EXTRA_PREFIX;
+    for (k, val) in extra {
+        if is_internal_extra_key(k) {
+            continue;
+        }
+        if let Some(sub) = k.strip_prefix(MESSAGE_EXTRA_PREFIX) {
+            let msg = line
+                .entry("message".to_string())
+                .or_insert_with(|| Value::Object(Map::new()));
+            if let Some(mobj) = msg.as_object_mut() {
+                mobj.insert(sub.to_string(), val.clone());
+            }
+        } else {
+            line.insert(k.clone(), val.clone());
+        }
+    }
+}
+
+/// Reconstruct Claude's `message.usage` object from the IR [`Usage`], reversing
+/// [`claude::parse_usage`]'s field renames (`cache_read_input_tokens` ↔ `cache_read_tokens`,
+/// `cache_creation_input_tokens` ↔ `cache_creation_tokens`). Emits only the fields actually present,
+/// so a source that carried just `input_tokens`/`output_tokens` round-trips with the same key set.
+/// `None` when there's no usage at all (an assistant turn the source had no `usage` block on).
+fn claude_usage(usage: Option<&crate::ir::Usage>) -> Option<Value> {
+    let u = usage?;
+    let mut m = Map::new();
+    if let Some(x) = u.input_tokens {
+        m.insert("input_tokens".into(), json!(x));
+    }
+    if let Some(x) = u.output_tokens {
+        m.insert("output_tokens".into(), json!(x));
+    }
+    if let Some(x) = u.cache_read_tokens {
+        m.insert("cache_read_input_tokens".into(), json!(x));
+    }
+    if let Some(x) = u.cache_creation_tokens {
+        m.insert("cache_creation_input_tokens".into(), json!(x));
+    }
+    (!m.is_empty()).then_some(Value::Object(m))
 }
 
 fn claude_assistant_blocks(content: &[Block]) -> Vec<Value> {
@@ -1843,16 +1944,55 @@ fn emit_hermes(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<
         .or(session.created_at)
         .map(|t| t.timestamp_millis() as f64 / 1000.0);
 
+    // Format-complete: pull the captured per-session columns back out of `Session.extra` (written
+    // by the Hermes parser under `SESSION_META_KEY`) so the round-trip reproduces every session-row
+    // value. Anything absent falls back to a sensible default (e.g. `source = "claurdvoyant"`).
+    use crate::harness::hermes::{SESSION_META_KEY, RAW_REASONING_KEY, RAW_REASONING_CONTENT_KEY};
+    let smeta = session
+        .extra
+        .get(SESSION_META_KEY)
+        .and_then(Value::as_object);
+    let smeta_str = |k: &str| -> Option<String> {
+        smeta
+            .and_then(|m| m.get(k))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    };
+    let smeta_int = |k: &str| -> i64 {
+        smeta
+            .and_then(|m| m.get(k))
+            .and_then(Value::as_i64)
+            .unwrap_or(0)
+    };
+    let source = smeta_str("source").unwrap_or_else(|| "claurdvoyant".to_string());
+    let user_id = smeta_str("user_id");
+    let model_config = smeta_str("model_config");
+    let system_prompt = smeta_str("system_prompt");
+    let end_reason = smeta_str("end_reason");
+
     conn.execute(
-        "INSERT OR REPLACE INTO sessions (id, source, model, started_at, ended_at, message_count, title) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        "INSERT OR REPLACE INTO sessions \
+         (id, source, user_id, model, model_config, system_prompt, started_at, ended_at, \
+          end_reason, message_count, tool_call_count, input_tokens, output_tokens, \
+          cache_read_tokens, cache_write_tokens, reasoning_tokens, title) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
         params![
             new_id,
-            "claurdvoyant",
+            source,
+            user_id,
             session.model,
+            model_config,
+            system_prompt,
             started,
             ended,
+            end_reason,
             session.messages.len() as i64,
+            smeta_int("tool_call_count"),
+            smeta_int("input_tokens"),
+            smeta_int("output_tokens"),
+            smeta_int("cache_read_tokens"),
+            smeta_int("cache_write_tokens"),
+            smeta_int("reasoning_tokens"),
             session.title,
         ],
     )
@@ -1875,26 +2015,72 @@ fn emit_hermes(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<
             Role::Tool => "tool",
         };
 
-        // Reasoning text/encrypted from any Thinking blocks.
-        let mut reasoning = String::new();
-        let mut reasoning_details: Option<String> = None;
-        for b in &msg.content {
-            if let Block::Thinking { text, encrypted, .. } = b {
-                if !text.is_empty() {
-                    if !reasoning.is_empty() {
-                        reasoning.push_str("\n\n");
+        // Reasoning columns. For a lossless round-trip we prefer the verbatim source columns the
+        // parser stashed in `extra` (`hermes_reasoning` / `hermes_reasoning_content` /
+        // `reasoning_details` / `codex_*`) over reconstructing from the folded `Thinking.text`
+        // projection — that projection merges + dedups across columns and so can't recover the
+        // originals. We only synthesize from Thinking blocks when no verbatim column was captured
+        // (i.e. a session built in-memory or ported from another harness).
+        let extra_str = |k: &str| -> Option<String> {
+            msg.extra.get(k).and_then(Value::as_str).map(str::to_string)
+        };
+        let extra_json = |k: &str| -> Option<String> {
+            msg.extra.get(k).map(|v| v.to_string())
+        };
+
+        let mut reasoning = extra_str(RAW_REASONING_KEY);
+        let reasoning_content = extra_str(RAW_REASONING_CONTENT_KEY);
+        // `reasoning_details` / codex items were stashed as parsed JSON; re-serialize them verbatim.
+        let mut reasoning_details = extra_json("reasoning_details");
+        let codex_reasoning_items = extra_json("codex_reasoning_items");
+        let codex_message_items = extra_json("codex_message_items");
+
+        // Fallback synthesis only when nothing verbatim was captured: a foreign/in-memory session
+        // still gets its Thinking text + encrypted blob persisted (matching the prior behaviour).
+        if reasoning.is_none() && reasoning_content.is_none() && reasoning_details.is_none() {
+            let mut text = String::new();
+            let mut enc: Option<&str> = None;
+            for b in &msg.content {
+                if let Block::Thinking { text: t, encrypted, .. } = b {
+                    if !t.is_empty() {
+                        if !text.is_empty() {
+                            text.push_str("\n\n");
+                        }
+                        text.push_str(t);
                     }
-                    reasoning.push_str(text);
-                }
-                if let Some(enc) = encrypted {
-                    reasoning_details = Some(
-                        json!([{ "type": "reasoning.encrypted_content", "encrypted_content": enc }])
-                            .to_string(),
-                    );
+                    if enc.is_none() {
+                        enc = encrypted.as_deref();
+                    }
                 }
             }
+            if !text.is_empty() {
+                reasoning = Some(text);
+            }
+            if let Some(enc) = enc {
+                reasoning_details = Some(
+                    json!([{ "type": "reasoning.encrypted_content", "encrypted_content": enc }])
+                        .to_string(),
+                );
+            }
         }
-        let reasoning = (!reasoning.is_empty()).then_some(reasoning);
+
+        let finish_reason = extra_str("finish_reason");
+        let platform_message_id = extra_str("platform_message_id");
+        let observed: i64 = if msg.extra.get("observed") == Some(&Value::Bool(true)) {
+            1
+        } else {
+            0
+        };
+        // token_count: the parser routes a row's single combined count to Usage (output for
+        // assistant turns, input otherwise); reverse that mapping to recover the column.
+        let token_count: Option<i64> = msg.usage.as_ref().and_then(|u| {
+            let v = if msg.role == Role::Assistant {
+                u.output_tokens
+            } else {
+                u.input_tokens
+            };
+            v.map(|n| n as i64)
+        });
 
         if msg.role == Role::Tool {
             for b in &msg.content {
@@ -1906,11 +2092,25 @@ fn emit_hermes(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<
                 } = b
                 {
                     // `tool_name` matters: Hermes's own reader (and our adapter) surfaces it, so
-                    // dropping it here made every ported tool turn come back nameless.
+                    // dropping it here made every ported tool turn come back nameless. The optional
+                    // per-row columns (token_count / finish_reason / platform_message_id / observed)
+                    // can also ride a tool row, so write them back for a lossless round-trip.
                     conn.execute(
-                        "INSERT INTO messages (session_id, role, content, tool_call_id, tool_name, timestamp) \
-                         VALUES (?1, 'tool', ?2, ?3, ?4, ?5)",
-                        params![new_id, content.to_string(), tool_use_id, tool_name, ts],
+                        "INSERT INTO messages \
+                         (session_id, role, content, tool_call_id, tool_name, timestamp, \
+                          token_count, finish_reason, platform_message_id, observed) \
+                         VALUES (?1, 'tool', ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                        params![
+                            new_id,
+                            content.to_string(),
+                            tool_use_id,
+                            tool_name,
+                            ts,
+                            token_count,
+                            finish_reason,
+                            platform_message_id,
+                            observed,
+                        ],
                     )
                     .context("inserting hermes tool message")?;
                 }
@@ -1965,9 +2165,27 @@ fn emit_hermes(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<
         };
 
         conn.execute(
-            "INSERT INTO messages (session_id, role, content, tool_calls, timestamp, reasoning, reasoning_details) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![new_id, role, content, tool_calls, ts, reasoning, reasoning_details],
+            "INSERT INTO messages \
+             (session_id, role, content, tool_calls, timestamp, token_count, finish_reason, \
+              reasoning, reasoning_content, reasoning_details, codex_reasoning_items, \
+              codex_message_items, platform_message_id, observed) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+            params![
+                new_id,
+                role,
+                content,
+                tool_calls,
+                ts,
+                token_count,
+                finish_reason,
+                reasoning,
+                reasoning_content,
+                reasoning_details,
+                codex_reasoning_items,
+                codex_message_items,
+                platform_message_id,
+                observed,
+            ],
         )
         .context("inserting hermes message")?;
     }
@@ -2651,6 +2869,274 @@ mod tests {
         );
     }
 
+    /// Every `messages`-row column we care about for losslessness, as a comparable record.
+    #[cfg(feature = "sqlite")]
+    #[derive(Debug, PartialEq)]
+    struct HermesMsgRow {
+        role: String,
+        content: Option<String>,
+        tool_call_id: Option<String>,
+        tool_calls: Option<String>,
+        tool_name: Option<String>,
+        token_count: Option<i64>,
+        finish_reason: Option<String>,
+        reasoning: Option<String>,
+        reasoning_content: Option<String>,
+        reasoning_details: Option<String>,
+        codex_reasoning_items: Option<String>,
+        codex_message_items: Option<String>,
+        platform_message_id: Option<String>,
+        observed: Option<i64>,
+    }
+
+    /// Dump every message row (ordered) of `session_id` from a Hermes `state.db` into comparable
+    /// tuples — the data side of the column set. `timestamp` is excluded (REAL secs, compared
+    /// separately at ms granularity); `id`/`session_id` are surrogate keys, not content.
+    #[cfg(feature = "sqlite")]
+    fn dump_hermes_messages(db: &Path, session_id: &str) -> Vec<HermesMsgRow> {
+        use rusqlite::{Connection, OpenFlags};
+        let conn =
+            Connection::open_with_flags(db, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT role, content, tool_call_id, tool_calls, tool_name, token_count, \
+                 finish_reason, reasoning, reasoning_content, reasoning_details, \
+                 codex_reasoning_items, codex_message_items, platform_message_id, observed \
+                 FROM messages WHERE session_id = ?1 ORDER BY timestamp ASC, id ASC",
+            )
+            .unwrap();
+        let rows = stmt
+            .query_map([session_id], |r| {
+                Ok(HermesMsgRow {
+                    role: r.get(0)?,
+                    content: r.get(1)?,
+                    tool_call_id: r.get(2)?,
+                    tool_calls: r.get(3)?,
+                    tool_name: r.get(4)?,
+                    token_count: r.get(5)?,
+                    finish_reason: r.get(6)?,
+                    reasoning: r.get(7)?,
+                    reasoning_content: r.get(8)?,
+                    reasoning_details: r.get(9)?,
+                    codex_reasoning_items: r.get(10)?,
+                    codex_message_items: r.get(11)?,
+                    platform_message_id: r.get(12)?,
+                    observed: r.get(13)?,
+                })
+            })
+            .unwrap();
+        rows.map(|r| r.unwrap()).collect()
+    }
+
+    /// Dump the session-row columns we round-trip (everything but the surrogate `id` and the
+    /// auto-derived `message_count`). `started_at`/`ended_at` are REAL secs and compared at ms
+    /// granularity in the caller, so they're excluded here.
+    #[cfg(feature = "sqlite")]
+    #[allow(clippy::type_complexity)]
+    fn dump_hermes_session(
+        db: &Path,
+        session_id: &str,
+    ) -> (
+        String,         // source
+        Option<String>, // user_id
+        Option<String>, // model
+        Option<String>, // model_config
+        Option<String>, // system_prompt
+        Option<String>, // end_reason
+        Option<String>, // title
+        // tool_call_count, input/output/cache_read/cache_write/reasoning tokens (grouped to stay
+        // within std's 12-arity Debug/PartialEq tuple impls).
+        [i64; 6],
+    ) {
+        use rusqlite::{Connection, OpenFlags};
+        let conn =
+            Connection::open_with_flags(db, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        conn.query_row(
+            "SELECT source, user_id, model, model_config, system_prompt, end_reason, title, \
+             tool_call_count, input_tokens, output_tokens, cache_read_tokens, \
+             cache_write_tokens, reasoning_tokens FROM sessions WHERE id = ?1",
+            [session_id],
+            |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                    r.get(6)?,
+                    [
+                        r.get(7)?,
+                        r.get(8)?,
+                        r.get(9)?,
+                        r.get(10)?,
+                        r.get(11)?,
+                        r.get(12)?,
+                    ],
+                ))
+            },
+        )
+        .unwrap()
+    }
+
+    /// Format-complete losslessness for the SQLite-backed Hermes adapter: build a `state.db` row set
+    /// that exercises the **full column surface** (every per-session column and every per-message
+    /// column: tool calls + results, all three reasoning columns, codex items, token_count,
+    /// finish_reason, platform_message_id, observed), parse it, emit it to a fresh db, re-parse, and
+    /// assert that emit reproduced every session-row and message-row column value. The parse→emit
+    /// path is the round-trip under test; we compare the *source* db's rows against the
+    /// *re-emitted* db's rows so nothing is asserted only via the lossy IR projection.
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn hermes_complete_round_trip_is_lossless() {
+        use crate::harness::hermes::Hermes;
+        use crate::harness::Adapter;
+        use rusqlite::Connection;
+        use std::sync::Mutex;
+
+        // Serialize HERMES_HOME mutation against the other env-touching hermes tests.
+        static HERMES_LOCK: Mutex<()> = Mutex::new(());
+        let _guard = HERMES_LOCK.lock().unwrap();
+
+        // --- 1. Build a source state.db exercising the full column set. ---
+        let src_home = temp_dir();
+        let src_db = src_home.join("state.db");
+        {
+            let conn = Connection::open(&src_db).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE sessions (
+                    id TEXT PRIMARY KEY, source TEXT NOT NULL, user_id TEXT, model TEXT,
+                    model_config TEXT, system_prompt TEXT, parent_session_id TEXT,
+                    started_at REAL NOT NULL, ended_at REAL, end_reason TEXT,
+                    message_count INTEGER DEFAULT 0, tool_call_count INTEGER DEFAULT 0,
+                    input_tokens INTEGER DEFAULT 0, output_tokens INTEGER DEFAULT 0,
+                    cache_read_tokens INTEGER DEFAULT 0, cache_write_tokens INTEGER DEFAULT 0,
+                    reasoning_tokens INTEGER DEFAULT 0, title TEXT
+                 );
+                 CREATE TABLE messages (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL, role TEXT NOT NULL,
+                    content TEXT, tool_call_id TEXT, tool_calls TEXT, tool_name TEXT,
+                    timestamp REAL NOT NULL, token_count INTEGER, finish_reason TEXT, reasoning TEXT,
+                    reasoning_content TEXT, reasoning_details TEXT, codex_reasoning_items TEXT,
+                    codex_message_items TEXT, platform_message_id TEXT, observed INTEGER DEFAULT 0
+                 );",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO sessions \
+                 (id, source, user_id, model, model_config, system_prompt, started_at, ended_at, \
+                  end_reason, message_count, tool_call_count, input_tokens, output_tokens, \
+                  cache_read_tokens, cache_write_tokens, reasoning_tokens, title) \
+                 VALUES ('src', 'telegram', 'u-42', 'nous/hermes-4', '{\"temp\":0.7}', \
+                 'be helpful', 1000.000, 1050.000, 'completed', 3, 1, 11, 22, 3, 4, 5, 'Full session')",
+                [],
+            )
+            .unwrap();
+            // user turn with token_count + platform_message_id + observed.
+            conn.execute(
+                "INSERT INTO messages \
+                 (session_id, role, content, timestamp, token_count, platform_message_id, observed) \
+                 VALUES ('src','user','hello there',1001.000,7,'pmid-1',1)",
+                [],
+            )
+            .unwrap();
+            // assistant turn: tool call + all reasoning columns + finish_reason + token_count + codex.
+            let tc = "[{\"id\":\"c1\",\"type\":\"function\",\"function\":{\"name\":\"web_search\",\"arguments\":\"{\\\"q\\\":\\\"x\\\"}\"}}]";
+            let rd = "[{\"type\":\"reasoning.summary\",\"summary\":\"sum\"},{\"type\":\"reasoning.encrypted_content\",\"encrypted_content\":\"ENC\"}]";
+            let cri = "[{\"type\":\"reasoning\",\"id\":\"rs_a\",\"encrypted_content\":\"CBLOB\"}]";
+            let cmi = "[{\"type\":\"message\",\"phase\":\"final\",\"content\":[{\"type\":\"output_text\",\"text\":\"D\"}]}]";
+            conn.execute(
+                "INSERT INTO messages \
+                 (session_id, role, content, tool_calls, timestamp, token_count, finish_reason, \
+                  reasoning, reasoning_content, reasoning_details, codex_reasoning_items, \
+                  codex_message_items) \
+                 VALUES ('src','assistant','here you go',?1,1002.000,99,'stop','short sum',\
+                 'native pad',?2,?3,?4)",
+                rusqlite::params![tc, rd, cri, cmi],
+            )
+            .unwrap();
+            // tool result turn with tool_name.
+            conn.execute(
+                "INSERT INTO messages \
+                 (session_id, role, content, tool_call_id, tool_name, timestamp) \
+                 VALUES ('src','tool','{\"ok\":true}','c1','web_search',1003.000)",
+                [],
+            )
+            .unwrap();
+        }
+        let src_rows = dump_hermes_messages(&src_db, "src");
+        let src_session = dump_hermes_session(&src_db, "src");
+
+        // --- 2. Parse the source db. ---
+        let prev = std::env::var_os("HERMES_HOME");
+        unsafe {
+            std::env::set_var("HERMES_HOME", &src_home);
+        }
+        let h = Hermes::new();
+        let sref = h
+            .discover()
+            .unwrap()
+            .into_iter()
+            .find(|r| r.id == "src")
+            .expect("source session discoverable");
+        let parsed = h.parse(&sref).unwrap();
+
+        // --- 3. Emit to a fresh db, preserving the original id so the dumps line up. ---
+        let dst_home = temp_dir();
+        let opts = EmitOptions {
+            new_id: Some("src".into()),
+            ..Default::default()
+        };
+        let res = emit(&parsed, Harness::Hermes, &dst_home, &opts).unwrap();
+        unsafe {
+            match prev {
+                Some(p) => std::env::set_var("HERMES_HOME", p),
+                None => std::env::remove_var("HERMES_HOME"),
+            }
+        }
+        drop(_guard);
+
+        // --- 4. Compare the source db rows against the re-emitted db rows, column by column. ---
+        // JSON-bearing columns (tool_calls / reasoning_details / codex_*) are compared by *parsed
+        // value*, not raw string: our IR stash → re-serialize path canonicalizes JSON key order
+        // (serde_json sorts object keys), which the losslessness bar explicitly permits ("key ORDER
+        // may differ"). Plain-text columns are compared verbatim.
+        let dst_rows = dump_hermes_messages(&res.path, "src");
+        let norm = |rows: Vec<HermesMsgRow>| -> Vec<HermesMsgRow> {
+            rows.into_iter()
+                .map(|mut r| {
+                    let canon = |s: &Option<String>| -> Option<String> {
+                        s.as_deref().and_then(|raw| {
+                            serde_json::from_str::<Value>(raw).ok().map(|v| v.to_string())
+                        })
+                    };
+                    if let Some(c) = canon(&r.tool_calls) {
+                        r.tool_calls = Some(c);
+                    }
+                    if let Some(c) = canon(&r.reasoning_details) {
+                        r.reasoning_details = Some(c);
+                    }
+                    if let Some(c) = canon(&r.codex_reasoning_items) {
+                        r.codex_reasoning_items = Some(c);
+                    }
+                    if let Some(c) = canon(&r.codex_message_items) {
+                        r.codex_message_items = Some(c);
+                    }
+                    r
+                })
+                .collect()
+        };
+        assert_eq!(
+            norm(src_rows), norm(dst_rows),
+            "message-row columns must round-trip losslessly (left=source, right=re-emitted)"
+        );
+        let dst_session = dump_hermes_session(&res.path, "src");
+        assert_eq!(
+            src_session, dst_session,
+            "session-row columns must round-trip losslessly (left=source, right=re-emitted)"
+        );
+    }
+
     #[cfg(feature = "sqlite")]
     #[test]
     fn emit_verified_clean_for_hermes() {
@@ -2663,5 +3149,136 @@ mod tests {
             warnings.is_empty(),
             "expected a clean round-trip for Hermes, got: {warnings:?}"
         );
+    }
+
+    /// Format-complete losslessness: a rich Claude transcript parsed under `ParseOptions::complete`
+    /// and re-emitted reproduces EVERY record with the same top-level key set and the same value
+    /// per key (key order may differ). Covers a user turn, an assistant turn (text + tool_use), a
+    /// user tool_result turn (with a `toolUseResult` mirror), a `system` record, and three meta
+    /// records (mode / queue-operation / ai-title) carried verbatim.
+    #[test]
+    fn claude_complete_round_trip_is_lossless() {
+        use crate::harness::claude::{self, CARRIER_KEY, stream_str};
+        use crate::stream::{CollectSink, ParseOptions};
+
+        let sid = "11111111-1111-4111-8111-111111111111";
+        // A transcript exercising every covered record shape, with assorted top-level + message-level
+        // metadata the lean passes would drop.
+        let src_lines = [
+            json!({"type":"user","uuid":"u0","parentUuid":null,"sessionId":sid,"cwd":"/work/proj",
+                "gitBranch":"main","version":"0.9.14","userType":"external","isSidechain":false,
+                "timestamp":"2026-06-16T00:00:00.000Z","message":{"role":"user","content":"hello there"}}),
+            json!({"type":"mode","sessionId":sid,"mode":"plan","timestamp":"2026-06-16T00:00:01.000Z"}),
+            json!({"type":"assistant","uuid":"a1","parentUuid":"u0","sessionId":sid,"cwd":"/work/proj",
+                "gitBranch":"main","version":"0.9.14","requestId":"req_42","isSidechain":false,
+                "timestamp":"2026-06-16T00:00:02.000Z",
+                "message":{"id":"msg_xyz","role":"assistant","model":"claude-opus-4",
+                    "stop_reason":"tool_use","stop_sequence":null,
+                    "usage":{"input_tokens":12,"output_tokens":34,"cache_read_input_tokens":5},
+                    "content":[{"type":"text","text":"on it"},
+                        {"type":"tool_use","id":"toolu_1","name":"Read","input":{"file":"a.rs"}}]}}),
+            json!({"type":"queue-operation","sessionId":sid,"operation":"enqueue","content":"do later",
+                "timestamp":"2026-06-16T00:00:03.000Z"}),
+            json!({"type":"user","uuid":"u2","parentUuid":"a1","sessionId":sid,"cwd":"/work/proj",
+                "gitBranch":"main","version":"0.9.14","userType":"external","isSidechain":false,
+                "timestamp":"2026-06-16T00:00:04.000Z",
+                "toolUseResult":{"filePath":"a.rs","content":"fn main(){}","numLines":1},
+                "message":{"role":"user","content":[
+                    {"type":"tool_result","tool_use_id":"toolu_1","content":"fn main(){}","is_error":false}]}}),
+            json!({"type":"system","subtype":"compact_boundary","uuid":"s3","parentUuid":"u2",
+                "sessionId":sid,"level":"info","timestamp":"2026-06-16T00:00:05.000Z",
+                "compactMetadata":{"trigger":"manual","preTokens":1000}}),
+            json!({"type":"ai-title","sessionId":sid,"aiTitle":"Reading a file"}),
+        ];
+        let src_text = src_lines
+            .iter()
+            .map(|v| serde_json::to_string(v).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        // Parse format-complete: every record is carried (meta/system as carriers, user/assistant/
+        // tool with exhaustive `extra`).
+        let mut sink = CollectSink::default();
+        let session = stream_str(sid, &src_text, None, &ParseOptions::complete(), &mut sink);
+        let mut session = session;
+        session.messages = sink.messages;
+        assert_eq!(
+            session.messages.len(),
+            src_lines.len(),
+            "every source record must produce a message under complete"
+        );
+
+        // Emit back to disk, keeping the original session id + cwd so the envelope matches the source.
+        let out = temp_dir();
+        let opts = EmitOptions {
+            new_id: Some(sid.to_string()),
+            new_cwd: Some(PathBuf::from("/work/proj")),
+        };
+        let res = emit(&session, Harness::Claude, &out, &opts).unwrap();
+
+        // Read the emitted .jsonl back, line by line, as raw JSON.
+        let emitted_text = fs::read_to_string(&res.path).unwrap();
+        let emitted: Vec<Value> = emitted_text
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str::<Value>(l).unwrap())
+            .collect();
+
+        assert_eq!(
+            emitted.len(),
+            src_lines.len(),
+            "same number of records out as in (no dup ai-title, no dropped record)"
+        );
+
+        // Index source records by uuid (else fall back to type for the uuid-less meta lines).
+        let key_of = |v: &Value| -> String {
+            v.get("uuid")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .unwrap_or_else(|| v.get("type").and_then(Value::as_str).unwrap_or("?").to_string())
+        };
+        let by_key: std::collections::HashMap<String, &Value> =
+            src_lines.iter().map(|v| (key_of(v), v)).collect();
+
+        // Carriers must come back byte-equal (same JSON value) to their source record.
+        let carrier_types: Vec<&str> = session
+            .messages
+            .iter()
+            .filter_map(|m| m.extra.get(CARRIER_KEY)?.get("type")?.as_str())
+            .collect();
+        assert!(
+            carrier_types.contains(&"mode")
+                && carrier_types.contains(&"queue-operation")
+                && carrier_types.contains(&"ai-title")
+                && carrier_types.contains(&"system"),
+            "meta + system records carried as carriers, got {carrier_types:?}"
+        );
+        // sanity: CARRIER_KEY constant is the public one.
+        assert_eq!(claude::CARRIER_KEY, "_record");
+
+        // For every emitted record, find its source and assert key-set + per-value parity.
+        for out_rec in &emitted {
+            let k = key_of(out_rec);
+            let src = by_key.get(&k).unwrap_or_else(|| panic!("no source for emitted record {k}"));
+            let src_obj = src.as_object().unwrap();
+            let out_obj = out_rec.as_object().unwrap();
+
+            let src_keys: std::collections::BTreeSet<&String> = src_obj.keys().collect();
+            let out_keys: std::collections::BTreeSet<&String> = out_obj.keys().collect();
+            assert_eq!(
+                src_keys, out_keys,
+                "record {k}: top-level key set differs\n src={src_keys:?}\n out={out_keys:?}"
+            );
+            for (key, src_val) in src_obj {
+                assert_eq!(
+                    out_obj.get(key),
+                    Some(src_val),
+                    "record {k}: value for `{key}` differs\n src={src_val}\n out={:?}",
+                    out_obj.get(key)
+                );
+            }
+        }
+
+        fs::remove_dir_all(&out).ok();
     }
 }

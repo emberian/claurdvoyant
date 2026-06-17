@@ -18,7 +18,11 @@ struct Cli {
 #[derive(Subcommand)]
 enum Cmd {
     /// Discover, parse, and (re)build the full-text index.
-    Index,
+    Index {
+        /// Also fold each session's sub-agent forest into the index (can add ~900MB).
+        #[arg(long)]
+        subagents: bool,
+    },
     /// Full-text query. Supports `harness:claude`, "phrases", AND/OR.
     Text {
         query: Vec<String>,
@@ -40,8 +44,8 @@ enum Cmd {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
-        Cmd::Index => {
-            let n = cv_search::index_all(None, false)?;
+        Cmd::Index { subagents } => {
+            let n = cv_search::index_all(None, false, subagents)?;
             println!("indexed {n} sessions into {}", cv_search::default_tantivy_dir().display());
         }
         Cmd::Text { query, limit } => {

@@ -39,6 +39,13 @@ struct Fields {
     created_at: Field,
     updated_at: Field,
     mtime: Field,
+    /// Sub-agent provenance, written only on folded-in sub-agent docs (`cv index --subagents`):
+    /// `parent_id` is fielded (`parent_id:<top-level id>` filters to one parent's whole forest),
+    /// `agent_id`/`workflow` are stored-only attribution carried onto the hit. NULL/absent on
+    /// top-level docs, which keeps those docs byte-for-byte as before.
+    parent_id: Field,
+    agent_id: Field,
+    workflow: Field,
 }
 
 fn build_schema() -> Schema {
@@ -53,6 +60,9 @@ fn build_schema() -> Schema {
     b.add_i64_field("created_at", INDEXED | STORED);
     b.add_i64_field("updated_at", INDEXED | STORED);
     b.add_i64_field("mtime", STORED);
+    b.add_text_field("parent_id", STRING | STORED); // fielded: `parent_id:<id>` scopes to a forest
+    b.add_text_field("agent_id", STRING | STORED); // stored attribution
+    b.add_text_field("workflow", STRING | STORED); // stored attribution
     b.build()
 }
 
@@ -69,6 +79,9 @@ fn fields_of(schema: &Schema) -> Result<Fields> {
         created_at: get("created_at")?,
         updated_at: get("updated_at")?,
         mtime: get("mtime")?,
+        parent_id: get("parent_id")?,
+        agent_id: get("agent_id")?,
+        workflow: get("workflow")?,
     })
 }
 
@@ -83,7 +96,12 @@ fn open_or_create(dir: &Path) -> Result<(Index, Fields)> {
         Ok(idx)
             if idx.schema().get_field("path").is_ok()
                 && idx.schema().get_field("mtime").is_ok()
-                && idx.schema().get_field("preview").is_ok() =>
+                && idx.schema().get_field("preview").is_ok()
+                // Pre-subagent indexes lack the provenance fields → rebuild fresh (self-heal),
+                // exactly like the earlier path/mtime/preview upgrade did.
+                && idx.schema().get_field("parent_id").is_ok()
+                && idx.schema().get_field("agent_id").is_ok()
+                && idx.schema().get_field("workflow").is_ok() =>
         {
             idx
         }
@@ -126,7 +144,13 @@ const CHUNK_BYTES: usize = 4 * 1024 * 1024;
 /// `--rebuild` doesn't force an event re-ingest and a tantivy-fresh session whose events are
 /// missing gets an events-only catch-up pass; when both are stale the session is read exactly once.
 /// Event persistence is best-effort (sqlite errors never fail indexing).
-pub fn index_all(dir: &Path, rebuild: bool) -> Result<usize> {
+///
+/// **Sub-agent forest (`subagents`):** after each top-level claude session, also walk its
+/// `cv_core::subagent_tree_of` forest and index/ingest every Task/Workflow agent transcript, tagged
+/// with provenance (parent id / agent id / workflow run). Off by default — the forest can be
+/// hundreds of transcripts (~900 MB) — and folded-in sub-agent docs carry the provenance fields so
+/// a hit knows which agent of which workflow of which parent it came from.
+pub fn index_all(dir: &Path, rebuild: bool, subagents: bool) -> Result<usize> {
     use cv_core::ParseOptions;
 
     let (index, f) = open_or_create(dir)?;
@@ -222,6 +246,7 @@ pub fn index_all(dir: &Path, rebuild: bool) -> Result<usize> {
             mtime,
             events.as_mut(),
             offsets.as_mut(),
+            cv_core::events::Provenance::default(),
         ) {
             Ok(docs) => docs,
             Err(e) => {
@@ -242,6 +267,41 @@ pub fn index_all(dir: &Path, rebuild: bool) -> Result<usize> {
         if since_commit >= COMMIT_EVERY {
             writer.commit().context("interim commit")?;
             since_commit = 0;
+        }
+    }
+
+    // Sub-agent forest fold (opt-in): after the top-level sweep, walk every claude session's
+    // `subagent_tree_of` and index/ingest each agent transcript tagged with provenance. Done as a
+    // second pass (a cheap metadata re-discovery) so the top-level loop's skip logic stays intact;
+    // its `seen` set is extended here so a previously-folded agent still on disk isn't reaped.
+    if subagents {
+        for r in cv_core::discover_all() {
+            for sub in cv_core::subagent_tree_of(&r) {
+                seen.insert(sub.session.id.clone());
+                match index_one_subagent(
+                    &mut writer,
+                    &f,
+                    &r,
+                    &sub,
+                    &existing,
+                    &event_sync,
+                    &offset_sync,
+                ) {
+                    Ok(0) => {}
+                    Ok(docs) => {
+                        changed += 1;
+                        since_commit += docs;
+                        if since_commit >= COMMIT_EVERY {
+                            writer.commit().context("interim commit")?;
+                            since_commit = 0;
+                        }
+                    }
+                    Err(e) => eprintln!(
+                        "cv-search: parse failed for {} ({}): {e:#}",
+                        sub.session.id, sub.session.harness
+                    ),
+                }
+            }
         }
     }
 
@@ -271,6 +331,7 @@ pub fn index_all(dir: &Path, rebuild: bool) -> Result<usize> {
 /// `lazy()` keeps large content as spans: the chunk sink chunk-resolves them and the other sinks
 /// never read them at all; with an offsets sink the pass runs under `lazy_offsets()` so the
 /// adapter stamps each message's byte offset for it to harvest. Returns the docs written.
+#[allow(clippy::too_many_arguments)]
 fn index_session(
     writer: &mut IndexWriter,
     f: &Fields,
@@ -279,6 +340,7 @@ fn index_session(
     mtime: i64,
     events: Option<&mut cv_core::events::EventSink>,
     offsets: Option<&mut cv_core::offsets::OffsetSink>,
+    prov: cv_core::events::Provenance,
 ) -> Result<usize> {
     use cv_core::ParseOptions;
     let opts = if offsets.is_some() {
@@ -286,7 +348,7 @@ fn index_session(
     } else {
         ParseOptions::lazy()
     };
-    let mut sink = ChunkSink::new(writer, f, r, mtime);
+    let mut sink = ChunkSink::new(writer, f, r, mtime, prov);
     match (events, offsets) {
         (Some(es), Some(os)) => {
             let mut tee = cv_core::TeeSink::new(&mut sink, es);
@@ -309,6 +371,94 @@ fn index_session(
     Ok(sink.docs)
 }
 
+/// Index/ingest one sub-agent transcript `sub` (a child of top-level `parent`) into the forest fold,
+/// tagged with provenance (parent id / agent id / workflow). Mirrors the top-level loop's per-axis
+/// freshness skip: returns `Ok(0)` when this agent is unchanged on all axes (or has no adapter), so
+/// the caller doesn't count it as changed. Events ride into the catalog with the same provenance.
+///
+/// Memory discipline is identical to the top-level path: lazy parse → large tool payloads stay on
+/// disk; only chunked docs and the small event rows touch memory.
+#[allow(clippy::too_many_arguments)]
+fn index_one_subagent(
+    writer: &mut IndexWriter,
+    f: &Fields,
+    parent: &cv_core::SessionRef,
+    sub: &cv_core::SubagentInfo,
+    existing: &HashMap<String, i64>,
+    event_sync: &cv_core::events::SyncTable,
+    offset_sync: &cv_core::offsets::SyncTable,
+) -> Result<usize> {
+    let sr = &sub.session;
+    let (mtime, size) = cv_core::offsets::file_sig(&sr.path);
+    let fts_fresh = existing.get(&sr.id).is_some_and(|&mt| mt == mtime && mtime != 0);
+    let events_stale = event_sync.needs_ingest(sr, mtime);
+    let offsets_stale =
+        cv_core::offsets::supported(sr.harness) && offset_sync.needs_record(sr, mtime, size);
+    if fts_fresh && !events_stale && !offsets_stale {
+        return Ok(0);
+    }
+    let Some(adapter) = cv_core::harness::for_harness(sr.harness) else {
+        return Ok(0);
+    };
+    let prov = cv_core::events::Provenance {
+        parent_id: Some(parent.id.clone()),
+        agent_id: Some(sub.agent_id().to_string()),
+        workflow: sub.workflow.clone(),
+    };
+    let mut events = events_stale.then(|| cv_core::events::EventSink::new(sr.cwd.clone()));
+    let mut offsets = offsets_stale.then(cv_core::offsets::OffsetSink::new);
+    if existing.contains_key(&sr.id) {
+        // Changed agent: drop its prior docs before re-adding (same delete-by-id as top-level).
+        writer.delete_term(Term::from_field_text(f.id, &sr.id));
+    }
+    // FTS-fresh but catalog/offsets stale: a catalog-only pass that never touches tantivy (keeps the
+    // doc set byte-stable), mirroring the top-level loop's fast path.
+    if fts_fresh {
+        let opts = if offsets.is_some() {
+            cv_core::ParseOptions::lazy_offsets()
+        } else {
+            cv_core::ParseOptions::lazy()
+        };
+        match (events.as_mut(), offsets.as_mut()) {
+            (Some(es), Some(os)) => {
+                let mut tee = cv_core::TeeSink::new(es, os);
+                adapter.stream(sr, &opts, &mut tee)?;
+            }
+            (Some(es), None) => {
+                adapter.stream(sr, &opts, es)?;
+            }
+            (None, Some(os)) => {
+                adapter.stream(sr, &opts, os)?;
+            }
+            (None, None) => return Ok(0),
+        }
+        if let Some(es) = &events {
+            cv_core::events::record_with(sr, es.events(), mtime, &prov);
+        }
+        if let Some(os) = &offsets {
+            cv_core::offsets::record(sr, os, mtime, size);
+        }
+        return Ok(0);
+    }
+    let docs = index_session(
+        writer,
+        f,
+        adapter.as_ref(),
+        sr,
+        mtime,
+        events.as_mut(),
+        offsets.as_mut(),
+        prov.clone(),
+    )?;
+    if let Some(es) = events {
+        cv_core::events::record_with(sr, es.events(), mtime, &prov);
+    }
+    if let Some(os) = offsets {
+        cv_core::offsets::record(sr, &os, mtime, size);
+    }
+    Ok(docs)
+}
+
 /// Streams one session's messages into bounded-size tantivy docs (all sharing the session id), so a
 /// large session never materializes its whole body in the index.
 struct ChunkSink<'w> {
@@ -325,6 +475,9 @@ struct ChunkSink<'w> {
     meta_title: Option<String>,
     meta_received: bool,
     first_user: Option<String>,
+    /// Sub-agent attribution stamped on every doc of a folded-in forest transcript; empty
+    /// (all-`None`) for a top-level session, leaving its docs unchanged.
+    prov: cv_core::events::Provenance,
     resolver: cv_core::Resolver,
     buf: String,
     /// Whitespace-collapsed head of the body, capped at [`PREVIEW_CHARS`]; stored on the first doc.
@@ -338,7 +491,13 @@ struct ChunkSink<'w> {
 const PREVIEW_CHARS: usize = 240;
 
 impl<'w> ChunkSink<'w> {
-    fn new(writer: &'w mut IndexWriter, f: &'w Fields, r: &cv_core::SessionRef, mtime: i64) -> Self {
+    fn new(
+        writer: &'w mut IndexWriter,
+        f: &'w Fields,
+        r: &cv_core::SessionRef,
+        mtime: i64,
+        prov: cv_core::events::Provenance,
+    ) -> Self {
         ChunkSink {
             writer,
             f,
@@ -353,6 +512,7 @@ impl<'w> ChunkSink<'w> {
             meta_title: None,
             meta_received: false,
             first_user: None,
+            prov,
             resolver: cv_core::Resolver::new(Some(r.path.clone())),
             buf: String::new(),
             preview: String::new(),
@@ -398,6 +558,17 @@ impl<'w> ChunkSink<'w> {
             doc.add_i64(self.f.updated_at, t);
         }
         doc.add_i64(self.f.mtime, self.mtime);
+        // Provenance rides every doc of a folded-in sub-agent; top-level docs add nothing here, so
+        // they stay byte-for-byte as before.
+        if let Some(p) = &self.prov.parent_id {
+            doc.add_text(self.f.parent_id, p);
+        }
+        if let Some(a) = &self.prov.agent_id {
+            doc.add_text(self.f.agent_id, a);
+        }
+        if let Some(w) = &self.prov.workflow {
+            doc.add_text(self.f.workflow, w);
+        }
         if let Err(e) = self.writer.add_document(doc) {
             self.err = Some(e.into());
         }
@@ -577,8 +748,17 @@ pub(crate) fn index_refs(dir: &Path, refs: &[cv_core::SessionRef], catalog: bool
         let mut es = catalog.then(|| cv_core::events::EventSink::new(r.cwd.clone()));
         let mut os = (catalog && cv_core::offsets::supported(r.harness))
             .then(cv_core::offsets::OffsetSink::new);
-        index_session(&mut writer, &f, adapter.as_ref(), r, mtime, es.as_mut(), os.as_mut())
-            .with_context(|| format!("indexing {}", r.id))?;
+        index_session(
+            &mut writer,
+            &f,
+            adapter.as_ref(),
+            r,
+            mtime,
+            es.as_mut(),
+            os.as_mut(),
+            cv_core::events::Provenance::default(),
+        )
+        .with_context(|| format!("indexing {}", r.id))?;
         if let Some(es) = es {
             cv_core::events::record(r, es.events(), mtime);
         }
@@ -588,6 +768,49 @@ pub(crate) fn index_refs(dir: &Path, refs: &[cv_core::SessionRef], catalog: bool
     }
     writer.commit().context("committing index")?;
     Ok(refs.len())
+}
+
+/// Index `refs` (top-level) **and** their sub-agent forests, exercising the exact production forest
+/// path [`index_one_subagent`] that `index_all(.., subagents=true)` drives — minus only the global
+/// `discover_all()` scan (which can't be pointed at a temp dir in a unit test). `catalog = true` tees
+/// each pass into the event catalog (set it only under an isolated `CLAURDVOYANT_HOME`). Returns the
+/// number of sub-agent transcripts folded in.
+#[cfg(test)]
+pub(crate) fn index_refs_with_subagents(
+    dir: &Path,
+    refs: &[cv_core::SessionRef],
+    catalog: bool,
+) -> Result<usize> {
+    // First the top-level pass (clears + indexes the parents).
+    index_refs(dir, refs, catalog)?;
+    let (index, f) = open_or_create(dir)?;
+    let mut writer: IndexWriter = index
+        .writer(50_000_000)
+        .context("creating tantivy index writer")?;
+    let existing = read_indexed_mtimes(&index, &f).unwrap_or_default();
+    let event_sync = cv_core::events::SyncTable::load();
+    let offset_sync = cv_core::offsets::SyncTable::load();
+    let mut folded = 0usize;
+    for r in refs {
+        for sub in cv_core::subagent_tree_of(r) {
+            // In a no-catalog test the skip tables are empty, so every agent indexes; with a catalog
+            // the freshness skip behaves exactly as `index_all` does.
+            let docs = index_one_subagent(
+                &mut writer,
+                &f,
+                r,
+                &sub,
+                &existing,
+                &event_sync,
+                &offset_sync,
+            )?;
+            if docs > 0 {
+                folded += 1;
+            }
+        }
+    }
+    writer.commit().context("committing index")?;
+    Ok(folded)
 }
 
 /// Run a full-text query, returning up to `limit` hits ranked by BM25, each with a live snippet and
@@ -672,6 +895,9 @@ pub fn text_search(dir: &Path, query: &str, limit: usize) -> Result<Vec<Hit>> {
             updated_at: doc.get_first(f.updated_at).and_then(|v| v.as_i64()),
             score,
             snippet,
+            parent_id: get_str(f.parent_id),
+            agent_id: get_str(f.agent_id),
+            workflow: get_str(f.workflow),
         });
     }
     Ok(hits)
@@ -1202,6 +1428,119 @@ mod tests {
         assert_eq!(touched.len(), 1);
         assert_eq!(touched[0].session_id, "tee-evt");
         assert_eq!(touched[0].edits, 1);
+
+        std::env::remove_var("CLAURDVOYANT_HOME");
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// Write a sub-agent transcript in the on-disk layout `subagent_tree_of` expects:
+    /// `<parent_dir>/<parent_stem>/subagents/agent-<agent_id>.jsonl`. `body` is one user message.
+    /// Returns the agent transcript path (so a test can prove it exists / mtime it).
+    fn write_subagent(parent_path: &str, agent_id: &str, body: &str) -> std::path::PathBuf {
+        let pp = Path::new(parent_path);
+        let stem = pp.file_stem().unwrap().to_str().unwrap();
+        let dir = pp.parent().unwrap().join(stem).join("subagents");
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join(format!("agent-{agent_id}.jsonl"));
+        let line = serde_json::json!({
+            "type": "user",
+            "uuid": format!("agent-{agent_id}"),
+            "sessionId": format!("agent-{agent_id}"),
+            "message": { "role": "user", "content": body }
+        });
+        std::fs::write(&p, format!("{line}\n")).unwrap();
+        p
+    }
+
+    /// `cv index --subagents` end to end: a string living ONLY inside a sub-agent transcript is
+    /// (a) NOT findable when the forest is not folded, and (b) findable AND provenance-tagged
+    /// (parent id + agent id) once it is. Exercises the production forest path
+    /// (`index_one_subagent`), not a parallel one.
+    #[test]
+    fn subagent_forest_is_searchable_and_provenance_tagged_only_when_folded() {
+        let dir = tmpdir();
+        let sdir = tmpdir();
+        // Parent transcript + a sub-agent whose body alone holds the unique marker.
+        let pp = write_claude(&sdir, "parent1", "orchestrator planning the work");
+        write_subagent(&pp, "child9", "deep in the weeds: zqsubmarker lives only here");
+        let parent = sref("parent1", "parent session", pp);
+
+        // (a) Top-level only: the sub-agent marker is invisible.
+        index_refs(&dir, std::slice::from_ref(&parent), false).unwrap();
+        assert!(
+            text_search(&dir, "zqsubmarker", 10).unwrap().is_empty(),
+            "without --subagents a sub-agent-only term must NOT be findable"
+        );
+        // The parent itself is still indexed.
+        assert_eq!(text_search(&dir, "orchestrator", 10).unwrap().len(), 1);
+
+        // (b) Fold the forest: the marker becomes findable, tagged back to its parent + agent.
+        let folded = index_refs_with_subagents(&dir, std::slice::from_ref(&parent), false).unwrap();
+        assert_eq!(folded, 1, "exactly one sub-agent transcript folded in");
+        let hits = text_search(&dir, "zqsubmarker", 10).unwrap();
+        assert_eq!(hits.len(), 1, "sub-agent term findable once folded");
+        let h = &hits[0];
+        assert_eq!(h.id, "agent-child9");
+        assert_eq!(h.parent_id.as_deref(), Some("parent1"), "tagged with parent id");
+        assert_eq!(h.agent_id.as_deref(), Some("child9"), "tagged with agent id");
+        assert_eq!(h.workflow, None, "directly-spawned agent has no workflow");
+        // A fielded query can scope to one parent's whole forest.
+        let scoped = text_search(&dir, "parent_id:parent1 zqsubmarker", 10).unwrap();
+        assert_eq!(scoped.len(), 1);
+        assert_eq!(scoped[0].id, "agent-child9");
+
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&sdir).ok();
+    }
+
+    /// The forest fold also tees sub-agent events into the catalog WITH provenance: a file the
+    /// sub-agent edited surfaces in `cv touched`, attributed to the agent + its parent.
+    #[test]
+    fn subagent_events_ride_along_with_provenance() {
+        let dir = tmpdir();
+        let home = tmpdir();
+        std::env::set_var("CLAURDVOYANT_HOME", &home);
+
+        let pp = write_claude_msgs(
+            &home,
+            "evt-parent",
+            &[("user", "spawn an agent to touch a file")],
+        );
+        // A sub-agent whose assistant turn edits a file.
+        let stem = Path::new(&pp).file_stem().unwrap().to_str().unwrap().to_string();
+        let sub_dir = Path::new(&pp).parent().unwrap().join(&stem).join("subagents");
+        std::fs::create_dir_all(&sub_dir).unwrap();
+        let sub_path = sub_dir.join("agent-ed1.jsonl");
+        // Absolute target so the catalog query is unambiguous (the agent transcript carries no cwd
+        // of its own, so a relative path wouldn't absolutize the same way the query side does).
+        let line = serde_json::json!({
+            "type": "assistant", "uuid": "agent-ed1", "sessionId": "agent-ed1",
+            "message": {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "t1", "name": "Edit",
+                 "input": {"file_path": "/repo/src/only_subagent.rs", "old_string": "a", "new_string": "b"}}
+            ]}
+        });
+        std::fs::write(&sub_path, format!("{line}\n")).unwrap();
+
+        let mut parent = sref("evt-parent", "parent", pp);
+        parent.cwd = Some("/repo".into());
+
+        index_refs_with_subagents(&dir, std::slice::from_ref(&parent), true).unwrap();
+
+        // The sub-agent's edit is in the catalog, attributed to it + its parent.
+        let touched = cv_core::events::sessions_touching("/repo/src/only_subagent.rs", true);
+        assert_eq!(touched.len(), 1, "sub-agent edit must be catalogued");
+        let t = &touched[0];
+        assert_eq!(t.session_id, "agent-ed1");
+        assert_eq!(t.parent_id.as_deref(), Some("evt-parent"));
+        assert_eq!(t.agent_id.as_deref(), Some("ed1"));
+
+        // And the per-session events carry it too.
+        let rows = cv_core::events::events_for("claude", "agent-ed1", None);
+        let edit = rows.iter().find(|e| e.kind == "file_edit").expect("edit event");
+        assert_eq!(edit.parent_id.as_deref(), Some("evt-parent"));
+        assert_eq!(edit.agent_id.as_deref(), Some("ed1"));
 
         std::env::remove_var("CLAURDVOYANT_HOME");
         std::fs::remove_dir_all(&dir).ok();

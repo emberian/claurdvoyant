@@ -41,6 +41,22 @@ use std::path::PathBuf;
 
 const MULTIMODAL_SENTINEL: &str = "\u{0}json:";
 
+/// `Message.extra` keys under which the parser stashes the raw `reasoning` / `reasoning_content`
+/// source columns verbatim (the folded `Thinking.text` projection is lossy — it merges and dedups
+/// across columns — so the originals are kept here for a lossless emit round-trip). Public so
+/// `emit_hermes` can read them back.
+pub const RAW_REASONING_KEY: &str = "hermes_reasoning";
+pub const RAW_REASONING_CONTENT_KEY: &str = "hermes_reasoning_content";
+
+/// `Session.extra` key under which the parser stashes the per-session columns that have no
+/// first-class IR home (`source`, `user_id`, `model_config`, `system_prompt`, `end_reason`, the
+/// aggregate token counters, …) so `emit_hermes` can write them back. A single namespaced object so
+/// it never collides with other session-level extra keys. `parent_session_id` is intentionally NOT
+/// stored: parse FLATTENS a parent→child lineage into one transcript, so the surviving IR session is
+/// the tip with no parent of its own; round-tripping the chain structure is out of scope (see
+/// caveats).
+pub const SESSION_META_KEY: &str = "hermes_session";
+
 /// Optional `messages` columns that older schemas may lack. We probe for each before SELECTing.
 const OPTIONAL_MSG_COLS: &[&str] = &[
     "token_count",
@@ -228,6 +244,78 @@ fn discover_conn(conn: &Connection, path: &Path) -> Result<Vec<SessionRef>> {
     Ok(out)
 }
 
+/// Per-session columns with no first-class IR home. Captured into `Session.extra[SESSION_META_KEY]`
+/// on parse and written back by `emit_hermes`, so the round-trip loses no session-row data. Text
+/// columns map to JSON strings; the aggregate counters to JSON numbers (see [`SESSION_META_INT_COLS`]).
+/// `source` / `end_reason` are read by the metadata SELECT already and passed in (so we don't re-probe
+/// them); everything here is probed independently to stay graceful on older schemas.
+const SESSION_META_TEXT_COLS: &[&str] = &["user_id", "model_config", "system_prompt"];
+const SESSION_META_INT_COLS: &[&str] = &[
+    "tool_call_count",
+    "input_tokens",
+    "output_tokens",
+    "cache_read_tokens",
+    "cache_write_tokens",
+    "reasoning_tokens",
+];
+
+/// Collect the dropped per-session columns into a namespaced extra object (empty if none present).
+/// `source` / `end_reason` come pre-read from the metadata SELECT; the rest are probed here.
+fn read_session_extra(
+    conn: &Connection,
+    id: &str,
+    source: Option<&str>,
+    end_reason: Option<&str>,
+) -> serde_json::Map<String, Value> {
+    let mut meta = serde_json::Map::new();
+    if let Some(s) = source.filter(|s| !s.is_empty()) {
+        meta.insert("source".into(), Value::String(s.to_string()));
+    }
+    if let Some(e) = end_reason.filter(|s| !s.is_empty()) {
+        meta.insert("end_reason".into(), Value::String(e.to_string()));
+    }
+    for col in SESSION_META_TEXT_COLS {
+        if !session_has_col(conn, col) {
+            continue;
+        }
+        let v: Option<String> = conn
+            .query_row(
+                &format!("SELECT {col} FROM sessions WHERE id = ?1"),
+                [id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .ok()
+            .flatten();
+        if let Some(v) = v.filter(|s| !s.is_empty()) {
+            meta.insert((*col).into(), Value::String(v));
+        }
+    }
+    for col in SESSION_META_INT_COLS {
+        if !session_has_col(conn, col) {
+            continue;
+        }
+        let v: Option<i64> = conn
+            .query_row(
+                &format!("SELECT {col} FROM sessions WHERE id = ?1"),
+                [id],
+                |row| row.get::<_, Option<i64>>(0),
+            )
+            .ok()
+            .flatten();
+        // Only carry non-zero aggregates: a freshly-emitted DB leaves these at their DEFAULT 0, so
+        // storing 0 would make the round-trip "lose" a value that was never meaningfully set. emit
+        // writes back exactly the keys present here, so omitting 0 keeps emit→parse symmetric.
+        if let Some(v) = v.filter(|n| *n != 0) {
+            meta.insert((*col).into(), Value::Number(v.into()));
+        }
+    }
+    let mut out = serde_json::Map::new();
+    if !meta.is_empty() {
+        out.insert(SESSION_META_KEY.into(), Value::Object(meta));
+    }
+    out
+}
+
 fn stream_conn(conn: &Connection, r: &SessionRef, sink: &mut dyn MessageSink) -> Result<Session> {
     // session-level metadata (guard optional columns for historical schemas).
     let has_model = session_has_col(conn, "model");
@@ -245,7 +333,7 @@ fn stream_conn(conn: &Connection, r: &SessionRef, sink: &mut dyn MessageSink) ->
         parent = if has_parent { "parent_session_id" } else { "NULL" },
         end_reason = if has_end_reason { "end_reason" } else { "NULL" },
     );
-    let (model, started, ended, title, source, _parent, _end_reason): SessionMetaRow = conn
+    let (model, started, ended, title, source, _parent, end_reason): SessionMetaRow = conn
         .query_row(&meta_sql, [&r.id], |row| {
             Ok((
                 row.get(0).ok().flatten(),
@@ -259,6 +347,11 @@ fn stream_conn(conn: &Connection, r: &SessionRef, sink: &mut dyn MessageSink) ->
         })
         .unwrap_or((None, None, None, r.title.clone(), None, None, None));
 
+    // Format-complete: capture the session columns that have no first-class IR home, so emit can
+    // write them back (small metadata only — text/aggregate counters, never message bodies). The tip
+    // session's row is the one whose metadata survives (lineage flattening keeps the tip).
+    let extra = read_session_extra(conn, &r.id, source.as_deref(), end_reason.as_deref());
+
     let s = Session {
         id: r.id.clone(),
         harness: Harness::Hermes,
@@ -270,7 +363,7 @@ fn stream_conn(conn: &Connection, r: &SessionRef, sink: &mut dyn MessageSink) ->
         git: None,
         messages: Vec::new(),
         source_path: Some(r.path.clone()),
-        extra: serde_json::Map::new(),
+        extra,
     };
 
     // Walk the compression/branch lineage root→tip so a compressed-and-continued conversation
@@ -280,10 +373,6 @@ fn stream_conn(conn: &Connection, r: &SessionRef, sink: &mut dyn MessageSink) ->
     } else {
         vec![r.id.clone()]
     };
-    // `source` (cli/tui/telegram/…) is intentionally not surfaced on the IR Session: it has no
-    // free-form extra map. See report for the proposed Session.extra addition.
-    let _ = &source;
-
     let cols = present_msg_cols(conn);
     let has = |c: &str| cols.contains(c);
 
@@ -506,6 +595,21 @@ impl MsgRow {
         }
         if matches!(self.observed, Some(o) if o != 0) {
             m.extra.insert("observed".into(), Value::Bool(true));
+        }
+
+        // Format-complete capture: keep the raw reasoning source columns verbatim so a parse→emit
+        // round-trip reproduces them byte-for-byte. The summary text we fold into `Thinking.text`
+        // below is a *projection* (it merges `reasoning` + `reasoning_content` + the text entries of
+        // `reasoning_details` and dedups them); reconstructing the original columns from that
+        // projection is impossible, so we stash the originals here. These are small metadata strings
+        // (summaries / encrypted handles), never large tool payloads. `reasoning_details` /
+        // `codex_*` are already stashed (as parsed JSON) further down.
+        if let Some(r) = self.reasoning.as_deref().filter(|s| !s.is_empty()) {
+            m.extra.insert(RAW_REASONING_KEY.into(), Value::String(r.to_string()));
+        }
+        if let Some(r) = self.reasoning_content.as_deref().filter(|s| !s.is_empty()) {
+            m.extra
+                .insert(RAW_REASONING_CONTENT_KEY.into(), Value::String(r.to_string()));
         }
 
         // Reasoning: combine summary text from `reasoning`, `reasoning_content`, and the text

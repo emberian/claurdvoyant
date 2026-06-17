@@ -239,7 +239,7 @@ fn search_fallback_messaging_and_index_path() {
 
     // Build the index; search must now use it (no live-scan note) and still hit.
     let (out, _) = w.cv_ok(&["index"]);
-    assert!(out.contains("indexed 2 session(s)"), "{out}");
+    assert!(out.contains("indexed 2 top-level session(s)"), "{out}");
     let (out, err) = w.cv_ok(&["search", "zebrafish"]);
     assert!(!err.contains("scanning live"), "indexed search must not live-scan:\n{err}");
     assert!(out.contains("alphases"), "{out}");

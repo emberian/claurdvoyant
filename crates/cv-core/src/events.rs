@@ -283,6 +283,29 @@ pub fn file_mtime_ns(path: &Path) -> i64 {
         .unwrap_or(0)
 }
 
+/// Provenance for a sub-agent event source: which parent session, which workflow run (if any), and
+/// which agent inside it the events came from. A top-level session has none of these (`None`).
+///
+/// Carried on the `event_sessions` row so a stored sub-agent's events can be attributed back to the
+/// orchestrator that spawned it (`cv touched` / `cv events` can then say *which* agent of *which*
+/// workflow of *which* parent edited a file).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Provenance {
+    /// The top-level session id this sub-agent was (transitively) spawned by.
+    pub parent_id: Option<String>,
+    /// The sub-agent's own agent id (`agentId`, the `agent-` prefix stripped).
+    pub agent_id: Option<String>,
+    /// The workflow run id (`wf_…`) this agent belonged to, or `None` for a directly-spawned agent.
+    pub workflow: Option<String>,
+}
+
+impl Provenance {
+    /// True when this carries no sub-agent attribution — i.e. an ordinary top-level session.
+    pub fn is_empty(&self) -> bool {
+        self.parent_id.is_none() && self.agent_id.is_none() && self.workflow.is_none()
+    }
+}
+
 /// One persisted event row, as read back from the catalog.
 #[derive(Debug, Clone)]
 pub struct EventRow {
@@ -294,6 +317,10 @@ pub struct EventRow {
     pub tool: Option<String>,
     pub target: Option<String>,
     pub detail: Option<String>,
+    /// Sub-agent attribution (all `None` for a top-level session).
+    pub parent_id: Option<String>,
+    pub agent_id: Option<String>,
+    pub workflow: Option<String>,
 }
 
 /// One session in a `cv touched <path>` result: who touched the file, how, and when last.
@@ -307,6 +334,11 @@ pub struct TouchedSession {
     pub reads: i64,
     /// Latest event timestamp on the file in this session (unix secs).
     pub last_ts: Option<i64>,
+    /// Sub-agent attribution (all `None` for a top-level session): the parent session, the
+    /// workflow run, and the agent inside it whose events touched the file.
+    pub parent_id: Option<String>,
+    pub agent_id: Option<String>,
+    pub workflow: Option<String>,
 }
 
 /// One `file_edit` event joined with its session's catalog metadata — the raw material for
@@ -343,7 +375,12 @@ mod db {
     /// cache, so "migration" is version-stamp + drop + lazy reingest (dropping `event_sync` makes
     /// every session look stale; the next `cv index` — or any on-the-spot `cv events <id>` —
     /// rebuilds), exactly like the tantivy schema self-heal.
-    const EVENTS_SCHEMA_VERSION: i64 = 2;
+    /// v3 (0.9.13) adds sub-agent provenance columns (`parent_id`, `agent_id`, `workflow`) to
+    /// `event_sessions`, so a folded-in sub-agent transcript's events can be attributed to the
+    /// orchestrator that spawned it. Same self-heal as before: bumping the version drops the event
+    /// tables + `event_sync`, so everything reads stale and the next `cv index` reingests on the
+    /// new schema.
+    const EVENTS_SCHEMA_VERSION: i64 = 3;
 
     /// Drop pre-v2 event tables (their indexes go with them) and stamp the version.
     ///
@@ -408,6 +445,9 @@ mod db {
                  id         INTEGER PRIMARY KEY,
                  harness    TEXT NOT NULL,
                  session_id TEXT NOT NULL,
+                 parent_id  TEXT,
+                 agent_id   TEXT,
+                 workflow   TEXT,
                  UNIQUE(harness, session_id)
              );
              CREATE TABLE IF NOT EXISTS event_targets(
@@ -508,12 +548,27 @@ mod db {
     /// duplicates *within* this batch — same `(msg_idx, kind, target)`, matching the old index's
     /// `COALESCE(target,'')` semantics — are dropped by the in-memory set below.
     pub fn record(r: &SessionRef, events: &[Event], mtime_ns: i64) {
+        record_with(r, events, mtime_ns, &Provenance::default());
+    }
+
+    /// [`record`], additionally stamping sub-agent `prov`enance onto the `event_sessions` row so the
+    /// stored events are attributable to the orchestrator that spawned the agent. A top-level
+    /// session passes an empty [`Provenance`] (this is exactly what [`record`] does); the columns
+    /// stay NULL and existing queries are unaffected.
+    pub fn record_with(r: &SessionRef, events: &[Event], mtime_ns: i64, prov: &Provenance) {
         let Some(mut conn) = open() else { return };
         let Ok(tx) = conn.transaction() else { return };
         let harness = r.harness.as_str();
         let _ = tx.execute(
             "INSERT OR IGNORE INTO event_sessions(harness, session_id) VALUES(?1,?2)",
             params![harness, r.id],
+        );
+        // Stamp provenance on every record (idempotent re-ingest keeps it current); top-level
+        // sessions write NULLs, which leaves the existing top-level rows exactly as before.
+        let _ = tx.execute(
+            "UPDATE event_sessions SET parent_id=?3, agent_id=?4, workflow=?5
+             WHERE harness=?1 AND session_id=?2",
+            params![harness, r.id, prov.parent_id, prov.agent_id, prov.workflow],
         );
         let Ok(session) = tx.query_row(
             "SELECT id FROM event_sessions WHERE harness=?1 AND session_id=?2",
@@ -591,22 +646,69 @@ mod db {
         Ok(events.len())
     }
 
+    /// (Re)ingest events for one sub-agent transcript, stamping `prov`enance on its catalog row so
+    /// the rows are attributable to the orchestrator that spawned it. Same streaming discipline as
+    /// [`ingest_ref`] (lazy parse → large content stays on disk); returns the events extracted.
+    pub fn ingest_subagent(r: &SessionRef, prov: &Provenance) -> Result<usize> {
+        let adapter = crate::harness::for_harness(r.harness)
+            .ok_or_else(|| anyhow::anyhow!("no adapter for {}", r.harness))?;
+        let mut sink = EventSink::new(r.cwd.clone());
+        adapter.stream(r, &crate::stream::ParseOptions::lazy(), &mut sink)?;
+        let events = sink.into_events();
+        record_with(r, &events, file_mtime_ns(&r.path), prov);
+        Ok(events.len())
+    }
+
     /// (Re)ingest events for every discovered session, skipping unchanged ones (by `event_sync`
     /// mtime) unless `force`. The standalone entry point for users who don't run the tantivy
     /// indexer (which otherwise ingests events as a ride-along). Returns sessions (re)ingested.
-    pub fn ingest_all(force: bool) -> Result<usize> {
+    ///
+    /// With `subagents`, also fold each top-level Claude session's whole sub-agent **forest**
+    /// (`crate::subagent_tree_of`) into the catalog: every Task/Workflow agent's transcript is
+    /// streamed through the same `EventSink` and stored with provenance (parent / workflow / agent),
+    /// so `cv touched`/`cv events` see what the agents did — not just the orchestrator. Off by
+    /// default (the forest can be hundreds of transcripts / ~900 MB).
+    pub fn ingest_all(force: bool, subagents: bool) -> Result<usize> {
         let mut n = 0usize;
         let sync = SyncTable::load();
         for r in crate::discover_all() {
-            if !force && !sync.needs_ingest(&r, file_mtime_ns(&r.path)) {
-                continue;
+            let top_stale = sync.needs_ingest(&r, file_mtime_ns(&r.path));
+            if force || top_stale {
+                match ingest_ref(&r) {
+                    Ok(_) => n += 1,
+                    Err(e) => {
+                        eprintln!("cv: event ingest failed for {} ({}): {e:#}", r.id, r.harness)
+                    }
+                }
             }
-            match ingest_ref(&r) {
-                Ok(_) => n += 1,
-                Err(e) => eprintln!("cv: event ingest failed for {} ({}): {e:#}", r.id, r.harness),
+            if subagents {
+                n += ingest_forest(&r, &sync, force);
             }
         }
         Ok(n)
+    }
+
+    /// Fold the sub-agent forest of one top-level session into the catalog, skipping unchanged
+    /// transcripts (by `event_sync` mtime) unless `force`. Best-effort per agent: an unreadable
+    /// sub-agent transcript is skipped, not fatal. Returns the number of agents (re)ingested.
+    fn ingest_forest(parent: &SessionRef, sync: &SyncTable, force: bool) -> usize {
+        let mut n = 0usize;
+        for sub in crate::subagent_tree_of(parent) {
+            let sr = &sub.session;
+            if !force && !sync.needs_ingest(sr, file_mtime_ns(&sr.path)) {
+                continue;
+            }
+            let prov = Provenance {
+                parent_id: Some(parent.id.clone()),
+                agent_id: Some(sub.agent_id().to_string()),
+                workflow: sub.workflow.clone(),
+            };
+            match ingest_subagent(sr, &prov) {
+                Ok(_) => n += 1,
+                Err(_) => continue,
+            }
+        }
+        n
     }
 
     /// All persisted events of one session in transcript order, optionally filtered by kind.
@@ -614,7 +716,8 @@ mod db {
     pub fn events_for(harness: &str, session_id: &str, kind: Option<&str>) -> Vec<EventRow> {
         let Some(conn) = open() else { return Vec::new() };
         let Ok(mut stmt) = conn.prepare(
-            "SELECT es.harness, es.session_id, e.msg_idx, e.ts, e.kind, e.tool, t.target, e.detail
+            "SELECT es.harness, es.session_id, e.msg_idx, e.ts, e.kind, e.tool, t.target, e.detail,
+                    es.parent_id, es.agent_id, es.workflow
              FROM events e
              JOIN event_sessions es ON es.id = e.session
              LEFT JOIN event_targets t ON t.id = e.target_id
@@ -633,6 +736,9 @@ mod db {
                 tool: row.get(5)?,
                 target: row.get(6)?,
                 detail: row.get(7)?,
+                parent_id: row.get(8)?,
+                agent_id: row.get(9)?,
+                workflow: row.get(10)?,
             })
         });
         match rows {
@@ -673,7 +779,8 @@ mod db {
                     SUM(e.kind='file_edit') AS edits,
                     SUM(e.kind='file_read') AS reads,
                     MAX(e.ts) AS last_ts,
-                    MAX(s.title) AS title
+                    MAX(s.title) AS title,
+                    es.parent_id, es.agent_id, es.workflow
              FROM events e
              JOIN event_sessions es ON es.id = e.session
              LEFT JOIN sessions s ON s.harness = es.harness AND s.id = es.session_id
@@ -693,6 +800,9 @@ mod db {
                 reads: row.get(3)?,
                 last_ts: row.get(4)?,
                 title: row.get(5)?,
+                parent_id: row.get(6)?,
+                agent_id: row.get(7)?,
+                workflow: row.get(8)?,
             })
         });
         match rows {
@@ -762,8 +872,8 @@ mod db {
 
 #[cfg(feature = "sqlite")]
 pub use db::{
-    catalog_has_events, edits_touching_file, events_for, ingest_all, ingest_ref, needs_ingest,
-    record, sessions_touching, SyncTable,
+    catalog_has_events, edits_touching_file, events_for, ingest_all, ingest_ref, ingest_subagent,
+    needs_ingest, record, record_with, sessions_touching, SyncTable,
 };
 
 /// No-op fallbacks without sqlite: extraction still works (the sink is pure), persistence and
@@ -787,10 +897,14 @@ mod db_stub {
         }
     }
     pub fn record(_r: &SessionRef, _events: &[Event], _mtime_ns: i64) {}
+    pub fn record_with(_r: &SessionRef, _events: &[Event], _mtime_ns: i64, _prov: &Provenance) {}
     pub fn ingest_ref(_r: &SessionRef) -> Result<usize> {
         Ok(0)
     }
-    pub fn ingest_all(_force: bool) -> Result<usize> {
+    pub fn ingest_subagent(_r: &SessionRef, _prov: &Provenance) -> Result<usize> {
+        Ok(0)
+    }
+    pub fn ingest_all(_force: bool, _subagents: bool) -> Result<usize> {
         Ok(0)
     }
     pub fn events_for(_harness: &str, _session_id: &str, _kind: Option<&str>) -> Vec<EventRow> {
@@ -808,8 +922,8 @@ mod db_stub {
 }
 #[cfg(not(feature = "sqlite"))]
 pub use db_stub::{
-    catalog_has_events, edits_touching_file, events_for, ingest_all, ingest_ref, needs_ingest,
-    record, sessions_touching, SyncTable,
+    catalog_has_events, edits_touching_file, events_for, ingest_all, ingest_ref, ingest_subagent,
+    needs_ingest, record, record_with, sessions_touching, SyncTable,
 };
 
 #[cfg(test)]
@@ -1181,7 +1295,7 @@ mod tests {
         {
             let conn = rusqlite::Connection::open(home.join("catalog.db")).unwrap();
             let v: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0)).unwrap();
-            assert_eq!(v, 2);
+            assert_eq!(v, 3);
 
             // Now simulate an old 0.9.10 binary recreating v1 tables under the v2 stamp.
             conn.execute_batch(&format!("DROP TABLE events; {V1_DDL}")).unwrap();

@@ -206,6 +206,12 @@ enum Cmd {
         /// Clear and rebuild the index from scratch instead of incrementally updating it.
         #[arg(long)]
         rebuild: bool,
+        /// Also fold every session's sub-agent forest (its Task/Workflow agent transcripts) into
+        /// BOTH the full-text index and the event catalog, tagged with provenance (which agent of
+        /// which workflow of which parent). Off by default: it can add ~900MB to the index and many
+        /// hundreds of transcripts to ingest. Without it, only top-level sessions are indexed.
+        #[arg(long)]
+        subagents: bool,
     },
     /// List what a session DID: its extracted events (file edits/reads, commands, errors).
     ///
@@ -523,7 +529,7 @@ fn main() -> Result<()> {
         Cmd::Convert { id, to, from, out, cwd } => convert::cmd_convert(&id, &to, from, out, cwd),
         Cmd::Port { id, to, from, to_dir, out, no_context } => convert::cmd_port(&id, to, from, to_dir, out, no_context),
         Cmd::Scry { harness, cwd, interval, existing } => live::cmd_scry(harness, cwd, interval, existing),
-        Cmd::Index { semantic, rebuild } => search::cmd_index(semantic, rebuild),
+        Cmd::Index { semantic, rebuild, subagents } => search::cmd_index(semantic, rebuild, subagents),
         Cmd::Events { id, harness, kind, subagents } => provenance::cmd_events(&id, harness, kind, subagents),
         Cmd::Touched { path, edits_only } => provenance::cmd_touched(&path, edits_only),
         Cmd::Blame { file, lines, show } => blame::cmd_blame(&file, lines.as_deref(), show),

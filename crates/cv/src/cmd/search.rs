@@ -261,15 +261,21 @@ fn recall_excerpt(hit: &cv_search::Hit, query: &str) -> String {
     out.trim_end().to_string()
 }
 
-pub(crate) fn cmd_index(semantic: bool, rebuild: bool) -> Result<()> {
+pub(crate) fn cmd_index(semantic: bool, rebuild: bool, subagents: bool) -> Result<()> {
     eprintln!(
-        "✦ {} full-text index…",
-        if rebuild { "rebuilding" } else { "updating" }
+        "✦ {} full-text index{}…",
+        if rebuild { "rebuilding" } else { "updating" },
+        if subagents { " (+ sub-agent forest)" } else { "" }
     );
-    let n = cv_search::index_all(None, rebuild)?;
+    let n = cv_search::index_all(None, rebuild, subagents)?;
     println!(
-        "indexed {n} session(s) → {}",
-        cv_search::default_tantivy_dir().display()
+        "indexed {n} top-level session(s) → {}{}",
+        cv_search::default_tantivy_dir().display(),
+        if subagents {
+            " (sub-agent transcripts folded in)"
+        } else {
+            ""
+        }
     );
     if semantic {
         eprintln!("✦ embedding sessions (downloads a small model on first use)…");
