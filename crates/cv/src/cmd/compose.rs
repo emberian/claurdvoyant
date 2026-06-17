@@ -21,6 +21,7 @@ pub(crate) fn cmd_prune(
     keep_last: usize,
     to: Option<String>,
     drop: bool,
+    copy_resources: bool,
     dry_run: bool,
 ) -> Result<()> {
     let want = parse_harness(&harness)?;
@@ -47,7 +48,7 @@ pub(crate) fn cmd_prune(
         bail!("cv prune currently supports Claude Code sessions only (got {})", r.harness);
     }
 
-    let opts = cv_core::prune::PruneOptions { min_size, keep_last, drop, new_id: to, dry_run };
+    let opts = cv_core::prune::PruneOptions { min_size, keep_last, drop, new_id: to, copy_resources, dry_run };
     let res = cv_core::prune::prune_session(&r.path, &opts)?;
 
     let pct = if res.original_size > 0 {

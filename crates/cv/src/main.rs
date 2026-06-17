@@ -308,6 +308,10 @@ enum Cmd {
         /// Hard-drop payloads (no sidecar, irreversible) instead of stashing them for retrieval.
         #[arg(long)]
         drop: bool,
+        /// Also copy the session's subagents/workflows dir under the new id (off by default; can be
+        /// hundreds of MB for big sessions). Resume doesn't need it — only cv's forest features do.
+        #[arg(long)]
+        copy_resources: bool,
         /// Report what would be pruned without writing anything.
         #[arg(long)]
         dry_run: bool,
@@ -526,8 +530,8 @@ fn main() -> Result<()> {
         Cmd::Share { id, harness, out, no_redact } => share::cmd_share(&id, harness, out, no_redact),
         Cmd::Pack { task, format, to, limit, out } => pack::cmd_pack(&task, &format, to, limit, out),
         Cmd::Stats { query } => browse::cmd_stats(query),
-        Cmd::Prune { id, harness, retrieve, min_size, keep_last, to, drop, dry_run } => {
-            compose::cmd_prune(&id, harness, retrieve, min_size, keep_last, to, drop, dry_run)
+        Cmd::Prune { id, harness, retrieve, min_size, keep_last, to, drop, copy_resources, dry_run } => {
+            compose::cmd_prune(&id, harness, retrieve, min_size, keep_last, to, drop, copy_resources, dry_run)
         }
         Cmd::Query { json } => query::cmd_query(json),
         Cmd::Resume { id, harness, launch } => convert::cmd_resume(&id, harness, launch),

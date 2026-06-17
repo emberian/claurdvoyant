@@ -68,6 +68,9 @@ impl Adapter for Claude {
             .filter_map(|e| e.ok())
             .map(|e| e.into_path())
             .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("jsonl"))
+            // `cv prune` writes a `<id>.flat.jsonl` sidecar next to the session it creates; it has the
+            // `.jsonl` extension but is NOT a session (it holds stashed tool payloads), so exclude it.
+            .filter(|p| !p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.ends_with(".flat.jsonl")))
             .collect();
         Ok(crate::par_filter_map(paths, |path| {
             crate::discover_cache::cached_scan(&path, || match scan(&path) {
@@ -1192,8 +1195,40 @@ fn parse_usage(v: &Value) -> Usage {
 }
 
 #[cfg(test)]
+impl Claude {
+    /// Test-only: point the adapter at an explicit projects root.
+    fn for_root(root: std::path::PathBuf) -> Self {
+        Claude { root: Some(root) }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn discovery_excludes_prune_flat_sidecar() {
+        let root = std::env::temp_dir().join(format!("cv-disc-{}", uuid::Uuid::new_v4()));
+        let proj = root.join("-Users-x-proj");
+        fs::create_dir_all(&proj).unwrap();
+        let sid = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        // a real session...
+        fs::write(
+            proj.join(format!("{sid}.jsonl")),
+            serde_json::json!({"type":"user","sessionId":sid,"uuid":"u0","timestamp":"2026-06-16T00:00:00Z",
+                "message":{"role":"user","content":"hi"}}).to_string() + "\n",
+        ).unwrap();
+        // ...and a prune sidecar sitting right next to it (must NOT be discovered as a session).
+        fs::write(
+            proj.join(format!("{sid}.flat.jsonl")),
+            serde_json::json!({"id":"toolu_1","slot":"content","name":"Read","content":"big","size":3,"line_count":1,"kind":"text"}).to_string() + "\n",
+        ).unwrap();
+
+        let refs = Claude::for_root(root.clone()).discover().unwrap();
+        assert_eq!(refs.len(), 1, "the .flat.jsonl sidecar must be excluded");
+        assert_eq!(refs[0].id, sid);
+        fs::remove_dir_all(&root).ok();
+    }
 
     fn fixture(name: &str) -> String {
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/claude/");

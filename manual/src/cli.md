@@ -274,7 +274,7 @@ edits that produced them, so matches are ranked, not asserted.
 
 *Custom, lossless compaction* of a Claude Code session into a **new, resumable** session. The standard answer to a full context window is compaction — the model rewrites your whole history into a shorter summary, which is lossy by construction. `cv prune` does the opposite: it changes *nothing* about what was said, and instead lifts the **bulky old tool payloads** (large file reads, command logs, base64 screenshots) out of the conversation into a sidecar, leaving a small `[PRUNED id=…]` marker in their place. Prompts and the chronological flow are preserved verbatim; the most recent turns are kept untouched so the model stays sharp on the task at hand.
 
-The output is a brand-new session (fresh id stamped across every line, sidecar resources copied under the new id) — resume it with `claude --resume <new-id>`. Nothing is ever lost: each snipped original stays in `<new-id>.flat.jsonl` and comes back with `--retrieve`.
+The output is a brand-new session (a fresh id stamped across every line) — resume it with `claude --resume <new-id>`. Nothing is ever lost: each snipped original stays in `<new-id>.flat.jsonl` and comes back with `--retrieve`.
 
 ```sh
 cv prune 3b829648                                  # default: snip >2KB payloads, keep the last 25 turns
@@ -290,6 +290,7 @@ cv prune <new-id> --retrieve toolu_abc123          # fetch a stashed original ba
 - `--keep-last <N>` — keep the last N conversational turns' payloads verbatim (default 25).
 - `--to <id>` — the new session id (default: a fresh UUID).
 - `--drop` — discard payloads entirely instead of stashing them (smallest output, irreversible; the source session is never touched regardless).
+- `--copy-resources` — also copy the session's `subagents/`/`workflows/` dir under the new id (off by default; can be hundreds of MB for big sessions). `claude --resume` doesn't need it — only cv's forest features (`cv workflow`/`cv tools`) on the pruned session do.
 - `--dry-run` — compute and report without writing.
 - `--retrieve <tool_use_id>` — instead of pruning, print the stashed original for that id from `<id>.flat.jsonl`.
 

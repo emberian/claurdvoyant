@@ -36,7 +36,7 @@ fn prunes_old_payloads_into_new_session_keeping_recent() {
     let big = "X".repeat(5000); // > default min_size 2048
     let src = fixture(&dir, &big);
 
-    let opts = PruneOptions { min_size: 2048, keep_last: 2, drop: false, new_id: None, dry_run: false };
+    let opts = PruneOptions { min_size: 2048, keep_last: 2, drop: false, new_id: None, copy_resources: false, dry_run: false };
     let r = prune_session(&src, &opts).unwrap();
 
     // new session, distinct id + file
@@ -82,7 +82,7 @@ fn drop_mode_writes_no_sidecar() {
     let big = "Y".repeat(5000);
     let src = fixture(&dir, &big);
     // keep_last 0 → every turn is "old", so the drop removes ALL big payloads.
-    let opts = PruneOptions { min_size: 2048, keep_last: 0, drop: true, new_id: Some("aaaa".into()), dry_run: false };
+    let opts = PruneOptions { min_size: 2048, keep_last: 0, drop: true, new_id: Some("aaaa".into()), copy_resources: false, dry_run: false };
     let r = prune_session(&src, &opts).unwrap();
     assert_eq!(r.new_id, "aaaa");
     assert!(r.sidecar_path.is_none());

@@ -42,13 +42,17 @@ pub struct PruneOptions {
     pub drop: bool,
     /// Explicit new session id; otherwise a fresh UUIDv4.
     pub new_id: Option<String>,
+    /// Also copy the session's `subagents/`/`workflows/` resource dir under the new id. Off by
+    /// default — `claude --resume` doesn't need it, and for big sessions it can be hundreds of MB /
+    /// thousands of files. Turn on if you want cv's forest features to work on the pruned session.
+    pub copy_resources: bool,
     /// Compute and report without writing anything.
     pub dry_run: bool,
 }
 
 impl Default for PruneOptions {
     fn default() -> Self {
-        PruneOptions { min_size: 2048, keep_last: 25, drop: false, new_id: None, dry_run: false }
+        PruneOptions { min_size: 2048, keep_last: 25, drop: false, new_id: None, copy_resources: false, dry_run: false }
     }
 }
 
@@ -167,7 +171,7 @@ pub fn prune_session(src_path: &Path, opts: &PruneOptions) -> Result<PruneResult
     let new_size = new_content.len() as u64;
 
     let sidecar_out = (!opts.drop && !sidecar.is_empty()).then(|| sidecar_path.clone());
-    let copied = (dir.join(src_stem).is_dir()).then(|| dir.join(&new_id));
+    let copied = (opts.copy_resources && dir.join(src_stem).is_dir()).then(|| dir.join(&new_id));
 
     if !opts.dry_run {
         std::fs::write(&new_path, &new_content)
