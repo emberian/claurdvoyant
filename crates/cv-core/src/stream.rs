@@ -58,6 +58,14 @@ pub struct ParseOptions {
     /// Implies nothing by itself: the adapters only stamp on their span-tracking paths, so use
     /// [`lazy_offsets()`](ParseOptions::lazy_offsets) (spans + offsets) rather than setting it solo.
     pub offsets: bool,
+    /// **Format-complete**: lose nothing on parse. Carry every record — including the
+    /// non-conversational meta records the lean passes skip (mode/permission-mode/attachment/
+    /// queue-operation/last-prompt/hook telemetry/…) — as round-trippable carrier messages, so a
+    /// `parse → emit` round-trip reproduces the original byte-for-byte (modulo key order). Off by
+    /// default so the conversational passes (render/dataset/index) stay exactly as they were; turned
+    /// on by conversion/round-trip/[`prune`](crate::prune)-via-IR paths that must not drop a field.
+    /// Implies [`extra`](ParseOptions::extra). Adapters that can't yet carry every record ignore it.
+    pub complete: bool,
 }
 
 impl ParseOptions {
@@ -71,6 +79,13 @@ impl ParseOptions {
     /// (these consumers read everything, so spans wouldn't help). Used by index/search/dataset.
     pub fn bulk() -> Self {
         ParseOptions::default()
+    }
+
+    /// Format-complete, lossless: full `extra` **and** every record carried (incl. meta records the
+    /// other passes skip), inline content. For `parse → emit` round-trips that must reproduce the
+    /// source losslessly. The strongest fidelity setting.
+    pub fn complete() -> Self {
+        ParseOptions { extra: true, complete: true, ..Default::default() }
     }
 
     /// Partial-access pass: lazy content [`Span`](crate::lazy::Span)s so unread giant fields are

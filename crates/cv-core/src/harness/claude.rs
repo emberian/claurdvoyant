@@ -268,7 +268,8 @@ fn ingest_value(
             if let Some(t) = v.get("aiTitle").and_then(Value::as_str) {
                 session.title = Some(t.to_string());
             }
-            return Flow::Continue;
+            // In `complete` mode, also carry the record itself so it round-trips.
+            return if opts.complete { sink.message(carrier_record(v)) } else { Flow::Continue };
         }
         // `summary`/`last-prompt` carry a title-ish/leaf pointer but no message body.
         // `summary` lines have a `summary` string we can fall back to for the title.
@@ -278,14 +279,17 @@ fn ingest_value(
                     session.title = Some(t.to_string());
                 }
             }
-            return Flow::Continue;
+            return if opts.complete { sink.message(carrier_record(v)) } else { Flow::Continue };
         }
         // Pure bookkeeping / live-process records with no conversational payload.
         // `progress`, `started`, `result` are sub-agent hook/streaming telemetry;
         // `queue-operation` is the input queue; `mode`/`permission-mode`/`attachment`/
-        // `last-prompt` are UI state. Ignore (unknown types fall through and are ignored too).
+        // `last-prompt` are UI state. The lean passes drop them; `complete` carries them verbatim as
+        // round-trippable carrier messages (unknown types still fall through and are ignored).
         "mode" | "permission-mode" | "last-prompt" | "attachment" | "progress" | "started"
-        | "result" | "queue-operation" | "x-quota" | "file-history-snapshot" => return Flow::Continue,
+        | "result" | "queue-operation" | "x-quota" | "file-history-snapshot" => {
+            return if opts.complete { sink.message(carrier_record(v)) } else { Flow::Continue };
+        }
         _ => {}
     }
 
@@ -324,6 +328,23 @@ fn ingest_value(
     }
     Flow::Continue
 }
+
+/// A non-conversational meta record (mode/attachment/queue-operation/hook telemetry/ai-title/…)
+/// carried verbatim under [`ParseOptions::complete`] so a `parse → emit` round-trip reproduces it.
+/// Modeled as an empty-content `System` message — render/dataset/count all skip empty turns, so
+/// existing consumers are unaffected — with the full original record stashed under `extra["_record"]`
+/// for the emitter to replay byte-for-byte.
+fn carrier_record(v: &Value) -> Message {
+    let mut m = Message::new(Role::System);
+    m.id = v.get("uuid").and_then(Value::as_str).map(String::from);
+    m.parent_id = v.get("parentUuid").and_then(Value::as_str).map(String::from);
+    m.timestamp = v.get("timestamp").and_then(Value::as_str).and_then(parse_ts);
+    m.extra.insert(CARRIER_KEY.into(), v.clone());
+    m
+}
+
+/// `extra` key under which a [`carrier_record`] stashes the verbatim original meta record.
+pub const CARRIER_KEY: &str = "_record";
 
 /// Sub-agent transcripts spawned by `parent_path`'s session (Claude Code's Task tool). They live at
 /// `<projects>/<encoded>/<sid>/subagents/<agent>.jsonl` — a sibling `subagents/` dir next to the
@@ -1205,6 +1226,43 @@ impl Claude {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn complete_mode_carries_dropped_meta_records() {
+        // A session mixing conversational turns with the meta records the lean passes drop.
+        let sid = "s1";
+        let text = [
+            r#"{"type":"user","sessionId":"s1","uuid":"u0","timestamp":"2026-06-16T00:00:00Z","message":{"role":"user","content":"hi"}}"#,
+            r#"{"type":"mode","sessionId":"s1","mode":"plan"}"#,
+            r#"{"type":"queue-operation","sessionId":"s1","operation":"enqueue","content":"later","timestamp":"2026-06-16T00:00:01Z"}"#,
+            r#"{"type":"ai-title","sessionId":"s1","aiTitle":"My Session"}"#,
+            r#"{"type":"assistant","sessionId":"s1","uuid":"a1","parentUuid":"u0","timestamp":"2026-06-16T00:00:02Z","message":{"role":"assistant","content":[{"type":"text","text":"hello"}]}}"#,
+        ].join("\n");
+
+        // Default (full, not complete): meta records dropped — only the 2 conversational turns.
+        let mut sink = CollectSink::default();
+        stream_str(sid, &text, None, &ParseOptions::full(), &mut sink);
+        let convo: Vec<_> = sink.messages.iter().filter(|m| m.extra.contains_key(CARRIER_KEY)).collect();
+        assert_eq!(sink.messages.len(), 2, "full mode keeps only conversational turns");
+        assert_eq!(convo.len(), 0, "no carriers in full mode");
+
+        // Complete: every record present; the 3 meta records become carriers holding the original.
+        let mut sink = CollectSink::default();
+        let session = stream_str(sid, &text, None, &ParseOptions::complete(), &mut sink);
+        let carriers: Vec<_> = sink.messages.iter().filter(|m| m.extra.contains_key(CARRIER_KEY)).collect();
+        assert_eq!(sink.messages.len(), 5, "complete mode carries every record");
+        assert_eq!(carriers.len(), 3, "mode + queue-operation + ai-title carried");
+        // carriers stash the verbatim original record
+        let types: Vec<&str> = carriers
+            .iter()
+            .filter_map(|m| m.extra.get(CARRIER_KEY)?.get("type")?.as_str())
+            .collect();
+        assert!(types.contains(&"mode") && types.contains(&"queue-operation") && types.contains(&"ai-title"), "got {types:?}");
+        // ai-title still sets the session title (IR convenience) AND round-trips as a carrier
+        assert_eq!(session.title.as_deref(), Some("My Session"));
+        // carriers are empty-content System turns, so message_count (user+assistant) is unaffected
+        assert!(carriers.iter().all(|m| m.content.is_empty() && m.role == Role::System));
+    }
 
     #[test]
     fn discovery_excludes_prune_flat_sidecar() {
