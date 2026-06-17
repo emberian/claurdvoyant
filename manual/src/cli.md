@@ -198,8 +198,9 @@ It prefers semantic ranking and quietly falls back to keyword mode if embeddings
 Build (or refresh) the search index. Run it once, re-run it whenever you want fresh sessions to be searchable.
 
 ```sh
-cv index                # full-text (tantivy) index
+cv index                # full-text (tantivy) index (top-level sessions)
 cv index --semantic     # also build embeddings for `cv search --semantic` / `cv recall`
+cv index --subagents    # also fold the sub-agent / workflow forest into the index + events
 ```
 
 ```text
@@ -210,6 +211,7 @@ embedded 2245 session(s) → ~/.cache/claurdvoyant/embeddings.bin
 ```
 
 - `--semantic` — also compute embeddings (downloads a ~30 MB model the first time).
+- `--subagents` — also index the **sub-agent / workflow forest** (the transcripts under each Claude session's `subagents/`), tagged with their parent session, workflow run, and agent id. Without it, `cv search`/`cv touched` see only top-level sessions; with it, a hit can point you *inside* a workflow agent (e.g. "agent `census:foo` of run `wf_…` in session `3b829648`"). It can add hundreds of MB to the index, so it's opt-in. A search `Hit` and `cv touched` rows carry the provenance.
 
 `cv index` also ingests the **event catalog** in the same streaming pass — every
 tool call is classified (`file_edit`, `file_read`, `command`, `error`, `tool`)
