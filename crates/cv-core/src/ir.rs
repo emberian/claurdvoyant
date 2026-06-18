@@ -70,6 +70,10 @@ harnesses! {
     Goose => "goose",
     /// Zed editor's agent panel (`threads.db` SQLite, zstd-compressed JSON thread blobs).
     Zed => "zed",
+    /// ChatGPT account **data export** (`conversations.json`, a `mapping` DAG per conversation).
+    ChatGptExport => "chatgpt-export",
+    /// Claude.ai account **data export** (`conversations.json`, linear `chat_messages[]`).
+    ClaudeExport => "claude-export",
 }
 
 impl Harness {
@@ -94,6 +98,8 @@ impl Harness {
             "continue" | "continuedev" => Harness::Continue,
             "goose" => Harness::Goose,
             "zed" | "zed-editor" => Harness::Zed,
+            "chatgpt-export" | "openai-export" | "chatgpt-data" | "openai-data" => Harness::ChatGptExport,
+            "claude-export" | "claude-ai" | "claudeai" | "claude-data" => Harness::ClaudeExport,
             _ => return None,
         })
     }

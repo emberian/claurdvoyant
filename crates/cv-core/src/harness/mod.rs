@@ -20,6 +20,7 @@ pub mod codex;
 pub mod continuedev;
 #[cfg(feature = "sqlite")]
 pub mod cursor;
+pub mod export;
 #[cfg(feature = "sqlite")]
 pub mod goose;
 pub mod roo;
@@ -200,6 +201,8 @@ pub fn all() -> Vec<Box<dyn Adapter>> {
         Box::new(cline::Cline::new()),
         Box::new(roo::Roo::new()),
         Box::new(continuedev::Continue::new()),
+        Box::new(export::ChatGptExport::new()),
+        Box::new(export::ClaudeExport::new()),
     ];
     #[cfg(feature = "sqlite")]
     {

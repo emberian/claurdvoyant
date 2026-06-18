@@ -1,6 +1,7 @@
 # Harnesses & where they store sessions
 
-claurdvoyant currently understands **18 harnesses** 🔮. Every one of them couples a session to a
+claurdvoyant currently understands **20 harnesses** 🔮 (incl. the ChatGPT & Claude.ai account data
+exports — `chatgpt-export`/`claude-export`, opt-in via `CV_EXPORTS`). Every one of them couples a session to a
 working directory — they encode the `cwd` into the path, the filename, a hash, or a DB column — which
 is exactly why your sessions feel "dir-jailed" and impossible to find later. claurdvoyant reads them
 all into one unified IR so that coupling stops mattering.

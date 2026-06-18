@@ -258,6 +258,32 @@ decouples them via a unified IR.
   (URI kept as a File block), and `creases` semantics aren't modeled; legacy `context` and 0.3.0
   `reasoning_details` ride in `extra`. We decode blobs with pure-Rust `ruzstd` (no C cross-compile cost).
 
+## Account data exports — `$CV_EXPORTS` (opt-in; e.g. `~/Downloads`)
+
+The archives you download via "Export data". One file (`conversations.json`, often split
+`conversations-000.json … -NNN.json`) holds **many** conversations, so one file → many `SessionRef`s.
+Distinct from the `claude`/`claude-app`/`chatgpt-app` harnesses. Discovery is **opt-in** via the
+`CV_EXPORTS` env var (`:`-separated dirs/files) — unset = no scan (these archives are large; enumerating
+thousands of conversations costs seconds). Conversations are **deduped by id** (overlapping exports
+repeat them). Both adapters parse-only (no emit). The two shapes are sniffed by content (a file's first
+conversation): `mapping` ⇒ ChatGPT, `chat_messages` ⇒ Claude.
+
+- **`chatgpt-export`** — each conversation: `{id|conversation_id, title, create_time, update_time,
+  default_model_slug, current_node, mapping}`. `mapping` is a **DAG**: `node_id → {id, parent,
+  children[], message}`; we walk the `root → current_node` chain (the active branch; regenerated/edited
+  branches are excluded). A message: `{author:{role}, content:{content_type, parts|text}, recipient,
+  create_time}`. `content_type` ∈ `text` (parts=strings) / `code` (`text`) / `multimodal_text` (parts
+  incl. `{content_type:image_asset_pointer, asset_pointer:"file-service://…"}` → `Block::Image`) /
+  `execution_output` / `tether_*` (browsing) / `user_editable_context` (custom instructions). On an
+  assistant turn, `recipient` ≠ `all` (e.g. `python`, `dalle.text2im`, `browser`, `bio`) ⇒ a tool call.
+- **`claude-export`** — each conversation: `{uuid, name, summary, created_at, updated_at,
+  chat_messages[]}`. `chat_messages` are linear (via `parent_message_uuid`); `sender` ∈ human/assistant;
+  `content[]` blocks ∈ `text` / `thinking` / `tool_use{id,name,input}` / `tool_result{tool_use_id,
+  content,is_error}`; a flat `text` field is the fallback when there are no structured blocks.
+- **Lossy notes (v1):** off-branch ChatGPT regenerations aren't surfaced; tool-call args beyond the
+  rendered text aren't structured for ChatGPT (recipient-tool turns become a `ToolUse` carrying the
+  text); image bytes are references (`asset_pointer`), not inlined.
+
 ---
 
 ## Prior art (don't reinvent; do unify)

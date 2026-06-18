@@ -55,7 +55,7 @@ cv scry
 - 📣 **A coordination board** (`cv board` + MCP): agents post status and hand off work to each other. With the daemon mirroring activity, it's a live feed across your whole **cloud fleet**.
 - 🌐 **A zero-install web viewer**: drag a zip of any harness folder into your browser and explore it. Nothing uploaded, all WASM.
 
-## 🪐 18 harnesses, one IR
+## 🪐 20 harnesses, one IR
 
 | | Harness | Parse | Convert *to* | | | Harness | Parse | Convert *to* |
 |---|---|:--:|:--:|---|---|---|:--:|:--:|
@@ -144,7 +144,7 @@ parse(any harness) → 🔮 unified IR → search · convert · port · loom · 
 
 Built in a wild few sessions, much of it by a swarm of agents working disjoint files. ✨ Honest about the edges:
 
-- **18 harnesses parse**; the 7 core ones also **emit** (N-way conversion). The newer 9 (Cursor, Kimi, Qwen, LM Studio, Cline, Roo, Continue, Goose, Zed) are parse-only for now.
+- **20 harnesses parse**; the 7 core ones also **emit** (N-way conversion). The rest — Cursor, Kimi, Qwen, LM Studio, Cline, Roo, Continue, Goose, Zed, and the ChatGPT/Claude.ai **account data exports** (`chatgpt-export`/`claude-export`, opt-in via `CV_EXPORTS`) — are parse-only for now.
 - **Robustness:** 2000+ real sessions parse with **0 panics**; parsers are fuzz-tested against hostile input.
 - The full-text index trades disk for speed; Gemini's protobuf `.pb` is opaque; a few sidecar tool-call streams aren't merged yet.
 - Historical format variants are an explicit goal — see [`ADDING_HARNESS.md`](ADDING_HARNESS.md), and **please send your own harness logs** (we can only test what we can see).
