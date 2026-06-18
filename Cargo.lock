@@ -454,7 +454,7 @@ checksum = "460fbee9c2c2f33933d720630a6a0bac33ba7053db5344fac858d4b8952d77d5"
 
 [[package]]
 name = "cv"
-version = "0.9.14"
+version = "0.9.15"
 dependencies = [
  "anyhow",
  "chrono",
@@ -467,7 +467,7 @@ dependencies = [
 
 [[package]]
 name = "cv-core"
-version = "0.9.14"
+version = "0.9.15"
 dependencies = [
  "anyhow",
  "chrono",
@@ -488,7 +488,7 @@ dependencies = [
 
 [[package]]
 name = "cv-llm"
-version = "0.9.14"
+version = "0.9.15"
 dependencies = [
  "anyhow",
  "cv-core",
@@ -499,7 +499,7 @@ dependencies = [
 
 [[package]]
 name = "cv-mcp"
-version = "0.9.14"
+version = "0.9.15"
 dependencies = [
  "anyhow",
  "chrono",
@@ -513,7 +513,7 @@ dependencies = [
 
 [[package]]
 name = "cv-search"
-version = "0.9.14"
+version = "0.9.15"
 dependencies = [
  "anyhow",
  "chrono",
@@ -529,7 +529,7 @@ dependencies = [
 
 [[package]]
 name = "cv-tui"
-version = "0.9.14"
+version = "0.9.15"
 dependencies = [
  "anyhow",
  "chrono",
@@ -543,7 +543,7 @@ dependencies = [
 
 [[package]]
 name = "cv-web"
-version = "0.9.14"
+version = "0.9.15"
 dependencies = [
  "cv-core",
  "serde_json",
@@ -554,7 +554,7 @@ dependencies = [
 
 [[package]]
 name = "cvd"
-version = "0.9.14"
+version = "0.9.15"
 dependencies = [
  "anyhow",
  "chrono",
