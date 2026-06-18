@@ -178,7 +178,9 @@ fn discover_kind(kind: Kind) -> Vec<SessionRef> {
             continue;
         }
         for raw in &arr {
-            let Ok(v) = serde_json::from_str::<Value>(raw.get()) else { continue };
+            let Ok(v) = serde_json::from_str::<Value>(raw.get()) else {
+                continue;
+            };
             if let Some(r) = conv_ref(kind, &path, &v) {
                 if seen.insert(r.id.clone()) {
                     out.push(r);
@@ -198,8 +200,14 @@ fn conv_ref(kind: Kind, path: &Path, v: &Value) -> Option<SessionRef> {
     }
     .filter(|s| !s.is_empty())
     .map(str::to_string);
-    let created = v.get("create_time").or_else(|| v.get("created_at")).and_then(ts_from_value);
-    let updated = v.get("update_time").or_else(|| v.get("updated_at")).and_then(ts_from_value);
+    let created = v
+        .get("create_time")
+        .or_else(|| v.get("created_at"))
+        .and_then(ts_from_value);
+    let updated = v
+        .get("update_time")
+        .or_else(|| v.get("updated_at"))
+        .and_then(ts_from_value);
     let message_count = match kind {
         Kind::ChatGpt => chatgpt_active_chain(v)
             .iter()
@@ -208,7 +216,11 @@ fn conv_ref(kind: Kind, path: &Path, v: &Value) -> Option<SessionRef> {
         Kind::Claude => v
             .get("chat_messages")
             .and_then(Value::as_array)
-            .map(|a| a.iter().filter(|m| matches!(m.get("sender").and_then(Value::as_str), Some("human" | "assistant"))).count())
+            .map(|a| {
+                a.iter()
+                    .filter(|m| matches!(m.get("sender").and_then(Value::as_str), Some("human" | "assistant")))
+                    .count()
+            })
             .unwrap_or(0),
     };
     Some(SessionRef {
@@ -247,7 +259,11 @@ fn parse_ref(kind: Kind, r: &SessionRef) -> Result<Session> {
         title: r.title.clone(),
         created_at: r.created_at,
         updated_at: r.updated_at,
-        model: conv.get("default_model_slug").and_then(Value::as_str).filter(|s| !s.is_empty()).map(str::to_string),
+        model: conv
+            .get("default_model_slug")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string),
         git: None,
         messages: match kind {
             Kind::ChatGpt => chatgpt_messages(&conv),
@@ -266,7 +282,9 @@ fn parse_ref(kind: Kind, r: &SessionRef) -> Result<Session> {
 /// Falls back to mapping order when `current_node` is absent. Shared by message-building and the
 /// metadata count so they agree (dead/regenerated branches are excluded).
 fn chatgpt_active_chain(conv: &Value) -> Vec<&Value> {
-    let Some(mapping) = conv.get("mapping").and_then(Value::as_object) else { return vec![] };
+    let Some(mapping) = conv.get("mapping").and_then(Value::as_object) else {
+        return vec![];
+    };
     let Some(cur) = conv.get("current_node").and_then(Value::as_str) else {
         return mapping.values().collect();
     };
@@ -311,7 +329,11 @@ fn chatgpt_messages(conv: &Value) -> Vec<Message> {
             last_call.insert(recipient.to_string(), node_id.clone());
         } else if role == Role::Tool {
             // A tool result. Link it to the most recent call of the same tool (author.name).
-            let tool = msg.get("author").and_then(|a| a.get("name")).and_then(Value::as_str).unwrap_or("");
+            let tool = msg
+                .get("author")
+                .and_then(|a| a.get("name"))
+                .and_then(Value::as_str)
+                .unwrap_or("");
             content.push(Block::ToolResult {
                 tool_use_id: last_call.get(tool).cloned().unwrap_or_default(),
                 content: text.clone().into(),
@@ -321,14 +343,20 @@ fn chatgpt_messages(conv: &Value) -> Vec<Message> {
                 details: None,
             });
             for ptr in chatgpt_image_pointers(msg.get("content")) {
-                content.push(Block::Image { media_type: None, data_ref: Some(ptr) });
+                content.push(Block::Image {
+                    media_type: None,
+                    data_ref: Some(ptr),
+                });
             }
         } else {
             if !text.trim().is_empty() {
                 content.push(Block::Text { text: text.into() });
             }
             for ptr in chatgpt_image_pointers(msg.get("content")) {
-                content.push(Block::Image { media_type: None, data_ref: Some(ptr) });
+                content.push(Block::Image {
+                    media_type: None,
+                    data_ref: Some(ptr),
+                });
             }
         }
         if content.is_empty() {
@@ -363,11 +391,7 @@ fn role_from_str(s: &str) -> Role {
 fn chatgpt_content_text(content: Option<&Value>) -> String {
     let Some(c) = content else { return String::new() };
     if let Some(parts) = c.get("parts").and_then(Value::as_array) {
-        return parts
-            .iter()
-            .filter_map(|p| p.as_str())
-            .collect::<Vec<_>>()
-            .join("\n");
+        return parts.iter().filter_map(|p| p.as_str()).collect::<Vec<_>>().join("\n");
     }
     // code / execution_output / tether_* carry `text`.
     c.get("text").and_then(Value::as_str).unwrap_or("").to_string()
@@ -376,7 +400,9 @@ fn chatgpt_content_text(content: Option<&Value>) -> String {
 /// Image asset pointers in a ChatGPT `multimodal_text` content (`{content_type:image_asset_pointer,
 /// asset_pointer:"file-service://…"}` parts).
 fn chatgpt_image_pointers(content: Option<&Value>) -> Vec<String> {
-    let Some(parts) = content.and_then(|c| c.get("parts")).and_then(Value::as_array) else { return vec![] };
+    let Some(parts) = content.and_then(|c| c.get("parts")).and_then(Value::as_array) else {
+        return vec![];
+    };
     parts
         .iter()
         .filter_map(|p| p.as_object())
@@ -386,7 +412,9 @@ fn chatgpt_image_pointers(content: Option<&Value>) -> Vec<String> {
 
 /// Claude.ai export: `chat_messages[]` (already in order) → IR turns.
 fn claude_messages(conv: &Value) -> Vec<Message> {
-    let Some(msgs) = conv.get("chat_messages").and_then(Value::as_array) else { return vec![] };
+    let Some(msgs) = conv.get("chat_messages").and_then(Value::as_array) else {
+        return vec![];
+    };
     msgs.iter()
         .filter_map(|m| {
             let role = role_from_str(m.get("sender").and_then(Value::as_str)?);
@@ -418,7 +446,12 @@ fn claude_content_blocks(m: &Value) -> Vec<Block> {
                 }
                 Some("thinking") => {
                     if let Some(t) = b.get("thinking").or_else(|| b.get("text")).and_then(Value::as_str) {
-                        out.push(Block::Thinking { text: t.into(), signature: None, encrypted: None, redacted: false });
+                        out.push(Block::Thinking {
+                            text: t.into(),
+                            signature: None,
+                            encrypted: None,
+                            redacted: false,
+                        });
                     }
                 }
                 Some("tool_use") => out.push(Block::ToolUse {

@@ -182,9 +182,7 @@ impl App {
 
     /// The currently-selected row, if any.
     pub fn current_row(&self) -> Option<&Row> {
-        self.filtered
-            .get(self.selected)
-            .and_then(|&i| self.all_rows.get(i))
+        self.filtered.get(self.selected).and_then(|&i| self.all_rows.get(i))
     }
 
     // ───────────────────────────── opening / parsing ─────────────────────────────
@@ -292,11 +290,7 @@ impl App {
     }
 
     fn scroll_transcript(&mut self, delta: isize) {
-        let max = self
-            .open
-            .as_ref()
-            .map(|o| o.lines.len().saturating_sub(1))
-            .unwrap_or(0);
+        let max = self.open.as_ref().map(|o| o.lines.len().saturating_sub(1)).unwrap_or(0);
         let next = (self.transcript_scroll as isize + delta).clamp(0, max as isize);
         self.transcript_scroll = next as usize;
     }
@@ -435,11 +429,7 @@ impl App {
                     let r = SessionRef {
                         id: open.session.id.clone(),
                         harness: open.session.harness,
-                        path: open
-                            .session
-                            .source_path
-                            .clone()
-                            .unwrap_or_default(),
+                        path: open.session.source_path.clone().unwrap_or_default(),
                         cwd: open.session.cwd.clone(),
                         title: open.session.title.clone(),
                         created_at: open.session.created_at,
@@ -501,8 +491,8 @@ fn is_text_input(key: KeyEvent) -> bool {
 
 /// Load + parse a session ref into the IR via its harness adapter.
 fn load_session(r: &SessionRef) -> anyhow::Result<Session> {
-    let adapter: Box<dyn Adapter> = harness::for_harness(r.harness)
-        .ok_or_else(|| anyhow::anyhow!("no adapter for harness {}", r.harness))?;
+    let adapter: Box<dyn Adapter> =
+        harness::for_harness(r.harness).ok_or_else(|| anyhow::anyhow!("no adapter for harness {}", r.harness))?;
     adapter.parse(r)
 }
 
@@ -651,9 +641,7 @@ fn render_lines(s: &Session) -> Vec<TLine> {
                         kind: LineKind::ToolUse,
                     });
                 }
-                Block::ToolResult {
-                    content, is_error, ..
-                } => {
+                Block::ToolResult { content, is_error, .. } => {
                     let kind = if *is_error {
                         LineKind::ToolError
                     } else {
@@ -672,10 +660,7 @@ fn render_lines(s: &Session) -> Vec<TLine> {
                     }
                 }
                 Block::File { path, source, .. } => {
-                    let label = path
-                        .as_deref()
-                        .or(source.as_deref())
-                        .unwrap_or("?");
+                    let label = path.as_deref().or(source.as_deref()).unwrap_or("?");
                     out.push(TLine {
                         text: format!("[file: {label}]"),
                         kind: LineKind::Meta,
@@ -747,7 +732,11 @@ mod tests {
     }
 
     fn row(id: &str, title: Option<&str>, cwd: Option<&str>) -> Row {
-        Row { r#ref: sref(id, title, cwd), snippet: None, score: None }
+        Row {
+            r#ref: sref(id, title, cwd),
+            snippet: None,
+            score: None,
+        }
     }
 
     fn session(messages: Vec<Message>) -> Session {
@@ -768,7 +757,9 @@ mod tests {
 
     fn text_msg(role: Role, text: &str) -> Message {
         let mut m = Message::new(role);
-        m.content.push(Block::Text { text: text.to_string().into() });
+        m.content.push(Block::Text {
+            text: text.to_string().into(),
+        });
         m
     }
 
@@ -789,7 +780,11 @@ mod tests {
 
     #[test]
     fn row_matching_covers_every_field_and_fuzzy() {
-        let r = row("deadbeef-1234", Some("Fix The Parser"), Some("/home/em/projects/claurd"));
+        let r = row(
+            "deadbeef-1234",
+            Some("Fix The Parser"),
+            Some("/home/em/projects/claurd"),
+        );
         assert!(row_matches(&r, "claude"), "harness");
         assert!(row_matches(&r, "deadbeef"), "id");
         assert!(row_matches(&r, "fix the parser"), "title, case-folded");
@@ -808,7 +803,11 @@ mod tests {
     fn render_lines_blocks_and_kinds() {
         let mut asst = Message::new(Role::Assistant);
         asst.content.push(Block::Thinking {
-            text: (0..10).map(|i| format!("thought {i}")).collect::<Vec<_>>().join("\n").into(),
+            text: (0..10)
+                .map(|i| format!("thought {i}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+                .into(),
             signature: None,
             encrypted: None,
             redacted: false,
@@ -827,11 +826,7 @@ mod tests {
             status: None,
             details: None,
         });
-        let s = session(vec![
-            text_msg(Role::User, "line one\nline two"),
-            asst,
-            toolm,
-        ]);
+        let s = session(vec![text_msg(Role::User, "line one\nline two"), asst, toolm]);
 
         let lines = render_lines(&s);
 
@@ -839,13 +834,21 @@ mod tests {
         assert!(lines[0].text.contains("claude"), "{}", lines[0].text);
         assert!(lines[0].text.contains("a test session"));
         assert_eq!(lines[0].kind, LineKind::Meta);
-        assert!(lines.iter().any(|l| l.kind == LineKind::Meta && l.text == "cwd: /work/proj"));
+        assert!(lines
+            .iter()
+            .any(|l| l.kind == LineKind::Meta && l.text == "cwd: /work/proj"));
         assert!(lines.iter().any(|l| l.text == "model: claude-test-1"));
 
         // Role separators carry role kinds.
-        assert!(lines.iter().any(|l| l.text == "── user ──" && l.kind == LineKind::RoleUser));
-        assert!(lines.iter().any(|l| l.text == "── assistant ──" && l.kind == LineKind::RoleAssistant));
-        assert!(lines.iter().any(|l| l.text == "── tool ──" && l.kind == LineKind::RoleTool));
+        assert!(lines
+            .iter()
+            .any(|l| l.text == "── user ──" && l.kind == LineKind::RoleUser));
+        assert!(lines
+            .iter()
+            .any(|l| l.text == "── assistant ──" && l.kind == LineKind::RoleAssistant));
+        assert!(lines
+            .iter()
+            .any(|l| l.text == "── tool ──" && l.kind == LineKind::RoleTool));
 
         // Multiline text splits into one TLine per line.
         assert!(lines.iter().any(|l| l.text == "line one" && l.kind == LineKind::Text));
@@ -857,9 +860,15 @@ mod tests {
         assert!(thinking.last().unwrap().text.contains("truncated"));
 
         // Tool use + error-flavored result.
-        assert!(lines.iter().any(|l| l.kind == LineKind::ToolUse && l.text.contains("Bash")));
-        assert!(lines.iter().any(|l| l.kind == LineKind::ToolError && l.text.contains("↩ error")));
-        assert!(lines.iter().any(|l| l.kind == LineKind::ToolError && l.text.contains("it broke")));
+        assert!(lines
+            .iter()
+            .any(|l| l.kind == LineKind::ToolUse && l.text.contains("Bash")));
+        assert!(lines
+            .iter()
+            .any(|l| l.kind == LineKind::ToolError && l.text.contains("↩ error")));
+        assert!(lines
+            .iter()
+            .any(|l| l.kind == LineKind::ToolError && l.text.contains("it broke")));
         assert!(
             !lines.iter().any(|l| l.kind == LineKind::ToolResult),
             "an error result must not also render as a plain result"

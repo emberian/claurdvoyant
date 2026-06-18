@@ -5,12 +5,12 @@
 //! state; both are passed only to the child process's environment.
 
 use serde_json::{json, Value};
+use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc;
 use std::time::Duration;
-use std::fs;
 
 /// A running cv-mcp server over stdio, with a line reader on a side thread so a hung server
 /// fails the test with a timeout instead of wedging the run.
@@ -82,7 +82,12 @@ impl Server {
                 }
             }
         });
-        Server { child, stdin, lines: rx, base }
+        Server {
+            child,
+            stdin,
+            lines: rx,
+            base,
+        }
     }
 
     /// Send one raw line to the server.
@@ -171,10 +176,7 @@ fn handshake_and_tool_schemas() {
             .as_object()
             .unwrap_or_else(|| panic!("{name}: properties must be an object"));
         for (pname, p) in props {
-            assert!(
-                p["type"].is_string(),
-                "{name}.{pname}: every property needs a type"
-            );
+            assert!(p["type"].is_string(), "{name}.{pname}: every property needs a type");
             assert!(
                 !p["description"].as_str().unwrap_or("").is_empty(),
                 "{name}.{pname}: every property needs a description"
@@ -183,14 +185,17 @@ fn handshake_and_tool_schemas() {
         if let Some(req) = schema["required"].as_array() {
             for r in req {
                 let r = r.as_str().expect("required entries are strings");
-                assert!(
-                    props.contains_key(r),
-                    "{name}: required {r:?} missing from properties"
-                );
+                assert!(props.contains_key(r), "{name}: required {r:?} missing from properties");
             }
         }
     }
-    for expected in ["list_sessions", "search_sessions", "read_session", "project_sessions", "recall"] {
+    for expected in [
+        "list_sessions",
+        "search_sessions",
+        "read_session",
+        "project_sessions",
+        "recall",
+    ] {
         assert!(names.contains(expected), "missing core tool {expected}");
     }
 }
@@ -227,10 +232,7 @@ fn tool_calls_against_fixture_corpus() {
     let hits = v.as_array().unwrap();
     assert_eq!(hits.len(), 1, "{text}");
     assert_eq!(hits[0]["id"], "alphasess", "{text}");
-    assert!(
-        hits[0]["snippet"].as_str().unwrap().contains("zebrafish"),
-        "{text}"
-    );
+    assert!(hits[0]["snippet"].as_str().unwrap().contains("zebrafish"), "{text}");
     // Missing required arg: tool error, not a crash.
     let (text, is_err) = s.call_tool(6, "search_sessions", json!({}));
     assert!(is_err, "{text}");
@@ -270,17 +272,33 @@ fn tool_calls_against_fixture_corpus() {
     assert_eq!(msgs[0]["body"], "hello fleet", "{text}");
 
     // board_claim: granted, then contended for another owner, then released.
-    let (text, _) = s.call_tool(14, "board_claim", json!({"channel": "testchan", "key": "taskA", "from": "me"}));
+    let (text, _) = s.call_tool(
+        14,
+        "board_claim",
+        json!({"channel": "testchan", "key": "taskA", "from": "me"}),
+    );
     let v: Value = serde_json::from_str(&text).unwrap();
     assert_eq!(v["granted"], true, "{text}");
-    let (text, _) = s.call_tool(15, "board_claim", json!({"channel": "testchan", "key": "taskA", "from": "other"}));
+    let (text, _) = s.call_tool(
+        15,
+        "board_claim",
+        json!({"channel": "testchan", "key": "taskA", "from": "other"}),
+    );
     let v: Value = serde_json::from_str(&text).unwrap();
     assert_eq!(v["granted"], false, "{text}");
-    let (text, _) = s.call_tool(16, "board_release", json!({"channel": "testchan", "key": "taskA", "from": "me"}));
+    let (text, _) = s.call_tool(
+        16,
+        "board_release",
+        json!({"channel": "testchan", "key": "taskA", "from": "me"}),
+    );
     let v: Value = serde_json::from_str(&text).unwrap();
     assert_eq!(v["released"], true, "{text}");
     // Releasing a key you don't hold reports false (idempotent), never an error.
-    let (text, is_err) = s.call_tool(17, "board_release", json!({"channel": "testchan", "key": "taskA", "from": "me"}));
+    let (text, is_err) = s.call_tool(
+        17,
+        "board_release",
+        json!({"channel": "testchan", "key": "taskA", "from": "me"}),
+    );
     assert!(!is_err, "{text}");
     let v: Value = serde_json::from_str(&text).unwrap();
     assert_eq!(v["released"], false, "{text}");

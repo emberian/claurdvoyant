@@ -86,8 +86,7 @@ impl Archive {
     /// if the serialized bytes are byte-identical to what's already on disk, returns `Skipped`
     /// without rewriting anything.
     pub fn store(&self, session: &Session) -> Result<StoreOutcome> {
-        let json = serde_json::to_vec_pretty(session)
-            .with_context(|| format!("serializing session {}", session.id))?;
+        let json = serde_json::to_vec_pretty(session).with_context(|| format!("serializing session {}", session.id))?;
 
         let dest = self.session_path(session.harness, &session.id);
         if let Ok(existing) = fs::read(&dest) {
@@ -97,8 +96,7 @@ impl Archive {
         }
 
         if let Some(parent) = dest.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("creating {}", parent.display()))?;
+            fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
         }
         fs::write(&dest, &json).with_context(|| format!("writing {}", dest.display()))?;
 
@@ -154,8 +152,7 @@ impl Archive {
     fn upsert_catalog(&self, entry: CatalogEntry) -> Result<()> {
         let path = self.catalog_path();
         if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("creating {}", parent.display()))?;
+            fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
         }
         let line = serde_json::to_string(&entry)?;
         {
@@ -188,15 +185,13 @@ impl Archive {
         }
         let tmp = path.with_extension(format!("{}.jsonl.tmp", std::process::id()));
         {
-            let mut f = fs::File::create(&tmp)
-                .with_context(|| format!("creating {}", tmp.display()))?;
+            let mut f = fs::File::create(&tmp).with_context(|| format!("creating {}", tmp.display()))?;
             for e in &entries {
                 writeln!(f, "{}", serde_json::to_string(e)?)?;
             }
             f.flush()?;
         }
-        fs::rename(&tmp, &path)
-            .with_context(|| format!("finalizing {}", path.display()))?;
+        fs::rename(&tmp, &path).with_context(|| format!("finalizing {}", path.display()))?;
         Ok(())
     }
 }

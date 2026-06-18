@@ -46,7 +46,10 @@ fn main() -> Result<()> {
     match cli.cmd {
         Cmd::Index { subagents } => {
             let n = cv_search::index_all(None, false, subagents)?;
-            println!("indexed {n} sessions into {}", cv_search::default_tantivy_dir().display());
+            println!(
+                "indexed {n} sessions into {}",
+                cv_search::default_tantivy_dir().display()
+            );
         }
         Cmd::Text { query, limit } => {
             let q = query.join(" ");

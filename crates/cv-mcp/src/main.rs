@@ -34,8 +34,8 @@ use anyhow::Context as _;
 use cv_core::watch::{Filter, Watcher};
 use cv_core::{Block, Harness, Session, SessionRef};
 use serde_json::{json, Value};
-use std::time::{Duration, Instant};
 use std::io::Write as _;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 const PROTOCOL_VERSION: &str = "2025-06-18";
@@ -104,19 +104,11 @@ async fn handle(method: &str, params: Option<Value>, id: Option<Value>) -> Optio
         "tools/list" => Some(ok_response(id, json!({ "tools": tool_list() }))),
         "tools/call" => {
             let params = params.unwrap_or(Value::Null);
-            let name = params
-                .get("name")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string();
-            let args = params
-                .get("arguments")
-                .cloned()
-                .unwrap_or_else(|| json!({}));
+            let name = params.get("name").and_then(Value::as_str).unwrap_or("").to_string();
+            let args = params.get("arguments").cloned().unwrap_or_else(|| json!({}));
 
             // Run the (synchronous, fs-bound) tool body off the async reactor.
-            let result =
-                tokio::task::spawn_blocking(move || call_tool(&name, &args)).await;
+            let result = tokio::task::spawn_blocking(move || call_tool(&name, &args)).await;
 
             match result {
                 Ok(Ok(text)) => Some(ok_response(id, tool_text_result(&text, false))),
@@ -125,11 +117,7 @@ async fn handle(method: &str, params: Option<Value>, id: Option<Value>) -> Optio
                     // protocol-level error, per the MCP spec.
                     Some(ok_response(id, tool_text_result(&format!("error: {e:#}"), true)))
                 }
-                Err(join_err) => Some(error_response(
-                    id,
-                    -32603,
-                    &format!("internal task error: {join_err}"),
-                )),
+                Err(join_err) => Some(error_response(id, -32603, &format!("internal task error: {join_err}"))),
             }
         }
         _ => Some(error_response(id, -32601, &format!("Method not found: {method}"))),
@@ -154,10 +142,10 @@ fn initialize_result() -> Value {
             "version": env!("CARGO_PKG_VERSION"),
         },
         "instructions": "claurdvoyant lets you read OTHER agents' sessions across harnesses and time. \
-Use project_sessions(cwd) to see what happened (or is happening) in the current project, \
-search_sessions(query) to find a past conversation by content, and read_session(id) to read a full transcript. \
-Use recall(query) — the 'find where this was solved before' tool — to semantically search the whole \
-cross-harness corpus and pull back the most relevant message spans mid-task."
+    Use project_sessions(cwd) to see what happened (or is happening) in the current project, \
+    search_sessions(query) to find a past conversation by content, and read_session(id) to read a full transcript. \
+    Use recall(query) — the 'find where this was solved before' tool — to semantically search the whole \
+    cross-harness corpus and pull back the most relevant message spans mid-task."
     })
 }
 
@@ -449,10 +437,7 @@ fn tool_text_result(text: &str, is_error: bool) -> Value {
     })
 }
 
-async fn write_message(
-    stdout: &mut tokio::io::Stdout,
-    msg: &Value,
-) -> anyhow::Result<()> {
+async fn write_message(stdout: &mut tokio::io::Stdout, msg: &Value) -> anyhow::Result<()> {
     let mut buf = serde_json::to_vec(msg)?;
     buf.push(b'\n');
     stdout.write_all(&buf).await?;
@@ -497,7 +482,10 @@ fn prune_session(args: &Value) -> anyhow::Result<String> {
     let (sref, _adapter) =
         cv_core::find(id, harness)?.ok_or_else(|| anyhow::anyhow!("no session found for id {id:?}"))?;
     if sref.harness != Harness::Claude {
-        anyhow::bail!("prune currently supports Claude Code sessions only (got {})", sref.harness);
+        anyhow::bail!(
+            "prune currently supports Claude Code sessions only (got {})",
+            sref.harness
+        );
     }
     let opts = cv_core::prune::PruneOptions {
         min_size: arg_usize(args, "min_size", 2048),
@@ -528,7 +516,8 @@ fn prune_session(args: &Value) -> anyhow::Result<String> {
 /// Fetch a stashed original out of a pruned session's sidecar by tool_use_id.
 fn prune_retrieve(args: &Value) -> anyhow::Result<String> {
     let session = arg_str(args, "session").ok_or_else(|| anyhow::anyhow!("missing required argument: session"))?;
-    let tool_use_id = arg_str(args, "tool_use_id").ok_or_else(|| anyhow::anyhow!("missing required argument: tool_use_id"))?;
+    let tool_use_id =
+        arg_str(args, "tool_use_id").ok_or_else(|| anyhow::anyhow!("missing required argument: tool_use_id"))?;
     let (sref, _adapter) =
         cv_core::find(session, None)?.ok_or_else(|| anyhow::anyhow!("no session found for id {session:?}"))?;
     let dir = sref.path.parent().unwrap_or(std::path::Path::new("."));
@@ -906,11 +895,7 @@ fn list_sessions(args: &Value) -> anyhow::Result<String> {
 fn paths_related(a: &std::path::Path, b: &std::path::Path) -> bool {
     let ac: Vec<_> = a.components().collect();
     let bc: Vec<_> = b.components().collect();
-    let (short, long) = if ac.len() <= bc.len() {
-        (&ac, &bc)
-    } else {
-        (&bc, &ac)
-    };
+    let (short, long) = if ac.len() <= bc.len() { (&ac, &bc) } else { (&bc, &ac) };
     // Ancestor relationship: `short` is a component-wise prefix of `long`.
     if long.starts_with(short.as_slice()) {
         return true;
@@ -924,8 +909,7 @@ fn paths_related(a: &std::path::Path, b: &std::path::Path) -> bool {
 }
 
 fn project_sessions(args: &Value) -> anyhow::Result<String> {
-    let cwd = arg_str(args, "cwd")
-        .ok_or_else(|| anyhow::anyhow!("missing required argument: cwd"))?;
+    let cwd = arg_str(args, "cwd").ok_or_else(|| anyhow::anyhow!("missing required argument: cwd"))?;
     let harness = parse_harness(args)?;
     let limit = arg_usize(args, "limit", 20);
 
@@ -944,8 +928,7 @@ fn project_sessions(args: &Value) -> anyhow::Result<String> {
 }
 
 fn search_sessions(args: &Value) -> anyhow::Result<String> {
-    let query = arg_str(args, "query")
-        .ok_or_else(|| anyhow::anyhow!("missing required argument: query"))?;
+    let query = arg_str(args, "query").ok_or_else(|| anyhow::anyhow!("missing required argument: query"))?;
     let harness = parse_harness(args)?;
     let cwd_needle = arg_str(args, "cwd_contains");
     let limit = arg_usize(args, "limit", 20);
@@ -1027,13 +1010,12 @@ fn ceil_char_boundary(s: &str, mut i: usize) -> usize {
 }
 
 fn read_session(args: &Value) -> anyhow::Result<String> {
-    let id = arg_str(args, "id")
-        .ok_or_else(|| anyhow::anyhow!("missing required argument: id"))?;
+    let id = arg_str(args, "id").ok_or_else(|| anyhow::anyhow!("missing required argument: id"))?;
     let harness = parse_harness(args)?;
     let format = arg_str(args, "format").unwrap_or("markdown");
 
-    let (sref, adapter) = cv_core::find(id, harness)?
-        .ok_or_else(|| anyhow::anyhow!("no session found for id {id:?}"))?;
+    let (sref, adapter) =
+        cv_core::find(id, harness)?.ok_or_else(|| anyhow::anyhow!("no session found for id {id:?}"))?;
     let session: Session = adapter.parse(&sref)?;
 
     match format {
@@ -1052,8 +1034,7 @@ fn read_session(args: &Value) -> anyhow::Result<String> {
 /// context mid-task. Tries `cv_search::semantic_search` first; on any error (e.g. no embedding store
 /// built) falls back to `cv_search::text_search`. Optionally filtered to one harness.
 fn recall(args: &Value) -> anyhow::Result<String> {
-    let query = arg_str(args, "query")
-        .ok_or_else(|| anyhow::anyhow!("missing required argument: query"))?;
+    let query = arg_str(args, "query").ok_or_else(|| anyhow::anyhow!("missing required argument: query"))?;
     let k = arg_usize(args, "k", 5).max(1);
     let harness = parse_harness(args)?;
     let cwd_needle = arg_str(args, "cwd_contains");
@@ -1094,8 +1075,7 @@ fn recall(args: &Value) -> anyhow::Result<String> {
     let out: Vec<Value> = hits
         .iter()
         .map(|hit| {
-            let span = extract_span(&hit.id, &hit.harness, query, per_hit_budget)
-                .unwrap_or_default();
+            let span = extract_span(&hit.id, &hit.harness, query, per_hit_budget).unwrap_or_default();
             json!({
                 "id": hit.id,
                 "harness": hit.harness,

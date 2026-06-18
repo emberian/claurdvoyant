@@ -89,9 +89,7 @@ fn record(r: &SessionRef) {
     let adapter = cv_core::harness::for_harness(r.harness).unwrap();
     let (mtime, size) = offsets::file_sig(&r.path);
     let mut sink = OffsetSink::new();
-    adapter
-        .stream(r, &ParseOptions::lazy_offsets(), &mut sink)
-        .unwrap();
+    adapter.stream(r, &ParseOptions::lazy_offsets(), &mut sink).unwrap();
     assert!(sink.seekable(), "fixture must produce a seekable session");
     offsets::record(r, &sink, mtime, size);
 }
@@ -119,7 +117,13 @@ fn record_then_seek_windows_match_full_stream_and_guard_staleness() {
     assert_eq!(full.len(), 9);
 
     // Several windows, including open-ended, end-past-EOF, and start-past-EOF.
-    for (start, end) in [(1usize, Some(3usize)), (3, Some(7)), (5, None), (8, Some(50)), (40, Some(44))] {
+    for (start, end) in [
+        (1usize, Some(3usize)),
+        (3, Some(7)),
+        (5, None),
+        (8, Some(50)),
+        (40, Some(44)),
+    ] {
         let mut probe = Probe::default();
         let hit = offsets::stream_range(&r, start, end, &opts, &mut probe).unwrap();
         assert!(hit, "offsets recorded+fresh ⇒ seek path taken (start={start})");
@@ -156,7 +160,10 @@ fn record_then_seek_windows_match_full_stream_and_guard_staleness() {
         !offsets::stream_range(&r, 2, Some(4), &opts, &mut probe).unwrap(),
         "a changed file must read as stale"
     );
-    assert!(probe.messages.is_empty() && probe.metas.is_empty(), "fallback leaves the sink untouched");
+    assert!(
+        probe.messages.is_empty() && probe.metas.is_empty(),
+        "fallback leaves the sink untouched"
+    );
     // Re-recording the grown file heals the seek path.
     record(&r);
     let full2 = full_stream(&r, &opts);
@@ -236,7 +243,10 @@ fn record_then_seek_windows_match_full_stream_and_guard_staleness() {
     assert!(probe.messages.is_empty());
 
     // ---------- unsupported harness: never seekable ----------
-    let other = SessionRef { harness: cv_core::Harness::Grok, ..r.clone() };
+    let other = SessionRef {
+        harness: cv_core::Harness::Grok,
+        ..r.clone()
+    };
     let mut probe = Probe::default();
     assert!(!offsets::stream_range(&other, 2, Some(4), &opts, &mut probe).unwrap());
 

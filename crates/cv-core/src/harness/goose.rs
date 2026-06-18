@@ -78,10 +78,7 @@ impl Goose {
     }
 
     fn db_path(&self) -> Option<PathBuf> {
-        self.dir
-            .as_ref()
-            .map(|d| d.join("sessions.db"))
-            .filter(|p| p.exists())
+        self.dir.as_ref().map(|d| d.join("sessions.db")).filter(|p| p.exists())
     }
 }
 
@@ -106,9 +103,7 @@ fn sessions_dir() -> Option<PathBuf> {
     let mut candidates: Vec<PathBuf> = Vec::new();
     if let Some(h) = &home {
         // macOS Apple-strategy (etcetera bundle_id = "Block.block.goose").
-        candidates.push(
-            h.join("Library/Application Support/Block.block.goose/sessions"),
-        );
+        candidates.push(h.join("Library/Application Support/Block.block.goose/sessions"));
         // Linux XDG default.
         candidates.push(h.join(".local/share/goose/sessions"));
     }
@@ -127,11 +122,8 @@ fn sessions_dir() -> Option<PathBuf> {
 }
 
 fn open_ro(path: &Path) -> Result<Connection> {
-    Connection::open_with_flags(
-        path,
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )
-    .with_context(|| format!("opening {}", path.display()))
+    Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX)
+        .with_context(|| format!("opening {}", path.display()))
 }
 
 impl Default for Goose {
@@ -184,12 +176,7 @@ impl Adapter for Goose {
         crate::stream::collect(self, r)
     }
 
-    fn stream(
-        &self,
-        r: &SessionRef,
-        _opts: &ParseOptions,
-        sink: &mut dyn MessageSink,
-    ) -> Result<Session> {
+    fn stream(&self, r: &SessionRef, _opts: &ParseOptions, sink: &mut dyn MessageSink) -> Result<Session> {
         // A legacy session's `path` is the `.jsonl`; a DB session's `path` is `sessions.db`.
         if r.path.extension().is_some_and(|e| e == "jsonl") {
             return stream_legacy(&r.id, &r.path, sink);
@@ -234,9 +221,7 @@ fn discover_db(conn: &Connection, db: &Path) -> Result<Vec<SessionRef>> {
     } else {
         ""
     };
-    let sql = format!(
-        "SELECT id, {title_expr}, {working_dir}, {created}, {updated} FROM sessions {order}"
-    );
+    let sql = format!("SELECT id, {title_expr}, {working_dir}, {created}, {updated} FROM sessions {order}");
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map([], |row| {
         let id: String = row.get(0)?;
@@ -251,18 +236,18 @@ fn discover_db(conn: &Connection, db: &Path) -> Result<Vec<SessionRef>> {
         let (id, title, wd, created, updated) = row;
         // message_count: cheap COUNT (a `message_count` column is not in the modern schema).
         let count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM messages WHERE session_id = ?1",
-                [&id],
-                |r| r.get(0),
-            )
+            .query_row("SELECT COUNT(*) FROM messages WHERE session_id = ?1", [&id], |r| {
+                r.get(0)
+            })
             .unwrap_or(0);
         out.push(SessionRef {
             id,
             harness: Harness::Goose,
             path: db.to_path_buf(),
             cwd: wd.filter(|s| !s.is_empty()).map(PathBuf::from),
-            title: title.filter(|s| !s.trim().is_empty()).map(|t| crate::ir::truncate(&t, 80)),
+            title: title
+                .filter(|s| !s.trim().is_empty())
+                .map(|t| crate::ir::truncate(&t, 80)),
             created_at: created.as_deref().and_then(parse_ts_text),
             updated_at: updated.as_deref().and_then(parse_ts_text),
             message_count: count.max(0) as usize,
@@ -287,7 +272,11 @@ fn stream_db(conn: &Connection, r: &SessionRef, sink: &mut dyn MessageSink) -> R
         created = if has("created_at") { "created_at" } else { "NULL" },
         updated = if has("updated_at") { "updated_at" } else { "NULL" },
         provider = if has("provider_name") { "provider_name" } else { "NULL" },
-        model_cfg = if has("model_config_json") { "model_config_json" } else { "NULL" },
+        model_cfg = if has("model_config_json") {
+            "model_config_json"
+        } else {
+            "NULL"
+        },
     );
     /// One optional TEXT value per metadata column the query selects.
     type MetaRow = (
@@ -320,9 +309,7 @@ fn stream_db(conn: &Connection, r: &SessionRef, sink: &mut dyn MessageSink) -> R
             .filter(|s| !s.is_empty())
             .map(PathBuf::from)
             .or_else(|| r.cwd.clone()),
-        title: title
-            .filter(|t| !t.trim().is_empty())
-            .or_else(|| r.title.clone()),
+        title: title.filter(|t| !t.trim().is_empty()).or_else(|| r.title.clone()),
         created_at: created.as_deref().and_then(parse_ts_text).or(r.created_at),
         updated_at: updated.as_deref().and_then(parse_ts_text).or(r.updated_at),
         model,
@@ -459,8 +446,7 @@ fn stream_legacy(name: &str, path: &Path, sink: &mut dyn MessageSink) -> Result<
     // Stream line-by-line: a legacy transcript can be large, and `read_to_string` would
     // resident-spike the whole file. `BufReader::lines()` keeps peak at O(largest line) and handing
     // each message to the sink keeps it at O(largest message).
-    let file = std::fs::File::open(path)
-        .with_context(|| format!("reading {}", path.display()))?;
+    let file = std::fs::File::open(path).with_context(|| format!("reading {}", path.display()))?;
     let mut lines = BufReader::new(file).lines();
 
     // First line is the metadata header.
@@ -528,7 +514,9 @@ fn content_to_blocks(content: &Value, tool_names: &mut HashMap<String, String>) 
         // A bare string content (defensive; Goose stores arrays) → one Text block.
         if let Some(t) = content.as_str() {
             if !t.is_empty() {
-                return vec![Block::Text { text: t.to_string().into() }];
+                return vec![Block::Text {
+                    text: t.to_string().into(),
+                }];
             }
         }
         return vec![];
@@ -556,7 +544,12 @@ fn item_to_block(item: &Value, tool_names: &mut HashMap<String, String>) -> Opti
                 .map(|d| crate::ir::truncate(d, 120)),
         }),
         "thinking" => Some(Block::Thinking {
-            text: item.get("thinking").and_then(Value::as_str).unwrap_or("").to_string().into(),
+            text: item
+                .get("thinking")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string()
+                .into(),
             signature: item
                 .get("signature")
                 .and_then(Value::as_str)
@@ -674,10 +667,7 @@ fn build_message(
     };
     // Goose stores tool results on `user` messages; if a message is *only* tool results, surface it
     // as a Tool turn so conversions re-encode it correctly.
-    if ir_role == Role::User
-        && !blocks.is_empty()
-        && blocks.iter().all(|b| matches!(b, Block::ToolResult { .. }))
-    {
+    if ir_role == Role::User && !blocks.is_empty() && blocks.iter().all(|b| matches!(b, Block::ToolResult { .. })) {
         ir_role = Role::Tool;
     }
     let mut m = Message::new(ir_role);
@@ -840,7 +830,8 @@ mod tests {
             "INSERT INTO messages (session_id, role, content_json, created_timestamp, tokens) \
              VALUES ('s1','user','[{\"type\":\"text\",\"text\":\"Hello\"}]',1704110400,3)",
             [],
-        ).unwrap();
+        )
+        .unwrap();
         // assistant: thinking + text + tool request
         let asst = r#"[{"type":"thinking","thinking":"let me think","signature":"sig"},{"type":"text","text":"Working on it"},{"type":"toolRequest","id":"call_1","toolCall":{"status":"success","value":{"name":"shell","arguments":{"command":"ls"}}}}]"#;
         c.execute(
@@ -869,29 +860,39 @@ mod tests {
         // assistant: thinking, text, tooluse
         let a = &s.messages[1];
         assert_eq!(a.role, Role::Assistant);
-        assert!(matches!(&a.content[0], Block::Thinking { text, signature, .. } if text == "let me think" && signature.as_deref() == Some("sig")));
+        assert!(
+            matches!(&a.content[0], Block::Thinking { text, signature, .. } if text == "let me think" && signature.as_deref() == Some("sig"))
+        );
         assert!(matches!(&a.content[1], Block::Text { text } if text == "Working on it"));
-        assert!(matches!(&a.content[2], Block::ToolUse { name, id, input } if name == "shell" && id == "call_1" && input.get("command").and_then(Value::as_str) == Some("ls")));
+        assert!(
+            matches!(&a.content[2], Block::ToolUse { name, id, input } if name == "shell" && id == "call_1" && input.get("command").and_then(Value::as_str) == Some("ls"))
+        );
         assert_eq!(a.usage.as_ref().unwrap().output_tokens, Some(42));
 
         // tool response reclassified to Role::Tool, paired name recovered
         let t = &s.messages[2];
         assert_eq!(t.role, Role::Tool);
-        assert!(matches!(&t.content[0], Block::ToolResult { tool_use_id, content, tool_name, is_error, .. }
-            if tool_use_id == "call_1" && content == "file1\nfile2" && tool_name.as_deref() == Some("shell") && !is_error));
+        assert!(
+            matches!(&t.content[0], Block::ToolResult { tool_use_id, content, tool_name, is_error, .. }
+            if tool_use_id == "call_1" && content == "file1\nfile2" && tool_name.as_deref() == Some("shell") && !is_error)
+        );
     }
 
     #[test]
     fn parses_tool_error_response() {
         let c = mk(SCHEMA);
-        c.execute("INSERT INTO sessions (id, working_dir) VALUES ('s1','/x')", []).unwrap();
+        c.execute("INSERT INTO sessions (id, working_dir) VALUES ('s1','/x')", [])
+            .unwrap();
         let resp = r#"[{"type":"toolResponse","id":"c9","toolResult":{"status":"error","error":"boom"}}]"#;
         c.execute(
             "INSERT INTO messages (session_id, role, content_json, created_timestamp) VALUES ('s1','user',?1,100)",
             [resp],
-        ).unwrap();
+        )
+        .unwrap();
         let s = parse_db(&c, &sref("s1")).unwrap();
-        assert!(matches!(&s.messages[0].content[0], Block::ToolResult { is_error, content, .. } if *is_error && content == "boom"));
+        assert!(
+            matches!(&s.messages[0].content[0], Block::ToolResult { is_error, content, .. } if *is_error && content == "boom")
+        );
     }
 
     #[test]
@@ -912,7 +913,11 @@ mod tests {
     #[test]
     fn old_schema_missing_columns_still_parses() {
         let c = mk(SCHEMA_OLD);
-        c.execute("INSERT INTO sessions (id, name, working_dir) VALUES ('s1','My Session','/p')", []).unwrap();
+        c.execute(
+            "INSERT INTO sessions (id, name, working_dir) VALUES ('s1','My Session','/p')",
+            [],
+        )
+        .unwrap();
         c.execute("INSERT INTO messages (session_id, role, content_json, created_timestamp) VALUES ('s1','user','[{\"type\":\"text\",\"text\":\"old\"}]',1704110400)", []).unwrap();
         let refs = discover_db(&c, Path::new("sessions.db")).unwrap();
         assert_eq!(refs.len(), 1);
@@ -953,8 +958,10 @@ mod tests {
         assert!(matches!(&s.messages[1].content[1], Block::ToolUse { name, .. } if name == "developer__shell"));
         // tool response reclassified + name paired
         assert_eq!(s.messages[2].role, Role::Tool);
-        assert!(matches!(&s.messages[2].content[0], Block::ToolResult { tool_name, content, .. }
-            if tool_name.as_deref() == Some("developer__shell") && content == "/home/u/old"));
+        assert!(
+            matches!(&s.messages[2].content[0], Block::ToolResult { tool_name, content, .. }
+            if tool_name.as_deref() == Some("developer__shell") && content == "/home/u/old")
+        );
     }
 
     #[test]
@@ -976,13 +983,16 @@ mod tests {
     #[test]
     fn redacted_thinking_maps() {
         let c = mk(SCHEMA);
-        c.execute("INSERT INTO sessions (id, working_dir) VALUES ('s1','/x')", []).unwrap();
+        c.execute("INSERT INTO sessions (id, working_dir) VALUES ('s1','/x')", [])
+            .unwrap();
         c.execute(
             "INSERT INTO messages (session_id, role, content_json, created_timestamp) VALUES ('s1','assistant','[{\"type\":\"redactedThinking\",\"data\":\"BLOB\"}]',1)",
             [],
         ).unwrap();
         let s = parse_db(&c, &sref("s1")).unwrap();
-        assert!(matches!(&s.messages[0].content[0], Block::Thinking { redacted, encrypted, .. } if *redacted && encrypted.as_deref() == Some("BLOB")));
+        assert!(
+            matches!(&s.messages[0].content[0], Block::Thinking { redacted, encrypted, .. } if *redacted && encrypted.as_deref() == Some("BLOB"))
+        );
     }
 
     #[test]
@@ -995,7 +1005,13 @@ mod tests {
     fn tempdir() -> PathBuf {
         let mut p = std::env::temp_dir();
         p.push(format!("cv-goose-test-{}", std::process::id()));
-        p.push(format!("{:?}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        p.push(format!(
+            "{:?}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
         std::fs::create_dir_all(&p).unwrap();
         p
     }

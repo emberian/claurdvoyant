@@ -45,7 +45,11 @@ impl World {
         std::env::set_var("XDG_DATA_HOME", home.join(".local/share"));
         std::env::remove_var("CLAURDVOYANT_MAX_STALE_SECS");
         std::env::remove_var("CURSOR_USER_DIR");
-        World { base, home, _guard: guard }
+        World {
+            base,
+            home,
+            _guard: guard,
+        }
     }
 
     fn proj_dir(&self, proj: &str) -> PathBuf {
@@ -174,7 +178,11 @@ fn vanished_sessions_dropped() {
     cv_core::sessions();
     fs::remove_dir_all(w.proj_dir("-work-other")).unwrap(); // watched dir itself vanishes
     let refs = cv_core::sessions();
-    assert_eq!(ids(&refs), Vec::<String>::new(), "vanished dir's sessions must not appear");
+    assert_eq!(
+        ids(&refs),
+        Vec::<String>::new(),
+        "vanished dir's sessions must not appear"
+    );
 }
 
 /// The warm path really reads the catalog (a row only the catalog knows shows up), and forcing a

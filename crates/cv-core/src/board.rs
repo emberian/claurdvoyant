@@ -117,9 +117,7 @@ impl ChannelLock {
                     backoff = (backoff * 2).min(max_backoff);
                 }
                 Err(e) => {
-                    return Err(e).with_context(|| {
-                        format!("creating board lockfile {}", path.display())
-                    });
+                    return Err(e).with_context(|| format!("creating board lockfile {}", path.display()));
                 }
             }
         }
@@ -167,8 +165,7 @@ pub fn post_to_dir(
     tags: Vec<String>,
     session_ref: Option<String>,
 ) -> Result<BoardMessage> {
-    fs::create_dir_all(dir)
-        .with_context(|| format!("creating board dir {}", dir.display()))?;
+    fs::create_dir_all(dir).with_context(|| format!("creating board dir {}", dir.display()))?;
 
     let msg = BoardMessage {
         id: uuid::Uuid::now_v7().to_string(),
@@ -217,19 +214,12 @@ pub fn read(channel: &str, since: Option<&str>, limit: usize) -> Result<Vec<Boar
 ///   returned (cursor/tail semantics for polling). If the id isn't found, all messages are returned.
 /// - `limit == 0` means unlimited; otherwise the most recent `limit` messages (after `since`) are
 ///   returned, still in chronological order.
-pub fn read_from_dir(
-    dir: &Path,
-    channel: &str,
-    since: Option<&str>,
-    limit: usize,
-) -> Result<Vec<BoardMessage>> {
+pub fn read_from_dir(dir: &Path, channel: &str, since: Option<&str>, limit: usize) -> Result<Vec<BoardMessage>> {
     let path = channel_path(dir, channel);
     let file = match File::open(&path) {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(e) => {
-            return Err(e).with_context(|| format!("opening board channel {}", path.display()))
-        }
+        Err(e) => return Err(e).with_context(|| format!("opening board channel {}", path.display())),
     };
 
     let mut msgs: Vec<BoardMessage> = Vec::new();
@@ -271,11 +261,7 @@ pub fn read_since_ts(channel: &str, after: DateTime<Utc>) -> Result<Vec<BoardMes
 }
 
 /// Core of [`read_since_ts`], parameterized on the board directory.
-pub fn read_since_ts_from_dir(
-    dir: &Path,
-    channel: &str,
-    after: DateTime<Utc>,
-) -> Result<Vec<BoardMessage>> {
+pub fn read_since_ts_from_dir(dir: &Path, channel: &str, after: DateTime<Utc>) -> Result<Vec<BoardMessage>> {
     let mut msgs = read_from_dir(dir, channel, None, 0)?;
     msgs.retain(|m| m.ts > after);
     Ok(msgs)
@@ -316,12 +302,7 @@ pub fn request_to_dir(dir: &Path, channel: &str, from: &str, body: &str) -> Resu
 }
 
 /// Post a `kind="reply"` answering `in_reply_to`. See [`reply_to_dir`].
-pub fn reply(
-    channel: &str,
-    from: &str,
-    in_reply_to: &str,
-    body: &str,
-) -> Result<BoardMessage> {
+pub fn reply(channel: &str, from: &str, in_reply_to: &str, body: &str) -> Result<BoardMessage> {
     reply_to_dir(&board_dir(), channel, from, in_reply_to, body)
 }
 
@@ -329,13 +310,7 @@ pub fn reply(
 ///
 /// The reply records the request id in **both** `session_ref` (the structured slot) and a
 /// `reply-to:<id>` tag (so it survives tag-only filtering); [`replies_to_dir`] matches either.
-pub fn reply_to_dir(
-    dir: &Path,
-    channel: &str,
-    from: &str,
-    in_reply_to: &str,
-    body: &str,
-) -> Result<BoardMessage> {
+pub fn reply_to_dir(dir: &Path, channel: &str, from: &str, in_reply_to: &str, body: &str) -> Result<BoardMessage> {
     post_to_dir(
         dir,
         channel,
@@ -356,17 +331,10 @@ pub fn replies(channel: &str, request_id: &str) -> Result<Vec<BoardMessage>> {
 ///
 /// Returns `kind="reply"` messages whose `session_ref` is `request_id` *or* which carry the
 /// `reply-to:<request_id>` tag, in chronological order.
-pub fn replies_to_dir(
-    dir: &Path,
-    channel: &str,
-    request_id: &str,
-) -> Result<Vec<BoardMessage>> {
+pub fn replies_to_dir(dir: &Path, channel: &str, request_id: &str) -> Result<Vec<BoardMessage>> {
     let want_tag = reply_to_tag(request_id);
     let mut msgs = read_from_dir(dir, channel, None, 0)?;
-    msgs.retain(|m| {
-        m.kind == "reply"
-            && (m.session_ref.as_deref() == Some(request_id) || m.tags.contains(&want_tag))
-    });
+    msgs.retain(|m| m.kind == "reply" && (m.session_ref.as_deref() == Some(request_id) || m.tags.contains(&want_tag)));
     Ok(msgs)
 }
 
@@ -416,8 +384,7 @@ pub fn who(channel: &str, within: Duration) -> Result<Vec<String>> {
 /// Returns the distinct `from` of every `kind="presence"` message newer than `now - within`,
 /// sorted. An agent with no recent heartbeat simply isn't listed.
 pub fn who_in_dir(dir: &Path, channel: &str, within: Duration) -> Result<Vec<String>> {
-    let cutoff = Utc::now()
-        - chrono::Duration::from_std(within).unwrap_or_else(|_| chrono::Duration::zero());
+    let cutoff = Utc::now() - chrono::Duration::from_std(within).unwrap_or_else(|_| chrono::Duration::zero());
     let msgs = read_from_dir(dir, channel, None, 0)?;
     let mut seen: Vec<String> = msgs
         .into_iter()
@@ -509,13 +476,7 @@ pub fn claim(channel: &str, from: &str, key: &str, ttl: Duration) -> Result<Opti
 /// (overwriting our own prior/expired entry), persist, and return the [`Lease`]. The whole
 /// load→check→write is serialized by [`ChannelLock`], so only one of N concurrent claimers wins.
 /// Also emits a `kind="claim"` board event for the activity feed (best-effort, inside the lock).
-pub fn claim_in_dir(
-    dir: &Path,
-    channel: &str,
-    from: &str,
-    key: &str,
-    ttl: Duration,
-) -> Result<Option<Lease>> {
+pub fn claim_in_dir(dir: &Path, channel: &str, from: &str, key: &str, ttl: Duration) -> Result<Option<Lease>> {
     fs::create_dir_all(dir).with_context(|| format!("creating board dir {}", dir.display()))?;
     let _lock = ChannelLock::acquire(lock_path(dir, channel))?;
 
@@ -532,8 +493,7 @@ pub fn claim_in_dir(
         // We already hold it: fall through to renew (refresh the expiry).
     }
 
-    let expires_at = now
-        + chrono::Duration::from_std(ttl).unwrap_or_else(|_| chrono::Duration::zero());
+    let expires_at = now + chrono::Duration::from_std(ttl).unwrap_or_else(|_| chrono::Duration::zero());
     claims.retain(|c| c.key != key); // remove our own prior entry, if any
     claims.push(ClaimRecord {
         key: key.to_string(),
@@ -579,10 +539,7 @@ pub fn active_claims(channel: &str) -> Result<Vec<(String, String, DateTime<Utc>
 ///
 /// Returns `(key, owner, expires_at)` for every claim not yet expired, sorted by key. Reads under
 /// the channel lock so it never observes a half-written claims file.
-pub fn active_claims_in_dir(
-    dir: &Path,
-    channel: &str,
-) -> Result<Vec<(String, String, DateTime<Utc>)>> {
+pub fn active_claims_in_dir(dir: &Path, channel: &str) -> Result<Vec<(String, String, DateTime<Utc>)>> {
     // A board dir that was never created means nobody ever claimed anything — empty, not an
     // error. (Without this, acquiring the lock `create_new`s a file inside the missing dir and
     // fails with NotFound — the one reader that errored on a fresh $CLAURDVOYANT_HOME.)
@@ -637,7 +594,7 @@ mod tests {
         assert_eq!(slug("/Users/ember/pug"), "-Users-ember-pug");
         assert_eq!(slug("team chat!"), "team-chat-");
         assert_eq!(slug("café☕"), "caf--"); // non-ascii -> '-'
-        // Empty / dot-only get a leading '-' so they don't collide with the dir.
+                                             // Empty / dot-only get a leading '-' so they don't collide with the dir.
         assert_eq!(slug(""), "-");
         assert_eq!(slug(".."), "-..");
     }
@@ -658,8 +615,7 @@ mod tests {
     fn post_then_read_in_order() {
         let dir = tmp_board();
         let m1 = post_to_dir(&dir, "ch", "alice", "first", None, vec![], None).unwrap();
-        let m2 =
-            post_to_dir(&dir, "ch", "bob", "second", Some("status"), vec!["x".into()], None).unwrap();
+        let m2 = post_to_dir(&dir, "ch", "bob", "second", Some("status"), vec!["x".into()], None).unwrap();
         let m3 = post_to_dir(
             &dir,
             "ch",

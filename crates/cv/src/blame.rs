@@ -113,15 +113,11 @@ fn repo_toplevel(abs: &Path) -> Result<Option<PathBuf>> {
 
 /// The file's commit history, newest first: `git log --follow` with a `%x1f`-separated format.
 fn file_commits(root: &Path, rel: &str) -> Result<Vec<CommitInfo>> {
-    let out = git_stdout(
-        root,
-        &["log", "--follow", "--format=%H%x1f%ct%x1f%h%x1f%s", "--", rel],
-    )?;
+    let out = git_stdout(root, &["log", "--follow", "--format=%H%x1f%ct%x1f%h%x1f%s", "--", rel])?;
     let mut commits = Vec::new();
     for line in out.lines() {
         let mut f = line.split('\u{1f}');
-        let (Some(_sha), Some(ct), Some(short), summary) = (f.next(), f.next(), f.next(), f.next())
-        else {
+        let (Some(_sha), Some(ct), Some(short), summary) = (f.next(), f.next(), f.next(), f.next()) else {
             continue;
         };
         let Ok(time) = ct.parse::<i64>() else { continue };
@@ -260,7 +256,9 @@ pub(crate) fn correlate(commit_time: i64, edits: &[EditEvent], repo_root: &Path)
                 }
             }
             None => {
-                let (Some(c), Some(u)) = (e.created_at, e.updated_at) else { continue };
+                let (Some(c), Some(u)) = (e.created_at, e.updated_at) else {
+                    continue;
+                };
                 if commit_time < c || commit_time > u + WINDOW_AFTER_SECS {
                     continue;
                 }
@@ -296,11 +294,7 @@ fn cwd_in_repo(cwd: Option<&str>, root: &Path) -> bool {
 /// same file in a checkout living somewhere else).
 #[cfg(test)]
 pub(crate) fn target_matches(target: &str, abs: &str, rel: &str) -> bool {
-    target == abs
-        || target == rel
-        || target
-            .strip_suffix(rel)
-            .is_some_and(|head| head.ends_with('/'))
+    target == abs || target == rel || target.strip_suffix(rel).is_some_and(|head| head.ends_with('/'))
 }
 
 /// The `cv show --range` window around an edit at `msg_idx`: `RANGE_CONTEXT` messages of leading
@@ -321,9 +315,7 @@ pub fn cmd_blame(file: &str, lines: Option<&str>, show: bool) -> Result<()> {
     let rel = abs
         .strip_prefix(&root)
         .map(|p| p.to_string_lossy().into_owned())
-        .with_context(|| {
-            format!("{} is not inside the repo at {}", abs.display(), root.display())
-        })?;
+        .with_context(|| format!("{} is not inside the repo at {}", abs.display(), root.display()))?;
 
     // The commits owning this file (or these lines), newest first.
     let (mut commits, total) = match lines {
@@ -353,7 +345,10 @@ pub fn cmd_blame(file: &str, lines: Option<&str>, show: bool) -> Result<()> {
     }
 
     match lines {
-        Some(spec) => println!("✦ blame {rel} -L {spec} — {} commit(s) own those lines\n", commits.len()),
+        Some(spec) => println!(
+            "✦ blame {rel} -L {spec} — {} commit(s) own those lines\n",
+            commits.len()
+        ),
         None => {
             let more = if total > commits.len() {
                 format!(" (of {total}; showing the most recent)")
@@ -406,11 +401,7 @@ fn print_match(e: &EditEvent, m: &SessionMatch) {
         Strength::SessionSpan => "(weak: session active at commit time; no event timestamps)".into(),
     };
     let elsewhere = if m.cwd_in_repo { "" } else { " · other checkout" };
-    let date = e
-        .ts
-        .or(e.updated_at)
-        .map(date)
-        .unwrap_or_else(|| "----------".into());
+    let date = e.ts.or(e.updated_at).map(date).unwrap_or_else(|| "----------".into());
     let title = e
         .title
         .as_deref()
@@ -512,7 +503,9 @@ fn absolutize_input(file: &str) -> Result<PathBuf> {
     let abs = if p.is_absolute() {
         p.to_path_buf()
     } else {
-        std::env::current_dir().context("cannot resolve current directory")?.join(p)
+        std::env::current_dir()
+            .context("cannot resolve current directory")?
+            .join(p)
     };
     Ok(abs.canonicalize().unwrap_or(abs))
 }
@@ -548,7 +541,11 @@ fn date(ts: i64) -> String {
 
 /// Humanize a commit↔edit delta: `8m before commit`, `2h10m before commit`, `30s after commit`.
 pub(crate) fn fmt_delta(delta: i64) -> String {
-    let (mag, dir) = if delta >= 0 { (delta, "before") } else { (-delta, "after") };
+    let (mag, dir) = if delta >= 0 {
+        (delta, "before")
+    } else {
+        (-delta, "after")
+    };
     let (h, m, s) = (mag / 3600, (mag % 3600) / 60, mag % 60);
     let t = if h > 0 {
         if m > 0 {
@@ -568,13 +565,7 @@ pub(crate) fn fmt_delta(delta: i64) -> String {
 mod tests {
     use super::*;
 
-    fn ev(
-        sid: &str,
-        msg_idx: i64,
-        ts: Option<i64>,
-        cwd: Option<&str>,
-        span: Option<(i64, i64)>,
-    ) -> EditEvent {
+    fn ev(sid: &str, msg_idx: i64, ts: Option<i64>, cwd: Option<&str>, span: Option<(i64, i64)>) -> EditEvent {
         EditEvent {
             harness: "claude".into(),
             session_id: sid.into(),

@@ -18,25 +18,16 @@ use cv_core::{Flow, MessageSink, ParseOptions};
 use std::io::Write;
 use std::path::PathBuf;
 
-pub(crate) fn cmd_share(
-    id: &str,
-    harness: Option<String>,
-    out: Option<PathBuf>,
-    no_redact: bool,
-) -> Result<()> {
+pub(crate) fn cmd_share(id: &str, harness: Option<String>, out: Option<PathBuf>, no_redact: bool) -> Result<()> {
     let want = parse_harness(&harness)?;
-    let (r, adapter) =
-        cv_core::find(id, want)?.with_context(|| format!("no session matching {id:?}"))?;
+    let (r, adapter) = cv_core::find(id, want)?.with_context(|| format!("no session matching {id:?}"))?;
 
     if no_redact {
-        eprintln!(
-            "⚠ --no-redact: secrets and PII will NOT be scrubbed — review the file before sharing it"
-        );
+        eprintln!("⚠ --no-redact: secrets and PII will NOT be scrubbed — review the file before sharing it");
     }
 
     let out_path = out.unwrap_or_else(|| PathBuf::from(format!("{}.html", safe_stem(&r.id))));
-    let file = std::fs::File::create(&out_path)
-        .with_context(|| format!("creating {}", out_path.display()))?;
+    let file = std::fs::File::create(&out_path).with_context(|| format!("creating {}", out_path.display()))?;
     let mut w = std::io::BufWriter::new(file);
 
     let mut sink = ShareSink {
@@ -66,8 +57,7 @@ pub(crate) fn cmd_share(
     let io_result = std::mem::replace(&mut sink.result, Ok(()));
     drop(sink);
     io_result.with_context(|| format!("writing {}", out_path.display()))?;
-    w.flush()
-        .with_context(|| format!("writing {}", out_path.display()))?;
+    w.flush().with_context(|| format!("writing {}", out_path.display()))?;
 
     let size = std::fs::metadata(&out_path).map(|m| m.len()).unwrap_or(0);
     eprintln!(

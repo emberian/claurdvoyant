@@ -73,7 +73,12 @@ fn load() -> Cache {
                     };
                     entries.insert(
                         PathBuf::from(path),
-                        Entry { mtime_ns: mtime_ns as u64, size: size as u64, refs, dirty: false },
+                        Entry {
+                            mtime_ns: mtime_ns as u64,
+                            size: size as u64,
+                            refs,
+                            dirty: false,
+                        },
                     );
                 }
             }
@@ -162,13 +167,15 @@ pub(crate) fn persist(prune: bool) {
         let Ok(tx) = conn.transaction() else { return };
         let mut g = cache.entries.write().unwrap();
         {
-            let Ok(mut stmt) = tx.prepare(
-                "INSERT OR REPLACE INTO scan_cache(path,mtime_ns,size,refs) VALUES(?1,?2,?3,?4)",
-            ) else {
+            let Ok(mut stmt) =
+                tx.prepare("INSERT OR REPLACE INTO scan_cache(path,mtime_ns,size,refs) VALUES(?1,?2,?3,?4)")
+            else {
                 return;
             };
             for (path, e) in g.iter_mut().filter(|(_, e)| e.dirty) {
-                let Ok(refs) = serde_json::to_string(&e.refs) else { continue };
+                let Ok(refs) = serde_json::to_string(&e.refs) else {
+                    continue;
+                };
                 if stmt
                     .execute(rusqlite::params![
                         path.to_string_lossy(),

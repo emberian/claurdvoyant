@@ -28,12 +28,18 @@ pub(crate) fn parse_msg_range(spec: &str) -> Result<(usize, Option<usize>)> {
             let start = if s.trim().is_empty() {
                 0
             } else {
-                s.trim().parse().with_context(|| format!("bad range {spec:?}: start must be a number"))?
+                s.trim()
+                    .parse()
+                    .with_context(|| format!("bad range {spec:?}: start must be a number"))?
             };
             let end = if e.trim().is_empty() {
                 None
             } else {
-                Some(e.trim().parse().with_context(|| format!("bad range {spec:?}: end must be a number"))?)
+                Some(
+                    e.trim()
+                        .parse()
+                        .with_context(|| format!("bad range {spec:?}: end must be a number"))?,
+                )
             };
             if let Some(end) = end {
                 if end < start {

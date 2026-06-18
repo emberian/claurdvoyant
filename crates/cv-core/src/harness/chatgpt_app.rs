@@ -45,11 +45,7 @@ impl ChatGptApp {
     /// The app's Application Support dir, if it exists.
     fn detect_root() -> Option<PathBuf> {
         dirs::home_dir()
-            .map(|h| {
-                h.join("Library")
-                    .join("Application Support")
-                    .join("com.openai.chat")
-            })
+            .map(|h| h.join("Library").join("Application Support").join("com.openai.chat"))
             .filter(|p| p.exists())
     }
 }

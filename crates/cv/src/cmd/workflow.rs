@@ -20,8 +20,7 @@ pub(crate) fn cmd_workflow(
     script: bool,
 ) -> Result<()> {
     let want = crate::util::parse_harness(&harness)?;
-    let (r, _adapter) =
-        cv_core::find(id, want)?.with_context(|| format!("no session matching {id:?}"))?;
+    let (r, _adapter) = cv_core::find(id, want)?.with_context(|| format!("no session matching {id:?}"))?;
 
     // No run id → list the session's workflows (a directory of runs).
     let Some(run_id) = run_id else {
@@ -89,7 +88,11 @@ fn list_workflows(r: &cv_core::SessionRef, json: bool) -> Result<()> {
 /// Render one workflow run: header (name/status/totals) → each phase with its agents and outcomes
 /// → optionally the driving script.
 fn render_workflow(w: &cv_core::Workflow, show_script: bool) {
-    println!("# workflow {}  ({})", w.name.as_deref().unwrap_or("(unnamed)"), w.run_id);
+    println!(
+        "# workflow {}  ({})",
+        w.name.as_deref().unwrap_or("(unnamed)"),
+        w.run_id
+    );
     let dur = w
         .duration_ms
         .map(|ms| format!(" · {}", fmt_duration(ms)))
@@ -119,7 +122,15 @@ fn render_workflow(w: &cv_core::Workflow, show_script: bool) {
     // The phase tree: phases in order, agents under each with their state + outcome.
     for p in &w.phases {
         let title = p.title.as_deref().unwrap_or("(phase)");
-        println!("\n## phase {} · {}{}", p.index, title, p.detail.as_deref().map(|d| format!("  — {}", truncate(d, 80))).unwrap_or_default());
+        println!(
+            "\n## phase {} · {}{}",
+            p.index,
+            title,
+            p.detail
+                .as_deref()
+                .map(|d| format!("  — {}", truncate(d, 80)))
+                .unwrap_or_default()
+        );
         if p.agents.is_empty() {
             println!("   (no agents)");
         }
@@ -137,7 +148,13 @@ fn render_workflow(w: &cv_core::Workflow, show_script: bool) {
     if show_script {
         match &w.script {
             Some(src) => {
-                println!("\n## script{}", w.script_path.as_ref().map(|p| format!(" ({})", p.display())).unwrap_or_default());
+                println!(
+                    "\n## script{}",
+                    w.script_path
+                        .as_ref()
+                        .map(|p| format!(" ({})", p.display()))
+                        .unwrap_or_default()
+                );
                 println!("```js\n{src}\n```");
             }
             None => println!("\n(no script recorded)"),
@@ -172,7 +189,11 @@ fn render_workflow_agent(a: &cv_core::WorkflowAgent) {
     if a.cached {
         tele.push("cached".into());
     }
-    let tele = if tele.is_empty() { String::new() } else { format!("  ({})", tele.join(", ")) };
+    let tele = if tele.is_empty() {
+        String::new()
+    } else {
+        format!("  ({})", tele.join(", "))
+    };
     println!("   {glyph} {label}  {id}{tele}");
     if let Some(e) = &a.error {
         println!("       ✗ {}", truncate(e, 120));
@@ -203,8 +224,7 @@ pub(crate) fn cmd_tools(
     json: bool,
 ) -> Result<()> {
     let want = crate::util::parse_harness(&harness)?;
-    let (r, _adapter) =
-        cv_core::find(id, want)?.with_context(|| format!("no session matching {id:?}"))?;
+    let (r, _adapter) = cv_core::find(id, want)?.with_context(|| format!("no session matching {id:?}"))?;
 
     if timeline {
         return tools_timeline(&r, agent.as_deref(), json);
@@ -230,9 +250,13 @@ pub(crate) fn cmd_tools(
     }
     // `--agent X`: one agent's histogram.
     if let Some(a) = &agent {
-        let at = forest
-            .agent(a)
-            .with_context(|| format!("no agent matching {a:?} in {} (try `cv tools {} --across`)", short_id(&r.id), short_id(&r.id)))?;
+        let at = forest.agent(a).with_context(|| {
+            format!(
+                "no agent matching {a:?} in {} (try `cv tools {} --across`)",
+                short_id(&r.id),
+                short_id(&r.id)
+            )
+        })?;
         if json {
             println!("{}", serde_json::to_string_pretty(at)?);
             return Ok(());
@@ -290,7 +314,11 @@ fn tools_which_agents(forest: &ForestTools, tool: &str, json: bool) -> Result<()
             "{:>5}  {:9}  {:18}{}",
             c.calls,
             a.agent_type,
-            if a.agent == cv_core::tools::ORCHESTRATOR { a.agent.clone() } else { short_id(&a.agent) },
+            if a.agent == cv_core::tools::ORCHESTRATOR {
+                a.agent.clone()
+            } else {
+                short_id(&a.agent)
+            },
             wf,
         );
     }
@@ -309,7 +337,11 @@ fn tools_across(forest: &ForestTools, json: bool) -> Result<()> {
     println!("# per-agent tool usage ({} active agent(s))\n", active.len());
     for a in active {
         let wf = a.workflow.as_deref().map(|w| format!("  ⟐{w}")).unwrap_or_default();
-        let label = if a.agent == cv_core::tools::ORCHESTRATOR { a.agent.clone() } else { short_id(&a.agent) };
+        let label = if a.agent == cv_core::tools::ORCHESTRATOR {
+            a.agent.clone()
+        } else {
+            short_id(&a.agent)
+        };
         let top: Vec<String> = a
             .histogram
             .ranked()
@@ -341,17 +373,23 @@ fn tools_timeline(r: &cv_core::SessionRef, agent: Option<&str>, json: bool) -> R
         return Ok(());
     }
     if events.is_empty() {
-        println!("no tool calls{}", agent.map(|a| format!(" for {a:?}")).unwrap_or_default());
+        println!(
+            "no tool calls{}",
+            agent.map(|a| format!(" for {a:?}")).unwrap_or_default()
+        );
         return Ok(());
     }
     println!("# {} tool call(s) (chronological)\n", events.len());
     for e in &events {
-        let time = e
-            .ts
-            .and_then(|t| chrono::DateTime::from_timestamp(t, 0))
-            .map(|d| d.format("%m-%d %H:%M:%S").to_string())
-            .unwrap_or_else(|| "--------------".into());
-        let who = if e.agent == cv_core::tools::ORCHESTRATOR { "orch".to_string() } else { short_id(&e.agent) };
+        let time =
+            e.ts.and_then(|t| chrono::DateTime::from_timestamp(t, 0))
+                .map(|d| d.format("%m-%d %H:%M:%S").to_string())
+                .unwrap_or_else(|| "--------------".into());
+        let who = if e.agent == cv_core::tools::ORCHESTRATOR {
+            "orch".to_string()
+        } else {
+            short_id(&e.agent)
+        };
         println!(
             "{}  {:8}  {:9}  {:14}  {}",
             time,
@@ -407,15 +445,9 @@ fn kindcell(n: usize) -> String {
 /// `cv compaction <id>`: list every compaction boundary in a session — when it happened, why
 /// (trigger), the pre-compaction context size, and the summary that seeded the next window. With
 /// `--summaries`, print each summary's full text.
-pub(crate) fn cmd_compaction(
-    id: &str,
-    harness: Option<String>,
-    summaries: bool,
-    json: bool,
-) -> Result<()> {
+pub(crate) fn cmd_compaction(id: &str, harness: Option<String>, summaries: bool, json: bool) -> Result<()> {
     let want = crate::util::parse_harness(&harness)?;
-    let (r, _adapter) =
-        cv_core::find(id, want)?.with_context(|| format!("no session matching {id:?}"))?;
+    let (r, _adapter) = cv_core::find(id, want)?.with_context(|| format!("no session matching {id:?}"))?;
 
     let comps = cv_core::compaction::detect(&r, true)?;
 
@@ -443,18 +475,17 @@ pub(crate) fn cmd_compaction(
         return Ok(());
     }
 
-    println!(
-        "# {} compacted {} time(s)\n",
-        short_id(&r.id),
-        comps.len()
-    );
+    println!("# {} compacted {} time(s)\n", short_id(&r.id), comps.len());
     for (i, c) in comps.iter().enumerate() {
         let trig = c.trigger.as_deref().unwrap_or("?");
         let pre = c
             .pre_tokens
             .map(|t| format!("{} tokens", fmt_int(t)))
             .unwrap_or_else(|| "? tokens".into());
-        let dur = c.duration_ms.map(|ms| format!(" · took {}", fmt_duration(ms))).unwrap_or_default();
+        let dur = c
+            .duration_ms
+            .map(|ms| format!(" · took {}", fmt_duration(ms)))
+            .unwrap_or_default();
         let span = cv_core::compaction::pre_compaction_span(&comps, i)
             .map(|(s, e)| format!("  · pre-span msgs {s}-{e}"))
             .unwrap_or_default();
@@ -474,7 +505,10 @@ pub(crate) fn cmd_compaction(
         }
     }
     if !summaries {
-        println!("→ `--summaries` for full summary text · `cv show {} --pre-compaction` to read the lost span", short_id(&r.id));
+        println!(
+            "→ `--summaries` for full summary text · `cv show {} --pre-compaction` to read the lost span",
+            short_id(&r.id)
+        );
     }
     Ok(())
 }

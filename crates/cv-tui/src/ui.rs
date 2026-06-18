@@ -11,19 +11,15 @@ use ratatui::Frame;
 
 use cv_core::ir::Harness;
 
-use crate::app::{App, LineKind, Mode, Row, View};
 use crate::app::{short_id, tildify};
+use crate::app::{App, LineKind, Mode, Row, View};
 
 pub fn draw(f: &mut Frame, app: &mut App) {
     let area = f.area();
     // header (1) / body (rest) / footer (1).
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(1),
-            Constraint::Min(1),
-            Constraint::Length(1),
-        ])
+        .constraints([Constraint::Length(1), Constraint::Min(1), Constraint::Length(1)])
         .split(area);
 
     draw_header(f, app, chunks[0]);
@@ -91,11 +87,7 @@ fn draw_list(f: &mut Frame, app: &mut App, area: Rect) {
     let inner_h = list_area.height.saturating_sub(2) as usize; // minus borders
     app.list_height = inner_h.max(1);
 
-    let items: Vec<ListItem> = app
-        .filtered
-        .iter()
-        .map(|&i| row_to_item(&app.all_rows[i]))
-        .collect();
+    let items: Vec<ListItem> = app.filtered.iter().map(|&i| row_to_item(&app.all_rows[i])).collect();
 
     let count = app.filtered.len();
     let block = Block::default()
@@ -110,11 +102,7 @@ fn draw_list(f: &mut Frame, app: &mut App, area: Rect) {
 
     let list = List::new(items)
         .block(block)
-        .highlight_style(
-            Style::default()
-                .bg(Color::DarkGray)
-                .add_modifier(Modifier::BOLD),
-        )
+        .highlight_style(Style::default().bg(Color::DarkGray).add_modifier(Modifier::BOLD))
         .highlight_symbol("▶ ");
     f.render_stateful_widget(list, list_area, &mut state);
 
@@ -137,16 +125,9 @@ fn row_to_item(row: &Row) -> ListItem<'static> {
         .or(r.created_at)
         .map(|t| t.format("%Y-%m-%d %H:%M").to_string())
         .unwrap_or_else(|| "—".to_string());
-    let title = r
-        .title
-        .clone()
-        .unwrap_or_else(|| "(untitled)".to_string());
+    let title = r.title.clone().unwrap_or_else(|| "(untitled)".to_string());
     let title = truncate(&title, 48);
-    let cwd = r
-        .cwd
-        .as_ref()
-        .map(|p| tildify(p))
-        .unwrap_or_default();
+    let cwd = r.cwd.as_ref().map(|p| tildify(p)).unwrap_or_default();
 
     let mut spans = vec![
         Span::styled(
@@ -158,18 +139,12 @@ fn row_to_item(row: &Row) -> ListItem<'static> {
         Span::raw(title),
     ];
     if !cwd.is_empty() {
-        spans.push(Span::styled(
-            format!("  {cwd}"),
-            Style::default().fg(Color::Green),
-        ));
+        spans.push(Span::styled(format!("  {cwd}"), Style::default().fg(Color::Green)));
     }
 
     let mut lines = vec![Line::from(spans)];
     if let Some(snippet) = &row.snippet {
-        let score = row
-            .score
-            .map(|s| format!("[{s:.2}] "))
-            .unwrap_or_default();
+        let score = row.score.map(|s| format!("[{s:.2}] ")).unwrap_or_default();
         lines.push(Line::from(Span::styled(
             format!("    {score}{}", truncate(snippet, 90)),
             Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
@@ -199,11 +174,7 @@ fn draw_transcript_inner(f: &mut Frame, app: &mut App, area: Rect, title: &str) 
     let total = open.lines.len();
     let scroll = app.transcript_scroll.min(total.saturating_sub(1));
 
-    let text: Vec<Line> = open
-        .lines
-        .iter()
-        .map(|tl| line_to_styled(&tl.text, tl.kind))
-        .collect();
+    let text: Vec<Line> = open.lines.iter().map(|tl| line_to_styled(&tl.text, tl.kind)).collect();
 
     let pct = if total <= 1 {
         100
@@ -223,22 +194,12 @@ fn draw_transcript_inner(f: &mut Frame, app: &mut App, area: Rect, title: &str) 
 
 fn line_to_styled(text: &str, kind: LineKind) -> Line<'static> {
     let style = match kind {
-        LineKind::RoleUser => Style::default()
-            .fg(Color::Green)
-            .add_modifier(Modifier::BOLD),
-        LineKind::RoleAssistant => Style::default()
-            .fg(Color::Magenta)
-            .add_modifier(Modifier::BOLD),
-        LineKind::RoleSystem => Style::default()
-            .fg(Color::Yellow)
-            .add_modifier(Modifier::BOLD),
-        LineKind::RoleTool => Style::default()
-            .fg(Color::Blue)
-            .add_modifier(Modifier::BOLD),
+        LineKind::RoleUser => Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+        LineKind::RoleAssistant => Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD),
+        LineKind::RoleSystem => Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+        LineKind::RoleTool => Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD),
         LineKind::Text => Style::default().fg(Color::White),
-        LineKind::Thinking => Style::default()
-            .fg(Color::DarkGray)
-            .add_modifier(Modifier::ITALIC),
+        LineKind::Thinking => Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
         LineKind::ToolUse => Style::default().fg(Color::Cyan),
         LineKind::ToolResult => Style::default().fg(Color::Blue),
         LineKind::ToolError => Style::default().fg(Color::Red),
@@ -282,11 +243,11 @@ fn draw_board(f: &mut Frame, app: &App, area: Rect) {
         })
         .map(ListItem::new)
         .collect();
-    let msgs = List::new(items).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title(format!(" board: {} ({}) ", app.board_channel, app.board_msgs.len())),
-    );
+    let msgs = List::new(items).block(Block::default().borders(Borders::ALL).title(format!(
+        " board: {} ({}) ",
+        app.board_channel,
+        app.board_msgs.len()
+    )));
     f.render_widget(msgs, cols[0]);
 
     // Active claims.
@@ -429,7 +390,7 @@ fn harness_color(h: Harness) -> Color {
         Harness::Roo => Color::Rgb(200, 90, 140),
         Harness::Continue => Color::Rgb(120, 200, 90),
         Harness::Goose => Color::Rgb(180, 160, 90),
-        Harness::Zed => Color::Rgb(7, 81, 207), // zed accent blue
+        Harness::Zed => Color::Rgb(7, 81, 207),              // zed accent blue
         Harness::ChatGptExport => Color::Rgb(116, 170, 156), // chatgpt teal (export)
         Harness::ClaudeExport => Color::Rgb(217, 119, 87),   // claude orange (export)
     }

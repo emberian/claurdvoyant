@@ -14,8 +14,8 @@ use crate::harness::EmitResult;
 use crate::ir::{Block, GitInfo, Harness, Role, Session, SessionRef};
 use anyhow::{Context, Result};
 use chrono::{DateTime, SecondsFormat, Utc};
-use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
-use serde_json::{Map, Value, json};
+use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
+use serde_json::{json, Map, Value};
 use std::fs;
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
@@ -31,12 +31,7 @@ pub struct EmitOptions {
 
 /// Emit `session` into `target`'s native format under `out_dir` (the target harness's storage root,
 /// or any directory for a dry run). Returns where it was written + how to resume it.
-pub fn emit(
-    session: &Session,
-    target: Harness,
-    out_dir: &Path,
-    opts: &EmitOptions,
-) -> Result<EmitResult> {
+pub fn emit(session: &Session, target: Harness, out_dir: &Path, opts: &EmitOptions) -> Result<EmitResult> {
     match target {
         Harness::Claude => emit_claude(session, out_dir, opts),
         Harness::Codex => emit_codex(session, out_dir, opts),
@@ -102,31 +97,29 @@ fn reparse_emitted(target: Harness, result: &EmitResult) -> Result<Session> {
             let id = result.new_id.clone();
             crate::harness::claude::Claude::new().parse(&sref(id, result.path.clone()))
         }
-        Harness::Codex => crate::harness::codex::Codex::new()
-            .parse(&sref(String::new(), result.path.clone())),
-        Harness::Grok => crate::harness::grok::Grok::new()
-            .parse(&sref(result.new_id.clone(), result.path.clone())),
-        Harness::OpenClaw => crate::harness::openclaw::OpenClaw::new()
-            .parse(&sref(result.new_id.clone(), result.path.clone())),
-        Harness::Gemini => crate::harness::gemini::Gemini::new()
-            .parse(&sref(result.new_id.clone(), result.path.clone())),
+        Harness::Codex => crate::harness::codex::Codex::new().parse(&sref(String::new(), result.path.clone())),
+        Harness::Grok => crate::harness::grok::Grok::new().parse(&sref(result.new_id.clone(), result.path.clone())),
+        Harness::OpenClaw => {
+            crate::harness::openclaw::OpenClaw::new().parse(&sref(result.new_id.clone(), result.path.clone()))
+        }
+        Harness::Gemini => {
+            crate::harness::gemini::Gemini::new().parse(&sref(result.new_id.clone(), result.path.clone()))
+        }
         Harness::OpenCode => reparse_opencode(result),
         #[cfg(feature = "sqlite")]
         Harness::Hermes => reparse_hermes(result),
         // The emitters whose output is parseable directly from the EmitResult path.
-        Harness::Kimi => crate::harness::kimi::Kimi::new()
-            .parse(&sref(result.new_id.clone(), result.path.clone())),
-        Harness::LmStudio => crate::harness::lmstudio::LmStudio::new()
-            .parse(&sref(result.new_id.clone(), result.path.clone())),
-        Harness::Cline => crate::harness::cline::Cline::new()
-            .parse(&sref(result.new_id.clone(), result.path.clone())),
-        Harness::Roo => crate::harness::roo::Roo::new()
-            .parse(&sref(result.new_id.clone(), result.path.clone())),
-        Harness::Continue => crate::harness::continuedev::Continue::new()
-            .parse(&sref(result.new_id.clone(), result.path.clone())),
+        Harness::Kimi => crate::harness::kimi::Kimi::new().parse(&sref(result.new_id.clone(), result.path.clone())),
+        Harness::LmStudio => {
+            crate::harness::lmstudio::LmStudio::new().parse(&sref(result.new_id.clone(), result.path.clone()))
+        }
+        Harness::Cline => crate::harness::cline::Cline::new().parse(&sref(result.new_id.clone(), result.path.clone())),
+        Harness::Roo => crate::harness::roo::Roo::new().parse(&sref(result.new_id.clone(), result.path.clone())),
+        Harness::Continue => {
+            crate::harness::continuedev::Continue::new().parse(&sref(result.new_id.clone(), result.path.clone()))
+        }
         // Qwen reuses Gemini's emitter (same record shape) but its own parser.
-        Harness::Qwen => crate::harness::qwen::Qwen::new()
-            .parse(&sref(result.new_id.clone(), result.path.clone())),
+        Harness::Qwen => crate::harness::qwen::Qwen::new().parse(&sref(result.new_id.clone(), result.path.clone())),
         other => anyhow::bail!("re-parse for {other} not supported"),
     }
 }
@@ -254,17 +247,11 @@ fn diff_lossy(input: &Session, reparsed: &Session) -> Vec<String> {
 
     if after.tool_uses < before.tool_uses {
         let n = before.tool_uses - after.tool_uses;
-        warnings.push(format!(
-            "dropped {n} tool call{}",
-            if n == 1 { "" } else { "s" }
-        ));
+        warnings.push(format!("dropped {n} tool call{}", if n == 1 { "" } else { "s" }));
     }
     if after.tool_results < before.tool_results {
         let n = before.tool_results - after.tool_results;
-        warnings.push(format!(
-            "dropped {n} tool result{}",
-            if n == 1 { "" } else { "s" }
-        ));
+        warnings.push(format!("dropped {n} tool result{}", if n == 1 { "" } else { "s" }));
     }
     if after.images < before.images {
         let n = before.images - after.images;
@@ -364,10 +351,7 @@ fn claude_encode_cwd(cwd: &Path) -> String {
 }
 
 fn emit_claude(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<EmitResult> {
-    let new_id = opts
-        .new_id
-        .clone()
-        .unwrap_or_else(|| Uuid::new_v4().to_string());
+    let new_id = opts.new_id.clone().unwrap_or_else(|| Uuid::new_v4().to_string());
     // Resolve symlinks so the project-dir name matches the realpath Claude resolves at resume time.
     let cwd = effective_cwd(session, opts).map(|p| realpath_for_claude(&p));
     let cwd_str = cwd
@@ -381,8 +365,7 @@ fn emit_claude(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<
     let branch = branch_of(session);
 
     let proj_dir = out_dir.join(&dir_name);
-    fs::create_dir_all(&proj_dir)
-        .with_context(|| format!("creating {}", proj_dir.display()))?;
+    fs::create_dir_all(&proj_dir).with_context(|| format!("creating {}", proj_dir.display()))?;
     let file_path = proj_dir.join(format!("{new_id}.jsonl"));
 
     let mut lines: Vec<Value> = Vec::new();
@@ -450,10 +433,7 @@ fn emit_claude(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<
                 // Simple user text → string content.
                 let text = msg.text().unwrap_or_default();
                 line.insert("type".into(), json!("user"));
-                line.insert(
-                    "message".into(),
-                    json!({ "role": "user", "content": text }),
-                );
+                line.insert("message".into(), json!({ "role": "user", "content": text }));
             }
             Role::Assistant => {
                 line.insert("type".into(), json!("assistant"));
@@ -663,19 +643,16 @@ fn claude_tool_result_blocks(content: &[Block]) -> Vec<Value> {
 // ------------------------------------------------------------------------------------------------
 
 fn emit_codex(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<EmitResult> {
-    let new_id = opts
-        .new_id
-        .clone()
-        .unwrap_or_else(|| Uuid::now_v7().to_string());
+    let new_id = opts.new_id.clone().unwrap_or_else(|| Uuid::now_v7().to_string());
     let cwd = effective_cwd(session, opts);
 
     let now = session.created_at.unwrap_or_else(Utc::now);
     // Path: out_dir/YYYY/MM/DD/rollout-<iso8601 colons→dashes>-<uuid>.jsonl
-    let date_dir = out_dir.join(now.format("%Y").to_string())
+    let date_dir = out_dir
+        .join(now.format("%Y").to_string())
         .join(now.format("%m").to_string())
         .join(now.format("%d").to_string());
-    fs::create_dir_all(&date_dir)
-        .with_context(|| format!("creating {}", date_dir.display()))?;
+    fs::create_dir_all(&date_dir).with_context(|| format!("creating {}", date_dir.display()))?;
     let iso = now.to_rfc3339_opts(SecondsFormat::Secs, true);
     let iso_dashed = iso.replace(':', "-");
     let file_path = date_dir.join(format!("rollout-{iso_dashed}-{new_id}.jsonl"));
@@ -738,10 +715,7 @@ fn emit_codex(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<E
                         "content": [{ "type": "input_text", "text": text }],
                     }),
                 ));
-                lines.push(codex_event_msg(
-                    &ts,
-                    json!({ "type": "user_message", "message": text }),
-                ));
+                lines.push(codex_event_msg(&ts, json!({ "type": "user_message", "message": text })));
             }
             Role::Assistant => {
                 // Split assistant content into NL text (event_msg) and structured items.
@@ -771,27 +745,20 @@ fn emit_codex(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<E
                             // prefers `content` over `summary`); preserve it as raw `content` so
                             // re-parsing recovers it verbatim. A distinct summary, if the source
                             // adapter stashed one in `extra.reasoning_summary`, rides in `summary`.
-                            p.insert(
-                                "content".into(),
-                                json!([{ "type": "reasoning_text", "text": text }]),
-                            );
+                            p.insert("content".into(), json!([{ "type": "reasoning_text", "text": text }]));
                             let summary = msg
                                 .extra
                                 .get("reasoning_summary")
                                 .and_then(Value::as_str)
                                 .unwrap_or(text);
-                            p.insert(
-                                "summary".into(),
-                                json!([{ "type": "summary_text", "text": summary }]),
-                            );
+                            p.insert("summary".into(), json!([{ "type": "summary_text", "text": summary }]));
                             if let Some(enc) = encrypted {
                                 p.insert("encrypted_content".into(), json!(enc));
                             }
                             lines.push(codex_response_item(&ts, Value::Object(p)));
                         }
                         Block::ToolUse { id, name, input } => {
-                            let args = serde_json::to_string(input)
-                                .unwrap_or_else(|_| "{}".to_string());
+                            let args = serde_json::to_string(input).unwrap_or_else(|_| "{}".to_string());
                             lines.push(codex_response_item(
                                 &ts,
                                 json!({
@@ -803,8 +770,7 @@ fn emit_codex(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<E
                             ));
                         }
                         Block::File { path, source, .. } => {
-                            let label =
-                                path.as_deref().or(source.as_deref()).unwrap_or("?");
+                            let label = path.as_deref().or(source.as_deref()).unwrap_or("?");
                             lines.push(codex_event_msg(
                                 &ts,
                                 json!({
@@ -820,9 +786,7 @@ fn emit_codex(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<E
             Role::Tool => {
                 for b in &msg.content {
                     if let Block::ToolResult {
-                        tool_use_id,
-                        content,
-                        ..
+                        tool_use_id, content, ..
                     } = b
                     {
                         lines.push(codex_response_item(
@@ -875,19 +839,10 @@ fn codex_git(g: &GitInfo) -> Value {
 // ------------------------------------------------------------------------------------------------
 
 /// Percent-encode everything except unreserved chars, so `/` → `%2F` (matching Grok's dir layout).
-const GROK_ENCODE: &AsciiSet = &CONTROLS
-    .add(b'/')
-    .add(b' ')
-    .add(b'.')
-    .add(b'%')
-    .add(b':')
-    .add(b'\\');
+const GROK_ENCODE: &AsciiSet = &CONTROLS.add(b'/').add(b' ').add(b'.').add(b'%').add(b':').add(b'\\');
 
 fn emit_grok(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<EmitResult> {
-    let new_id = opts
-        .new_id
-        .clone()
-        .unwrap_or_else(|| Uuid::now_v7().to_string());
+    let new_id = opts.new_id.clone().unwrap_or_else(|| Uuid::now_v7().to_string());
     let cwd = effective_cwd(session, opts);
     let cwd_str = cwd
         .as_ref()
@@ -896,8 +851,7 @@ fn emit_grok(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<Em
     let enc_cwd = utf8_percent_encode(&cwd_str, GROK_ENCODE).to_string();
 
     let session_dir = out_dir.join(&enc_cwd).join(&new_id);
-    fs::create_dir_all(&session_dir)
-        .with_context(|| format!("creating {}", session_dir.display()))?;
+    fs::create_dir_all(&session_dir).with_context(|| format!("creating {}", session_dir.display()))?;
 
     let created = session
         .created_at
@@ -911,25 +865,15 @@ fn emit_grok(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<Em
 
     // summary.json
     let mut summary = Map::new();
-    summary.insert(
-        "info".into(),
-        json!({ "id": new_id, "cwd": cwd_str }),
-    );
+    summary.insert("info".into(), json!({ "id": new_id, "cwd": cwd_str }));
     summary.insert("created_at".into(), json!(created));
     summary.insert("updated_at".into(), json!(updated));
     summary.insert("last_active_at".into(), json!(updated));
-    summary.insert(
-        "num_chat_messages".into(),
-        json!(session.messages.len()),
-    );
+    summary.insert("num_chat_messages".into(), json!(session.messages.len()));
     // Real Grok summaries carry these too; without at least `chat_format_version`
     // the loader rejects the dir with "Session does not exist". (Verified live against
     // grok 0.1.219 — adding the full field set is what makes `grok --resume` discover it.)
-    let num_turns = session
-        .messages
-        .iter()
-        .filter(|m| matches!(m.role, Role::User))
-        .count();
+    let num_turns = session.messages.iter().filter(|m| matches!(m.role, Role::User)).count();
     summary.insert("num_messages".into(), json!(num_turns));
     summary.insert("next_trace_turn".into(), json!(0));
     summary.insert("chat_format_version".into(), json!(1));
@@ -960,10 +904,7 @@ fn emit_grok(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<Em
             summary.insert("git_remotes".into(), json!([r]));
         }
     }
-    summary.insert(
-        "session_summary".into(),
-        json!(session.title.as_deref().unwrap_or("")),
-    );
+    summary.insert("session_summary".into(), json!(session.title.as_deref().unwrap_or("")));
     let summary_path = session_dir.join("summary.json");
     fs::write(&summary_path, serde_json::to_string_pretty(&summary)?)
         .with_context(|| format!("writing {}", summary_path.display()))?;
@@ -1122,7 +1063,11 @@ fn emit_opencode(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Resul
     // found", verified live). Refuse rather than silently produce an unresumable session. Emitting
     // INTO opencode.db is tracked as a follow-up. If the DB is absent (fresh install), the legacy JSON
     // is still imported on next launch, so we proceed normally.
-    if out_dir.parent().map(|p| p.join("opencode.db")).is_some_and(|db| db.exists()) {
+    if out_dir
+        .parent()
+        .map(|p| p.join("opencode.db"))
+        .is_some_and(|db| db.exists())
+    {
         anyhow::bail!(
             "opencode has migrated to SQLite (opencode.db); it no longer reads the file-based \
              storage/ layout, so a session converted here cannot be resumed. Emitting into \
@@ -1149,8 +1094,7 @@ fn emit_opencode(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Resul
 
     let session_dir = out_dir.join("session").join(&project_id);
     let msg_dir = out_dir.join("message").join(&new_id);
-    fs::create_dir_all(&session_dir)
-        .with_context(|| format!("creating {}", session_dir.display()))?;
+    fs::create_dir_all(&session_dir).with_context(|| format!("creating {}", session_dir.display()))?;
     fs::create_dir_all(&msg_dir).with_context(|| format!("creating {}", msg_dir.display()))?;
 
     let created = epoch_ms(session.created_at.or(session.updated_at));
@@ -1165,18 +1109,14 @@ fn emit_opencode(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Resul
     if let Some(t) = &session.title {
         meta.insert("title".into(), json!(t));
     }
-    meta.insert(
-        "time".into(),
-        json!({ "created": created, "updated": updated }),
-    );
+    meta.insert("time".into(), json!({ "created": created, "updated": updated }));
     let ses_path = session_dir.join(format!("{new_id}.json"));
     fs::write(&ses_path, serde_json::to_string_pretty(&meta)?)
         .with_context(|| format!("writing {}", ses_path.display()))?;
 
     // Pre-index tool results (from Role::Tool turns) by tool_use_id so we can attach them to the
     // matching `tool` part on the assistant message that produced the call.
-    let mut tool_results: std::collections::HashMap<String, &Block> =
-        std::collections::HashMap::new();
+    let mut tool_results: std::collections::HashMap<String, &Block> = std::collections::HashMap::new();
     for msg in &session.messages {
         if msg.role == Role::Tool {
             for b in &msg.content {
@@ -1214,16 +1154,14 @@ fn emit_opencode(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Resul
             .with_context(|| format!("writing {}", mrec_path.display()))?;
 
         let part_dir = out_dir.join("part").join(&mid);
-        fs::create_dir_all(&part_dir)
-            .with_context(|| format!("creating {}", part_dir.display()))?;
+        fs::create_dir_all(&part_dir).with_context(|| format!("creating {}", part_dir.display()))?;
 
         let mut pidx: u64 = 0;
         let mut write_part = |part: Value| -> Result<()> {
             // Zero-padded prefix keeps the reader's filename sort == emission order.
             let pid = format!("prt_{seq:08}_{pidx:04}_{}", Uuid::now_v7().simple());
             let p = part_dir.join(format!("{pid}.json"));
-            fs::write(&p, serde_json::to_string_pretty(&part)?)
-                .with_context(|| format!("writing {}", p.display()))?;
+            fs::write(&p, serde_json::to_string_pretty(&part)?).with_context(|| format!("writing {}", p.display()))?;
             pidx += 1;
             Ok(())
         };
@@ -1238,10 +1176,7 @@ fn emit_opencode(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Resul
                     p.insert("type".into(), json!("reasoning"));
                     p.insert("text".into(), json!(text));
                     if let Some(sig) = signature {
-                        p.insert(
-                            "metadata".into(),
-                            json!({ "anthropic": { "signature": sig } }),
-                        );
+                        p.insert("metadata".into(), json!({ "anthropic": { "signature": sig } }));
                     }
                     write_part(Value::Object(p))?;
                 }
@@ -1249,10 +1184,7 @@ fn emit_opencode(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Resul
                     let mut state = Map::new();
                     state.insert("input".into(), input.clone());
                     // Attach the paired result, if we have one.
-                    if let Some(Block::ToolResult {
-                        content, is_error, ..
-                    }) = tool_results.get(id).copied()
-                    {
+                    if let Some(Block::ToolResult { content, is_error, .. }) = tool_results.get(id).copied() {
                         if *is_error {
                             state.insert("status".into(), json!("error"));
                             state.insert("error".into(), json!(content));
@@ -1324,10 +1256,7 @@ fn short_hash(s: &str) -> String {
 /// a `sessions.json` index entry. Mirrors `harness/openclaw.rs`'s reader: a `{type:session,…}`
 /// header line followed by `{type:message,id,parentId,timestamp,message:{role,content,…}}` lines.
 fn emit_openclaw(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<EmitResult> {
-    let new_id = opts
-        .new_id
-        .clone()
-        .unwrap_or_else(|| Uuid::new_v4().to_string());
+    let new_id = opts.new_id.clone().unwrap_or_else(|| Uuid::new_v4().to_string());
     let agent_id = "main";
     let cwd = effective_cwd(session, opts);
     let cwd_str = cwd
@@ -1346,14 +1275,10 @@ fn emit_openclaw(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Resul
         out_dir.join("agents")
     };
     let sessions_dir = agents_root.join(agent_id).join("sessions");
-    fs::create_dir_all(&sessions_dir)
-        .with_context(|| format!("creating {}", sessions_dir.display()))?;
+    fs::create_dir_all(&sessions_dir).with_context(|| format!("creating {}", sessions_dir.display()))?;
     let file_path = sessions_dir.join(format!("{new_id}.jsonl"));
 
-    let created = session
-        .created_at
-        .or(session.updated_at)
-        .unwrap_or_else(Utc::now);
+    let created = session.created_at.or(session.updated_at).unwrap_or_else(Utc::now);
     let created_iso = created.to_rfc3339_opts(SecondsFormat::Millis, true);
 
     let mut lines: Vec<Value> = Vec::new();
@@ -1399,18 +1324,14 @@ fn emit_openclaw(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Resul
             }
             Role::Tool => {
                 // OpenClaw models each tool result as its own `toolResult` message.
-                let (tool_use_id, content, is_error, tool_name) =
-                    openclaw_tool_result(&msg.content);
+                let (tool_use_id, content, is_error, tool_name) = openclaw_tool_result(&msg.content);
                 let mut m = Map::new();
                 m.insert("role".into(), json!("toolResult"));
                 m.insert("toolCallId".into(), json!(tool_use_id));
                 if let Some(tn) = tool_name {
                     m.insert("toolName".into(), json!(tn));
                 }
-                m.insert(
-                    "content".into(),
-                    json!([{ "type": "text", "text": content }]),
-                );
+                m.insert("content".into(), json!([{ "type": "text", "text": content }]));
                 m.insert("isError".into(), json!(is_error));
                 m.insert("timestamp".into(), json!(ts_ms));
                 Value::Object(m)
@@ -1522,12 +1443,7 @@ fn openclaw_tool_result(content: &[Block]) -> (String, String, bool, Option<Stri
             ..
         } = b
         {
-            return (
-                tool_use_id.clone(),
-                content.to_string(),
-                *is_error,
-                tool_name.clone(),
-            );
+            return (tool_use_id.clone(), content.to_string(), *is_error, tool_name.clone());
         }
     }
     (String::new(), String::new(), false, None)
@@ -1542,10 +1458,7 @@ fn openclaw_tool_result(content: &[Block]) -> (String, String, bool, Option<Stri
 /// (`harness/gemini.rs`) requires the file to live under a `chats/` dir to be picked up by
 /// `discover`, but `parse_all_str` / `parse` will read it directly from any path.
 fn emit_gemini(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<EmitResult> {
-    let new_id = opts
-        .new_id
-        .clone()
-        .unwrap_or_else(|| Uuid::new_v4().to_string());
+    let new_id = opts.new_id.clone().unwrap_or_else(|| Uuid::new_v4().to_string());
     let cwd = effective_cwd(session, opts);
     let cwd_str = cwd
         .as_ref()
@@ -1562,8 +1475,7 @@ fn emit_gemini(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<
         Some(slug) => out_dir.join(slug).join("chats"),
         None => out_dir.join("chats"), // no cwd → fall back to the legacy bare path
     };
-    fs::create_dir_all(&chats_dir)
-        .with_context(|| format!("creating {}", chats_dir.display()))?;
+    fs::create_dir_all(&chats_dir).with_context(|| format!("creating {}", chats_dir.display()))?;
     let file_path = chats_dir.join(format!("session-{new_id}.json"));
 
     let start = session
@@ -1579,8 +1491,7 @@ fn emit_gemini(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<
 
     // Index tool results by tool_use_id so they can be folded into the producing assistant's
     // `toolCalls[].result` (the canonical legacy shape the reader pairs from).
-    let mut tool_results: std::collections::HashMap<String, (String, bool)> =
-        std::collections::HashMap::new();
+    let mut tool_results: std::collections::HashMap<String, (String, bool)> = std::collections::HashMap::new();
     for msg in &session.messages {
         if msg.role == Role::Tool {
             for b in &msg.content {
@@ -1599,9 +1510,7 @@ fn emit_gemini(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<
 
     let mut messages: Vec<Value> = Vec::new();
     for msg in &session.messages {
-        let ts = msg
-            .timestamp
-            .map(|t| t.to_rfc3339_opts(SecondsFormat::Millis, true));
+        let ts = msg.timestamp.map(|t| t.to_rfc3339_opts(SecondsFormat::Millis, true));
         match msg.role {
             Role::User | Role::System => {
                 let mty = if msg.role == Role::System { "info" } else { "user" };
@@ -1645,10 +1554,7 @@ fn emit_gemini(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<
                         call.insert("name".into(), json!(name));
                         call.insert("args".into(), input.clone());
                         if let Some((content, is_error)) = tool_results.get(id) {
-                            call.insert(
-                                "status".into(),
-                                json!(if *is_error { "error" } else { "success" }),
-                            );
+                            call.insert("status".into(), json!(if *is_error { "error" } else { "success" }));
                             call.insert(
                                 "result".into(),
                                 json!([{
@@ -1778,9 +1684,7 @@ fn gemini_parts(content: &[Block]) -> Value {
     for b in content {
         match b {
             Block::Text { text } => out.push(json!({ "text": text })),
-            Block::Thinking { text, .. } => {
-                out.push(json!({ "text": text, "thought": true }))
-            }
+            Block::Thinking { text, .. } => out.push(json!({ "text": text, "thought": true })),
             Block::Image { media_type, .. } => {
                 let mut inline = Map::new();
                 if let Some(mt) = media_type {
@@ -1819,10 +1723,7 @@ fn emit_hermes(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<
 
     const MULTIMODAL_SENTINEL: &str = "\u{0}json:";
 
-    let new_id = opts
-        .new_id
-        .clone()
-        .unwrap_or_else(|| Uuid::new_v4().to_string());
+    let new_id = opts.new_id.clone().unwrap_or_else(|| Uuid::new_v4().to_string());
 
     // `out_dir` may be a directory to drop state.db into, OR the state.db file itself — the hermes
     // adapter's storage_root() returns the .db path, so `cv convert --to hermes` (no --out) passes
@@ -1835,8 +1736,7 @@ fn emit_hermes(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<
     if let Some(parent) = db_path.parent() {
         fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
     }
-    let conn = Connection::open(&db_path)
-        .with_context(|| format!("opening {}", db_path.display()))?;
+    let conn = Connection::open(&db_path).with_context(|| format!("opening {}", db_path.display()))?;
 
     // Create the (subset of) v14 schema if the DB is fresh. `IF NOT EXISTS` makes append safe.
     conn.execute_batch(
@@ -1911,8 +1811,7 @@ fn emit_hermes(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<
     // Trigram table for CJK/substring search. Guarded: if the trigram tokenizer isn't compiled in,
     // skip it (and its triggers) rather than failing the whole emit. The unicode61 table above is
     // enough for Hermes to find ASCII content; the trigram index is a CJK nicety.
-    let trigram_sql =
-        "CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts_trigram USING fts5(content, tokenize='trigram');
+    let trigram_sql = "CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts_trigram USING fts5(content, tokenize='trigram');
          CREATE TRIGGER IF NOT EXISTS messages_fts_trigram_insert AFTER INSERT ON messages BEGIN
              INSERT INTO messages_fts_trigram(rowid, content) VALUES (
                  new.id,
@@ -1947,23 +1846,11 @@ fn emit_hermes(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<
     // Format-complete: pull the captured per-session columns back out of `Session.extra` (written
     // by the Hermes parser under `SESSION_META_KEY`) so the round-trip reproduces every session-row
     // value. Anything absent falls back to a sensible default (e.g. `source = "claurdvoyant"`).
-    use crate::harness::hermes::{SESSION_META_KEY, RAW_REASONING_KEY, RAW_REASONING_CONTENT_KEY};
-    let smeta = session
-        .extra
-        .get(SESSION_META_KEY)
-        .and_then(Value::as_object);
-    let smeta_str = |k: &str| -> Option<String> {
-        smeta
-            .and_then(|m| m.get(k))
-            .and_then(Value::as_str)
-            .map(str::to_string)
-    };
-    let smeta_int = |k: &str| -> i64 {
-        smeta
-            .and_then(|m| m.get(k))
-            .and_then(Value::as_i64)
-            .unwrap_or(0)
-    };
+    use crate::harness::hermes::{RAW_REASONING_CONTENT_KEY, RAW_REASONING_KEY, SESSION_META_KEY};
+    let smeta = session.extra.get(SESSION_META_KEY).and_then(Value::as_object);
+    let smeta_str =
+        |k: &str| -> Option<String> { smeta.and_then(|m| m.get(k)).and_then(Value::as_str).map(str::to_string) };
+    let smeta_int = |k: &str| -> i64 { smeta.and_then(|m| m.get(k)).and_then(Value::as_i64).unwrap_or(0) };
     let source = smeta_str("source").unwrap_or_else(|| "claurdvoyant".to_string());
     let user_id = smeta_str("user_id");
     let model_config = smeta_str("model_config");
@@ -2021,12 +1908,8 @@ fn emit_hermes(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<
         // projection — that projection merges + dedups across columns and so can't recover the
         // originals. We only synthesize from Thinking blocks when no verbatim column was captured
         // (i.e. a session built in-memory or ported from another harness).
-        let extra_str = |k: &str| -> Option<String> {
-            msg.extra.get(k).and_then(Value::as_str).map(str::to_string)
-        };
-        let extra_json = |k: &str| -> Option<String> {
-            msg.extra.get(k).map(|v| v.to_string())
-        };
+        let extra_str = |k: &str| -> Option<String> { msg.extra.get(k).and_then(Value::as_str).map(str::to_string) };
+        let extra_json = |k: &str| -> Option<String> { msg.extra.get(k).map(|v| v.to_string()) };
 
         let mut reasoning = extra_str(RAW_REASONING_KEY);
         let reasoning_content = extra_str(RAW_REASONING_CONTENT_KEY);
@@ -2057,10 +1940,8 @@ fn emit_hermes(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<
                 reasoning = Some(text);
             }
             if let Some(enc) = enc {
-                reasoning_details = Some(
-                    json!([{ "type": "reasoning.encrypted_content", "encrypted_content": enc }])
-                        .to_string(),
-                );
+                reasoning_details =
+                    Some(json!([{ "type": "reasoning.encrypted_content", "encrypted_content": enc }]).to_string());
             }
         }
 
@@ -2124,9 +2005,7 @@ fn emit_hermes(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<
             let mut parts = Vec::new();
             for b in &msg.content {
                 match b {
-                    Block::Text { text } => {
-                        parts.push(json!({ "type": "text", "text": text }))
-                    }
+                    Block::Text { text } => parts.push(json!({ "type": "text", "text": text })),
                     Block::Image { data_ref, .. } => {
                         parts.push(json!({
                             "type": "image_url",
@@ -2215,8 +2094,7 @@ fn write_jsonl(path: &Path, lines: &[Value]) -> Result<()> {
 mod tests {
     use super::*;
     use crate::harness::{
-        Adapter, claude::Claude, codex::Codex, gemini::Gemini, grok::Grok,
-        opencode::OpenCode, openclaw::OpenClaw,
+        claude::Claude, codex::Codex, gemini::Gemini, grok::Grok, openclaw::OpenClaw, opencode::OpenCode, Adapter,
     };
     use crate::ir::*;
 
@@ -2332,22 +2210,15 @@ mod tests {
         assert_eq!(texts(&parsed, Role::Assistant), vec!["Sure, listing now."]);
         assert_eq!(tool_names(&parsed), vec!["run_shell"]);
         // The Tool turn (tool_result) should survive as a Role::Tool message.
-        let tool_results: Vec<_> = parsed
-            .messages
-            .iter()
-            .filter(|m| m.role == Role::Tool)
-            .collect();
+        let tool_results: Vec<_> = parsed.messages.iter().filter(|m| m.role == Role::Tool).collect();
         assert_eq!(tool_results.len(), 1);
         // Thinking survives.
-        assert!(parsed.messages.iter().any(|m| m
-            .content
+        assert!(parsed
+            .messages
             .iter()
-            .any(|b| matches!(b, Block::Thinking { .. }))));
+            .any(|m| m.content.iter().any(|b| matches!(b, Block::Thinking { .. }))));
         // gitBranch round-trips.
-        assert_eq!(
-            parsed.git.and_then(|g| g.branch),
-            Some("main".to_string())
-        );
+        assert_eq!(parsed.git.and_then(|g| g.branch), Some("main".to_string()));
     }
 
     #[test]
@@ -2419,11 +2290,7 @@ mod tests {
         assert_eq!(texts(&parsed, Role::Assistant), vec!["Sure, listing now."]);
         assert_eq!(tool_names(&parsed), vec!["run_shell"]);
         // function_call_output round-trips as a Tool message.
-        let tool_results: Vec<_> = parsed
-            .messages
-            .iter()
-            .filter(|m| m.role == Role::Tool)
-            .collect();
+        let tool_results: Vec<_> = parsed.messages.iter().filter(|m| m.role == Role::Tool).collect();
         assert_eq!(tool_results.len(), 1);
         if let Block::ToolResult { content, .. } = &tool_results[0].content[0] {
             assert_eq!(content, "file_a.txt\nfile_b.txt");
@@ -2431,10 +2298,10 @@ mod tests {
             panic!("expected tool result");
         }
         // reasoning survives.
-        assert!(parsed.messages.iter().any(|m| m
-            .content
+        assert!(parsed
+            .messages
             .iter()
-            .any(|b| matches!(b, Block::Thinking { .. }))));
+            .any(|m| m.content.iter().any(|b| matches!(b, Block::Thinking { .. }))));
         // git branch round-trips.
         assert_eq!(parsed.git.and_then(|g| g.branch), Some("main".to_string()));
         // System turn (developer) survives.
@@ -2469,10 +2336,10 @@ mod tests {
         assert_eq!(texts(&parsed, Role::Assistant), vec!["Sure, listing now."]);
         assert_eq!(parsed.git.clone().and_then(|g| g.branch), Some("main".to_string()));
         // Thinking/reasoning survives on the assistant turn.
-        assert!(parsed.messages.iter().any(|m| m
-            .content
+        assert!(parsed
+            .messages
             .iter()
-            .any(|b| matches!(b, Block::Thinking { .. }))));
+            .any(|m| m.content.iter().any(|b| matches!(b, Block::Thinking { .. }))));
         // Tool calls now SURVIVE (previously emit dropped all tool turns).
         assert_eq!(tool_names(&parsed), vec!["run_shell"]);
         // And the assistant tool call's arguments round-trip.
@@ -2483,17 +2350,19 @@ mod tests {
             })
         });
         assert_eq!(
-            tool_use_input.as_ref().and_then(|v| v.get("cmd")).and_then(|v| v.as_str()),
+            tool_use_input
+                .as_ref()
+                .and_then(|v| v.get("cmd"))
+                .and_then(|v| v.as_str()),
             Some("ls")
         );
         // The tool RESULT survives as a Role::Tool message with its content intact.
-        let tool_results: Vec<_> = parsed
-            .messages
-            .iter()
-            .filter(|m| m.role == Role::Tool)
-            .collect();
+        let tool_results: Vec<_> = parsed.messages.iter().filter(|m| m.role == Role::Tool).collect();
         assert_eq!(tool_results.len(), 1);
-        if let Block::ToolResult { content, tool_use_id, .. } = &tool_results[0].content[0] {
+        if let Block::ToolResult {
+            content, tool_use_id, ..
+        } = &tool_results[0].content[0]
+        {
             assert_eq!(content, "file_a.txt\nfile_b.txt");
             assert_eq!(tool_use_id, "call_1");
         } else {
@@ -2536,7 +2405,13 @@ mod tests {
         let mut results: Vec<(String, bool, Option<String>)> = Vec::new();
         for m in parsed.messages.iter().filter(|m| m.role == Role::Tool) {
             for b in &m.content {
-                if let Block::ToolResult { tool_use_id, is_error, status, .. } = b {
+                if let Block::ToolResult {
+                    tool_use_id,
+                    is_error,
+                    status,
+                    ..
+                } = b
+                {
                     results.push((tool_use_id.clone(), *is_error, status.clone()));
                 }
             }
@@ -2589,10 +2464,7 @@ mod tests {
         }
         let oc = OpenCode::new();
         let refs = oc.discover().unwrap();
-        let parsed = refs
-            .iter()
-            .find(|r| r.id == res.new_id)
-            .map(|r| oc.parse(r).unwrap());
+        let parsed = refs.iter().find(|r| r.id == res.new_id).map(|r| oc.parse(r).unwrap());
         unsafe {
             match prev_home {
                 Some(h) => std::env::set_var("HOME", h),
@@ -2607,11 +2479,7 @@ mod tests {
         assert_eq!(texts(&parsed, Role::Assistant), vec!["Sure, listing now."]);
         assert_eq!(tool_names(&parsed), vec!["run_shell"]);
         // tool result split into a Tool turn
-        let tool_results: Vec<_> = parsed
-            .messages
-            .iter()
-            .filter(|m| m.role == Role::Tool)
-            .collect();
+        let tool_results: Vec<_> = parsed.messages.iter().filter(|m| m.role == Role::Tool).collect();
         assert_eq!(tool_results.len(), 1);
         if let Block::ToolResult { content, .. } = &tool_results[0].content[0] {
             assert_eq!(content, "file_a.txt\nfile_b.txt");
@@ -2619,10 +2487,10 @@ mod tests {
             panic!("expected tool result");
         }
         // reasoning survives
-        assert!(parsed.messages.iter().any(|m| m
-            .content
+        assert!(parsed
+            .messages
             .iter()
-            .any(|b| matches!(b, Block::Thinking { .. }))));
+            .any(|m| m.content.iter().any(|b| matches!(b, Block::Thinking { .. }))));
     }
 
     #[test]
@@ -2653,17 +2521,13 @@ mod tests {
         assert_eq!(texts(&parsed, Role::Assistant), vec!["Sure, listing now."]);
         assert_eq!(tool_names(&parsed), vec!["run_shell"]);
         // tool result → toolResult message (Role::Tool)
-        let tool_results: Vec<_> = parsed
-            .messages
-            .iter()
-            .filter(|m| m.role == Role::Tool)
-            .collect();
+        let tool_results: Vec<_> = parsed.messages.iter().filter(|m| m.role == Role::Tool).collect();
         assert_eq!(tool_results.len(), 1);
         // thinking survives
-        assert!(parsed.messages.iter().any(|m| m
-            .content
+        assert!(parsed
+            .messages
             .iter()
-            .any(|b| matches!(b, Block::Thinking { .. }))));
+            .any(|m| m.content.iter().any(|b| matches!(b, Block::Thinking { .. }))));
         // model promoted
         assert_eq!(parsed.model.as_deref(), Some("test-model"));
     }
@@ -2700,10 +2564,10 @@ mod tests {
             && m.content.iter().any(|b| matches!(b, Block::ToolResult { content, .. }
                 if content == "file_a.txt\nfile_b.txt"))));
         // thinking → thoughts survives
-        assert!(parsed.messages.iter().any(|m| m
-            .content
+        assert!(parsed
+            .messages
             .iter()
-            .any(|b| matches!(b, Block::Thinking { .. }))));
+            .any(|m| m.content.iter().any(|b| matches!(b, Block::Thinking { .. }))));
     }
 
     #[cfg(feature = "sqlite")]
@@ -2726,10 +2590,7 @@ mod tests {
         }
         let h = Hermes::new();
         let refs = h.discover().unwrap();
-        let parsed = refs
-            .iter()
-            .find(|r| r.id == res.new_id)
-            .map(|r| h.parse(r).unwrap());
+        let parsed = refs.iter().find(|r| r.id == res.new_id).map(|r| h.parse(r).unwrap());
         unsafe {
             match prev {
                 Some(p) => std::env::set_var("HERMES_HOME", p),
@@ -2750,10 +2611,10 @@ mod tests {
             && m.content.iter().any(|b| matches!(b, Block::ToolResult { content, .. }
                 if content == "file_a.txt\nfile_b.txt"))));
         // reasoning → Thinking
-        assert!(parsed.messages.iter().any(|m| m
-            .content
+        assert!(parsed
+            .messages
             .iter()
-            .any(|b| matches!(b, Block::Thinking { .. }))));
+            .any(|m| m.content.iter().any(|b| matches!(b, Block::Thinking { .. }))));
     }
 
     #[cfg(feature = "sqlite")]
@@ -2810,13 +2671,17 @@ mod tests {
     /// only) should report the image as dropped.
     fn image_session() -> Session {
         let mut user = Message::new(Role::User);
-        user.content.push(Block::Text { text: "look at this".into() });
+        user.content.push(Block::Text {
+            text: "look at this".into(),
+        });
         user.content.push(Block::Image {
             media_type: Some("image/png".into()),
             data_ref: Some("data:image/png;base64,AAAA".into()),
         });
         let mut asst = Message::new(Role::Assistant);
-        asst.content.push(Block::Text { text: "nice picture".into() });
+        asst.content.push(Block::Text {
+            text: "nice picture".into(),
+        });
 
         Session {
             id: "img-id".into(),
@@ -2839,8 +2704,7 @@ mod tests {
         // image was dropped — the canonical lossy case.
         let img = image_session();
         let out = temp_dir();
-        let (_res, warnings) =
-            emit_verified(&img, Harness::Grok, &out, &EmitOptions::default()).unwrap();
+        let (_res, warnings) = emit_verified(&img, Harness::Grok, &out, &EmitOptions::default()).unwrap();
         assert!(
             warnings.iter().any(|w| w.contains("image")),
             "expected an image-dropped warning, got: {warnings:?}"
@@ -2850,8 +2714,7 @@ mod tests {
         // Grok keeps system turns, tool calls, tool results, and reasoning.
         let clean = sample_session(Harness::Grok);
         let out2 = temp_dir();
-        let (_r2, w2) =
-            emit_verified(&clean, Harness::Grok, &out2, &EmitOptions::default()).unwrap();
+        let (_r2, w2) = emit_verified(&clean, Harness::Grok, &out2, &EmitOptions::default()).unwrap();
         assert!(w2.is_empty(), "expected clean Grok round-trip, got: {w2:?}");
     }
 
@@ -2860,8 +2723,7 @@ mod tests {
         // OpenClaw represents text, thinking, tool calls/results, system turns — a clean round-trip.
         let s = sample_session(Harness::OpenClaw);
         let out = temp_dir();
-        let (_res, warnings) =
-            emit_verified(&s, Harness::OpenClaw, &out, &EmitOptions::default()).unwrap();
+        let (_res, warnings) = emit_verified(&s, Harness::OpenClaw, &out, &EmitOptions::default()).unwrap();
         // No tool/image/reasoning loss; OpenClaw keeps system turns and the title.
         assert!(
             warnings.is_empty(),
@@ -2895,8 +2757,7 @@ mod tests {
     #[cfg(feature = "sqlite")]
     fn dump_hermes_messages(db: &Path, session_id: &str) -> Vec<HermesMsgRow> {
         use rusqlite::{Connection, OpenFlags};
-        let conn =
-            Connection::open_with_flags(db, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        let conn = Connection::open_with_flags(db, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
         let mut stmt = conn
             .prepare(
                 "SELECT role, content, tool_call_id, tool_calls, tool_name, token_count, \
@@ -2949,8 +2810,7 @@ mod tests {
         [i64; 6],
     ) {
         use rusqlite::{Connection, OpenFlags};
-        let conn =
-            Connection::open_with_flags(db, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        let conn = Connection::open_with_flags(db, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
         conn.query_row(
             "SELECT source, user_id, model, model_config, system_prompt, end_reason, title, \
              tool_call_count, input_tokens, output_tokens, cache_read_tokens, \
@@ -2965,14 +2825,7 @@ mod tests {
                     r.get(4)?,
                     r.get(5)?,
                     r.get(6)?,
-                    [
-                        r.get(7)?,
-                        r.get(8)?,
-                        r.get(9)?,
-                        r.get(10)?,
-                        r.get(11)?,
-                        r.get(12)?,
-                    ],
+                    [r.get(7)?, r.get(8)?, r.get(9)?, r.get(10)?, r.get(11)?, r.get(12)?],
                 ))
             },
         )
@@ -3044,7 +2897,8 @@ mod tests {
             let tc = "[{\"id\":\"c1\",\"type\":\"function\",\"function\":{\"name\":\"web_search\",\"arguments\":\"{\\\"q\\\":\\\"x\\\"}\"}}]";
             let rd = "[{\"type\":\"reasoning.summary\",\"summary\":\"sum\"},{\"type\":\"reasoning.encrypted_content\",\"encrypted_content\":\"ENC\"}]";
             let cri = "[{\"type\":\"reasoning\",\"id\":\"rs_a\",\"encrypted_content\":\"CBLOB\"}]";
-            let cmi = "[{\"type\":\"message\",\"phase\":\"final\",\"content\":[{\"type\":\"output_text\",\"text\":\"D\"}]}]";
+            let cmi =
+                "[{\"type\":\"message\",\"phase\":\"final\",\"content\":[{\"type\":\"output_text\",\"text\":\"D\"}]}]";
             conn.execute(
                 "INSERT INTO messages \
                  (session_id, role, content, tool_calls, timestamp, token_count, finish_reason, \
@@ -3106,9 +2960,8 @@ mod tests {
             rows.into_iter()
                 .map(|mut r| {
                     let canon = |s: &Option<String>| -> Option<String> {
-                        s.as_deref().and_then(|raw| {
-                            serde_json::from_str::<Value>(raw).ok().map(|v| v.to_string())
-                        })
+                        s.as_deref()
+                            .and_then(|raw| serde_json::from_str::<Value>(raw).ok().map(|v| v.to_string()))
                     };
                     if let Some(c) = canon(&r.tool_calls) {
                         r.tool_calls = Some(c);
@@ -3127,7 +2980,8 @@ mod tests {
                 .collect()
         };
         assert_eq!(
-            norm(src_rows), norm(dst_rows),
+            norm(src_rows),
+            norm(dst_rows),
             "message-row columns must round-trip losslessly (left=source, right=re-emitted)"
         );
         let dst_session = dump_hermes_session(&res.path, "src");
@@ -3143,8 +2997,7 @@ mod tests {
         // Hermes keeps tools, reasoning, system turns, and title — should round-trip cleanly.
         let s = sample_session(Harness::Hermes);
         let out = temp_dir();
-        let (_res, warnings) =
-            emit_verified(&s, Harness::Hermes, &out, &EmitOptions::default()).unwrap();
+        let (_res, warnings) = emit_verified(&s, Harness::Hermes, &out, &EmitOptions::default()).unwrap();
         assert!(
             warnings.is_empty(),
             "expected a clean round-trip for Hermes, got: {warnings:?}"
@@ -3158,7 +3011,7 @@ mod tests {
     /// records (mode / queue-operation / ai-title) carried verbatim.
     #[test]
     fn claude_complete_round_trip_is_lossless() {
-        use crate::harness::claude::{self, CARRIER_KEY, stream_str};
+        use crate::harness::claude::{self, stream_str, CARRIER_KEY};
         use crate::stream::{CollectSink, ParseOptions};
 
         let sid = "11111111-1111-4111-8111-111111111111";
@@ -3237,8 +3090,7 @@ mod tests {
                 .map(str::to_string)
                 .unwrap_or_else(|| v.get("type").and_then(Value::as_str).unwrap_or("?").to_string())
         };
-        let by_key: std::collections::HashMap<String, &Value> =
-            src_lines.iter().map(|v| (key_of(v), v)).collect();
+        let by_key: std::collections::HashMap<String, &Value> = src_lines.iter().map(|v| (key_of(v), v)).collect();
 
         // Carriers must come back byte-equal (same JSON value) to their source record.
         let carrier_types: Vec<&str> = session
@@ -3259,7 +3111,9 @@ mod tests {
         // For every emitted record, find its source and assert key-set + per-value parity.
         for out_rec in &emitted {
             let k = key_of(out_rec);
-            let src = by_key.get(&k).unwrap_or_else(|| panic!("no source for emitted record {k}"));
+            let src = by_key
+                .get(&k)
+                .unwrap_or_else(|| panic!("no source for emitted record {k}"));
             let src_obj = src.as_object().unwrap();
             let out_obj = out_rec.as_object().unwrap();
 

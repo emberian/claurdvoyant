@@ -73,12 +73,7 @@ impl Adapter for Roo {
         crate::stream::collect(self, r)
     }
 
-    fn stream(
-        &self,
-        r: &SessionRef,
-        opts: &ParseOptions,
-        sink: &mut dyn MessageSink,
-    ) -> Result<Session> {
+    fn stream(&self, r: &SessionRef, opts: &ParseOptions, sink: &mut dyn MessageSink) -> Result<Session> {
         stream_task_dir(&r.path, &r.id, Harness::Roo, opts, sink)
     }
 
@@ -99,11 +94,7 @@ impl Adapter for Roo {
 /// `out_dir/tasks/<taskId>/api_conversation_history.json` (+ a `task_metadata.json` cwd hint), the
 /// faithful inverse of this module's parser. Honors `opts.new_cwd` (fallback `session.cwd`) and
 /// `opts.new_id` (the taskId; fallback a generated millis-epoch / uuid id).
-pub fn emit(
-    session: &Session,
-    out_dir: &Path,
-    opts: &crate::emit::EmitOptions,
-) -> Result<crate::harness::EmitResult> {
+pub fn emit(session: &Session, out_dir: &Path, opts: &crate::emit::EmitOptions) -> Result<crate::harness::EmitResult> {
     let new_id = opts.new_id.clone().unwrap_or_else(|| generate_task_id(session));
     let cwd = opts.new_cwd.clone().or_else(|| session.cwd.clone());
     let cwd_str = cwd
@@ -112,8 +103,7 @@ pub fn emit(
         .unwrap_or_default();
 
     let task_dir = out_dir.join("tasks").join(&new_id);
-    fs::create_dir_all(&task_dir)
-        .with_context(|| format!("creating {}", task_dir.display()))?;
+    fs::create_dir_all(&task_dir).with_context(|| format!("creating {}", task_dir.display()))?;
 
     // Build the Anthropic message array.
     let mut messages: Vec<Value> = Vec::new();
@@ -146,11 +136,8 @@ pub fn emit(
     }
 
     let history_path = task_dir.join("api_conversation_history.json");
-    fs::write(
-        &history_path,
-        serde_json::to_string_pretty(&Value::Array(messages))?,
-    )
-    .with_context(|| format!("writing {}", history_path.display()))?;
+    fs::write(&history_path, serde_json::to_string_pretty(&Value::Array(messages))?)
+        .with_context(|| format!("writing {}", history_path.display()))?;
 
     // task_metadata.json — a cwd hint sidecar (the parser falls back to it when the first user turn
     // lacked an <environment_details> cwd line).
@@ -191,12 +178,7 @@ fn generate_task_id(session: &crate::ir::Session) -> String {
 /// Map an IR user message's blocks → Anthropic content blocks. When `inject_env` is set, prepend a
 /// `<task>` + `<environment_details>` text block (Roo's native cwd/title carrier) if the message
 /// doesn't already start with one.
-fn roo_user_blocks(
-    content: &[Block],
-    inject_env: bool,
-    title: Option<&str>,
-    cwd_str: &str,
-) -> Vec<Value> {
+fn roo_user_blocks(content: &[Block], inject_env: bool, title: Option<&str>, cwd_str: &str) -> Vec<Value> {
     let mut out = Vec::new();
 
     if inject_env && (title.is_some() || !cwd_str.is_empty()) {
@@ -337,8 +319,7 @@ mod tests {
 
     fn fixture(name: &str) -> String {
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/roo/");
-        std::fs::read_to_string(format!("{path}{name}"))
-            .unwrap_or_else(|e| panic!("reading fixture {name}: {e}"))
+        std::fs::read_to_string(format!("{path}{name}")).unwrap_or_else(|e| panic!("reading fixture {name}: {e}"))
     }
 
     #[test]
@@ -378,9 +359,7 @@ mod tests {
                 encrypted: None,
                 redacted: false,
             },
-            Block::Text {
-                text: "On it.".into(),
-            },
+            Block::Text { text: "On it.".into() },
             Block::ToolUse {
                 id: "toolu_42".into(),
                 name: "write_to_file".into(),
@@ -414,15 +393,10 @@ mod tests {
 
         // ── emit to a unique temp dir (no tempfile crate) ──
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let out_dir = std::env::temp_dir().join(format!(
-            "cv-roo-emit-{}-{}",
-            std::process::id(),
-            n
-        ));
+        let out_dir = std::env::temp_dir().join(format!("cv-roo-emit-{}-{}", std::process::id(), n));
         let _ = fs::remove_dir_all(&out_dir);
 
-        let result = emit(&session, &out_dir, &crate::emit::EmitOptions::default())
-            .expect("emit roo session");
+        let result = emit(&session, &out_dir, &crate::emit::EmitOptions::default()).expect("emit roo session");
 
         // emit returns the task DIR (tasks/<taskId>/), holding api_conversation_history.json.
         let task_dir = result.path.as_path();
@@ -433,8 +407,7 @@ mod tests {
         assert!(task_dir.join("api_conversation_history.json").exists());
 
         // ── re-parse with this adapter and assert structure survives ──
-        let reparsed = parse_task_dir(task_dir, &result.new_id, Harness::Roo)
-            .expect("re-parse emitted roo session");
+        let reparsed = parse_task_dir(task_dir, &result.new_id, Harness::Roo).expect("re-parse emitted roo session");
 
         assert_eq!(reparsed.harness, Harness::Roo);
         assert_eq!(reparsed.messages.len(), 3);
@@ -444,10 +417,7 @@ mod tests {
         assert_eq!(reparsed.messages[2].role, Role::Tool);
 
         // cwd + title recovered from the injected <environment_details>/<task> wrappers.
-        assert_eq!(
-            reparsed.cwd.as_deref(),
-            Some(std::path::Path::new("/home/dev/app"))
-        );
+        assert_eq!(reparsed.cwd.as_deref(), Some(std::path::Path::new("/home/dev/app")));
         assert_eq!(reparsed.title.as_deref(), Some("Add a unit test"));
 
         // Assistant blocks survived: thinking (with signature), text, tool_use.

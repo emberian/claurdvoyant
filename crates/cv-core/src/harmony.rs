@@ -29,9 +29,7 @@ use crate::ir::Block;
 
 /// True if `text` looks like it contains Harmony channel markers worth decoding.
 pub fn looks_like_harmony(text: &str) -> bool {
-    text.contains("<|channel|>")
-        || text.contains("<|message|>")
-        || text.contains("<|start|>assistant")
+    text.contains("<|channel|>") || text.contains("<|message|>") || text.contains("<|start|>assistant")
 }
 
 // Harmony control tokens.
@@ -348,8 +346,7 @@ mod tests {
 
     #[test]
     fn tool_call_with_non_json_body_keeps_raw_string() {
-        let text =
-            "<|channel|>commentary to=functions.run <|message|>not json here<|call|>";
+        let text = "<|channel|>commentary to=functions.run <|message|>not json here<|call|>";
         let blocks = decode_content(text);
         assert_eq!(blocks.len(), 1);
         match &blocks[0] {

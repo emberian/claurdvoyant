@@ -24,10 +24,10 @@
 //! Behind the `sqlite` feature (default-on); no-op fallbacks keep the scan path working without it.
 
 use crate::ir::{Harness, SessionRef};
-#[cfg(feature = "sqlite")]
-use std::path::{Path, PathBuf};
 #[cfg(not(feature = "sqlite"))]
 use std::path::Path;
+#[cfg(feature = "sqlite")]
+use std::path::{Path, PathBuf};
 
 #[cfg(feature = "sqlite")]
 mod imp {
@@ -126,17 +126,12 @@ mod imp {
     }
 
     /// The SELECT column list [`row_to_ref`] decodes — keep the two in lockstep.
-    const REF_COLUMNS: &str =
-        "harness,id,path,cwd,title,created_at,updated_at,message_count,created_ns,updated_ns";
+    const REF_COLUMNS: &str = "harness,id,path,cwd,title,created_at,updated_at,message_count,created_ns,updated_ns";
 
     /// A timestamp from the nanosecond column at `ns_idx`, falling back to the second-precision
     /// column at `s_idx` (rows written before the `_ns` migration, or dates outside the i64-ns
     /// range — ±~292 years of 1970, where `timestamp_nanos_opt` stores NULL).
-    fn ts_col(
-        row: &Row,
-        ns_idx: usize,
-        s_idx: usize,
-    ) -> rusqlite::Result<Option<chrono::DateTime<chrono::Utc>>> {
+    fn ts_col(row: &Row, ns_idx: usize, s_idx: usize) -> rusqlite::Result<Option<chrono::DateTime<chrono::Utc>>> {
         if let Some(ns) = row.get::<_, Option<i64>>(ns_idx)? {
             return Ok(Some(chrono::DateTime::from_timestamp_nanos(ns)));
         }
@@ -209,8 +204,7 @@ mod imp {
         let _ = tx.execute("DELETE FROM watched WHERE harness=?1", params![h.as_str()]);
         insert_refs(&tx, refs);
         {
-            let Ok(mut stmt) =
-                tx.prepare("INSERT OR REPLACE INTO watched(harness,path,mtime_ns) VALUES(?1,?2,?3)")
+            let Ok(mut stmt) = tx.prepare("INSERT OR REPLACE INTO watched(harness,path,mtime_ns) VALUES(?1,?2,?3)")
             else {
                 return;
             };
@@ -227,19 +221,12 @@ mod imp {
     /// session's backing file itself (their "session file" is a database that grows in place, which
     /// directory mtimes never reflect). Paths that can't be stat'd are skipped: if they reappear,
     /// their parent's mtime changes. Recently-modified paths record `0` (see [`WATCH_FUDGE`]).
-    pub(crate) fn watches_for(
-        h: Harness,
-        root: Option<&Path>,
-        refs: &[SessionRef],
-    ) -> Vec<(PathBuf, i64)> {
+    pub(crate) fn watches_for(h: Harness, root: Option<&Path>, refs: &[SessionRef]) -> Vec<(PathBuf, i64)> {
         let mut paths: BTreeSet<PathBuf> = BTreeSet::new();
         if let Some(root) = root {
             paths.insert(root.to_path_buf());
         }
-        let file_watch = matches!(
-            h,
-            Harness::Cursor | Harness::Goose | Harness::Hermes | Harness::Zed
-        );
+        let file_watch = matches!(h, Harness::Cursor | Harness::Goose | Harness::Hermes | Harness::Zed);
         for r in refs {
             if file_watch {
                 paths.insert(r.path.clone());
@@ -303,9 +290,7 @@ mod imp {
         // 1. watched dirs + db files.
         let mut watched_harnesses: HashSet<Harness> = HashSet::new();
         {
-            let mut stmt = conn
-                .prepare("SELECT harness, path, mtime_ns FROM watched")
-                .ok()?;
+            let mut stmt = conn.prepare("SELECT harness, path, mtime_ns FROM watched").ok()?;
             let rows = stmt
                 .query_map([], |r| {
                     Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?))
@@ -388,11 +373,9 @@ mod imp {
     /// Seconds-since-epoch of the last completed full discovery, if any. Absent = cold catalog.
     pub(crate) fn last_full_sync() -> Option<i64> {
         let conn = open()?;
-        conn.query_row(
-            "SELECT value FROM catalog_meta WHERE key='last_full_sync'",
-            [],
-            |r| r.get::<_, String>(0),
-        )
+        conn.query_row("SELECT value FROM catalog_meta WHERE key='last_full_sync'", [], |r| {
+            r.get::<_, String>(0)
+        })
         .ok()?
         .parse()
         .ok()
@@ -428,12 +411,11 @@ mod imp {
 }
 
 #[cfg(feature = "sqlite")]
-pub use imp::{lookup, sync};
-#[cfg(feature = "sqlite")]
 pub(crate) use imp::{
-    all_sessions, last_full_sync, open_db, probe_stale, replace_harness, stamp_full_sync,
-    watches_for,
+    all_sessions, last_full_sync, open_db, probe_stale, replace_harness, stamp_full_sync, watches_for,
 };
+#[cfg(feature = "sqlite")]
+pub use imp::{lookup, sync};
 
 /// No-op fallbacks when sqlite is disabled — `find`/`sessions` simply always take the scan path.
 #[cfg(not(feature = "sqlite"))]
@@ -445,11 +427,7 @@ pub fn lookup(_id: &str, _harness: Option<Harness>) -> Vec<SessionRef> {
 #[cfg(not(feature = "sqlite"))]
 pub(crate) fn replace_harness(_h: Harness, _refs: &[SessionRef], _watches: &[(std::path::PathBuf, i64)]) {}
 #[cfg(not(feature = "sqlite"))]
-pub(crate) fn watches_for(
-    _h: Harness,
-    _root: Option<&Path>,
-    _refs: &[SessionRef],
-) -> Vec<(std::path::PathBuf, i64)> {
+pub(crate) fn watches_for(_h: Harness, _root: Option<&Path>, _refs: &[SessionRef]) -> Vec<(std::path::PathBuf, i64)> {
     Vec::new()
 }
 #[cfg(not(feature = "sqlite"))]

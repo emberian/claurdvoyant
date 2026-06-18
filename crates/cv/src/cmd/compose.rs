@@ -33,7 +33,11 @@ pub(crate) fn cmd_prune(
     if let Some(tool_use_id) = retrieve {
         let sidecar = dir.join(format!("{stem}.flat.jsonl"));
         if !sidecar.exists() {
-            bail!("no prune sidecar at {} — is {} a pruned session?", sidecar.display(), short_id(&r.id));
+            bail!(
+                "no prune sidecar at {} — is {} a pruned session?",
+                sidecar.display(),
+                short_id(&r.id)
+            );
         }
         let value = cv_core::prune::retrieve(&sidecar, &tool_use_id)?;
         // Print raw text verbatim; pretty-print structured payloads.
@@ -45,10 +49,20 @@ pub(crate) fn cmd_prune(
     }
 
     if r.harness != Harness::Claude {
-        bail!("cv prune currently supports Claude Code sessions only (got {})", r.harness);
+        bail!(
+            "cv prune currently supports Claude Code sessions only (got {})",
+            r.harness
+        );
     }
 
-    let opts = cv_core::prune::PruneOptions { min_size, keep_last, drop, new_id: to, copy_resources, dry_run };
+    let opts = cv_core::prune::PruneOptions {
+        min_size,
+        keep_last,
+        drop,
+        new_id: to,
+        copy_resources,
+        dry_run,
+    };
     let res = cv_core::prune::prune_session(&r.path, &opts)?;
 
     let pct = if res.original_size > 0 {
@@ -70,7 +84,11 @@ pub(crate) fn cmd_prune(
     if !dry_run {
         eprintln!("  new session: {}", res.new_path.display());
         if let Some(sc) = &res.sidecar_path {
-            eprintln!("  sidecar:     {} (retrieve: cv prune {} --retrieve <tool_use_id>)", sc.display(), short_id(&res.new_id));
+            eprintln!(
+                "  sidecar:     {} (retrieve: cv prune {} --retrieve <tool_use_id>)",
+                sc.display(),
+                short_id(&res.new_id)
+            );
         }
         if let Some(rc) = &res.copied_resources {
             eprintln!("  resources:   copied subagents/workflows → {}", rc.display());
@@ -108,7 +126,11 @@ struct SpliceSpec {
 /// Parse `<id>:<start>-<end>` | `<id>:<start>-` | `<id>` into a [`SpliceSpec`].
 fn parse_splice_spec(spec: &str) -> Result<SpliceSpec> {
     match spec.split_once(':') {
-        None => Ok(SpliceSpec { id: spec.to_string(), start: 0, end: None }),
+        None => Ok(SpliceSpec {
+            id: spec.to_string(),
+            start: 0,
+            end: None,
+        }),
         Some((id, range)) => {
             let (s, e) = range
                 .split_once('-')
@@ -126,7 +148,11 @@ fn parse_splice_spec(spec: &str) -> Result<SpliceSpec> {
                         .with_context(|| format!("bad spec {spec:?}: end must be a number"))?,
                 )
             };
-            Ok(SpliceSpec { id: id.to_string(), start, end })
+            Ok(SpliceSpec {
+                id: id.to_string(),
+                start,
+                end,
+            })
         }
     }
 }
@@ -147,15 +173,18 @@ pub(crate) fn cmd_splice(
     // borrow them. We pair each parsed session with the (start, end) it'll select.
     let mut owned: Vec<(Session, usize, Option<usize>)> = Vec::with_capacity(parsed.len());
     for sp in &parsed {
-        let (r, adapter) =
-            cv_core::find(&sp.id, None)?.with_context(|| format!("no session matching {:?}", sp.id))?;
+        let (r, adapter) = cv_core::find(&sp.id, None)?.with_context(|| format!("no session matching {:?}", sp.id))?;
         let session = adapter.parse(&r)?;
         owned.push((session, sp.start, sp.end));
     }
 
     let spans: Vec<cv_core::loom::Span<'_>> = owned
         .iter()
-        .map(|(s, start, end)| cv_core::loom::Span { source: s, start: *start, end: *end })
+        .map(|(s, start, end)| cv_core::loom::Span {
+            source: s,
+            start: *start,
+            end: *end,
+        })
         .collect();
 
     // Target harness: --to, else the first spec's source harness.
@@ -225,12 +254,18 @@ fn finish_composed(
         }
         let text = cv_llm::generate(
             &session,
-            &cv_llm::GenerateOptions { model: gen_model, ..Default::default() },
+            &cv_llm::GenerateOptions {
+                model: gen_model,
+                ..Default::default()
+            },
         )?;
         let mut m = Message::new(Role::Assistant);
         m.content.push(Block::Text { text: text.into() });
         session.messages.push(m);
-        eprintln!("  ↳ grew the branch by 1 generated turn ({} msg total)", session.messages.len());
+        eprintln!(
+            "  ↳ grew the branch by 1 generated turn ({} msg total)",
+            session.messages.len()
+        );
     }
 
     // Emit path: an explicit --to or an --out directory means "materialize this for a harness".
@@ -238,7 +273,15 @@ fn finish_composed(
         if let Some(dir) = &cwd {
             session.cwd = Some(dir.clone());
         }
-        return emit_session(&session, to_h, out, EmitOptions { new_cwd: cwd, new_id: None });
+        return emit_session(
+            &session,
+            to_h,
+            out,
+            EmitOptions {
+                new_cwd: cwd,
+                new_id: None,
+            },
+        );
     }
 
     // Otherwise: print a summary, and with --export, dump the composed session to stdout.
@@ -254,7 +297,10 @@ fn finish_composed(
                 println!(
                     "  ↳ {} {}[{}..{}]",
                     p.get("harness").and_then(|v| v.as_str()).unwrap_or("?"),
-                    p.get("source_id").and_then(|v| v.as_str()).map(short_id).unwrap_or_default(),
+                    p.get("source_id")
+                        .and_then(|v| v.as_str())
+                        .map(short_id)
+                        .unwrap_or_default(),
                     p.get("start").and_then(|v| v.as_u64()).unwrap_or(0),
                     p.get("end").and_then(|v| v.as_u64()).unwrap_or(0),
                 );
@@ -283,8 +329,7 @@ pub(crate) fn cmd_distill(
     append: bool,
 ) -> Result<()> {
     let want = parse_harness(&harness)?;
-    let (r, adapter) =
-        cv_core::find(id, want)?.with_context(|| format!("no session matching {id:?}"))?;
+    let (r, adapter) = cv_core::find(id, want)?.with_context(|| format!("no session matching {id:?}"))?;
     let session = adapter.parse(&r)?;
 
     match cv_llm::available_provider() {
@@ -326,8 +371,7 @@ pub(crate) fn cmd_distill(
                 }
                 eprintln!("✦ appended distillation → {}", path.display());
             } else {
-                fs::write(&path, &digest)
-                    .with_context(|| format!("writing {}", path.display()))?;
+                fs::write(&path, &digest).with_context(|| format!("writing {}", path.display()))?;
                 eprintln!("✦ wrote distillation → {}", path.display());
             }
         }
@@ -370,7 +414,10 @@ pub(crate) fn cmd_dataset(
         None => redact.then(cv_core::redact::RedactOptions::default),
     };
     // Pre-resolve any `text:` predicates against the full-text index (one search per needle).
-    let text_sets = query.as_ref().map(crate::cmd::query::TextSets::resolve).unwrap_or_else(crate::cmd::query::TextSets::empty);
+    let text_sets = query
+        .as_ref()
+        .map(crate::cmd::query::TextSets::resolve)
+        .unwrap_or_else(crate::cmd::query::TextSets::empty);
     let mut writer: Box<dyn Write> = match &out {
         Some(p) => Box::new(std::io::BufWriter::new(fs::File::create(p)?)),
         None => Box::new(std::io::BufWriter::new(std::io::stdout())),
@@ -379,7 +426,17 @@ pub(crate) fn cmd_dataset(
     // Stream the corpus one session at a time (parse -> emit -> drop) so memory stays bounded.
     let mut emitted = 0usize;
     let mut skipped = 0usize;
-    let mut ctx = EmitCtx { writer: writer.as_mut(), query: query.as_ref(), text_sets: &text_sets, fmt, redact_opts: redact_opts.as_ref(), min_messages, limit, emitted: &mut emitted, skipped: &mut skipped };
+    let mut ctx = EmitCtx {
+        writer: writer.as_mut(),
+        query: query.as_ref(),
+        text_sets: &text_sets,
+        fmt,
+        redact_opts: redact_opts.as_ref(),
+        min_messages,
+        limit,
+        emitted: &mut emitted,
+        skipped: &mut skipped,
+    };
 
     'outer: for r in cv_core::discover_all() {
         if let Some(w) = want {
@@ -404,10 +461,7 @@ pub(crate) fn cmd_dataset(
         }
     }
     writer.flush()?;
-    let dest = out
-        .as_ref()
-        .map(|p| format!(" to {}", p.display()))
-        .unwrap_or_default();
+    let dest = out.as_ref().map(|p| format!(" to {}", p.display())).unwrap_or_default();
     let forest = if subagents { " (incl. sub-agent forest)" } else { "" };
     eprintln!("✦ {format}: wrote {emitted} record(s){dest}{forest} ({skipped} skipped)");
     Ok(())

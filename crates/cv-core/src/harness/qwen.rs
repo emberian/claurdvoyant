@@ -76,12 +76,7 @@ impl Adapter for Qwen {
         crate::stream::collect(self, r)
     }
 
-    fn stream(
-        &self,
-        r: &SessionRef,
-        opts: &ParseOptions,
-        sink: &mut dyn MessageSink,
-    ) -> Result<Session> {
+    fn stream(&self, r: &SessionRef, opts: &ParseOptions, sink: &mut dyn MessageSink) -> Result<Session> {
         // The on-disk format is identical to Gemini's, so the streaming machinery (mmap +
         // RawValue for legacy whole-file JSON, line streaming for modern JSONL recordings) is
         // shared; it re-tags the resulting session as Qwen — the same retag `parse_qwen_str`
@@ -107,11 +102,7 @@ fn is_session_file(path: &Path) -> bool {
     let in_chats = path
         .components()
         .any(|c| c.as_os_str() == std::ffi::OsStr::new("chats"));
-    in_chats
-        && matches!(
-            path.extension().and_then(|e| e.to_str()),
-            Some("json") | Some("jsonl")
-        )
+    in_chats && matches!(path.extension().and_then(|e| e.to_str()), Some("json") | Some("jsonl"))
 }
 
 #[cfg(test)]
@@ -132,11 +123,7 @@ mod tests {
 
     fn fixture(name: &str) -> String {
         // Reuse the Gemini fixtures — Qwen shares the on-disk format.
-        let path = format!(
-            "{}/tests/fixtures/gemini/{}",
-            env!("CARGO_MANIFEST_DIR"),
-            name
-        );
+        let path = format!("{}/tests/fixtures/gemini/{}", env!("CARGO_MANIFEST_DIR"), name);
         fs::read_to_string(&path).unwrap_or_else(|e| panic!("reading {path}: {e}"))
     }
 

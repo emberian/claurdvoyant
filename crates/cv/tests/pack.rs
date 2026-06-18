@@ -142,7 +142,11 @@ fn pack_corpus(w: &World) {
     w.write_session(
         "gammasess",
         &[
-            user_line("g1", "2026-04-01T09:00:00Z", "the parser chokes on empty caching headers"),
+            user_line(
+                "g1",
+                "2026-04-01T09:00:00Z",
+                "the parser chokes on empty caching headers",
+            ),
             assistant_line(
                 "g2",
                 "2026-04-01T09:05:00Z",
@@ -167,7 +171,10 @@ fn pack_md_no_index_fallback_and_content() {
     let (out, err) = w.cv_ok(&["pack", "wombat caching layer"]);
     assert!(err.contains("no index yet"), "want live-scan note, stderr:\n{err}");
     assert!(err.contains("live scan"), "{err}");
-    assert!(err.contains("no embeddings store"), "honest FTS-only note expected:\n{err}");
+    assert!(
+        err.contains("no embeddings store"),
+        "honest FTS-only note expected:\n{err}"
+    );
 
     // Bundle framing.
     assert!(out.contains("# Context pack: wombat caching layer"), "{out}");
@@ -189,7 +196,10 @@ fn pack_md_no_index_fallback_and_content() {
     // A pointer back into the full transcript.
     assert!(out.contains("cv show wombatse"), "{out}");
     // The irrelevant session is NOT packed.
-    assert!(!out.contains("quokkas"), "irrelevant session leaked into the pack:\n{out}");
+    assert!(
+        !out.contains("quokkas"),
+        "irrelevant session leaked into the pack:\n{out}"
+    );
 }
 
 #[test]
@@ -239,7 +249,10 @@ fn pack_prompt_differs_from_md() {
     let (prompt, _) = w.cv_ok(&["pack", "wombat caching layer", "--format", "prompt"]);
 
     // Second-person system-prompt shape.
-    assert!(prompt.contains("You are picking up work on: wombat caching layer"), "{prompt}");
+    assert!(
+        prompt.contains("You are picking up work on: wombat caching layer"),
+        "{prompt}"
+    );
     assert!(prompt.contains("Prior context from earlier sessions"), "{prompt}");
     assert!(prompt.contains("You touched:"), "{prompt}");
     assert!(prompt.contains("You ran:"), "{prompt}");
@@ -298,7 +311,10 @@ fn pack_session_emits_resumable_claude_session_that_round_trips() {
     assert_eq!(parsed.messages.len(), 2, "user framing + assistant ack");
     let user_text = parsed.messages[0].text().unwrap_or_default();
     assert!(user_text.contains("wombat caching layer"), "{user_text}");
-    assert!(user_text.contains("# Context pack"), "bundle must ride in the user turn");
+    assert!(
+        user_text.contains("# Context pack"),
+        "bundle must ride in the user turn"
+    );
     assert!(user_text.contains("src/cache.rs"), "{user_text}");
     let ack = parsed.messages[1].text().unwrap_or_default();
     assert!(ack.contains("Ready to continue"), "{ack}");

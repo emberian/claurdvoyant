@@ -115,12 +115,7 @@ impl Adapter for OpenCode {
         crate::stream::collect(self, r)
     }
 
-    fn stream(
-        &self,
-        r: &SessionRef,
-        _opts: &ParseOptions,
-        sink: &mut dyn MessageSink,
-    ) -> Result<Session> {
+    fn stream(&self, r: &SessionRef, _opts: &ParseOptions, sink: &mut dyn MessageSink) -> Result<Session> {
         // OpenCode stores a session as a *directory* of per-message JSON files (plus per-message
         // part files). The old `parse` slurped every message body into a `Vec` to sort it — for a
         // large session that resident-spikes the whole transcript. Here we instead:
@@ -130,18 +125,14 @@ impl Adapter for OpenCode {
         //   3. re-read each file in order, build its IR message(s), emit to `sink`, and drop it
         //      before touching the next.
         // `load_parts` already loads one message's parts at a time, so peak stays O(one message).
-        let text = fs::read_to_string(&r.path)
-            .with_context(|| format!("reading {}", r.path.display()))?;
+        let text = fs::read_to_string(&r.path).with_context(|| format!("reading {}", r.path.display()))?;
         let meta: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
 
         let mut s = Session {
             id: r.id.clone(),
             harness: Harness::OpenCode,
             cwd: meta.get("directory").and_then(Value::as_str).map(PathBuf::from),
-            title: meta
-                .get("title")
-                .and_then(Value::as_str)
-                .map(str::to_string),
+            title: meta.get("title").and_then(Value::as_str).map(str::to_string),
             created_at: meta.pointer("/time/created").and_then(super::ts_from_value),
             updated_at: meta.pointer("/time/updated").and_then(super::ts_from_value),
             model: None,
@@ -160,8 +151,7 @@ impl Adapter for OpenCode {
                     let path = e.path();
                     if let Ok(t) = fs::read_to_string(&path) {
                         if let Ok(v) = serde_json::from_str::<Value>(&t) {
-                            let when =
-                                v.pointer("/time/created").and_then(Value::as_i64).unwrap_or(0);
+                            let when = v.pointer("/time/created").and_then(Value::as_i64).unwrap_or(0);
                             order.push((when, path));
                         }
                     }
@@ -175,7 +165,9 @@ impl Adapter for OpenCode {
         // Re-read one message file at a time, emit, then drop before the next.
         for (_, path) in &order {
             let Ok(t) = fs::read_to_string(path) else { continue };
-            let Ok(mv) = serde_json::from_str::<Value>(&t) else { continue };
+            let Ok(mv) = serde_json::from_str::<Value>(&t) else {
+                continue;
+            };
             let msg_id = mv.get("id").and_then(Value::as_str).unwrap_or("");
             let parts = self.load_parts(msg_id);
             for built in build_messages(&mv, &parts) {
@@ -211,10 +203,7 @@ fn count_turns(dir: &std::path::Path) -> usize {
             let Ok(v) = serde_json::from_str::<Value>(&text) else {
                 return false;
             };
-            matches!(
-                v.get("role").and_then(Value::as_str),
-                Some("user") | Some("assistant")
-            )
+            matches!(v.get("role").and_then(Value::as_str), Some("user") | Some("assistant"))
         })
         .count()
 }
@@ -272,7 +261,9 @@ fn build_messages(mv: &Value, parts: &[Value]) -> Vec<Message> {
             "text" => {
                 if let Some(t) = part.get("text").and_then(Value::as_str) {
                     if !t.is_empty() {
-                        m.content.push(Block::Text { text: t.to_string().into() });
+                        m.content.push(Block::Text {
+                            text: t.to_string().into(),
+                        });
                     }
                 }
             }
@@ -390,16 +381,14 @@ fn tool_blocks(part: &Value) -> (Block, Option<Block>) {
 
     // A completed tool carries `output`; an error tool carries `error`.
     let result = match status {
-        "completed" | "running" | "pending" => {
-            part.pointer("/state/output").map(|out| Block::ToolResult {
-                tool_use_id: call_id.clone(),
-                content: coerce_text(out).into(),
-                is_error: false,
-                tool_name: tool_name.clone(),
-                status: status_field.clone(),
-                details: None,
-            })
-        }
+        "completed" | "running" | "pending" => part.pointer("/state/output").map(|out| Block::ToolResult {
+            tool_use_id: call_id.clone(),
+            content: coerce_text(out).into(),
+            is_error: false,
+            tool_name: tool_name.clone(),
+            status: status_field.clone(),
+            details: None,
+        }),
         "error" => {
             let content = part
                 .pointer("/state/error")
@@ -457,17 +446,17 @@ fn file_block(part: &Value) -> Block {
 /// Preserve message-level fields the IR has no home for, verbatim, in `Message.extra`.
 fn collect_message_extra(mv: &Value, extra: &mut Map<String, Value>) {
     for key in [
-        "agent",       // which agent ran this turn (Sisyphus, build, compaction, …)
-        "mode",        // deprecated alias of agent; kept for old records
-        "providerID",  // amazon-bedrock, anthropic, …
-        "cost",        // USD cost of the turn
-        "finish",      // finish reason: stop | tool-calls | length | …
-        "error",       // assistant error object (aborted / overflow / api error)
-        "variant",     // model variant
-        "structured",  // structured-output result
-        "format",      // requested output format
-        "system",      // per-message system prompt (user records)
-        "tools",       // enabled-tools map (user records)
+        "agent",      // which agent ran this turn (Sisyphus, build, compaction, …)
+        "mode",       // deprecated alias of agent; kept for old records
+        "providerID", // amazon-bedrock, anthropic, …
+        "cost",       // USD cost of the turn
+        "finish",     // finish reason: stop | tool-calls | length | …
+        "error",      // assistant error object (aborted / overflow / api error)
+        "variant",    // model variant
+        "structured", // structured-output result
+        "format",     // requested output format
+        "system",     // per-message system prompt (user records)
+        "tools",      // enabled-tools map (user records)
     ] {
         if let Some(v) = mv.get(key) {
             if !v.is_null() {
@@ -585,7 +574,14 @@ mod tests {
         // tool result became its own Tool message
         assert_eq!(out[1].role, Role::Tool);
         match &out[1].content[0] {
-            Block::ToolResult { content, is_error, tool_use_id, tool_name, status, .. } => {
+            Block::ToolResult {
+                content,
+                is_error,
+                tool_use_id,
+                tool_name,
+                status,
+                ..
+            } => {
                 assert_eq!(content, "a\nb");
                 assert!(!is_error);
                 assert_eq!(tool_use_id, "c1");
@@ -598,8 +594,7 @@ mod tests {
 
     #[test]
     fn tool_error_state_marks_is_error() {
-        let mv: Value =
-            serde_json::from_str(r#"{"id":"m","role":"assistant","time":{"created":1}}"#).unwrap();
+        let mv: Value = serde_json::from_str(r#"{"id":"m","role":"assistant","time":{"created":1}}"#).unwrap();
         let p = parts(&[
             r#"{"type":"tool","callID":"c","tool":"edit","state":{"status":"error","input":{},"error":"oldString not found","time":{"start":1,"end":2}}}"#,
         ]);
@@ -613,8 +608,7 @@ mod tests {
 
     #[test]
     fn file_part_image_vs_reference() {
-        let mv: Value =
-            serde_json::from_str(r#"{"id":"m","role":"user","time":{"created":1}}"#).unwrap();
+        let mv: Value = serde_json::from_str(r#"{"id":"m","role":"user","time":{"created":1}}"#).unwrap();
         let p = parts(&[
             r#"{"type":"file","mime":"image/png","url":"file:///x.png","filename":"x.png"}"#,
             r#"{"type":"file","mime":"text/plain","url":"file:///Makefile","filename":"Makefile","source":{"type":"file","path":"Makefile"}}"#,
@@ -627,13 +621,14 @@ mod tests {
         // text file -> File reference, NOT an image
         assert!(matches!(&m.content[1], Block::File { path, .. } if path.as_deref()==Some("Makefile")));
         // directory -> File reference, NOT an image
-        assert!(matches!(&m.content[2], Block::File { source, .. } if source.as_deref().unwrap_or("").contains("tools/")));
+        assert!(
+            matches!(&m.content[2], Block::File { source, .. } if source.as_deref().unwrap_or("").contains("tools/"))
+        );
     }
 
     #[test]
     fn agent_subtask_patch_snapshot_steps_preserved() {
-        let mv: Value =
-            serde_json::from_str(r#"{"id":"m","role":"assistant","time":{"created":1}}"#).unwrap();
+        let mv: Value = serde_json::from_str(r#"{"id":"m","role":"assistant","time":{"created":1}}"#).unwrap();
         let p = parts(&[
             r#"{"type":"agent","name":"oracle","source":{"value":"@oracle","start":0,"end":7}}"#,
             r#"{"type":"subtask","prompt":"do the thing","description":"d","agent":"build"}"#,
@@ -647,18 +642,48 @@ mod tests {
         ]);
         let out = build_messages(&mv, &p);
         let m = &out[0];
-        assert_eq!(m.extra.get("patches").and_then(|v| v.as_array()).map(|a| a.len()), Some(1));
-        assert_eq!(m.extra.get("snapshots").and_then(|v| v.as_array()).map(|a| a.len()), Some(1));
-        assert_eq!(m.extra.get("steps").and_then(|v| v.as_array()).map(|a| a.len()), Some(2));
-        assert_eq!(m.extra.get("retries").and_then(|v| v.as_array()).map(|a| a.len()), Some(1));
-        assert_eq!(m.extra.get("compactions").and_then(|v| v.as_array()).map(|a| a.len()), Some(1));
-        assert_eq!(m.extra.get("agent_refs").and_then(|v| v.as_array()).map(|a| a.len()), Some(1));
-        assert_eq!(m.extra.get("subtasks").and_then(|v| v.as_array()).map(|a| a.len()), Some(1));
+        assert_eq!(
+            m.extra.get("patches").and_then(|v| v.as_array()).map(|a| a.len()),
+            Some(1)
+        );
+        assert_eq!(
+            m.extra.get("snapshots").and_then(|v| v.as_array()).map(|a| a.len()),
+            Some(1)
+        );
+        assert_eq!(
+            m.extra.get("steps").and_then(|v| v.as_array()).map(|a| a.len()),
+            Some(2)
+        );
+        assert_eq!(
+            m.extra.get("retries").and_then(|v| v.as_array()).map(|a| a.len()),
+            Some(1)
+        );
+        assert_eq!(
+            m.extra.get("compactions").and_then(|v| v.as_array()).map(|a| a.len()),
+            Some(1)
+        );
+        assert_eq!(
+            m.extra.get("agent_refs").and_then(|v| v.as_array()).map(|a| a.len()),
+            Some(1)
+        );
+        assert_eq!(
+            m.extra.get("subtasks").and_then(|v| v.as_array()).map(|a| a.len()),
+            Some(1)
+        );
         // unknown part type is never dropped
-        assert_eq!(m.extra.get("unknown_parts").and_then(|v| v.as_array()).map(|a| a.len()), Some(1));
+        assert_eq!(
+            m.extra.get("unknown_parts").and_then(|v| v.as_array()).map(|a| a.len()),
+            Some(1)
+        );
         // agent + subtask also surface as text
-        assert!(m.content.iter().any(|b| matches!(b, Block::Text { text } if text == "@oracle")));
-        assert!(m.content.iter().any(|b| matches!(b, Block::Text { text } if text.contains("subtask → build"))));
+        assert!(m
+            .content
+            .iter()
+            .any(|b| matches!(b, Block::Text { text } if text == "@oracle")));
+        assert!(m
+            .content
+            .iter()
+            .any(|b| matches!(b, Block::Text { text } if text.contains("subtask → build"))));
     }
 
     #[test]
@@ -687,15 +712,17 @@ mod tests {
         let p = parts(&[r#"{"type":"text","text":"compacted history…"}"#]);
         let out = build_messages(&mv, &p);
         let m = &out[0];
-        assert_eq!(m.extra.get("is_compaction_summary").and_then(Value::as_bool), Some(true));
+        assert_eq!(
+            m.extra.get("is_compaction_summary").and_then(Value::as_bool),
+            Some(true)
+        );
         // the boolean must NOT be rendered as a text body; the real text comes from parts
         assert!(matches!(&m.content[0], Block::Text { text } if text == "compacted history…"));
     }
 
     #[test]
     fn synthetic_text_still_rendered() {
-        let mv: Value =
-            serde_json::from_str(r#"{"id":"m","role":"user","time":{"created":1}}"#).unwrap();
+        let mv: Value = serde_json::from_str(r#"{"id":"m","role":"user","time":{"created":1}}"#).unwrap();
         let p = parts(&[r#"{"type":"text","text":"[search-mode] ...","synthetic":true}"#]);
         let out = build_messages(&mv, &p);
         assert!(matches!(&out[0].content[0], Block::Text { text } if text.starts_with("[search-mode]")));
@@ -719,7 +746,9 @@ mod tests {
         let base = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/opencode");
 
         // Newer parts generation.
-        let oc = OpenCode { root: Some(base.join("parts_gen")) };
+        let oc = OpenCode {
+            root: Some(base.join("parts_gen")),
+        };
         let refs = oc.discover().unwrap();
         assert_eq!(refs.len(), 1, "one session in parts_gen fixture");
         let s = oc.parse(&refs[0]).unwrap();
@@ -729,14 +758,13 @@ mod tests {
             .iter()
             .flat_map(|m| &m.content)
             .any(|b| matches!(b, Block::ToolUse { name, .. } if name == "bash")));
-        assert!(s
-            .messages
-            .iter()
-            .any(|m| m.role == Role::Tool && !m.content.is_empty()));
+        assert!(s.messages.iter().any(|m| m.role == Role::Tool && !m.content.is_empty()));
         assert_eq!(s.model.as_deref(), Some("anthropic.claude-sonnet-4-5"));
 
         // Older inline-summary generation (message records only, no part files).
-        let oc2 = OpenCode { root: Some(base.join("summary_gen")) };
+        let oc2 = OpenCode {
+            root: Some(base.join("summary_gen")),
+        };
         let refs2 = oc2.discover().unwrap();
         assert_eq!(refs2.len(), 1, "one session in summary_gen fixture");
         let s2 = oc2.parse(&refs2[0]).unwrap();

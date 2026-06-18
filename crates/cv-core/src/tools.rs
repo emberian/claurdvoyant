@@ -210,8 +210,8 @@ pub const ORCHESTRATOR: &str = "<orchestrator>";
 /// aggregate across the whole forest ([`ForestTools::aggregate`]). Best-effort per agent: an
 /// unreadable transcript contributes an empty histogram rather than aborting.
 pub fn forest_tools(r: &SessionRef) -> anyhow::Result<ForestTools> {
-    let adapter = crate::harness::for_harness(r.harness)
-        .ok_or_else(|| anyhow::anyhow!("no adapter for {}", r.harness))?;
+    let adapter =
+        crate::harness::for_harness(r.harness).ok_or_else(|| anyhow::anyhow!("no adapter for {}", r.harness))?;
 
     let mut agents = Vec::new();
 
@@ -250,8 +250,8 @@ pub fn forest_tools(r: &SessionRef) -> anyhow::Result<ForestTools> {
 /// Streams each agent, collects its tool rows tagged with the agent id, then sorts by `(ts,
 /// agent, msg_idx)` so calls interleave in wall-clock order (untimestamped rows sort last, stably).
 pub fn forest_timeline(r: &SessionRef) -> anyhow::Result<Vec<ToolEvent>> {
-    let adapter = crate::harness::for_harness(r.harness)
-        .ok_or_else(|| anyhow::anyhow!("no adapter for {}", r.harness))?;
+    let adapter =
+        crate::harness::for_harness(r.harness).ok_or_else(|| anyhow::anyhow!("no adapter for {}", r.harness))?;
     let mut out: Vec<ToolEvent> = Vec::new();
 
     let mut collect = |agent: String, evs: Vec<Event>| {
@@ -282,7 +282,10 @@ pub fn forest_timeline(r: &SessionRef) -> anyhow::Result<Vec<ToolEvent>> {
     }
 
     out.sort_by(|a, b| match (a.ts, b.ts) {
-        (Some(x), Some(y)) => x.cmp(&y).then_with(|| a.agent.cmp(&b.agent)).then_with(|| a.msg_idx.cmp(&b.msg_idx)),
+        (Some(x), Some(y)) => x
+            .cmp(&y)
+            .then_with(|| a.agent.cmp(&b.agent))
+            .then_with(|| a.msg_idx.cmp(&b.msg_idx)),
         (Some(_), None) => std::cmp::Ordering::Less,
         (None, Some(_)) => std::cmp::Ordering::Greater,
         (None, None) => a.agent.cmp(&b.agent).then_with(|| a.msg_idx.cmp(&b.msg_idx)),
@@ -302,14 +305,21 @@ mod tests {
         m
     }
     fn tool_use(name: &str, input: serde_json::Value) -> Block {
-        Block::ToolUse { id: "t".into(), name: name.into(), input }
+        Block::ToolUse {
+            id: "t".into(),
+            name: name.into(),
+            input,
+        }
     }
 
     #[test]
     fn histogram_tallies_kinds_and_ranks() {
         let msgs = [
             asst(vec![
-                tool_use("Edit", json!({"file_path": "a.rs", "old_string": "x", "new_string": "y"})),
+                tool_use(
+                    "Edit",
+                    json!({"file_path": "a.rs", "old_string": "x", "new_string": "y"}),
+                ),
                 tool_use("Read", json!({"file_path": "b.rs"})),
                 tool_use("Bash", json!({"command": "ls"})),
             ]),

@@ -112,7 +112,11 @@ fn show_subagents(r: &SessionRef, json: bool) -> Result<()> {
     println!("# sub-agents of {}\n", short_id(&r.id));
     for s in &subs {
         let wf = s.workflow.as_deref().map(|w| format!("  ⟐{w}")).unwrap_or_default();
-        let status = s.result_status.as_deref().map(|st| format!(" [{st}]")).unwrap_or_default();
+        let status = s
+            .result_status
+            .as_deref()
+            .map(|st| format!(" [{st}]"))
+            .unwrap_or_default();
         println!(
             "── {}  {}{}{} · {} msg ──",
             short_id(s.agent_id()),
@@ -168,7 +172,10 @@ fn show_one_subagent(
         many => bail!(
             "{} sub-agents match {agent_id:?} — disambiguate with a longer id ({})",
             many.len(),
-            many.iter().map(|s| short_id(s.agent_id())).collect::<Vec<_>>().join(", "),
+            many.iter()
+                .map(|s| short_id(s.agent_id()))
+                .collect::<Vec<_>>()
+                .join(", "),
         ),
     };
 
@@ -187,8 +194,16 @@ fn show_one_subagent(
     if let Some(d) = &sub.description {
         println!("# sub-agent: {}", truncate(d, 120));
     }
-    let wf = sub.workflow.as_deref().map(|w| format!(" · workflow {w}")).unwrap_or_default();
-    let status = sub.result_status.as_deref().map(|st| format!(" · {st}")).unwrap_or_default();
+    let wf = sub
+        .workflow
+        .as_deref()
+        .map(|w| format!(" · workflow {w}"))
+        .unwrap_or_default();
+    let status = sub
+        .result_status
+        .as_deref()
+        .map(|st| format!(" · {st}"))
+        .unwrap_or_default();
     println!(
         "{} · {}{}{}\n",
         sub.agent_type.as_deref().unwrap_or("agent"),
@@ -230,8 +245,7 @@ pub(crate) fn cmd_export(id: &str, format: &str, harness: Option<String>) -> Res
 
 pub(crate) fn cmd_redact(id: &str, harness: Option<String>, format: &str, stats: bool) -> Result<()> {
     let want = parse_harness(&harness)?;
-    let (r, adapter) =
-        cv_core::find(id, want)?.with_context(|| format!("no session matching {id:?}"))?;
+    let (r, adapter) = cv_core::find(id, want)?.with_context(|| format!("no session matching {id:?}"))?;
     let session = adapter.parse(&r)?;
 
     let (redacted, st) = cv_core::redact::redact_with(&session, &Default::default());
@@ -261,17 +275,11 @@ pub(crate) fn cmd_redact(id: &str, harness: Option<String>, format: &str, stats:
 
 pub(crate) fn cmd_tree(id: &str, harness: Option<String>) -> Result<()> {
     let want = parse_harness(&harness)?;
-    let (r, adapter) =
-        cv_core::find(id, want)?.with_context(|| format!("no session matching {id:?}"))?;
+    let (r, adapter) = cv_core::find(id, want)?.with_context(|| format!("no session matching {id:?}"))?;
     let session = adapter.parse(&r)?;
 
     println!("# {}", session.label());
-    println!(
-        "{} · {} · {} msg",
-        session.harness,
-        session.id,
-        session.messages.len()
-    );
+    println!("{} · {} · {} msg", session.harness, session.id, session.messages.len());
     println!();
 
     // Threaded view only if at least one message carries a parent_id.
@@ -392,14 +400,8 @@ fn render_tree_dag(session: &Session) {
 fn tree_line(m: &Message) -> String {
     let role = cv_core::render::role_label(m.role);
     let mut tags = Vec::new();
-    let has_tool_use = m
-        .content
-        .iter()
-        .any(|b| matches!(b, Block::ToolUse { .. }));
-    let has_tool_result = m
-        .content
-        .iter()
-        .any(|b| matches!(b, Block::ToolResult { .. }));
+    let has_tool_use = m.content.iter().any(|b| matches!(b, Block::ToolUse { .. }));
+    let has_tool_result = m.content.iter().any(|b| matches!(b, Block::ToolResult { .. }));
     if has_tool_use {
         tags.push("🔧 tool".to_string());
         // Surface a sub-agent spawn if the tool looks like one.
@@ -420,22 +422,19 @@ fn tree_line(m: &Message) -> String {
         tags.push(format!("↳ sub-agent ({sub})"));
     }
 
-    let preview = m
-        .text()
-        .map(|t| truncate(&t, 80))
-        .unwrap_or_else(|| {
-            if has_tool_use {
-                m.content
-                    .iter()
-                    .find_map(|b| match b {
-                        Block::ToolUse { name, .. } => Some(format!("[{name}]")),
-                        _ => None,
-                    })
-                    .unwrap_or_default()
-            } else {
-                String::new()
-            }
-        });
+    let preview = m.text().map(|t| truncate(&t, 80)).unwrap_or_else(|| {
+        if has_tool_use {
+            m.content
+                .iter()
+                .find_map(|b| match b {
+                    Block::ToolUse { name, .. } => Some(format!("[{name}]")),
+                    _ => None,
+                })
+                .unwrap_or_default()
+        } else {
+            String::new()
+        }
+    });
 
     let tagstr = if tags.is_empty() {
         String::new()
@@ -474,8 +473,18 @@ pub(crate) fn cmd_diff(a: &str, b: &str, harness: Option<String>) -> Result<()> 
     let sa = aa.parse(&ra)?;
     let sb = ab.parse(&rb)?;
 
-    println!("A {:8} {:8}  {} msg", sa.harness.as_str(), short_id(&sa.id), sa.messages.len());
-    println!("B {:8} {:8}  {} msg", sb.harness.as_str(), short_id(&sb.id), sb.messages.len());
+    println!(
+        "A {:8} {:8}  {} msg",
+        sa.harness.as_str(),
+        short_id(&sa.id),
+        sa.messages.len()
+    );
+    println!(
+        "B {:8} {:8}  {} msg",
+        sb.harness.as_str(),
+        short_id(&sb.id),
+        sb.messages.len()
+    );
     println!();
 
     let key = |m: &Message| (m.role, m.text().unwrap_or_default());
@@ -597,9 +606,7 @@ pub(crate) fn stream_session_render<W: std::io::Write>(
             self.printed = true;
         }
     }
-    impl<W: std::io::Write, H: Fn(&HeaderInfo) -> String, R: Fn(&Message) -> String> MessageSink
-        for Sink<'_, W, H, R>
-    {
+    impl<W: std::io::Write, H: Fn(&HeaderInfo) -> String, R: Fn(&Message) -> String> MessageSink for Sink<'_, W, H, R> {
         fn meta(&mut self, s: &Session) {
             // Authoritative *parsed* session metadata, delivered before the body by the bridge
             // `stream` and by adapters that call `sink.meta` (e.g. codex). The parsed title overrides
@@ -769,11 +776,7 @@ pub(crate) fn show_message(m: &Message) -> String {
 
 /// Header for `cv export md`.
 fn md_header(h: &HeaderInfo) -> String {
-    let model = h
-        .model
-        .as_ref()
-        .map(|m| format!("- model: {m}\n"))
-        .unwrap_or_default();
+    let model = h.model.as_ref().map(|m| format!("- model: {m}\n")).unwrap_or_default();
     format!(
         "# {}\n\n- harness: {}\n- id: {}\n- cwd: {}\n{}\n",
         h.label,
@@ -856,16 +859,14 @@ mod tests {
     fn render(r: &SessionRef, range: Option<(usize, Option<usize>)>) -> String {
         let adapter = cv_core::harness::for_harness(r.harness).unwrap();
         let mut out = Vec::new();
-        stream_session_render(adapter.as_ref(), r, &mut out, show_header, show_message, range)
-            .unwrap();
+        stream_session_render(adapter.as_ref(), r, &mut out, show_header, show_message, range).unwrap();
         String::from_utf8(out).unwrap()
     }
 
     /// Whether a windowed render of `r` would take the seek path right now.
     fn seekable(r: &SessionRef, start: usize) -> bool {
         let mut sink = cv_core::CollectSink::default();
-        cv_core::offsets::stream_range(r, start, Some(start + 1), &cv_core::ParseOptions::lazy(), &mut sink)
-            .unwrap()
+        cv_core::offsets::stream_range(r, start, Some(start + 1), &cv_core::ParseOptions::lazy(), &mut sink).unwrap()
     }
 
     /// THE Phase-2 contract: the same window rendered via the seek path (offsets recorded) and
@@ -881,7 +882,11 @@ mod tests {
         let big = "long \"quoted\" content\n".repeat(400);
         let mut f = std::fs::File::create(&path).unwrap();
         writeln!(f, r#"{{"type":"ai-title","aiTitle":"render seek"}}"#).unwrap();
-        writeln!(f, r#"{{"type":"user","uuid":"u0","cwd":"/w","message":{{"role":"user","content":"q one"}}}}"#).unwrap();
+        writeln!(
+            f,
+            r#"{{"type":"user","uuid":"u0","cwd":"/w","message":{{"role":"user","content":"q one"}}}}"#
+        )
+        .unwrap();
         writeln!(
             f,
             "{}",
@@ -934,7 +939,11 @@ mod tests {
         // Staleness: appending a message makes the recording stale → fallback, still correct.
         {
             let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
-            writeln!(f, r#"{{"type":"user","uuid":"uz","message":{{"role":"user","content":"appended"}}}}"#).unwrap();
+            writeln!(
+                f,
+                r#"{{"type":"user","uuid":"uz","message":{{"role":"user","content":"appended"}}}}"#
+            )
+            .unwrap();
         }
         assert!(!seekable(&r, 3), "appended file must read as stale");
         let after = render(&r, Some((9, Some(12))));

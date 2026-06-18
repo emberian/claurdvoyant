@@ -108,11 +108,9 @@ impl Hermes {
 
     fn open_path(path: &PathBuf) -> Result<Connection> {
         // Read-only so we never touch the user's live DB / take a write lock.
-        let conn = Connection::open_with_flags(
-            path,
-            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        )
-        .with_context(|| format!("opening {}", path.display()))?;
+        let conn =
+            Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX)
+                .with_context(|| format!("opening {}", path.display()))?;
         Ok(conn)
     }
 }
@@ -154,12 +152,7 @@ impl Adapter for Hermes {
         crate::stream::collect(self, r)
     }
 
-    fn stream(
-        &self,
-        r: &SessionRef,
-        _opts: &ParseOptions,
-        sink: &mut dyn MessageSink,
-    ) -> Result<Session> {
+    fn stream(&self, r: &SessionRef, _opts: &ParseOptions, sink: &mut dyn MessageSink) -> Result<Session> {
         // Route by the ref's own DB path (set at discovery time), NOT a single self.db — this is
         // what lets one Hermes adapter span many profile DBs without id collisions.
         let conn = Self::open_path(&r.path)?;
@@ -279,11 +272,9 @@ fn read_session_extra(
             continue;
         }
         let v: Option<String> = conn
-            .query_row(
-                &format!("SELECT {col} FROM sessions WHERE id = ?1"),
-                [id],
-                |row| row.get::<_, Option<String>>(0),
-            )
+            .query_row(&format!("SELECT {col} FROM sessions WHERE id = ?1"), [id], |row| {
+                row.get::<_, Option<String>>(0)
+            })
             .ok()
             .flatten();
         if let Some(v) = v.filter(|s| !s.is_empty()) {
@@ -295,11 +286,9 @@ fn read_session_extra(
             continue;
         }
         let v: Option<i64> = conn
-            .query_row(
-                &format!("SELECT {col} FROM sessions WHERE id = ?1"),
-                [id],
-                |row| row.get::<_, Option<i64>>(0),
-            )
+            .query_row(&format!("SELECT {col} FROM sessions WHERE id = ?1"), [id], |row| {
+                row.get::<_, Option<i64>>(0)
+            })
             .ok()
             .flatten();
         // Only carry non-zero aggregates: a freshly-emitted DB leaves these at their DEFAULT 0, so
@@ -377,7 +366,14 @@ fn stream_conn(conn: &Connection, r: &SessionRef, sink: &mut dyn MessageSink) ->
     let has = |c: &str| cols.contains(c);
 
     // Build the SELECT defensively: required cols always present; optional cols gated by probe.
-    let mut select_cols: Vec<&str> = vec!["role", "content", "tool_call_id", "tool_calls", "tool_name", "timestamp"];
+    let mut select_cols: Vec<&str> = vec![
+        "role",
+        "content",
+        "tool_call_id",
+        "tool_calls",
+        "tool_name",
+        "timestamp",
+    ];
     for c in OPTIONAL_MSG_COLS {
         if has(c) {
             select_cols.push(c);
@@ -393,9 +389,7 @@ fn stream_conn(conn: &Connection, r: &SessionRef, sink: &mut dyn MessageSink) ->
     // not the whole transcript, so peak stays O(one message).
     let mut dedup = ReplayDedup::default();
     'lineage: for sid in &lineage {
-        let sql = format!(
-            "SELECT {select_list} FROM messages WHERE session_id = ?1 ORDER BY timestamp ASC, id ASC"
-        );
+        let sql = format!("SELECT {select_list} FROM messages WHERE session_id = ?1 ORDER BY timestamp ASC, id ASC");
         let mut stmt = conn.prepare(&sql)?;
         // Map column name -> index so we can read by name regardless of which optionals exist.
         let idx = |name: &str| select_cols.iter().position(|c| *c == name);
@@ -405,17 +399,15 @@ fn stream_conn(conn: &Connection, r: &SessionRef, sink: &mut dyn MessageSink) ->
             let get_str = |name: &str| -> Option<String> {
                 idx(name).and_then(|i| row.get::<_, Option<String>>(i).ok().flatten())
             };
-            let get_i64 = |name: &str| -> Option<i64> {
-                idx(name).and_then(|i| row.get::<_, Option<i64>>(i).ok().flatten())
-            };
+            let get_i64 =
+                |name: &str| -> Option<i64> { idx(name).and_then(|i| row.get::<_, Option<i64>>(i).ok().flatten()) };
             Ok(MsgRow {
                 role: get_str("role").unwrap_or_default(),
                 content: get_str("content"),
                 tool_call_id: get_str("tool_call_id"),
                 tool_calls: get_str("tool_calls"),
                 tool_name: get_str("tool_name"),
-                timestamp: idx("timestamp")
-                    .and_then(|i| row.get::<_, Option<f64>>(i).ok().flatten()),
+                timestamp: idx("timestamp").and_then(|i| row.get::<_, Option<f64>>(i).ok().flatten()),
                 token_count: get_i64("token_count"),
                 finish_reason: get_str("finish_reason"),
                 reasoning: get_str("reasoning"),
@@ -732,9 +724,9 @@ fn object_content_to_blocks(map: &serde_json::Map<String, Value>) -> Option<Vec<
             .iter()
             .filter_map(|p| {
                 part_to_block(p).or_else(|| {
-                    p.get("text")
-                        .and_then(Value::as_str)
-                        .map(|t| Block::Text { text: t.to_string().into() })
+                    p.get("text").and_then(Value::as_str).map(|t| Block::Text {
+                        text: t.to_string().into(),
+                    })
                 })
             })
             .collect();
@@ -827,11 +819,9 @@ fn extract_codex_encrypted(raw: &str) -> Option<String> {
     let Value::Array(items) = serde_json::from_str::<Value>(raw).ok()? else {
         return None;
     };
-    items.iter().find_map(|it| {
-        it.get("encrypted_content")
-            .and_then(Value::as_str)
-            .map(str::to_string)
-    })
+    items
+        .iter()
+        .find_map(|it| it.get("encrypted_content").and_then(Value::as_str).map(str::to_string))
 }
 
 fn secs_to_dt(s: f64) -> Option<DateTime<Utc>> {
@@ -942,12 +932,20 @@ mod tests {
         }
     }
 
-    fn insert_session(conn: &Connection, id: &str, parent: Option<&str>, end_reason: Option<&str>, started: f64, ended: Option<f64>) {
+    fn insert_session(
+        conn: &Connection,
+        id: &str,
+        parent: Option<&str>,
+        end_reason: Option<&str>,
+        started: f64,
+        ended: Option<f64>,
+    ) {
         conn.execute(
             "INSERT INTO sessions (id, source, model, parent_session_id, started_at, ended_at, end_reason, title) \
              VALUES (?1, 'cli', 'nous/hermes-4', ?2, ?3, ?4, ?5, 'T')",
             rusqlite::params![id, parent, started, ended, end_reason],
-        ).unwrap();
+        )
+        .unwrap();
     }
 
     #[test]
@@ -957,12 +955,14 @@ mod tests {
         conn.execute(
             "INSERT INTO messages (session_id, role, content, timestamp) VALUES ('s1','user','Hello',1001.0)",
             [],
-        ).unwrap();
+        )
+        .unwrap();
         conn.execute(
             "INSERT INTO messages (session_id, role, content, timestamp, token_count, finish_reason) \
              VALUES ('s1','assistant','Hi there!',1002.0, 42, 'stop')",
             [],
-        ).unwrap();
+        )
+        .unwrap();
 
         let s = parse_conn(&conn, &sref("s1")).unwrap();
         assert_eq!(s.messages.len(), 2);
@@ -984,7 +984,8 @@ mod tests {
         conn.execute(
             "INSERT INTO messages (session_id, role, content, timestamp) VALUES ('s1','user',?1,1001.0)",
             [content],
-        ).unwrap();
+        )
+        .unwrap();
         let s = parse_conn(&conn, &sref("s1")).unwrap();
         assert_eq!(s.messages.len(), 1);
         let blocks = &s.messages[0].content;
@@ -1001,7 +1002,8 @@ mod tests {
         conn.execute(
             "INSERT INTO messages (session_id, role, content, timestamp) VALUES ('s1','user',?1,1001.0)",
             [content],
-        ).unwrap();
+        )
+        .unwrap();
         let s = parse_conn(&conn, &sref("s1")).unwrap();
         let blocks = &s.messages[0].content;
         assert!(matches!(&blocks[0], Block::Text { text } if text == "hi"));
@@ -1016,7 +1018,8 @@ mod tests {
         conn.execute(
             "INSERT INTO messages (session_id, role, content, timestamp) VALUES ('s1','user',?1,1001.0)",
             [content],
-        ).unwrap();
+        )
+        .unwrap();
         let s = parse_conn(&conn, &sref("s1")).unwrap();
         assert_eq!(s.messages[0].text().as_deref(), Some("hi"));
     }
@@ -1034,7 +1037,8 @@ mod tests {
             "INSERT INTO messages (session_id, role, content, tool_call_id, tool_name, timestamp) \
              VALUES ('s1','tool','{\"ok\":true}','c1','web_search',1002.0)",
             [],
-        ).unwrap();
+        )
+        .unwrap();
         let s = parse_conn(&conn, &sref("s1")).unwrap();
         assert_eq!(s.messages.len(), 2);
         let tu = &s.messages[0].content[0];
@@ -1058,10 +1062,14 @@ mod tests {
             [details],
         ).unwrap();
         let s = parse_conn(&conn, &sref("s1")).unwrap();
-        let think = s.messages[0].content.iter().find_map(|b| match b {
-            Block::Thinking { text, encrypted, .. } => Some((text.clone(), encrypted.clone())),
-            _ => None,
-        }).unwrap();
+        let think = s.messages[0]
+            .content
+            .iter()
+            .find_map(|b| match b {
+                Block::Thinking { text, encrypted, .. } => Some((text.clone(), encrypted.clone())),
+                _ => None,
+            })
+            .unwrap();
         assert!(think.0.contains("short summary"));
         assert!(think.0.contains("native scratchpad"));
         assert!(think.0.contains("summarised"));
@@ -1078,12 +1086,17 @@ mod tests {
             "INSERT INTO messages (session_id, role, content, timestamp, reasoning, reasoning_content) \
              VALUES ('s1','assistant','a',1001.0,'same','same')",
             [],
-        ).unwrap();
+        )
+        .unwrap();
         let s = parse_conn(&conn, &sref("s1")).unwrap();
-        let text = s.messages[0].content.iter().find_map(|b| match b {
-            Block::Thinking { text, .. } => Some(text.clone()),
-            _ => None,
-        }).unwrap();
+        let text = s.messages[0]
+            .content
+            .iter()
+            .find_map(|b| match b {
+                Block::Thinking { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .unwrap();
         assert_eq!(text, "same");
     }
 
@@ -1097,7 +1110,8 @@ mod tests {
             "INSERT INTO messages (session_id, role, content, timestamp, codex_reasoning_items, codex_message_items) \
              VALUES ('s1','assistant','Done',1001.0,?1,?2)",
             [cri, cmi],
-        ).unwrap();
+        )
+        .unwrap();
         let s = parse_conn(&conn, &sref("s1")).unwrap();
         let enc = s.messages[0].content.iter().find_map(|b| match b {
             Block::Thinking { encrypted, .. } => encrypted.clone(),
@@ -1116,7 +1130,8 @@ mod tests {
             "INSERT INTO messages (session_id, role, content, timestamp, platform_message_id, observed) \
              VALUES ('s1','user','hi',1001.0,'abc-123',1)",
             [],
-        ).unwrap();
+        )
+        .unwrap();
         let s = parse_conn(&conn, &sref("s1")).unwrap();
         assert_eq!(s.messages[0].extra.get("platform_message_id").unwrap(), "abc-123");
         assert_eq!(s.messages[0].extra.get("observed").unwrap(), &Value::Bool(true));
@@ -1128,9 +1143,17 @@ mod tests {
         // root ended via compression at t=2000; child created after, replays the last user msg.
         insert_session(&conn, "root", None, Some("compression"), 1000.0, Some(2000.0));
         insert_session(&conn, "child", Some("root"), None, 2001.0, None);
-        conn.execute("INSERT INTO messages (session_id, role, content, timestamp) VALUES ('root','user','first prompt',1001.0)", []).unwrap();
+        conn.execute(
+            "INSERT INTO messages (session_id, role, content, timestamp) VALUES ('root','user','first prompt',1001.0)",
+            [],
+        )
+        .unwrap();
         conn.execute("INSERT INTO messages (session_id, role, content, timestamp) VALUES ('root','assistant','first answer',1002.0)", []).unwrap();
-        conn.execute("INSERT INTO messages (session_id, role, content, timestamp) VALUES ('root','user','second prompt',1003.0)", []).unwrap();
+        conn.execute(
+            "INSERT INTO messages (session_id, role, content, timestamp) VALUES ('root','user','second prompt',1003.0)",
+            [],
+        )
+        .unwrap();
         // child replays 'second prompt' then continues.
         conn.execute("INSERT INTO messages (session_id, role, content, timestamp) VALUES ('child','user','second prompt',2002.0)", []).unwrap();
         conn.execute("INSERT INTO messages (session_id, role, content, timestamp) VALUES ('child','assistant','second answer',2003.0)", []).unwrap();
@@ -1138,7 +1161,10 @@ mod tests {
         // Parsing the CHILD should walk up to the root and merge, deduping the replayed user msg.
         let s = parse_conn(&conn, &sref("child")).unwrap();
         let texts: Vec<String> = s.messages.iter().filter_map(|m| m.text()).collect();
-        assert_eq!(texts, vec!["first prompt", "first answer", "second prompt", "second answer"]);
+        assert_eq!(
+            texts,
+            vec!["first prompt", "first answer", "second prompt", "second answer"]
+        );
     }
 
     #[test]
@@ -1147,8 +1173,13 @@ mod tests {
         conn.execute(
             "INSERT INTO sessions (id, source, model, started_at, title) VALUES ('s1','cli','m',1000.0,'T')",
             [],
-        ).unwrap();
-        conn.execute("INSERT INTO messages (session_id, role, content, timestamp) VALUES ('s1','user','hello old',1001.0)", []).unwrap();
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO messages (session_id, role, content, timestamp) VALUES ('s1','user','hello old',1001.0)",
+            [],
+        )
+        .unwrap();
         conn.execute("INSERT INTO messages (session_id, role, content, tool_calls, timestamp) VALUES ('s1','assistant','',?1,1002.0)",
             ["[{\"id\":\"c1\",\"type\":\"function\",\"function\":{\"name\":\"f\",\"arguments\":\"{}\"}}]"]).unwrap();
         // Must not error despite missing reasoning/token/codex/parent columns.
@@ -1210,8 +1241,14 @@ mod tests {
 
         let ids: HashSet<&str> = refs.iter().map(|r| r.id.as_str()).collect();
         assert!(ids.contains("top-session"), "top-level session must be discovered");
-        assert!(ids.contains("profile-session"), "profile session must be discovered (the bug)");
-        assert!(!ids.contains("snapshot-session"), "depth-2 snapshot DB must NOT be discovered");
+        assert!(
+            ids.contains("profile-session"),
+            "profile session must be discovered (the bug)"
+        );
+        assert!(
+            !ids.contains("snapshot-session"),
+            "depth-2 snapshot DB must NOT be discovered"
+        );
 
         // parse() must route by the ref's own DB path, so the profile session parses from its DB.
         let pref = refs.iter().find(|r| r.id == "profile-session").unwrap();
@@ -1225,8 +1262,16 @@ mod tests {
     #[test]
     fn discover_orders_and_counts() {
         let conn = mk_conn(SCHEMA_V14);
-        conn.execute("INSERT INTO sessions (id, source, started_at, message_count, title) VALUES ('a','cli',1000.0,3,'A')", []).unwrap();
-        conn.execute("INSERT INTO sessions (id, source, started_at, message_count, title) VALUES ('b','cli',2000.0,5,'B')", []).unwrap();
+        conn.execute(
+            "INSERT INTO sessions (id, source, started_at, message_count, title) VALUES ('a','cli',1000.0,3,'A')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO sessions (id, source, started_at, message_count, title) VALUES ('b','cli',2000.0,5,'B')",
+            [],
+        )
+        .unwrap();
         let refs = discover_conn(&conn, &PathBuf::from(":memory:")).unwrap();
         assert_eq!(refs.len(), 2);
         // ordered by started_at DESC

@@ -46,14 +46,13 @@ fn sniff(name: &str, text: &str) -> Sniff {
             if let Ok(Value::Array(items)) = serde_json::from_str::<Value>(text) {
                 // logs.json: items with sessionId + messageId + message.
                 let looks_logs = items.iter().take(8).any(|it| {
-                    it.get("sessionId").is_some()
-                        && it.get("messageId").is_some()
-                        && it.get("message").is_some()
+                    it.get("sessionId").is_some() && it.get("messageId").is_some() && it.get("message").is_some()
                 });
                 // bare checkpoint: a top-level array of `{role, parts}` Content objects.
-                let looks_checkpoint = items.iter().take(8).any(|it| {
-                    it.get("role").is_some() && it.get("parts").is_some()
-                });
+                let looks_checkpoint = items
+                    .iter()
+                    .take(8)
+                    .any(|it| it.get("role").is_some() && it.get("parts").is_some());
                 if looks_logs || looks_checkpoint {
                     return Sniff::Gemini;
                 }
@@ -62,8 +61,8 @@ fn sniff(name: &str, text: &str) -> Sniff {
             // A *whole-file* JSON object: either a legacy `ConversationRecord` recording
             // (`messages` + `sessionId`/`projectHash`) or a checkpoint (`{history:[{role,parts}…]}`).
             if let Ok(Value::Object(map)) = serde_json::from_str::<Value>(text) {
-                let looks_recording = map.contains_key("messages")
-                    && (map.contains_key("sessionId") || map.contains_key("projectHash"));
+                let looks_recording =
+                    map.contains_key("messages") && (map.contains_key("sessionId") || map.contains_key("projectHash"));
                 let looks_checkpoint = map
                     .get("history")
                     .and_then(Value::as_array)
@@ -91,23 +90,20 @@ fn sniff(name: &str, text: &str) -> Sniff {
                     }
                 }
                 // Otherwise look for gemini per-message / control markers in the early lines.
-                let line_is_gemini = text
-                    .lines()
-                    .map(str::trim)
-                    .filter(|l| !l.is_empty())
-                    .take(8)
-                    .any(|line| match serde_json::from_str::<Value>(line) {
-                        Ok(v) => {
-                            v.get("$set").is_some()
-                                || v.get("$rewindTo").is_some()
-                                || v.get("projectHash").is_some()
-                                || v.get("thoughts").is_some()
-                                || v.get("toolCalls").is_some()
-                                || ((v.get("parts").is_some())
-                                    && v.get("parentUuid").is_none())
-                        }
-                        Err(_) => false,
-                    });
+                let line_is_gemini =
+                    text.lines().map(str::trim).filter(|l| !l.is_empty()).take(8).any(
+                        |line| match serde_json::from_str::<Value>(line) {
+                            Ok(v) => {
+                                v.get("$set").is_some()
+                                    || v.get("$rewindTo").is_some()
+                                    || v.get("projectHash").is_some()
+                                    || v.get("thoughts").is_some()
+                                    || v.get("toolCalls").is_some()
+                                    || ((v.get("parts").is_some()) && v.get("parentUuid").is_none())
+                            }
+                            Err(_) => false,
+                        },
+                    );
                 if line_is_gemini {
                     return Sniff::Gemini;
                 }
@@ -125,12 +121,8 @@ fn sniff(name: &str, text: &str) -> Sniff {
         }
         if let Ok(v) = serde_json::from_str::<Value>(first) {
             // bare {id, timestamp} header with no "type"
-            let is_header = v.get("type").is_none()
-                && v.get("id").is_some()
-                && v.get("timestamp").is_some();
-            if is_header
-                && (text.contains("\"response_item\"") || text.contains("\"event_msg\""))
-            {
+            let is_header = v.get("type").is_none() && v.get("id").is_some() && v.get("timestamp").is_some();
+            if is_header && (text.contains("\"response_item\"") || text.contains("\"event_msg\"")) {
                 return Sniff::Codex { is_jsonl };
             }
         }
@@ -250,7 +242,8 @@ mod tests {
 {"$set":{"summary":"Listed the project files."}}"#;
 
     // A checkpoint: {history: Content[]} with {role, parts}.
-    const GEMINI_CHECKPOINT: &str = r#"{"history":[{"role":"user","parts":[{"text":"what is 2+2"}]},{"role":"model","parts":[{"text":"4"}]}]}"#;
+    const GEMINI_CHECKPOINT: &str =
+        r#"{"history":[{"role":"user","parts":[{"text":"what is 2+2"}]},{"role":"model","parts":[{"text":"4"}]}]}"#;
 
     #[test]
     fn ingests_gemini_legacy_recording() {
@@ -266,10 +259,7 @@ mod tests {
 
     #[test]
     fn ingests_gemini_modern_jsonl() {
-        let files = vec![(
-            "session-456.jsonl".to_string(),
-            GEMINI_MODERN_JSONL.as_bytes().to_vec(),
-        )];
+        let files = vec![("session-456.jsonl".to_string(), GEMINI_MODERN_JSONL.as_bytes().to_vec())];
         let sessions = ingest_files(files);
         assert!(!sessions.is_empty(), "modern jsonl recording should yield ≥1 session");
         assert!(sessions.iter().all(|s| s.harness == Harness::Gemini));

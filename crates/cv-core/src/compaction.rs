@@ -100,15 +100,16 @@ impl MessageSink for CompactionSink {
         self.msg_idx += 1;
 
         // A compaction boundary: a System message whose `subtype` is `compact_boundary`.
-        if m.role == Role::System
-            && m.extra.get("subtype").and_then(Value::as_str) == Some("compact_boundary")
-        {
+        if m.role == Role::System && m.extra.get("subtype").and_then(Value::as_str) == Some("compact_boundary") {
             let meta = m.extra.get("compactMetadata");
             let comp = Compaction {
                 boundary_msg_idx: idx,
                 boundary_uuid: m.id.clone(),
                 summary_msg_idx: None,
-                trigger: meta.and_then(|v| v.get("trigger")).and_then(Value::as_str).map(str::to_string),
+                trigger: meta
+                    .and_then(|v| v.get("trigger"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
                 pre_tokens: meta.and_then(|v| v.get("preTokens")).and_then(Value::as_u64),
                 duration_ms: meta.and_then(|v| v.get("durationMs")).and_then(Value::as_u64),
                 summary: None,
@@ -125,20 +126,13 @@ impl MessageSink for CompactionSink {
         // absent — older transcripts linked only by adjacency.)
         let is_summary = m.extra.get("isCompactSummary").and_then(Value::as_bool) == Some(true);
         if is_summary {
-            let slot = m
-                .parent_id
-                .as_deref()
-                .and_then(|p| self.pending.remove(p))
-                .or_else(|| {
-                    // No/unknown parent link: attach to the latest boundary still awaiting a summary.
-                    let last = self
-                        .boundaries
-                        .iter()
-                        .rposition(|c| c.summary_msg_idx.is_none())?;
-                    // Drop any stale pending entry for it so it isn't double-claimed.
-                    self.pending.retain(|_, v| *v != last);
-                    Some(last)
-                });
+            let slot = m.parent_id.as_deref().and_then(|p| self.pending.remove(p)).or_else(|| {
+                // No/unknown parent link: attach to the latest boundary still awaiting a summary.
+                let last = self.boundaries.iter().rposition(|c| c.summary_msg_idx.is_none())?;
+                // Drop any stale pending entry for it so it isn't double-claimed.
+                self.pending.retain(|_, v| *v != last);
+                Some(last)
+            });
             if let Some(i) = slot {
                 self.boundaries[i].summary_msg_idx = Some(idx);
                 if self.keep_summaries {
@@ -172,8 +166,8 @@ fn summary_text(m: &Message, resolver: Option<&crate::lazy::Resolver>) -> Option
 /// `keep_summaries` retains each boundary's (bounded) summary text. Best-effort: a parse error
 /// yields whatever boundaries were seen before it.
 pub fn detect(r: &SessionRef, keep_summaries: bool) -> anyhow::Result<Vec<Compaction>> {
-    let adapter = crate::harness::for_harness(r.harness)
-        .ok_or_else(|| anyhow::anyhow!("no adapter for {}", r.harness))?;
+    let adapter =
+        crate::harness::for_harness(r.harness).ok_or_else(|| anyhow::anyhow!("no adapter for {}", r.harness))?;
     let mut sink = CompactionSink::new(keep_summaries);
     sink.resolver = Some(crate::lazy::Resolver::new(Some(r.path.clone())));
     // `lazy_extra`: the `subtype`/`compactMetadata`/`isCompactSummary` keys this detector keys on
@@ -218,8 +212,11 @@ mod tests {
     fn boundary(uuid: &str, trigger: &str, pre: u64) -> Message {
         let mut m = Message::new(Role::System);
         m.id = Some(uuid.to_string());
-        m.content = vec![Block::Text { text: "Conversation compacted".into() }];
-        m.extra.insert("subtype".into(), Value::String("compact_boundary".into()));
+        m.content = vec![Block::Text {
+            text: "Conversation compacted".into(),
+        }];
+        m.extra
+            .insert("subtype".into(), Value::String("compact_boundary".into()));
         m.extra.insert(
             "compactMetadata".into(),
             serde_json::json!({"trigger": trigger, "preTokens": pre, "durationMs": 1234}),
@@ -256,13 +253,13 @@ mod tests {
             source_path: None,
             extra: Default::default(),
             messages: vec![
-                plain_user("hello"),                       // 0
-                boundary("b1", "manual", 989063),          // 1
+                plain_user("hello"),                           // 0
+                boundary("b1", "manual", 989063),              // 1
                 summary("b1", "SUMMARY ONE covers the start"), // 2
-                plain_user("more work"),                   // 3
-                boundary("b2", "auto", 500000),            // 4
-                summary("b2", "SUMMARY TWO"),              // 5
-                plain_user("after"),                       // 6
+                plain_user("more work"),                       // 3
+                boundary("b2", "auto", 500000),                // 4
+                summary("b2", "SUMMARY TWO"),                  // 5
+                plain_user("after"),                           // 6
             ],
         };
         let comps = detect_in_session(&session, true);
@@ -295,8 +292,14 @@ mod tests {
         let session = Session {
             id: "s".into(),
             harness: Harness::Claude,
-            cwd: None, title: None, created_at: None, updated_at: None, model: None, git: None,
-            source_path: None, extra: Default::default(),
+            cwd: None,
+            title: None,
+            created_at: None,
+            updated_at: None,
+            model: None,
+            git: None,
+            source_path: None,
+            extra: Default::default(),
             messages: vec![boundary("bx", "manual", 100), sum],
         };
         let comps = detect_in_session(&session, true);
@@ -310,8 +313,14 @@ mod tests {
         let session = Session {
             id: "s".into(),
             harness: Harness::Claude,
-            cwd: None, title: None, created_at: None, updated_at: None, model: None, git: None,
-            source_path: None, extra: Default::default(),
+            cwd: None,
+            title: None,
+            created_at: None,
+            updated_at: None,
+            model: None,
+            git: None,
+            source_path: None,
+            extra: Default::default(),
             messages: vec![boundary("b", "manual", 100), summary("b", "text")],
         };
         let comps = detect_in_session(&session, false);

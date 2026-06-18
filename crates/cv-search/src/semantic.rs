@@ -125,7 +125,12 @@ impl From<LegacyStore> for Store {
                 updated_at: r.updated_at,
             });
         }
-        Store { model: old.model, dim, meta, vectors }
+        Store {
+            model: old.model,
+            dim,
+            meta,
+            vectors,
+        }
     }
 }
 
@@ -143,8 +148,11 @@ fn save_store(path: &Path, store: &Store) -> Result<()> {
             model: &'a str,
             records: &'a [RecordMeta],
         }
-        serde_json::to_vec(&MetaBlockRef { model: &store.model, records: &store.meta })
-            .context("serializing embedding store metadata")?
+        serde_json::to_vec(&MetaBlockRef {
+            model: &store.model,
+            records: &store.meta,
+        })
+        .context("serializing embedding store metadata")?
     };
 
     let mut out = Vec::with_capacity(8 + 4 + 4 + 8 + meta_json.len() + store.vectors.len() * 4);
@@ -158,24 +166,17 @@ fn save_store(path: &Path, store: &Store) -> Result<()> {
     }
 
     let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
-    std::fs::write(&tmp, &out)
-        .with_context(|| format!("writing embedding store {}", tmp.display()))?;
-    std::fs::rename(&tmp, path)
-        .with_context(|| format!("moving embedding store into place at {}", path.display()))?;
+    std::fs::write(&tmp, &out).with_context(|| format!("writing embedding store {}", tmp.display()))?;
+    std::fs::rename(&tmp, path).with_context(|| format!("moving embedding store into place at {}", path.display()))?;
     Ok(())
 }
 
 /// Load a store: the binary format, or (transparently) a legacy all-JSON store.
 fn load_store(path: &Path) -> Result<Store> {
-    let bytes = std::fs::read(path).with_context(|| {
-        format!(
-            "reading embedding store {} — run `embed_all` first",
-            path.display()
-        )
-    })?;
+    let bytes = std::fs::read(path)
+        .with_context(|| format!("reading embedding store {} — run `embed_all` first", path.display()))?;
     if bytes.first() == Some(&b'{') {
-        let legacy: LegacyStore =
-            serde_json::from_slice(&bytes).context("parsing legacy JSON embedding store")?;
+        let legacy: LegacyStore = serde_json::from_slice(&bytes).context("parsing legacy JSON embedding store")?;
         return Ok(legacy.into());
     }
     if bytes.len() < 24 || &bytes[..8] != MAGIC {
@@ -191,8 +192,7 @@ fn load_store(path: &Path) -> Result<Store> {
         .checked_add(meta_len)
         .filter(|&e| e <= bytes.len())
         .with_context(|| format!("truncated embedding store {}", path.display()))?;
-    let meta: MetaBlock =
-        serde_json::from_slice(&bytes[24..meta_end]).context("parsing embedding store metadata")?;
+    let meta: MetaBlock = serde_json::from_slice(&bytes[24..meta_end]).context("parsing embedding store metadata")?;
     let vec_bytes = &bytes[meta_end..];
     if meta.records.len() != count || vec_bytes.len() != count * dim * 4 {
         bail!(
@@ -206,7 +206,12 @@ fn load_store(path: &Path) -> Result<Store> {
         .chunks_exact(4)
         .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
         .collect();
-    Ok(Store { model: meta.model, dim, meta: meta.records, vectors })
+    Ok(Store {
+        model: meta.model,
+        dim,
+        meta: meta.records,
+        vectors,
+    })
 }
 
 // ---- embedding -------------------------------------------------------------------------------
@@ -214,12 +219,10 @@ fn load_store(path: &Path) -> Result<Store> {
 /// Load the embedding model, honoring `CV_SEARCH_MODEL` (local dir) before falling back to the Hub.
 fn load_model() -> Result<StaticModel> {
     if let Some(dir) = std::env::var_os("CV_SEARCH_MODEL") {
-        return StaticModel::from_pretrained(dir, None, None, None)
-            .context("loading model from $CV_SEARCH_MODEL");
+        return StaticModel::from_pretrained(dir, None, None, None).context("loading model from $CV_SEARCH_MODEL");
     }
-    StaticModel::from_pretrained(MODEL_REPO, None, None, None).with_context(|| {
-        format!("loading/downloading embedding model {MODEL_REPO} (set CV_SEARCH_MODEL for offline)")
-    })
+    StaticModel::from_pretrained(MODEL_REPO, None, None, None)
+        .with_context(|| format!("loading/downloading embedding model {MODEL_REPO} (set CV_SEARCH_MODEL for offline)"))
 }
 
 /// Sessions whose bodies are batched into one `model.encode` call. Bounds how many session body
@@ -270,12 +273,7 @@ pub fn embed_all(path: &Path) -> Result<usize> {
 /// Encode the pending batch of bodies (one `model.encode` call — model2vec truncates to 512 tokens
 /// by default), appending each vector to the store's flat block alongside its metadata. Clears the
 /// batch (freeing the bodies) before returning.
-fn encode_batch(
-    model: &StaticModel,
-    pending: &mut Vec<RecordMeta>,
-    bodies: &mut Vec<String>,
-    store: &mut Store,
-) {
+fn encode_batch(model: &StaticModel, pending: &mut Vec<RecordMeta>, bodies: &mut Vec<String>, store: &mut Store) {
     if bodies.is_empty() {
         return;
     }
@@ -334,9 +332,7 @@ fn migrate_legacy_sibling(path: &Path) {
 /// records to [`Hit`]s. Split from [`semantic_search`] so the record→hit projection (dates,
 /// preview-as-snippet) is testable without loading the embedding model.
 fn rank(store: &Store, q: &[f32], k: usize) -> Vec<Hit> {
-    let mut scored: Vec<(f32, usize)> = (0..store.meta.len())
-        .map(|i| (cosine(q, store.vector(i)), i))
-        .collect();
+    let mut scored: Vec<(f32, usize)> = (0..store.meta.len()).map(|i| (cosine(q, store.vector(i)), i)).collect();
     scored.sort_by(|a, b| b.0.total_cmp(&a.0));
     scored.truncate(k);
 
@@ -411,7 +407,12 @@ mod tests {
 
     fn store(records: Vec<(RecordMeta, Vec<f32>)>) -> Store {
         let dim = records.first().map(|(_, v)| v.len()).unwrap_or(0);
-        let mut s = Store { model: "test".into(), dim, meta: Vec::new(), vectors: Vec::new() };
+        let mut s = Store {
+            model: "test".into(),
+            dim,
+            meta: Vec::new(),
+            vectors: Vec::new(),
+        };
         for (m, v) in records {
             assert_eq!(v.len(), dim);
             s.vectors.extend_from_slice(&v);
@@ -458,7 +459,7 @@ mod tests {
         assert_eq!(back.meta[0].created_at, Some(1));
         assert_eq!(back.meta[1].title.as_deref(), Some("title-b"));
         assert_eq!(back.vectors, s.vectors); // bit-exact through to_le_bytes/from_le_bytes
-        // And the loaded store ranks like the in-memory one.
+                                             // And the loaded store ranks like the in-memory one.
         assert_eq!(rank(&back, &[0.25, -1.5, 3.0], 1)[0].id, "a");
 
         std::fs::remove_dir_all(&dir).ok();

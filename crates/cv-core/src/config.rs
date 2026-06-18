@@ -35,7 +35,9 @@ pub fn config_path() -> Option<PathBuf> {
 
 /// Load the config, tolerantly: a missing or malformed file yields [`Config::default`].
 pub fn load() -> Config {
-    let Some(p) = config_path() else { return Config::default() };
+    let Some(p) = config_path() else {
+        return Config::default();
+    };
     match std::fs::read_to_string(&p) {
         Ok(text) => toml::from_str(&text).unwrap_or_else(|e| {
             eprintln!("cv: ignoring malformed {}: {e}", p.display());
@@ -62,7 +64,9 @@ mod tests {
 
     #[test]
     fn round_trips_exports() {
-        let cfg = Config { exports: vec![PathBuf::from("/a/exports"), PathBuf::from("/b/conversations.json")] };
+        let cfg = Config {
+            exports: vec![PathBuf::from("/a/exports"), PathBuf::from("/b/conversations.json")],
+        };
         let text = toml::to_string_pretty(&cfg).unwrap();
         let back: Config = toml::from_str(&text).unwrap();
         assert_eq!(back.exports, cfg.exports);

@@ -33,17 +33,18 @@ pub(crate) fn cmd_ls(
 ) -> Result<()> {
     let want = parse_harness(&harness)?;
     let query = crate::cmd::query::build(query)?;
-    let all = if fresh { cv_core::discover_all() } else { cv_core::sessions() };
+    let all = if fresh {
+        cv_core::discover_all()
+    } else {
+        cv_core::sessions()
+    };
     let discovered = all.len();
     let mut refs: Vec<SessionRef> = all
         .into_iter()
         .filter(|r| want.is_none_or(|h| r.harness == h))
         .filter(|r| match &cwd {
             None => true,
-            Some(c) => r
-                .cwd
-                .as_ref()
-                .is_some_and(|p| p.to_string_lossy().contains(c)),
+            Some(c) => r.cwd.as_ref().is_some_and(|p| p.to_string_lossy().contains(c)),
         })
         .collect();
     apply_query(&mut refs, &query);
@@ -88,7 +89,12 @@ pub(crate) fn cmd_ls(
 // ---------- timeline ----------
 
 /// A unified chronological feed across all harnesses (oldest → newest, like a feed). Grouped by day.
-pub(crate) fn cmd_timeline(harness: Option<String>, cwd: Option<String>, query: Option<String>, limit: usize) -> Result<()> {
+pub(crate) fn cmd_timeline(
+    harness: Option<String>,
+    cwd: Option<String>,
+    query: Option<String>,
+    limit: usize,
+) -> Result<()> {
     let want = parse_harness(&harness)?;
     let query = crate::cmd::query::build(query)?;
     let mut refs: Vec<SessionRef> = cv_core::sessions()
@@ -96,11 +102,7 @@ pub(crate) fn cmd_timeline(harness: Option<String>, cwd: Option<String>, query: 
         .filter(|r| want.is_none_or(|h| r.harness == h))
         .filter(|r| match &cwd {
             None => true,
-            Some(c) => r
-                .cwd
-                .as_ref()
-                .map(|p| p.to_string_lossy().contains(c))
-                .unwrap_or(false),
+            Some(c) => r.cwd.as_ref().map(|p| p.to_string_lossy().contains(c)).unwrap_or(false),
         })
         .collect();
     apply_query(&mut refs, &query);
@@ -111,7 +113,11 @@ pub(crate) fn cmd_timeline(harness: Option<String>, cwd: Option<String>, query: 
 
     let total = refs.len();
     // A feed shows the *most recent* window; keep the last `limit` rows but still oldest → newest.
-    let shown = if total > limit { &refs[total - limit..] } else { &refs[..] };
+    let shown = if total > limit {
+        &refs[total - limit..]
+    } else {
+        &refs[..]
+    };
     if total > limit {
         println!("… {} older (use --limit)\n", total - limit);
     }
@@ -157,7 +163,11 @@ pub(crate) fn cmd_stats(query: Option<String>) -> Result<()> {
     apply_query(&mut refs, &query);
     let total = refs.len();
     if total == 0 {
-        let scope = if query.is_some() { " match the query" } else { " discovered" };
+        let scope = if query.is_some() {
+            " match the query"
+        } else {
+            " discovered"
+        };
         println!("no sessions{scope}.");
         return Ok(());
     }
@@ -171,11 +181,7 @@ pub(crate) fn cmd_stats(query: Option<String>) -> Result<()> {
     for r in &refs {
         *per_harness.entry(r.harness.as_str()).or_default() += 1;
         total_messages += r.message_count;
-        let cwd = r
-            .cwd
-            .as_deref()
-            .map(home_rel)
-            .unwrap_or_else(|| "(no cwd)".into());
+        let cwd = r.cwd.as_deref().map(home_rel).unwrap_or_else(|| "(no cwd)".into());
         *per_cwd.entry(cwd).or_default() += 1;
         if let Some(c) = r.created_at {
             min_created = Some(min_created.map_or(c, |m| m.min(c)));

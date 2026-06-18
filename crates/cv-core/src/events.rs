@@ -36,8 +36,14 @@ const WRITE_HINTS: &[&str] = &["edit", "write", "patch", "notebook", "replace", 
 const READ_HINTS: &[&str] = &["read", "grep", "glob", "search", "cat", "view", "list"];
 
 /// Input keys (across harnesses) whose string value is the tool's file target.
-const FILE_KEYS: &[&str] =
-    &["file_path", "absolute_path", "filePath", "notebook_path", "target_file", "path"];
+const FILE_KEYS: &[&str] = &[
+    "file_path",
+    "absolute_path",
+    "filePath",
+    "notebook_path",
+    "target_file",
+    "path",
+];
 
 /// One normalized thing a session did, extracted from a message's tool blocks.
 ///
@@ -70,7 +76,11 @@ impl EventSink {
     /// `cwd` is the session working directory relative file paths resolve against (usually the
     /// [`SessionRef`]'s); when `None`, the adapter's `meta` cwd is used if it arrives.
     pub fn new(cwd: Option<PathBuf>) -> Self {
-        EventSink { cwd, msg_idx: 0, events: Vec::new() }
+        EventSink {
+            cwd,
+            msg_idx: 0,
+            events: Vec::new(),
+        }
     }
 
     pub fn events(&self) -> &[Event] {
@@ -121,7 +131,12 @@ fn extract_into(m: &Message, msg_idx: usize, cwd: Option<&Path>, out: &mut Vec<E
                     });
                 }
             }
-            Block::ToolResult { content, is_error: true, tool_name, .. } => {
+            Block::ToolResult {
+                content,
+                is_error: true,
+                tool_name,
+                ..
+            } => {
                 // Never materialize a lazy span just for a 200-char detail — an unresolved span
                 // (a giant failed-command dump) simply contributes no detail.
                 let detail = content
@@ -517,7 +532,11 @@ mod db {
                 let rows = stmt
                     .query_map([], |row| {
                         Ok((
-                            (row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?),
+                            (
+                                row.get::<_, String>(0)?,
+                                row.get::<_, String>(1)?,
+                                row.get::<_, String>(2)?,
+                            ),
                             row.get::<_, i64>(3)?,
                         ))
                     })
@@ -579,13 +598,10 @@ mod db {
         };
         let _ = tx.execute("DELETE FROM events WHERE session=?1", params![session]);
         {
-            let Ok(mut intern) =
-                tx.prepare("INSERT OR IGNORE INTO event_targets(target) VALUES(?1)")
-            else {
+            let Ok(mut intern) = tx.prepare("INSERT OR IGNORE INTO event_targets(target) VALUES(?1)") else {
                 return;
             };
-            let Ok(mut intern_id) = tx.prepare("SELECT id FROM event_targets WHERE target=?1")
-            else {
+            let Ok(mut intern_id) = tx.prepare("SELECT id FROM event_targets WHERE target=?1") else {
                 return;
             };
             let Ok(mut insert) = tx.prepare(
@@ -594,10 +610,8 @@ mod db {
             ) else {
                 return;
             };
-            let mut seen: std::collections::HashSet<(usize, &str, &str)> =
-                std::collections::HashSet::new();
-            let mut targets: std::collections::HashMap<&str, i64> =
-                std::collections::HashMap::new();
+            let mut seen: std::collections::HashSet<(usize, &str, &str)> = std::collections::HashSet::new();
+            let mut targets: std::collections::HashMap<&str, i64> = std::collections::HashMap::new();
             for e in events {
                 if !seen.insert((e.msg_idx, e.kind, e.target.as_deref().unwrap_or(""))) {
                     continue;
@@ -637,8 +651,8 @@ mod db {
     /// (Re)ingest events for one session: stream it (lazily — large content stays on disk) through
     /// an [`EventSink`] and persist the rows. Returns the number of events extracted.
     pub fn ingest_ref(r: &SessionRef) -> Result<usize> {
-        let adapter = crate::harness::for_harness(r.harness)
-            .ok_or_else(|| anyhow::anyhow!("no adapter for {}", r.harness))?;
+        let adapter =
+            crate::harness::for_harness(r.harness).ok_or_else(|| anyhow::anyhow!("no adapter for {}", r.harness))?;
         let mut sink = EventSink::new(r.cwd.clone());
         adapter.stream(r, &crate::stream::ParseOptions::lazy(), &mut sink)?;
         let events = sink.into_events();
@@ -650,8 +664,8 @@ mod db {
     /// the rows are attributable to the orchestrator that spawned it. Same streaming discipline as
     /// [`ingest_ref`] (lazy parse → large content stays on disk); returns the events extracted.
     pub fn ingest_subagent(r: &SessionRef, prov: &Provenance) -> Result<usize> {
-        let adapter = crate::harness::for_harness(r.harness)
-            .ok_or_else(|| anyhow::anyhow!("no adapter for {}", r.harness))?;
+        let adapter =
+            crate::harness::for_harness(r.harness).ok_or_else(|| anyhow::anyhow!("no adapter for {}", r.harness))?;
         let mut sink = EventSink::new(r.cwd.clone());
         adapter.stream(r, &crate::stream::ParseOptions::lazy(), &mut sink)?;
         let events = sink.into_events();
@@ -791,7 +805,9 @@ mod db {
              {having}
              ORDER BY last_ts DESC, es.session_id"
         );
-        let Ok(mut stmt) = conn.prepare(&sql) else { return Vec::new() };
+        let Ok(mut stmt) = conn.prepare(&sql) else {
+            return Vec::new();
+        };
         let rows = stmt.query_map(params![abs, suffix], |row| {
             Ok(TouchedSession {
                 harness: row.get(0)?,
@@ -820,10 +836,7 @@ mod db {
     /// cataloged at more than one path. Empty on any error or a cold catalog.
     pub fn edits_touching_file(abs: &str, rel: &str) -> Vec<EditEvent> {
         let Some(conn) = open() else { return Vec::new() };
-        let escaped = rel
-            .replace('\\', "\\\\")
-            .replace('%', "\\%")
-            .replace('_', "\\_");
+        let escaped = rel.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
         let suffix = format!("%/{escaped}");
         // IN-subquery for the same plan-pinning reason as [`sessions_touching`]; the extra join
         // back to event_targets only resolves the matched rows' target strings by rowid.
@@ -865,15 +878,14 @@ mod db {
     /// touched this file" from "nobody ran `cv index` yet" and hint accordingly.
     pub fn catalog_has_events() -> bool {
         let Some(conn) = open() else { return false };
-        conn.query_row("SELECT 1 FROM events LIMIT 1", [], |_| Ok(()))
-            .is_ok()
+        conn.query_row("SELECT 1 FROM events LIMIT 1", [], |_| Ok(())).is_ok()
     }
 }
 
 #[cfg(feature = "sqlite")]
 pub use db::{
-    catalog_has_events, edits_touching_file, events_for, ingest_all, ingest_ref, ingest_subagent,
-    needs_ingest, record, record_with, sessions_touching, SyncTable,
+    catalog_has_events, edits_touching_file, events_for, ingest_all, ingest_ref, ingest_subagent, needs_ingest, record,
+    record_with, sessions_touching, SyncTable,
 };
 
 /// No-op fallbacks without sqlite: extraction still works (the sink is pure), persistence and
@@ -922,8 +934,8 @@ mod db_stub {
 }
 #[cfg(not(feature = "sqlite"))]
 pub use db_stub::{
-    catalog_has_events, edits_touching_file, events_for, ingest_all, ingest_ref, ingest_subagent,
-    needs_ingest, record, record_with, sessions_touching, SyncTable,
+    catalog_has_events, edits_touching_file, events_for, ingest_all, ingest_ref, ingest_subagent, needs_ingest, record,
+    record_with, sessions_touching, SyncTable,
 };
 
 #[cfg(test)]
@@ -939,25 +951,41 @@ mod tests {
     }
 
     fn tool_use(name: &str, input: Value) -> Block {
-        Block::ToolUse { id: "t1".into(), name: name.into(), input }
+        Block::ToolUse {
+            id: "t1".into(),
+            name: name.into(),
+            input,
+        }
     }
 
     #[test]
     fn claude_style_tools_classify_and_resolve_relative_paths() {
         let cwd = Path::new("/repo");
         let m = msg(vec![
-            tool_use("Edit", json!({"file_path": "src/ir.rs", "old_string": "a", "new_string": "b"})),
+            tool_use(
+                "Edit",
+                json!({"file_path": "src/ir.rs", "old_string": "a", "new_string": "b"}),
+            ),
             tool_use("Read", json!({"file_path": "/etc/hosts"})),
             tool_use("Bash", json!({"command": "cargo test -p cv-core"})),
             tool_use("Glob", json!({"pattern": "**/*.rs", "path": "crates"})),
         ]);
         let ev = extract(&m, 7, Some(cwd));
         assert_eq!(ev.len(), 4);
-        assert_eq!((ev[0].kind, ev[0].target.as_deref()), ("file_edit", Some("/repo/src/ir.rs")));
+        assert_eq!(
+            (ev[0].kind, ev[0].target.as_deref()),
+            ("file_edit", Some("/repo/src/ir.rs"))
+        );
         assert_eq!(ev[0].msg_idx, 7);
         assert_eq!((ev[1].kind, ev[1].target.as_deref()), ("file_read", Some("/etc/hosts")));
-        assert_eq!((ev[2].kind, ev[2].target.as_deref()), ("command", Some("cargo test -p cv-core")));
-        assert_eq!((ev[3].kind, ev[3].target.as_deref()), ("file_read", Some("/repo/crates")));
+        assert_eq!(
+            (ev[2].kind, ev[2].target.as_deref()),
+            ("command", Some("cargo test -p cv-core"))
+        );
+        assert_eq!(
+            (ev[3].kind, ev[3].target.as_deref()),
+            ("file_read", Some("/repo/crates"))
+        );
         assert_eq!(ev[0].tool.as_deref(), Some("Edit"));
     }
 
@@ -966,7 +994,10 @@ mod tests {
         // codex `shell`: argv array.
         let m = msg(vec![tool_use("shell", json!({"command": ["bash", "-lc", "ls -la"]}))]);
         let ev = extract(&m, 0, None);
-        assert_eq!((ev[0].kind, ev[0].target.as_deref()), ("command", Some("bash -lc ls -la")));
+        assert_eq!(
+            (ev[0].kind, ev[0].target.as_deref()),
+            ("command", Some("bash -lc ls -la"))
+        );
 
         // codex `local_shell`: nested action.command.
         let m = msg(vec![tool_use(
@@ -989,8 +1020,14 @@ mod tests {
         let m = msg(vec![tool_use("apply_patch", json!(patch))]);
         let ev = extract(&m, 0, Some(Path::new("/repo")));
         assert_eq!(ev.len(), 2);
-        assert_eq!((ev[0].kind, ev[0].target.as_deref()), ("file_edit", Some("/repo/crates/cv-core/src/ir.rs")));
-        assert_eq!((ev[1].kind, ev[1].target.as_deref()), ("file_edit", Some("/repo/docs/notes.md")));
+        assert_eq!(
+            (ev[0].kind, ev[0].target.as_deref()),
+            ("file_edit", Some("/repo/crates/cv-core/src/ir.rs"))
+        );
+        assert_eq!(
+            (ev[1].kind, ev[1].target.as_deref()),
+            ("file_edit", Some("/repo/docs/notes.md"))
+        );
 
         // The same patch routed through the shell tool: command row + per-file edits.
         let m = msg(vec![tool_use("shell", json!({"command": ["apply_patch", patch]}))]);
@@ -1030,13 +1067,19 @@ mod tests {
             tool_use("write_file", json!({"file_path": "out.txt", "content": "hi"})),
             tool_use("read_file", json!({"absolute_path": "/g/in.txt"})),
             tool_use("run_shell_command", json!({"command": "make build"})),
-            tool_use("replace", json!({"file_path": "/g/edit.txt", "old_string": "a", "new_string": "b"})),
+            tool_use(
+                "replace",
+                json!({"file_path": "/g/edit.txt", "old_string": "a", "new_string": "b"}),
+            ),
         ]);
         let ev = extract(&m, 0, Some(Path::new("/g")));
         assert_eq!((ev[0].kind, ev[0].target.as_deref()), ("file_edit", Some("/g/out.txt")));
         assert_eq!((ev[1].kind, ev[1].target.as_deref()), ("file_read", Some("/g/in.txt")));
         assert_eq!((ev[2].kind, ev[2].target.as_deref()), ("command", Some("make build")));
-        assert_eq!((ev[3].kind, ev[3].target.as_deref()), ("file_edit", Some("/g/edit.txt")));
+        assert_eq!(
+            (ev[3].kind, ev[3].target.as_deref()),
+            ("file_edit", Some("/g/edit.txt"))
+        );
     }
 
     #[test]
@@ -1279,7 +1322,10 @@ mod tests {
         };
 
         // First v2 open (inside needs_ingest) migrates: v1 rows gone, sync stamp gone → stale.
-        assert!(needs_ingest(&r, mtime), "v1 event_sync stamps must not survive migration");
+        assert!(
+            needs_ingest(&r, mtime),
+            "v1 event_sync stamps must not survive migration"
+        );
         assert!(!catalog_has_events(), "v1 event rows must not survive migration");
 
         // The normal lazy path then rebuilds cleanly on the v2 schema.
@@ -1301,7 +1347,10 @@ mod tests {
             conn.execute_batch(&format!("DROP TABLE events; {V1_DDL}")).unwrap();
         }
         // Shape detection self-heals on open: full reset, stale again, reingest works.
-        assert!(!catalog_has_events(), "a v1-shaped table under a v2 stamp must be dropped");
+        assert!(
+            !catalog_has_events(),
+            "a v1-shaped table under a v2 stamp must be dropped"
+        );
         assert!(needs_ingest(&r, mtime));
         ingest_ref(&r).unwrap();
         assert_eq!(events_for("claude", "mig-e2e", None).len(), 1);

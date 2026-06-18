@@ -529,52 +529,184 @@ enum Cmd {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
-        Cmd::Ls { harness, cwd, query, limit, sort_by, fresh } => browse::cmd_ls(harness, cwd, query, limit, &sort_by, fresh),
-        Cmd::Search { query, harness, limit, semantic } => search::cmd_search(&query, harness, limit, semantic),
-        Cmd::Show { id, harness, json, range, subagents, agent, pre_compaction } => {
-            view::cmd_show(&id, harness, json, range, subagents, agent, pre_compaction)
-        }
+        Cmd::Ls {
+            harness,
+            cwd,
+            query,
+            limit,
+            sort_by,
+            fresh,
+        } => browse::cmd_ls(harness, cwd, query, limit, &sort_by, fresh),
+        Cmd::Search {
+            query,
+            harness,
+            limit,
+            semantic,
+        } => search::cmd_search(&query, harness, limit, semantic),
+        Cmd::Show {
+            id,
+            harness,
+            json,
+            range,
+            subagents,
+            agent,
+            pre_compaction,
+        } => view::cmd_show(&id, harness, json, range, subagents, agent, pre_compaction),
         Cmd::Export { id, format, harness } => view::cmd_export(&id, &format, harness),
-        Cmd::Dataset { format, harness, query, subagents, limit, min_messages, redact, redact_only, out } => {
-            compose::cmd_dataset(&format, harness, query, subagents, limit, min_messages, redact, redact_only, out)
-        }
+        Cmd::Dataset {
+            format,
+            harness,
+            query,
+            subagents,
+            limit,
+            min_messages,
+            redact,
+            redact_only,
+            out,
+        } => compose::cmd_dataset(
+            &format,
+            harness,
+            query,
+            subagents,
+            limit,
+            min_messages,
+            redact,
+            redact_only,
+            out,
+        ),
         Cmd::Convert { id, to, from, out, cwd } => convert::cmd_convert(&id, &to, from, out, cwd),
-        Cmd::Port { id, to, from, to_dir, out, no_context } => convert::cmd_port(&id, to, from, to_dir, out, no_context),
-        Cmd::Scry { harness, cwd, interval, existing } => live::cmd_scry(harness, cwd, interval, existing),
-        Cmd::Index { semantic, rebuild, subagents } => search::cmd_index(semantic, rebuild, subagents),
-        Cmd::Events { id, harness, kind, subagents } => provenance::cmd_events(&id, harness, kind, subagents),
+        Cmd::Port {
+            id,
+            to,
+            from,
+            to_dir,
+            out,
+            no_context,
+        } => convert::cmd_port(&id, to, from, to_dir, out, no_context),
+        Cmd::Scry {
+            harness,
+            cwd,
+            interval,
+            existing,
+        } => live::cmd_scry(harness, cwd, interval, existing),
+        Cmd::Index {
+            semantic,
+            rebuild,
+            subagents,
+        } => search::cmd_index(semantic, rebuild, subagents),
+        Cmd::Events {
+            id,
+            harness,
+            kind,
+            subagents,
+        } => provenance::cmd_events(&id, harness, kind, subagents),
         Cmd::Touched { path, edits_only } => provenance::cmd_touched(&path, edits_only),
         Cmd::Blame { file, lines, show } => blame::cmd_blame(&file, lines.as_deref(), show),
-        Cmd::Share { id, harness, out, no_redact } => share::cmd_share(&id, harness, out, no_redact),
-        Cmd::Pack { task, format, to, limit, out } => pack::cmd_pack(&task, &format, to, limit, out),
+        Cmd::Share {
+            id,
+            harness,
+            out,
+            no_redact,
+        } => share::cmd_share(&id, harness, out, no_redact),
+        Cmd::Pack {
+            task,
+            format,
+            to,
+            limit,
+            out,
+        } => pack::cmd_pack(&task, &format, to, limit, out),
         Cmd::Stats { query } => browse::cmd_stats(query),
-        Cmd::Prune { id, harness, retrieve, min_size, keep_last, to, drop, copy_resources, dry_run } => {
-            compose::cmd_prune(&id, harness, retrieve, min_size, keep_last, to, drop, copy_resources, dry_run)
-        }
+        Cmd::Prune {
+            id,
+            harness,
+            retrieve,
+            min_size,
+            keep_last,
+            to,
+            drop,
+            copy_resources,
+            dry_run,
+        } => compose::cmd_prune(
+            &id,
+            harness,
+            retrieve,
+            min_size,
+            keep_last,
+            to,
+            drop,
+            copy_resources,
+            dry_run,
+        ),
         Cmd::Config { add_export, rm_export } => config::cmd_config(add_export, rm_export),
         Cmd::Query { json } => query::cmd_query(json),
         Cmd::Resume { id, harness, launch } => convert::cmd_resume(&id, harness, launch),
         Cmd::Tree { id, harness } => view::cmd_tree(&id, harness),
-        Cmd::Workflow { id, run_id, harness, json, script } => {
-            workflow::cmd_workflow(&id, run_id, harness, json, script)
-        }
-        Cmd::Tools { id, harness, agent, tool, workflow: wf, across, timeline, json } => {
-            workflow::cmd_tools(&id, harness, agent, tool, wf, across, timeline, json)
-        }
-        Cmd::Compaction { id, harness, summaries, json } => {
-            workflow::cmd_compaction(&id, harness, summaries, json)
-        }
+        Cmd::Workflow {
+            id,
+            run_id,
+            harness,
+            json,
+            script,
+        } => workflow::cmd_workflow(&id, run_id, harness, json, script),
+        Cmd::Tools {
+            id,
+            harness,
+            agent,
+            tool,
+            workflow: wf,
+            across,
+            timeline,
+            json,
+        } => workflow::cmd_tools(&id, harness, agent, tool, wf, across, timeline, json),
+        Cmd::Compaction {
+            id,
+            harness,
+            summaries,
+            json,
+        } => workflow::cmd_compaction(&id, harness, summaries, json),
         Cmd::Board { action } => live::cmd_board(action),
-        Cmd::Timeline { harness, cwd, query, limit } => browse::cmd_timeline(harness, cwd, query, limit),
+        Cmd::Timeline {
+            harness,
+            cwd,
+            query,
+            limit,
+        } => browse::cmd_timeline(harness, cwd, query, limit),
         Cmd::Diff { a, b, harness } => view::cmd_diff(&a, &b, harness),
-        Cmd::Splice { specs, to, out, export, cwd, generate, gen_model } => compose::cmd_splice(&specs, to, out, export, cwd, generate, gen_model),
-        Cmd::Distill { id, harness, model, project, out, append } => {
-            compose::cmd_distill(&id, harness, model, project, out, append)
-        }
+        Cmd::Splice {
+            specs,
+            to,
+            out,
+            export,
+            cwd,
+            generate,
+            gen_model,
+        } => compose::cmd_splice(&specs, to, out, export, cwd, generate, gen_model),
+        Cmd::Distill {
+            id,
+            harness,
+            model,
+            project,
+            out,
+            append,
+        } => compose::cmd_distill(&id, harness, model, project, out, append),
         Cmd::Recall { query, k, harness } => search::cmd_recall(&query, k, harness),
-        Cmd::Redact { id, harness, format, stats } => view::cmd_redact(&id, harness, &format, stats),
-        Cmd::Loom { base, at, graft, from, to, out, export, cwd, generate, gen_model } => {
-            compose::cmd_loom(&base, at, &graft, from, to, out, export, cwd, generate, gen_model)
-        }
+        Cmd::Redact {
+            id,
+            harness,
+            format,
+            stats,
+        } => view::cmd_redact(&id, harness, &format, stats),
+        Cmd::Loom {
+            base,
+            at,
+            graft,
+            from,
+            to,
+            out,
+            export,
+            cwd,
+            generate,
+            gen_model,
+        } => compose::cmd_loom(&base, at, &graft, from, to, out, export, cwd, generate, gen_model),
     }
 }

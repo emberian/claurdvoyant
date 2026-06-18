@@ -45,11 +45,7 @@ impl ClaudeApp {
     /// The Electron profile dir for the Claude desktop app, if it exists.
     fn detect_root() -> Option<PathBuf> {
         dirs::home_dir()
-            .map(|h| {
-                h.join("Library")
-                    .join("Application Support")
-                    .join("Claude")
-            })
+            .map(|h| h.join("Library").join("Application Support").join("Claude"))
             .filter(|p| p.exists())
     }
 }
@@ -76,9 +72,7 @@ impl Adapter for ClaudeApp {
     }
 
     fn parse(&self, _r: &SessionRef) -> Result<Session> {
-        anyhow::bail!(
-            "claude-app stores conversations server-side (claude.ai); no local transcripts to parse"
-        )
+        anyhow::bail!("claude-app stores conversations server-side (claude.ai); no local transcripts to parse")
     }
 }
 

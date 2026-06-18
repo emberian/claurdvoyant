@@ -40,20 +40,12 @@ const MAX_FILES_PER_SOURCE: usize = 8;
 /// Rows of the cross-source file rollup.
 const MAX_ROLLUP: usize = 12;
 
-pub(crate) fn cmd_pack(
-    task: &str,
-    format: &str,
-    to: Option<String>,
-    limit: usize,
-    out: Option<PathBuf>,
-) -> Result<()> {
+pub(crate) fn cmd_pack(task: &str, format: &str, to: Option<String>, limit: usize, out: Option<PathBuf>) -> Result<()> {
     if !matches!(format, "md" | "prompt" | "session") {
         bail!("unknown format {format:?} (use md, prompt, or session)");
     }
     let to_h = match (format, &to) {
-        ("session", Some(s)) => {
-            Some(Harness::parse(s).with_context(|| format!("unknown target harness: {s}"))?)
-        }
+        ("session", Some(s)) => Some(Harness::parse(s).with_context(|| format!("unknown target harness: {s}"))?),
         ("session", None) => bail!("--format session needs --to <harness> (e.g. --to claude)"),
         (_, Some(_)) => bail!("--to only applies to --format session"),
         _ => None,
@@ -86,11 +78,7 @@ pub(crate) fn cmd_pack(
     for hit in hits {
         match build_source(&hit, task, llm_model.as_ref()) {
             Ok(s) => sources.push(s),
-            Err(e) => eprintln!(
-                "cv pack: skipping {} ({}): {e:#}",
-                short_id(&hit.id),
-                hit.harness
-            ),
+            Err(e) => eprintln!("cv pack: skipping {} ({}): {e:#}", short_id(&hit.id), hit.harness),
         }
     }
     if sources.is_empty() {
@@ -170,8 +158,8 @@ fn recall(task: &str, limit: usize) -> Result<Vec<cv_search::Hit>> {
 
 /// English filler that would make an OR query match everything.
 const STOPWORDS: &[&str] = &[
-    "the", "and", "for", "with", "that", "this", "from", "into", "our", "your", "how", "what",
-    "when", "where", "why", "are", "was", "were", "has", "have", "had", "not", "but", "all",
+    "the", "and", "for", "with", "that", "this", "from", "into", "our", "your", "how", "what", "when", "where", "why",
+    "are", "was", "were", "has", "have", "had", "not", "but", "all",
 ];
 
 /// The task's distinct searchable words joined with OR — the relaxed second-try query.
@@ -268,8 +256,7 @@ fn live_scan(task: &str, fetch: usize) -> Result<Vec<cv_search::Hit>> {
                 return;
             }
             if let Some(sp) = text.as_span() {
-                self.hay
-                    .push_str(&self.resolver.resolve_prefix(sp, remaining as u64));
+                self.hay.push_str(&self.resolver.resolve_prefix(sp, remaining as u64));
             } else if let Some(t) = text.inline_str() {
                 self.hay.push_str(&t[..floor_char(t, remaining.min(t.len()))]);
             }
@@ -341,11 +328,7 @@ fn live_scan(task: &str, fetch: usize) -> Result<Vec<cv_search::Hit>> {
                 continue;
             }
             // Snippet around the first matched word, from the original-case haystack.
-            let pos = words
-                .iter()
-                .filter_map(|w| low.find(*w))
-                .min()
-                .unwrap_or(0);
+            let pos = words.iter().filter_map(|w| low.find(*w)).min().unwrap_or(0);
             let lo = floor_char(&sink.hay, pos.saturating_sub(40));
             let hi = ceil_char(&sink.hay, (pos + 120).min(sink.hay.len()));
             let snippet = sink.hay[lo..hi].replace('\n', " ").trim().to_string();
@@ -397,14 +380,10 @@ struct PackSource {
     llm_digest: Option<String>,
 }
 
-fn build_source(
-    hit: &cv_search::Hit,
-    task: &str,
-    llm_model: Option<&Option<String>>,
-) -> Result<PackSource> {
+fn build_source(hit: &cv_search::Hit, task: &str, llm_model: Option<&Option<String>>) -> Result<PackSource> {
     let want = Harness::parse(&hit.harness);
-    let (r, adapter) = cv_core::find(&hit.id, want)?
-        .with_context(|| format!("session {} no longer on disk", short_id(&hit.id)))?;
+    let (r, adapter) =
+        cv_core::find(&hit.id, want)?.with_context(|| format!("session {} no longer on disk", short_id(&hit.id)))?;
 
     // The excerpt window: one streamed pass under lazy options, spans resolved head-only.
     let (excerpt, excerpt_range) = best_window(adapter.as_ref(), &r, task)?;
@@ -460,14 +439,22 @@ fn build_source(
         };
         for (role, text) in &excerpt {
             let mut m = Message::new(*role);
-            m.content.push(Block::Text { text: text.clone().into() });
+            m.content.push(Block::Text {
+                text: text.clone().into(),
+            });
             mini.messages.push(m);
         }
-        let opts = cv_llm::DistillOptions { model: model.clone(), project: false };
+        let opts = cv_llm::DistillOptions {
+            model: model.clone(),
+            project: false,
+        };
         match cv_llm::distill(&mini, &opts) {
             Ok(d) => Some(d.trim().to_string()),
             Err(e) => {
-                eprintln!("cv pack: LLM digest failed for {} ({e:#}); keeping the extractive digest", short_id(&hit.id));
+                eprintln!(
+                    "cv pack: LLM digest failed for {} ({e:#}); keeping the extractive digest",
+                    short_id(&hit.id)
+                );
                 None
             }
         }
@@ -642,10 +629,8 @@ fn rollup_files(sources: &[PackSource]) -> Vec<(String, usize, i64, i64)> {
             e.2 += n;
         }
     }
-    let mut rows: Vec<(String, usize, i64, i64)> = acc
-        .into_iter()
-        .map(|(p, (sess, e, r))| (p, sess.len(), e, r))
-        .collect();
+    let mut rows: Vec<(String, usize, i64, i64)> =
+        acc.into_iter().map(|(p, (sess, e, r))| (p, sess.len(), e, r)).collect();
     rows.sort_by_key(|r| std::cmp::Reverse((r.1, r.2, r.3)));
     rows.truncate(MAX_ROLLUP);
     rows
@@ -747,11 +732,7 @@ fn md_bundle(task: &str, sources: &[PackSource], rollup: &[(String, usize, i64, 
             if *r > 0 {
                 counts.push(format!("{r} read(s)"));
             }
-            let _ = writeln!(
-                out,
-                "- `{p}` — {sess} session(s), {}",
-                counts.join(", ")
-            );
+            let _ = writeln!(out, "- `{p}` — {sess} session(s), {}", counts.join(", "));
         }
     }
     out
@@ -906,10 +887,13 @@ mod tests {
 
     #[test]
     fn or_query_relaxes_multiword_tasks_only() {
-        assert_eq!(or_query("tantivy chunked indexing").as_deref(), Some("tantivy OR chunked OR indexing"));
+        assert_eq!(
+            or_query("tantivy chunked indexing").as_deref(),
+            Some("tantivy OR chunked OR indexing")
+        );
         assert_eq!(or_query("tantivy"), None);
         assert_eq!(or_query("a of in"), None); // short words dropped
-        // Punctuation stripped, dupes (case-insensitive) collapsed.
+                                               // Punctuation stripped, dupes (case-insensitive) collapsed.
         assert_eq!(or_query("Fix fix, the (parser)!").as_deref(), Some("Fix OR parser"));
     }
 

@@ -94,21 +94,26 @@ fn share_corpus(w: &World) {
         }),
     ];
     let body: String = lines.iter().map(|l| format!("{l}\n")).collect();
-    fs::write(
-        w.home.join(".claude/projects/-work-proj/sharesess.jsonl"),
-        body,
-    )
-    .unwrap();
+    fs::write(w.home.join(".claude/projects/-work-proj/sharesess.jsonl"), body).unwrap();
 }
 
 /// No `src=`/`href=` attribute may point at the network. (Fragment anchors and data: are fine.)
 fn assert_no_external_urls(html: &str) {
     let lower = html.to_lowercase();
     for needle in [
-        "src=\"http", "src='http", "href=\"http", "href='http", "src=\"//", "href=\"//",
-        "@import", "url(http",
+        "src=\"http",
+        "src='http",
+        "href=\"http",
+        "href='http",
+        "src=\"//",
+        "href=\"//",
+        "@import",
+        "url(http",
     ] {
-        assert!(!lower.contains(needle), "external reference {needle:?} found in artifact");
+        assert!(
+            !lower.contains(needle),
+            "external reference {needle:?} found in artifact"
+        );
     }
 }
 
@@ -153,7 +158,10 @@ fn share_redacts_by_default() {
     assert!(html.contains("fold think"), "thinking not collapsible");
     assert!(html.contains("fold tool tool-use"), "tool call not collapsible");
     assert!(html.contains("fold tool tool-res"), "tool result not collapsible");
-    assert!(html.contains("<style>") && html.contains("<script>"), "inline assets missing");
+    assert!(
+        html.contains("<style>") && html.contains("<script>"),
+        "inline assets missing"
+    );
     // session content is escaped, never raw markup
     assert!(html.contains("&lt;tables&gt;"), "content not escaped");
     // footer credits the emitting version

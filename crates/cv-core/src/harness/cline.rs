@@ -91,12 +91,7 @@ impl Adapter for Cline {
         crate::stream::collect(self, r)
     }
 
-    fn stream(
-        &self,
-        r: &SessionRef,
-        opts: &ParseOptions,
-        sink: &mut dyn MessageSink,
-    ) -> Result<Session> {
+    fn stream(&self, r: &SessionRef, opts: &ParseOptions, sink: &mut dyn MessageSink) -> Result<Session> {
         stream_task_dir(&r.path, &r.id, Harness::Cline, opts, sink)
     }
 
@@ -418,12 +413,7 @@ impl AsRef<[u8]> for HistoryBytes {
 /// so it's unit-testable with a small fixture string. Shared by Cline and Roo. Drives the same
 /// per-message parse as [`stream_task_dir`] (one message `Value` at a time, off `&RawValue` slices),
 /// so the two paths stay byte-identical without building the whole-document `Value`.
-pub fn parse_history_str(
-    id: &str,
-    text: &str,
-    harness: Harness,
-    source_path: Option<PathBuf>,
-) -> Session {
+pub fn parse_history_str(id: &str, text: &str, harness: Harness, source_path: Option<PathBuf>) -> Session {
     let mut session = Session {
         id: id.to_string(),
         harness,
@@ -499,14 +489,12 @@ fn parse_message(v: &Value, session: &mut Session) -> Option<Message> {
     }
 
     // A user turn that is *only* tool_result blocks is really a Tool turn (Anthropic convention).
-    let role = if role == Role::User
-        && !blocks.is_empty()
-        && blocks.iter().all(|b| matches!(b, Block::ToolResult { .. }))
-    {
-        Role::Tool
-    } else {
-        role
-    };
+    let role =
+        if role == Role::User && !blocks.is_empty() && blocks.iter().all(|b| matches!(b, Block::ToolResult { .. })) {
+            Role::Tool
+        } else {
+            role
+        };
 
     let mut m = Message::new(role);
     m.content = blocks;
@@ -524,11 +512,9 @@ fn parse_block(item: &Value) -> Option<Block> {
                 .get("thinking")
                 .and_then(Value::as_str)
                 .unwrap_or("")
-                .to_string().into(),
-            signature: item
-                .get("signature")
-                .and_then(Value::as_str)
-                .map(str::to_string),
+                .to_string()
+                .into(),
+            signature: item.get("signature").and_then(Value::as_str).map(str::to_string),
             encrypted: None,
             redacted: false,
         }),
@@ -540,11 +526,7 @@ fn parse_block(item: &Value) -> Option<Block> {
         }),
         "tool_use" => Some(Block::ToolUse {
             id: item.get("id").and_then(Value::as_str).unwrap_or("").to_string(),
-            name: item
-                .get("name")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string(),
+            name: item.get("name").and_then(Value::as_str).unwrap_or("").to_string(),
             input: item.get("input").cloned().unwrap_or(Value::Null),
         }),
         "tool_result" => Some(Block::ToolResult {
@@ -573,10 +555,7 @@ fn parse_block(item: &Value) -> Option<Block> {
                     .map(|_| "base64:inline".to_string()),
                 Some(other) => Some(other.to_string()),
             });
-            Some(Block::Image {
-                media_type,
-                data_ref,
-            })
+            Some(Block::Image { media_type, data_ref })
         }
         _ => None,
     }
@@ -637,11 +616,7 @@ fn content_plain_text(content: Option<&Value>) -> String {
 /// session's created/updated time (the parser turns the taskId back into `created_at`). The cwd
 /// (`opts.new_cwd`, else `session.cwd`) is threaded into the first user turn's
 /// `<environment_details>` block (where the parser extracts it from) and into `task_metadata.json`.
-pub fn emit(
-    session: &Session,
-    out_dir: &Path,
-    opts: &crate::emit::EmitOptions,
-) -> Result<crate::harness::EmitResult> {
+pub fn emit(session: &Session, out_dir: &Path, opts: &crate::emit::EmitOptions) -> Result<crate::harness::EmitResult> {
     emit_with_harness(session, out_dir, opts, Harness::Cline)
 }
 
@@ -659,14 +634,16 @@ pub fn emit_with_harness(
     let _ = harness;
     // taskId: an explicit override, else a ms-epoch string the parser can turn back into created_at.
     let created = session.created_at.or(session.updated_at).unwrap_or_else(Utc::now);
-    let new_id = opts.new_id.clone().unwrap_or_else(|| created.timestamp_millis().to_string());
+    let new_id = opts
+        .new_id
+        .clone()
+        .unwrap_or_else(|| created.timestamp_millis().to_string());
 
     let cwd = opts.new_cwd.clone().or_else(|| session.cwd.clone());
     let cwd_str = cwd.as_ref().map(|p| p.to_string_lossy().to_string());
 
     let task_dir = out_dir.join("tasks").join(&new_id);
-    fs::create_dir_all(&task_dir)
-        .with_context(|| format!("creating {}", task_dir.display()))?;
+    fs::create_dir_all(&task_dir).with_context(|| format!("creating {}", task_dir.display()))?;
 
     // ── api_conversation_history.json ──
     let mut history: Vec<Value> = Vec::new();
@@ -758,7 +735,11 @@ pub fn emit_with_harness(
         .with_context(|| format!("writing {}", ui_path.display()))?;
 
     let resume = match &cwd {
-        Some(c) => format!("open {} in Cline (task {new_id}, cwd {})", task_dir.display(), c.display()),
+        Some(c) => format!(
+            "open {} in Cline (task {new_id}, cwd {})",
+            task_dir.display(),
+            c.display()
+        ),
         None => format!("open {} in Cline (task {new_id})", task_dir.display()),
     };
     Ok(crate::harness::EmitResult {
@@ -775,7 +756,12 @@ fn emit_blocks(content: &[Block]) -> Vec<Value> {
     for b in content {
         match b {
             Block::Text { text } => out.push(json!({ "type": "text", "text": text })),
-            Block::Thinking { text, signature, encrypted, redacted } => {
+            Block::Thinking {
+                text,
+                signature,
+                encrypted,
+                redacted,
+            } => {
                 if *redacted {
                     let mut m = Map::new();
                     m.insert("type".into(), json!("redacted_thinking"));
@@ -830,7 +816,13 @@ fn emit_blocks(content: &[Block]) -> Vec<Value> {
 fn emit_tool_result_blocks(content: &[Block]) -> Vec<Value> {
     let mut out = Vec::new();
     for b in content {
-        if let Block::ToolResult { tool_use_id, content, is_error, .. } = b {
+        if let Block::ToolResult {
+            tool_use_id,
+            content,
+            is_error,
+            ..
+        } = b
+        {
             out.push(json!({
                 "type": "tool_result",
                 "tool_use_id": tool_use_id,
@@ -898,10 +890,7 @@ fn strip_block(hay: &str, open: &str, close: &str) -> String {
 }
 
 fn first_line(text: &str) -> Option<String> {
-    text.lines()
-        .map(str::trim)
-        .find(|l| !l.is_empty())
-        .map(str::to_string)
+    text.lines().map(str::trim).find(|l| !l.is_empty()).map(str::to_string)
 }
 
 /// `<taskId>` is a millisecond epoch timestamp string. Convert it to a UTC time, when it parses.
@@ -958,11 +947,7 @@ fn cwd_from_metadata(dir: &Path) -> Option<PathBuf> {
 /// - `first_user_ts`: same first `ts`, which the streaming core stamps onto the first user turn.
 ///
 /// `(created_at, updated_at, last_api_start)` extracted from a task's `ui_messages.json`.
-type UiTimes = (
-    Option<DateTime<Utc>>,
-    Option<DateTime<Utc>>,
-    Option<DateTime<Utc>>,
-);
+type UiTimes = (Option<DateTime<Utc>>, Option<DateTime<Utc>>, Option<DateTime<Utc>>);
 
 /// Small file (one entry per UI event, no transcript bodies), so a plain `from_str::<Value>` here is
 /// fine — the OOM concern is `api_conversation_history.json`, not this sidecar.
@@ -997,8 +982,7 @@ mod tests {
 
     fn fixture(name: &str) -> String {
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/cline/");
-        std::fs::read_to_string(format!("{path}{name}"))
-            .unwrap_or_else(|e| panic!("reading fixture {name}: {e}"))
+        std::fs::read_to_string(format!("{path}{name}")).unwrap_or_else(|e| panic!("reading fixture {name}: {e}"))
     }
 
     #[test]
@@ -1031,14 +1015,18 @@ mod tests {
         let tool = &s.messages[2];
         assert_eq!(tool.role, Role::Tool);
         match &tool.content[0] {
-            Block::ToolResult { tool_use_id, content, is_error, .. } => {
+            Block::ToolResult {
+                tool_use_id,
+                content,
+                is_error,
+                ..
+            } => {
                 assert_eq!(tool_use_id, "toolu_1");
                 assert!(content.contains("fn main"));
                 assert!(!is_error);
             }
             o => panic!("expected tool_result, got {o:?}"),
         }
-
     }
 
     #[test]
@@ -1072,9 +1060,7 @@ mod tests {
         assert!(parse_history_str("x", "not json", Harness::Cline, None)
             .messages
             .is_empty());
-        assert!(parse_history_str("x", "{}", Harness::Cline, None)
-            .messages
-            .is_empty());
+        assert!(parse_history_str("x", "{}", Harness::Cline, None).messages.is_empty());
     }
 
     #[test]
@@ -1098,12 +1084,16 @@ mod tests {
         };
 
         let mut user = Message::new(Role::User);
-        user.content = vec![Block::Text { text: "please fix it".to_string().into() }];
+        user.content = vec![Block::Text {
+            text: "please fix it".to_string().into(),
+        }];
         session.messages.push(user);
 
         let mut asst = Message::new(Role::Assistant);
         asst.content = vec![
-            Block::Text { text: "on it".to_string().into() },
+            Block::Text {
+                text: "on it".to_string().into(),
+            },
             Block::ToolUse {
                 id: "toolu_1".to_string(),
                 name: "read_file".to_string(),
@@ -1124,11 +1114,7 @@ mod tests {
         session.messages.push(tool);
 
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let out_dir = std::env::temp_dir().join(format!(
-            "cv-cline-emit-{}-{}",
-            std::process::id(),
-            n
-        ));
+        let out_dir = std::env::temp_dir().join(format!("cv-cline-emit-{}-{}", std::process::id(), n));
 
         let cline = Cline::new();
         let res = cline.emit(&session, &out_dir).expect("emit");
@@ -1166,7 +1152,12 @@ mod tests {
 
         // Tool result survives with id + content.
         match &parsed.messages[2].content[0] {
-            Block::ToolResult { tool_use_id, content, is_error, .. } => {
+            Block::ToolResult {
+                tool_use_id,
+                content,
+                is_error,
+                ..
+            } => {
                 assert_eq!(tool_use_id, "toolu_1");
                 assert!(content.contains("fn main"));
                 assert!(!is_error);

@@ -120,16 +120,10 @@ impl Adapter for LmStudio {
     /// pinned) and `messages` as a `Vec<&RawValue>` slicing the mapped/owned bytes. Each turn is then
     /// turned into one small `Value` ([`parse_message`]), emitted to `sink`, and dropped before the
     /// next — so peak memory is O(largest turn) + the mmap (reclaimable) + the slice vec.
-    fn stream(
-        &self,
-        r: &SessionRef,
-        _opts: &ParseOptions,
-        sink: &mut dyn MessageSink,
-    ) -> Result<Session> {
-        let bytes = read_bytes(&r.path)
-            .with_context(|| format!("reading {}", r.path.display()))?;
-        let doc: Doc = serde_json::from_slice(bytes.as_ref())
-            .with_context(|| format!("parsing {}", r.path.display()))?;
+    fn stream(&self, r: &SessionRef, _opts: &ParseOptions, sink: &mut dyn MessageSink) -> Result<Session> {
+        let bytes = read_bytes(&r.path).with_context(|| format!("reading {}", r.path.display()))?;
+        let doc: Doc =
+            serde_json::from_slice(bytes.as_ref()).with_context(|| format!("parsing {}", r.path.display()))?;
 
         let created_at = doc.created_at.as_ref().and_then(super::ts_from_value);
         let updated_at = file_mtime(&r.path).or(created_at);
@@ -224,9 +218,7 @@ impl Doc<'_> {
                 }
             }
         }
-        self.system_prompt
-            .as_deref()
-            .filter(|s| !s.trim().is_empty())
+        self.system_prompt.as_deref().filter(|s| !s.trim().is_empty())
     }
 }
 
@@ -282,26 +274,15 @@ fn read_bytes(path: &Path) -> std::io::Result<Bytes> {
 ///
 /// LM Studio is a chat app with no working directory, so `opts.new_cwd` / `session.cwd` are not
 /// written into the file; we surface the chosen cwd only in the resume hint.
-pub fn emit(
-    session: &Session,
-    out_dir: &Path,
-    opts: &crate::emit::EmitOptions,
-) -> Result<EmitResult> {
-    let created = session
-        .created_at
-        .or(session.updated_at)
-        .unwrap_or_else(Utc::now);
+pub fn emit(session: &Session, out_dir: &Path, opts: &crate::emit::EmitOptions) -> Result<EmitResult> {
+    let created = session.created_at.or(session.updated_at).unwrap_or_else(Utc::now);
     let created_ms = created.timestamp_millis();
 
     // The id (filename stem) is the ms-epoch createdAt unless explicitly overridden.
-    let new_id = opts
-        .new_id
-        .clone()
-        .unwrap_or_else(|| created_ms.to_string());
+    let new_id = opts.new_id.clone().unwrap_or_else(|| created_ms.to_string());
 
     let conv_dir = out_dir.join("conversations");
-    fs::create_dir_all(&conv_dir)
-        .with_context(|| format!("creating {}", conv_dir.display()))?;
+    fs::create_dir_all(&conv_dir).with_context(|| format!("creating {}", conv_dir.display()))?;
     let file_path = conv_dir.join(format!("{new_id}.conversation.json"));
 
     let mut messages: Vec<Value> = Vec::new();
@@ -457,9 +438,7 @@ fn emit_content_parts(blocks: &[Block]) -> Vec<Value> {
         match b {
             Block::Text { text } => out.push(json!({ "type": "text", "text": text })),
             // Reasoning is unusual on a user turn, but keep the text rather than drop it.
-            Block::Thinking { text, .. } if !text.is_empty() => {
-                out.push(json!({ "type": "text", "text": text }))
-            }
+            Block::Thinking { text, .. } if !text.is_empty() => out.push(json!({ "type": "text", "text": text })),
             Block::ToolResult { content, .. } => {
                 out.push(json!({ "type": "text", "text": format!("[tool result: {content}]") }))
             }
@@ -592,10 +571,7 @@ fn chat_title(v: &Value) -> Option<String> {
 /// retained as the reference the unit test pins the precedence rule against.
 #[cfg(test)]
 fn system_prompt(v: &Value) -> Option<String> {
-    if let Some(fields) = v
-        .pointer("/perChatPredictionConfig/fields")
-        .and_then(Value::as_array)
-    {
+    if let Some(fields) = v.pointer("/perChatPredictionConfig/fields").and_then(Value::as_array) {
         for f in fields {
             if f.get("key").and_then(Value::as_str) == Some("llm.prediction.systemPrompt") {
                 if let Some(val) = f.get("value").and_then(Value::as_str) {
@@ -689,20 +665,13 @@ fn parse_step(step: &Value, m: &mut Message, session_model: &mut Option<String>)
 
     // Per-step timestamp from the stepIdentifier prefix ("<ms-epoch>-<rand>").
     if m.timestamp.is_none() {
-        if let Some(ts) = step
-            .get("stepIdentifier")
-            .and_then(Value::as_str)
-            .and_then(step_id_ts)
-        {
+        if let Some(ts) = step.get("stepIdentifier").and_then(Value::as_str).and_then(step_id_ts) {
             m.timestamp = Some(ts);
         }
     }
 
     // A `style.type == "thinking"` block is chain-of-thought reasoning.
-    let is_thinking = step
-        .pointer("/style/type")
-        .and_then(Value::as_str)
-        == Some("thinking");
+    let is_thinking = step.pointer("/style/type").and_then(Value::as_str) == Some("thinking");
     push_content_parts(step.get("content"), m, is_thinking);
 }
 
@@ -873,10 +842,7 @@ mod tests {
 
     #[test]
     fn empty_messages_and_untitled_yield_no_title() {
-        let v: Value = serde_json::from_str(
-            r#"{"name":"Untitled","createdAt":1754424586190,"messages":[]}"#,
-        )
-        .unwrap();
+        let v: Value = serde_json::from_str(r#"{"name":"Untitled","createdAt":1754424586190,"messages":[]}"#).unwrap();
         assert!(chat_title(&v).is_none());
     }
 
@@ -975,15 +941,10 @@ mod tests {
         };
 
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let out_dir = std::env::temp_dir().join(format!(
-            "cv-lmstudio-emit-{}-{}",
-            std::process::id(),
-            n
-        ));
+        let out_dir = std::env::temp_dir().join(format!("cv-lmstudio-emit-{}-{}", std::process::id(), n));
         let _ = fs::remove_dir_all(&out_dir);
 
-        let result =
-            emit(&session, &out_dir, &crate::emit::EmitOptions::default()).unwrap();
+        let result = emit(&session, &out_dir, &crate::emit::EmitOptions::default()).unwrap();
         assert!(result.path.exists(), "emitted file exists");
 
         // Re-parse the emitted file with this adapter.
@@ -1066,8 +1027,7 @@ mod tests {
         static COUNTER: AtomicU32 = AtomicU32::new(0);
 
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir()
-            .join(format!("cv-lmstudio-stream-{}-{}", std::process::id(), n));
+        let dir = std::env::temp_dir().join(format!("cv-lmstudio-stream-{}-{}", std::process::id(), n));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("c.conversation.json");
@@ -1100,10 +1060,7 @@ mod tests {
         assert_eq!(sink.seen, vec!["one".to_string()]);
         assert!(s.messages.is_empty(), "stream returns empty messages");
         // Session-level extras survive without being subject to early-stop.
-        assert_eq!(
-            s.extra.get("systemPrompt").and_then(Value::as_str),
-            Some("be terse")
-        );
+        assert_eq!(s.extra.get("systemPrompt").and_then(Value::as_str), Some("be terse"));
 
         let _ = fs::remove_dir_all(&dir);
     }

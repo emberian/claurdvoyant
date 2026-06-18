@@ -80,21 +80,13 @@ pub fn default_embeddings_path() -> PathBuf {
 /// Discover, parse, and update the full-text index at its default location. Incremental by default
 /// (only changed/new sessions are rewritten; vanished ones are reaped); `rebuild = true` clears and
 /// rebuilds from scratch. Returns the number of sessions discovered.
-pub fn index_all(
-    dir: impl Into<Option<PathBuf>>,
-    rebuild: bool,
-    subagents: bool,
-) -> Result<usize> {
+pub fn index_all(dir: impl Into<Option<PathBuf>>, rebuild: bool, subagents: bool) -> Result<usize> {
     let dir = dir.into().unwrap_or_else(default_tantivy_dir);
     fts::index_all(&dir, rebuild, subagents)
 }
 
 /// Run a full-text query against the index at its default location.
-pub fn text_search(
-    dir: impl Into<Option<PathBuf>>,
-    query: &str,
-    limit: usize,
-) -> Result<Vec<Hit>> {
+pub fn text_search(dir: impl Into<Option<PathBuf>>, query: &str, limit: usize) -> Result<Vec<Hit>> {
     let dir = dir.into().unwrap_or_else(default_tantivy_dir);
     fts::text_search(&dir, query, limit)
 }
@@ -108,11 +100,7 @@ pub fn embed_all(path: impl Into<Option<PathBuf>>) -> Result<usize> {
 
 /// Embed the query and rank stored session vectors by cosine similarity (default store).
 #[cfg(feature = "semantic")]
-pub fn semantic_search(
-    path: impl Into<Option<PathBuf>>,
-    query: &str,
-    k: usize,
-) -> Result<Vec<Hit>> {
+pub fn semantic_search(path: impl Into<Option<PathBuf>>, query: &str, k: usize) -> Result<Vec<Hit>> {
     let path = path.into().unwrap_or_else(default_embeddings_path);
     semantic::semantic_search(&path, query, k)
 }

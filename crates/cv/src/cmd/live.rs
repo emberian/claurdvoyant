@@ -61,10 +61,7 @@ pub(crate) enum BoardCmd {
         from: String,
     },
     /// Collect all replies to a request id.
-    Replies {
-        channel: String,
-        request_id: String,
-    },
+    Replies { channel: String, request_id: String },
     /// Try to claim a task `key` (a soft lease). Exits non-zero on contention.
     Claim {
         channel: String,
@@ -83,9 +80,7 @@ pub(crate) enum BoardCmd {
         from: String,
     },
     /// List the currently-active (un-expired) claims on a channel.
-    Claims {
-        channel: String,
-    },
+    Claims { channel: String },
     /// List agents that heartbeat on a channel recently (also posts your own heartbeat).
     Who {
         channel: String,
@@ -101,12 +96,7 @@ pub(crate) enum BoardCmd {
     },
 }
 
-pub(crate) fn cmd_scry(
-    harness: Option<String>,
-    cwd: Option<String>,
-    interval: f64,
-    existing: bool,
-) -> Result<()> {
+pub(crate) fn cmd_scry(harness: Option<String>, cwd: Option<String>, interval: f64, existing: bool) -> Result<()> {
     let filter = Filter {
         harness: parse_harness(&harness)?,
         cwd_contains: cwd,
@@ -119,11 +109,7 @@ pub(crate) fn cmd_scry(
             cv_core::watch::EventKind::New => "✷ new",
             cv_core::watch::EventKind::Updated => "   +",
         };
-        let where_ = r
-            .cwd
-            .as_deref()
-            .map(home_rel)
-            .unwrap_or_else(|| "?".into());
+        let where_ = r.cwd.as_deref().map(home_rel).unwrap_or_else(|| "?".into());
         println!(
             "{tag}  {:8} {:8}  {}  ({} msg)",
             r.harness.as_str(),
@@ -142,11 +128,23 @@ pub(crate) fn cmd_scry(
 pub(crate) fn cmd_board(action: BoardCmd) -> Result<()> {
     use cv_core::board;
     match action {
-        BoardCmd::Post { channel, body, from, kind, tags, session_ref } => {
+        BoardCmd::Post {
+            channel,
+            body,
+            from,
+            kind,
+            tags,
+            session_ref,
+        } => {
             let m = board::post(&channel, &from, &body, kind.as_deref(), tags, session_ref)?;
             println!("✦ posted {} to #{}", short_id(&m.id), channel);
         }
-        BoardCmd::Read { channel, since, limit, json } => {
+        BoardCmd::Read {
+            channel,
+            since,
+            limit,
+            json,
+        } => {
             let msgs = board::read(&channel, since.as_deref(), limit)?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&msgs)?);
@@ -164,7 +162,12 @@ pub(crate) fn cmd_board(action: BoardCmd) -> Result<()> {
                 println!("#{c}");
             }
         }
-        BoardCmd::Watch { channel, since, pattern, interval } => {
+        BoardCmd::Watch {
+            channel,
+            since,
+            pattern,
+            interval,
+        } => {
             eprintln!("✦ watching #{channel} … (Ctrl-C to stop)");
             let mut cursor = since;
             loop {
@@ -186,9 +189,19 @@ pub(crate) fn cmd_board(action: BoardCmd) -> Result<()> {
             println!("✦ requested {} on #{}", short_id(&m.id), channel);
             println!("  ↳ reply with: cv board reply {channel} {} <body>", m.id);
         }
-        BoardCmd::Reply { channel, in_reply_to, body, from } => {
+        BoardCmd::Reply {
+            channel,
+            in_reply_to,
+            body,
+            from,
+        } => {
             let m = board::reply(&channel, &from, &in_reply_to, &body)?;
-            println!("✦ replied {} to {} on #{}", short_id(&m.id), short_id(&in_reply_to), channel);
+            println!(
+                "✦ replied {} to {} on #{}",
+                short_id(&m.id),
+                short_id(&in_reply_to),
+                channel
+            );
         }
         BoardCmd::Replies { channel, request_id } => {
             let msgs = board::replies(&channel, &request_id)?;
@@ -199,7 +212,12 @@ pub(crate) fn cmd_board(action: BoardCmd) -> Result<()> {
                 println!("(no replies to {} on #{channel})", short_id(&request_id));
             }
         }
-        BoardCmd::Claim { channel, key, from, ttl_secs } => {
+        BoardCmd::Claim {
+            channel,
+            key,
+            from,
+            ttl_secs,
+        } => {
             let lease = board::claim(&channel, &from, &key, Duration::from_secs(ttl_secs))?;
             match lease {
                 Some(l) => {
@@ -245,10 +263,7 @@ pub(crate) fn cmd_board(action: BoardCmd) -> Result<()> {
         BoardCmd::Claims { channel } => {
             let claims = board::active_claims(&channel)?;
             for (key, owner, expires) in &claims {
-                println!(
-                    "{key:30}  {owner:16}  expires {}",
-                    expires.format("%Y-%m-%d %H:%M:%S")
-                );
+                println!("{key:30}  {owner:16}  expires {}", expires.format("%Y-%m-%d %H:%M:%S"));
             }
             if claims.is_empty() {
                 println!("(no active claims on #{channel})");
@@ -265,7 +280,11 @@ pub(crate) fn cmd_board(action: BoardCmd) -> Result<()> {
                 println!("(nobody seen on #{channel} in the last {within_secs}s)");
             }
         }
-        BoardCmd::Ack { channel, message_id, from } => {
+        BoardCmd::Ack {
+            channel,
+            message_id,
+            from,
+        } => {
             let m = board::ack(&channel, &from, &message_id)?;
             println!("✦ acked {} on #{channel}", short_id(&message_id));
             let _ = m;
@@ -275,11 +294,5 @@ pub(crate) fn cmd_board(action: BoardCmd) -> Result<()> {
 }
 
 fn print_board_msg(m: &cv_core::board::BoardMessage) {
-    println!(
-        "{}  {}  ({}) {}",
-        m.ts.format("%H:%M:%S"),
-        m.from,
-        m.kind,
-        m.body
-    );
+    println!("{}  {}  ({}) {}", m.ts.format("%H:%M:%S"), m.from, m.kind, m.body);
 }

@@ -23,8 +23,7 @@ use tiny_http::{Header, Method, Request, Response, Server};
 /// static file from `dir` (with `index.html` for `/`), so the same process hosts both the JSON API
 /// and the browser dashboard.
 pub fn run(host: &str, port: u16, web_root: Option<PathBuf>) -> Result<()> {
-    let server = Server::http((host, port))
-        .map_err(|e| anyhow::anyhow!("failed to bind {host}:{port}: {e}"))?;
+    let server = Server::http((host, port)).map_err(|e| anyhow::anyhow!("failed to bind {host}:{port}: {e}"))?;
     // Canonicalize the web root once so per-request path-traversal checks are cheap and robust.
     let web_root = web_root.and_then(|d| match d.canonicalize() {
         Ok(c) => Some(c),
@@ -81,7 +80,11 @@ fn handle(request: Request, web_root: &Option<PathBuf>) {
     let segments: Vec<String> = trimmed
         .split('/')
         .filter(|s| !s.is_empty())
-        .map(|s| urlencoding::decode(s).map(|c| c.into_owned()).unwrap_or_else(|_| s.to_string()))
+        .map(|s| {
+            urlencoding::decode(s)
+                .map(|c| c.into_owned())
+                .unwrap_or_else(|_| s.to_string())
+        })
         .collect();
 
     // Only GET (besides the OPTIONS handled above) is supported.
@@ -327,7 +330,10 @@ fn messages(harness: &str, id: &str, query: &str) -> (u16, Value) {
     };
 
     // Lazy spans (so unread giant fields aren't materialized) plus, when asked, the `extra` maps.
-    let opts = ParseOptions { extra: want_extra, ..ParseOptions::lazy() };
+    let opts = ParseOptions {
+        extra: want_extra,
+        ..ParseOptions::lazy()
+    };
     let mut sink = WindowSink {
         resolver: cv_core::Resolver::new(Some(r.path.clone())),
         idx: start,
@@ -614,10 +620,7 @@ fn workflow_script(harness: &str, id: &str, wf: &str) -> (u16, Value) {
 fn board(channel: &str, query: &str) -> (u16, Value) {
     let params = Query::parse(query);
     let since = params.get("since");
-    let limit = params
-        .get("limit")
-        .and_then(|l| l.parse::<usize>().ok())
-        .unwrap_or(0); // 0 == unlimited in cv_core::board::read.
+    let limit = params.get("limit").and_then(|l| l.parse::<usize>().ok()).unwrap_or(0); // 0 == unlimited in cv_core::board::read.
     match cv_core::board::read(channel, since.as_deref(), limit) {
         Ok(msgs) => ok(json!(msgs)),
         Err(e) => err(500, &e.to_string()),
@@ -630,9 +633,7 @@ fn claims(channel: &str) -> (u16, Value) {
         Ok(claims) => {
             let out: Vec<Value> = claims
                 .into_iter()
-                .map(|(key, owner, expires_at)| {
-                    json!({ "key": key, "owner": owner, "expires_at": expires_at })
-                })
+                .map(|(key, owner, expires_at)| json!({ "key": key, "owner": owner, "expires_at": expires_at }))
                 .collect();
             ok(json!(out))
         }
@@ -731,7 +732,12 @@ fn static_file(root: &Path, segments: &[String]) -> Response<std::io::Cursor<Vec
 
 /// Guess a `Content-Type` from a file extension — enough for the dashboard's asset set.
 fn content_type_for(path: &Path) -> &'static str {
-    match path.extension().and_then(|e| e.to_str()).map(str::to_ascii_lowercase).as_deref() {
+    match path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
         Some("html") => "text/html; charset=utf-8",
         Some("js") | Some("mjs") => "text/javascript; charset=utf-8",
         Some("css") => "text/css; charset=utf-8",

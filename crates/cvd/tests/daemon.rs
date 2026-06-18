@@ -3,12 +3,12 @@
 //! temp `$HOME` + `$CLAURDVOYANT_HOME` passed only to child processes.
 
 use serde_json::{json, Value};
+use std::fs;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
-use std::fs;
 
 struct World {
     base: PathBuf,
@@ -190,14 +190,20 @@ fn sync_is_idempotent() {
 
     // First sync archives both sessions.
     let (out, _) = w.cvd(&["sync"]);
-    assert!(out.contains("2 archived, 0 skipped (unchanged) of 2 discovered"), "{out}");
+    assert!(
+        out.contains("2 archived, 0 skipped (unchanged) of 2 discovered"),
+        "{out}"
+    );
     assert!(w.cv_home.join("archive/claude/alphasess.json").is_file());
     assert!(w.cv_home.join("archive/claude/betasess.json").is_file());
     assert_eq!(count_lines(&w.cv_home.join("catalog.jsonl")), 2);
 
     // Second sync: nothing changed → nothing rewritten, no duplicate catalog rows.
     let (out, _) = w.cvd(&["sync"]);
-    assert!(out.contains("0 archived, 2 skipped (unchanged) of 2 discovered"), "{out}");
+    assert!(
+        out.contains("0 archived, 2 skipped (unchanged) of 2 discovered"),
+        "{out}"
+    );
     assert_eq!(count_lines(&w.cv_home.join("catalog.jsonl")), 2, "no dupes on resync");
 
     // ls shows each session exactly once.
@@ -217,16 +223,21 @@ fn sync_is_idempotent() {
     fs::write(w.session_path("alphasess"), body).unwrap();
 
     let (out, _) = w.cvd(&["sync"]);
-    assert!(out.contains("1 archived, 1 skipped (unchanged) of 2 discovered"), "{out}");
+    assert!(
+        out.contains("1 archived, 1 skipped (unchanged) of 2 discovered"),
+        "{out}"
+    );
     let (out, _) = w.cvd(&["ls"]);
-    assert!(out.contains("2 session(s)"), "changed session must not duplicate:\n{out}");
+    assert!(
+        out.contains("2 session(s)"),
+        "changed session must not duplicate:\n{out}"
+    );
     assert!(out.contains("3 msgs"), "updated message count visible:\n{out}");
 
     // The archived JSON is the parsed IR, scrubbed of nothing — spot-check its shape.
-    let archived: Value = serde_json::from_str(
-        &fs::read_to_string(w.cv_home.join("archive/claude/alphasess.json")).unwrap(),
-    )
-    .expect("archived session is valid JSON");
+    let archived: Value =
+        serde_json::from_str(&fs::read_to_string(w.cv_home.join("archive/claude/alphasess.json")).unwrap())
+            .expect("archived session is valid JSON");
     assert_eq!(archived["id"], "alphasess");
     assert_eq!(archived["messages"].as_array().unwrap().len(), 3);
 }
@@ -245,9 +256,7 @@ fn ls_and_path_on_empty_archive() {
 /// A minimal HTTP/1.0-style GET over a raw socket (no client dep): returns (status, body).
 fn http(port: u16, method: &str, path: &str) -> (u16, String) {
     let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect to cvd serve");
-    stream
-        .set_read_timeout(Some(Duration::from_secs(10)))
-        .unwrap();
+    stream.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
     write!(
         stream,
         "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
@@ -270,8 +279,7 @@ fn http(port: u16, method: &str, path: &str) -> (u16, String) {
 
 fn get_json(port: u16, path: &str) -> (u16, Value) {
     let (status, body) = http(port, "GET", path);
-    let v = serde_json::from_str(&body)
-        .unwrap_or_else(|e| panic!("GET {path}: non-JSON body {body:?}: {e}"));
+    let v = serde_json::from_str(&body).unwrap_or_else(|e| panic!("GET {path}: non-JSON body {body:?}: {e}"));
     (status, v)
 }
 
@@ -293,11 +301,7 @@ fn spawn_serve(w: &World) -> (u16, Reaper) {
 /// Like [`spawn_serve`] but with extra `serve` args (e.g. `["--web", dir]`).
 fn spawn_serve_with(w: &World, extra: &[&str]) -> (u16, Reaper) {
     // A free port: bind 0, note the assignment, release it for cvd (tiny race, fine for tests).
-    let port = TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port();
+    let port = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
 
     let mut args: Vec<String> = vec!["serve".into(), "--port".into(), port.to_string()];
     args.extend(extra.iter().map(|s| s.to_string()));
@@ -410,7 +414,11 @@ fn serve_endpoints() {
     let (_, raw) = (status, {
         // Re-fetch to check the CORS header is present on data responses too.
         let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
-        write!(stream, "GET /api/health HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n").unwrap();
+        write!(
+            stream,
+            "GET /api/health HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"
+        )
+        .unwrap();
         let mut s = String::new();
         stream.read_to_string(&mut s).unwrap();
         s
@@ -541,7 +549,11 @@ fn serve_workflow_script() {
     assert!(v["error"].is_string(), "{v}");
 
     // A path-y / traversal run id is a clean 400, never a filesystem read.
-    let (status, v) = http(port, "GET", "/api/session/claude/alphasess/workflow/..%2F..%2Fetc/script");
+    let (status, v) = http(
+        port,
+        "GET",
+        "/api/session/claude/alphasess/workflow/..%2F..%2Fetc/script",
+    );
     assert_eq!(status, 400, "{v}");
 
     // Unknown session id is a 404.
@@ -642,7 +654,10 @@ fn serve_static_web_hub() {
     assert!(!body.contains("TOP SECRET"), "traversal leaked the secret:\n{body}");
     // Encoded traversal too.
     let (status, body) = http(port, "GET", "/%2e%2e/secret.txt");
-    assert!(!body.contains("TOP SECRET"), "encoded traversal leaked:\n{body} (status {status})");
+    assert!(
+        !body.contains("TOP SECRET"),
+        "encoded traversal leaked:\n{body} (status {status})"
+    );
 }
 
 /// Raw GET returning the full response text (headers + body) — for content-type / CORS assertions.

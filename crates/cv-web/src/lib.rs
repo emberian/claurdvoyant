@@ -11,8 +11,7 @@ use wasm_bindgen::prelude::*;
 #[wasm_bindgen]
 pub fn ingest_zip(bytes: &[u8]) -> Result<String, JsValue> {
     let reader = Cursor::new(bytes);
-    let mut archive =
-        zip::ZipArchive::new(reader).map_err(|e| JsValue::from_str(&format!("zip: {e}")))?;
+    let mut archive = zip::ZipArchive::new(reader).map_err(|e| JsValue::from_str(&format!("zip: {e}")))?;
 
     let mut files: Vec<(String, Vec<u8>)> = Vec::with_capacity(archive.len());
     for i in 0..archive.len() {

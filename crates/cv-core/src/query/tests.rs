@@ -54,7 +54,10 @@ fn negation_both_forms() {
 
 #[test]
 fn or_pipe_and_keyword_equivalent() {
-    assert_eq!(q("harness:claude | harness:codex").expr, q("harness:claude OR harness:codex").expr);
+    assert_eq!(
+        q("harness:claude | harness:codex").expr,
+        q("harness:claude OR harness:codex").expr
+    );
 }
 
 #[test]
@@ -129,7 +132,11 @@ fn git_field_matches_branch() {
     let query = q("git:lazy-content");
     assert!(query.needs_parse());
     let mut s = sess(None, &[]);
-    s.git = Some(GitInfo { branch: Some("lazy-content-ir".into()), commit: None, remote: None });
+    s.git = Some(GitInfo {
+        branch: Some("lazy-content-ir".into()),
+        commit: None,
+        remote: None,
+    });
     assert!(query.matches_session(&s));
 }
 
@@ -155,7 +162,11 @@ fn ext_facts_drive_external_terms() {
     }
     let query = q("tool:Bash has:errors");
     let r = refx("a", Harness::Claude, None, None, 1);
-    let facts = Facts { r: &r, session: None, ext: &Fx };
+    let facts = Facts {
+        r: &r,
+        session: None,
+        ext: &Fx,
+    };
     assert!(query.matches(&facts));
     let query2 = q("tool:Grep");
     assert!(!query2.matches(&facts)); // Fx.tool("grep") = False
@@ -180,7 +191,9 @@ fn regex_operator() {
 #[test]
 fn regex_errors_and_restrictions() {
     // a literal paren in a regex must be quoted (bare `(` is grouping syntax)
-    assert!(SessionQuery::parse(r#"title~"(unclosed""#).unwrap_err().contains("bad regex"));
+    assert!(SessionQuery::parse(r#"title~"(unclosed""#)
+        .unwrap_err()
+        .contains("bad regex"));
     // `~` rejected on external/non-string fields
     assert!(SessionQuery::parse("text~foo").unwrap_err().contains("regex"));
     assert!(SessionQuery::parse("msgs~5").unwrap_err().contains("regex"));
@@ -217,13 +230,17 @@ fn forest_fields_classify_and_resolve() {
         }
     }
     let r = refx("a", Harness::Claude, None, None, 1);
-    let facts = Facts { r: &r, session: None, ext: &Fx };
+    let facts = Facts {
+        r: &r,
+        session: None,
+        ext: &Fx,
+    };
     assert!(query.matches(&facts));
 
     // a count that fails the comparison flips it false
     let q2 = q("agents>=10");
     assert!(!q2.matches(&facts)); // Fx says 4
-    // regex is rejected on forest fields
+                                  // regex is rejected on forest fields
     assert!(SessionQuery::parse("agent~explore").unwrap_err().contains("regex"));
     assert!(SessionQuery::parse("subtool~bash").unwrap_err().contains("regex"));
 }
@@ -255,7 +272,16 @@ fn thread_matches_message_path() {
         messages: vec![
             msg("u1", None, Role::User, vec![text("please refactor this")]),
             msg("a1", Some("u1"), Role::Assistant, vec![text("on it")]),
-            msg("t1", Some("a1"), Role::Tool, vec![Block::ToolUse { id: "x".into(), name: "Bash".into(), input: serde_json::json!({}) }]),
+            msg(
+                "t1",
+                Some("a1"),
+                Role::Tool,
+                vec![Block::ToolUse {
+                    id: "x".into(),
+                    name: "Bash".into(),
+                    input: serde_json::json!({}),
+                }],
+            ),
         ],
         source_path: None,
         extra: serde_json::Map::new(),
@@ -264,15 +290,19 @@ fn thread_matches_message_path() {
     assert!(q(r#"thread:"text:refactor > assistant""#).matches_session(&s));
     assert!(q(r#"thread:"user > assistant > tool:Bash""#).matches_session(&s));
     assert!(q(r#"thread:"refactor > assistant > tool:bash""#).matches_session(&s)); // bare word=text, case-insens
-    // wrong child role
+                                                                                    // wrong child role
     assert!(!q(r#"thread:"user > tool""#).matches_session(&s)); // a1 is assistant, not tool
-    // tool not present as a child of user
+                                                                // tool not present as a child of user
     assert!(!q(r#"thread:"user > tool:Grep""#).matches_session(&s));
     // single step still works
     assert!(q(r#"thread:"tool:Bash""#).matches_session(&s));
 
-    assert!(SessionQuery::parse(r#"thread:"user > > assistant""#).unwrap_err().contains("empty step"));
-    assert!(SessionQuery::parse(r#"thread:"role:bogus""#).unwrap_err().contains("role"));
+    assert!(SessionQuery::parse(r#"thread:"user > > assistant""#)
+        .unwrap_err()
+        .contains("empty step"));
+    assert!(SessionQuery::parse(r#"thread:"role:bogus""#)
+        .unwrap_err()
+        .contains("role"));
     assert!(SessionQuery::parse("thread~x").unwrap_err().contains("thread"));
     assert!(q("thread:\"user\"").needs_parse());
 }
@@ -283,7 +313,9 @@ fn errors_teach() {
     assert!(SessionQuery::parse("harness:nope").unwrap_err().contains("harness"));
     assert!(SessionQuery::parse("msgs>=abc").unwrap_err().contains("number"));
     assert!(SessionQuery::parse("(harness:claude").unwrap_err().contains(')'));
-    assert!(SessionQuery::parse(r#"title:"unterminated"#).unwrap_err().contains("quote"));
+    assert!(SessionQuery::parse(r#"title:"unterminated"#)
+        .unwrap_err()
+        .contains("quote"));
     assert!(SessionQuery::parse("title>foo").unwrap_err().contains("isn't valid"));
 }
 
@@ -294,7 +326,12 @@ fn reference_and_schema_cover_every_field() {
         assert!(r.contains(f.name), "reference missing {}", f.name);
     }
     let schema = schema_json();
-    let names: Vec<&str> = schema["fields"].as_array().unwrap().iter().map(|f| f["name"].as_str().unwrap()).collect();
+    let names: Vec<&str> = schema["fields"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["name"].as_str().unwrap())
+        .collect();
     assert_eq!(names.len(), FIELDS.len());
     assert!(names.contains(&"model"));
 }

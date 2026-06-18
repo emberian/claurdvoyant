@@ -6,8 +6,8 @@
 //!
 //! Provider is chosen by environment: `OPENROUTER_API_KEY` (preferred) or `ANTHROPIC_API_KEY`.
 
-use anyhow::{Context, Result, anyhow, bail};
-use serde_json::{Value, json};
+use anyhow::{anyhow, bail, Context, Result};
+use serde_json::{json, Value};
 
 /// Knobs for distillation.
 #[derive(Debug, Clone, Default)]
@@ -65,10 +65,16 @@ pub fn distill_markdown(session: &cv_core::Session, opts: &DistillOptions) -> Re
 
 /// The provider we resolved from the environment, carrying the API key.
 enum Provider {
-    OpenRouter { key: String },
-    Anthropic { key: String },
+    OpenRouter {
+        key: String,
+    },
+    Anthropic {
+        key: String,
+    },
     /// A local OpenAI-compatible server (LM Studio, Ollama, vLLM, …). No API key; free + offline.
-    LmStudio { base: String },
+    LmStudio {
+        base: String,
+    },
 }
 
 impl Provider {
@@ -284,9 +290,7 @@ fn extract_anthropic_text(v: &Value) -> Result<String> {
 /// Read a response body as JSON, turning HTTP error statuses into clear errors.
 fn read_json(resp: reqwest::blocking::Response, who: &str) -> Result<Value> {
     let status = resp.status();
-    let text = resp
-        .text()
-        .with_context(|| format!("reading {who} response body"))?;
+    let text = resp.text().with_context(|| format!("reading {who} response body"))?;
     if !status.is_success() {
         bail!("{who} API returned {status}: {text}");
     }
@@ -411,10 +415,7 @@ fn call_chat(
     };
 
     match provider {
-        Provider::OpenRouter { key } => openai_call(
-            "https://openrouter.ai/api/v1/chat/completions".into(),
-            Some(key),
-        ),
+        Provider::OpenRouter { key } => openai_call("https://openrouter.ai/api/v1/chat/completions".into(), Some(key)),
         Provider::LmStudio { base } => openai_call(format!("{base}/chat/completions"), None),
         Provider::Anthropic { key } => {
             let (sys, msgs) = normalize_for_anthropic(system, messages)?;
@@ -447,10 +448,7 @@ fn call_chat(
 ///    Non-assistant roles (tool, anything unknown) normalize to `user`.
 /// 3. **Leading-user guarantee** — the first message must be `user`; a transcript opening on an
 ///    assistant turn gets a small synthetic user preamble. An empty message list is an error.
-fn normalize_for_anthropic(
-    system: Option<&str>,
-    messages: &[Value],
-) -> Result<(Option<String>, Vec<Value>)> {
+fn normalize_for_anthropic(system: Option<&str>, messages: &[Value]) -> Result<(Option<String>, Vec<Value>)> {
     let mut sys = system.unwrap_or("").to_string();
     let mut msgs: Vec<Value> = Vec::new();
     for m in messages {
@@ -514,10 +512,7 @@ mod tests {
             git: None,
             messages: vec![
                 msg(Role::User, "How do I fix the build?"),
-                msg(
-                    Role::Assistant,
-                    "The bug lives in src/lib.rs; pin reqwest to 0.12.",
-                ),
+                msg(Role::Assistant, "The bug lives in src/lib.rs; pin reqwest to 0.12."),
             ],
             source_path: None,
             extra: Default::default(),
@@ -587,7 +582,9 @@ mod tests {
         let mut s = sample_session();
         // A system turn, a tool turn (folds to user), an empty turn (dropped), and tool blocks.
         let mut sysm = Message::new(Role::System);
-        sysm.content.push(Block::Text { text: "be terse".to_string().into() });
+        sysm.content.push(Block::Text {
+            text: "be terse".to_string().into(),
+        });
         s.messages.insert(0, sysm);
 
         let mut toolm = Message::new(Role::Tool);

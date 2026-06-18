@@ -229,7 +229,10 @@ impl Resolver {
         if sp.len <= max_raw {
             return self.resolve(sp);
         }
-        let capped = Span { len: max_raw, ..sp.clone() };
+        let capped = Span {
+            len: max_raw,
+            ..sp.clone()
+        };
         match self.raw_bytes(&capped) {
             None => Cow::Borrowed(""),
             Some(bytes) if sp.escaped => {
@@ -388,8 +391,7 @@ fn unescape_json_body(raw: &[u8]) -> String {
     quoted.push(b'"');
     quoted.extend_from_slice(raw);
     quoted.push(b'"');
-    serde_json::from_slice::<String>(&quoted)
-        .unwrap_or_else(|_| String::from_utf8_lossy(raw).into_owned())
+    serde_json::from_slice::<String>(&quoted).unwrap_or_else(|_| String::from_utf8_lossy(raw).into_owned())
 }
 
 #[cfg(test)]
@@ -448,7 +450,12 @@ mod tests {
         std::fs::write(&path, b"line one\\nline two and much more after").unwrap();
         let resolver = Resolver::new(Some(path.clone()));
 
-        let span = |len: u64, escaped: bool| Span { source: None, offset: 0, len, escaped };
+        let span = |len: u64, escaped: bool| Span {
+            source: None,
+            offset: 0,
+            len,
+            escaped,
+        };
         let full_len = std::fs::metadata(&path).unwrap().len();
 
         // Unescaped: plain byte cap.

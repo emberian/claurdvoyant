@@ -38,7 +38,11 @@ pub(crate) fn cmd_config(add_export: Option<PathBuf>, rm_export: Option<PathBuf>
 
     // No mutation requested → show the config.
     match cv_core::config::config_path() {
-        Some(p) => println!("config: {}{}", p.display(), if p.exists() { "" } else { "  (not created yet)" }),
+        Some(p) => println!(
+            "config: {}{}",
+            p.display(),
+            if p.exists() { "" } else { "  (not created yet)" }
+        ),
         None => println!("config: <no home directory>"),
     }
     if cfg.exports.is_empty() {

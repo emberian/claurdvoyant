@@ -6,16 +6,10 @@ use cv_core::ir::truncate;
 
 // ---------- events / touched ----------
 
-pub(crate) fn cmd_events(
-    id: &str,
-    harness: Option<String>,
-    kind: Option<String>,
-    subagents: bool,
-) -> Result<()> {
+pub(crate) fn cmd_events(id: &str, harness: Option<String>, kind: Option<String>, subagents: bool) -> Result<()> {
     use cv_core::events;
     let want = parse_harness(&harness)?;
-    let (r, _adapter) =
-        cv_core::find(id, want)?.with_context(|| format!("no session matching {id:?}"))?;
+    let (r, _adapter) = cv_core::find(id, want)?.with_context(|| format!("no session matching {id:?}"))?;
 
     // Ensure this one session's events are current (cheap: a single streamed pass); a session
     // already cataloged at this mtime is a no-op.
@@ -39,7 +33,14 @@ pub(crate) fn cmd_events(
         short_id(&r.id)
     );
     for e in &rows {
-        print_event_row(e.msg_idx, e.ts, &e.kind, e.tool.as_deref(), e.target.as_deref(), e.detail.as_deref());
+        print_event_row(
+            e.msg_idx,
+            e.ts,
+            &e.kind,
+            e.tool.as_deref(),
+            e.target.as_deref(),
+            e.detail.as_deref(),
+        );
     }
 
     // `--subagents`: descend into the forest and attribute each agent's events to it. Sub-agents
@@ -60,8 +61,7 @@ fn print_subagent_events(r: &cv_core::SessionRef, kind: Option<&str>) -> Result<
     if subs.is_empty() {
         return Ok(());
     }
-    let adapter = cv_core::harness::for_harness(r.harness)
-        .with_context(|| format!("no adapter for {}", r.harness))?;
+    let adapter = cv_core::harness::for_harness(r.harness).with_context(|| format!("no adapter for {}", r.harness))?;
 
     let mut total = 0usize;
     for s in &subs {
@@ -86,11 +86,21 @@ fn print_subagent_events(r: &cv_core::SessionRef, kind: Option<&str>) -> Result<
             s.agent_type.as_deref().unwrap_or("agent"),
             wf,
             evs.len(),
-            s.description.as_deref().map(|d| format!("  — {}", truncate(d, 60))).unwrap_or_default(),
+            s.description
+                .as_deref()
+                .map(|d| format!("  — {}", truncate(d, 60)))
+                .unwrap_or_default(),
         );
         for e in &evs {
             print!("│ ");
-            print_event_row(e.msg_idx as i64, e.ts, e.kind, e.tool.as_deref(), e.target.as_deref(), e.detail.as_deref());
+            print_event_row(
+                e.msg_idx as i64,
+                e.ts,
+                e.kind,
+                e.tool.as_deref(),
+                e.target.as_deref(),
+                e.detail.as_deref(),
+            );
         }
     }
     if total > 0 {

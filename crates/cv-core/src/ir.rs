@@ -77,7 +77,6 @@ harnesses! {
 }
 
 impl Harness {
-
     pub fn parse(s: &str) -> Option<Harness> {
         Some(match s.to_ascii_lowercase().as_str() {
             "claude" | "claude-code" | "cc" => Harness::Claude,

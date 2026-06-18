@@ -241,7 +241,10 @@ fn search_fallback_messaging_and_index_path() {
     let (out, _) = w.cv_ok(&["index"]);
     assert!(out.contains("indexed 2 top-level session(s)"), "{out}");
     let (out, err) = w.cv_ok(&["search", "zebrafish"]);
-    assert!(!err.contains("scanning live"), "indexed search must not live-scan:\n{err}");
+    assert!(
+        !err.contains("scanning live"),
+        "indexed search must not live-scan:\n{err}"
+    );
     assert!(out.contains("alphases"), "{out}");
 
     // The index is authoritative: a miss is a miss (with the index hint), not a fallback.
@@ -349,7 +352,11 @@ fn dataset_emits_parseable_jsonl() {
 
     let (out, err) = w.cv_ok(&["dataset"]);
     let lines: Vec<&str> = out.lines().filter(|l| !l.trim().is_empty()).collect();
-    assert_eq!(lines.len(), 2, "one record per session:\nstdout:\n{out}\nstderr:\n{err}");
+    assert_eq!(
+        lines.len(),
+        2,
+        "one record per session:\nstdout:\n{out}\nstderr:\n{err}"
+    );
     for line in &lines {
         let v: serde_json::Value = serde_json::from_str(line).expect("each record is JSON");
         assert!(v["messages"].is_array(), "chatml shape: {line}");

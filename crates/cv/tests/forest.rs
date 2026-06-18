@@ -5,9 +5,9 @@
 //!
 //! Mirrors `cli.rs`'s hermetic World (own `$HOME` + `$CLAURDVOYANT_HOME`, env-only, parallel-safe).
 
+use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
-use std::fs;
 
 struct World {
     base: PathBuf,
@@ -21,14 +21,22 @@ impl World {
         let base = std::env::temp_dir().join(format!(
             "cv-forest-{tag}-{}-{}",
             std::process::id(),
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
         ));
         let home = base.join("home");
         let cv_home = base.join("cvhome");
         let proj = home.join(".claude/projects/-work-proj");
         fs::create_dir_all(&proj).unwrap();
         fs::create_dir_all(&cv_home).unwrap();
-        World { base, home, cv_home, proj }
+        World {
+            base,
+            home,
+            cv_home,
+            proj,
+        }
     }
 
     /// Write the parent transcript at `<sid>.jsonl`.
@@ -160,7 +168,10 @@ fn build_world(tag: &str) -> World {
             assistant_tools(
                 "a1",
                 "2026-06-07T12:05:00Z",
-                serde_json::json!([tool_use("Edit", serde_json::json!({"file_path": "x.rs", "old_string": "a", "new_string": "b"}))]),
+                serde_json::json!([tool_use(
+                    "Edit",
+                    serde_json::json!({"file_path": "x.rs", "old_string": "a", "new_string": "b"})
+                )]),
             ),
             // Second compaction.
             boundary("b2", "a1", "auto", 750000),
@@ -219,7 +230,10 @@ fn build_world(tag: &str) -> World {
                 serde_json::json!([
                     tool_use("Bash", serde_json::json!({"command": "make"})),
                     tool_use("Read", serde_json::json!({"file_path": "src/lib.rs"})),
-                    tool_use("Edit", serde_json::json!({"file_path": "src/lib.rs", "old_string": "x", "new_string": "y"})),
+                    tool_use(
+                        "Edit",
+                        serde_json::json!({"file_path": "src/lib.rs", "old_string": "x", "new_string": "y"})
+                    ),
                 ]),
             ),
         ],
@@ -273,7 +287,10 @@ fn show_pre_compaction_windows_the_lost_span() {
     assert!(err.contains("messages 0-3"), "computed span:\n{err}");
     // The pre-span body holds the first user turn, not the post-compaction "finish up".
     assert!(out.contains("start the work"), "pre-span body:\n{out}");
-    assert!(!out.contains("finish up"), "must not leak post-compaction content:\n{out}");
+    assert!(
+        !out.contains("finish up"),
+        "must not leak post-compaction content:\n{out}"
+    );
 
     // A second boundary's span exists; an out-of-range one errors cleanly.
     let (_, err2) = w.cv_ok(&["show", "fsess", "--pre-compaction", "2"]);
@@ -299,7 +316,10 @@ fn workflow_renders_phase_tree_and_lists() {
     assert!(tree.contains("phase 1 · Phase-A"), "{tree}");
     assert!(tree.contains("build the thing"), "phase detail:\n{tree}");
     assert!(tree.contains("builder"), "agent label:\n{tree}");
-    assert!(tree.contains("✓ builder") && tree.contains("✗ verifier"), "state glyphs:\n{tree}");
+    assert!(
+        tree.contains("✓ builder") && tree.contains("✗ verifier"),
+        "state glyphs:\n{tree}"
+    );
     assert!(tree.contains("found a bug"), "agent error surfaced:\n{tree}");
     assert!(tree.contains("\"built\":true"), "result preview:\n{tree}");
 
@@ -332,12 +352,18 @@ fn tools_cross_agent_queries() {
     // One agent's histogram: the builder ran Bash+Read+Edit.
     let (one, _) = w.cv_ok(&["tools", "fsess", "--agent", "aBUILD"]);
     assert!(one.contains("tools used by aBUILD"), "{one}");
-    assert!(one.contains("Bash") && one.contains("Read") && one.contains("Edit"), "{one}");
+    assert!(
+        one.contains("Bash") && one.contains("Read") && one.contains("Edit"),
+        "{one}"
+    );
 
     // Workflow-restricted per-agent breakdown (prefix resolves to the full run id).
     let (across, _) = w.cv_ok(&["tools", "fsess", "--workflow", "wf_test", "--across"]);
     assert!(across.contains("aBUILD") && across.contains("aVERIFY"), "{across}");
-    assert!(!across.contains("orchestrator"), "workflow view excludes orchestrator:\n{across}");
+    assert!(
+        !across.contains("orchestrator"),
+        "workflow view excludes orchestrator:\n{across}"
+    );
 
     // Timeline is chronological and tagged by agent.
     let (tl, _) = w.cv_ok(&["tools", "fsess", "--timeline"]);

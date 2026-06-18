@@ -82,11 +82,7 @@ fn render_blocks(blocks: &[Block], resolver: &crate::lazy::Resolver) -> String {
 /// Stream one message's blocks as training text to `emit`, resolving span content **in chunks** (so a
 /// giant field is never materialized whole). Byte-identical to the old `parts.join("\n\n")`: the same
 /// parts, separated by `\n\n`, with empty/redacted text turns producing no part.
-fn render_blocks_into(
-    blocks: &[Block],
-    resolver: &crate::lazy::Resolver,
-    emit: &mut dyn FnMut(&str),
-) {
+fn render_blocks_into(blocks: &[Block], resolver: &crate::lazy::Resolver, emit: &mut dyn FnMut(&str)) {
     render_blocks_impl(blocks, resolver, None, emit)
 }
 
@@ -222,9 +218,7 @@ fn render_blocks_impl(
 /// turns are empty; any tool/image/file block, or any span, makes it non-empty).
 fn message_is_empty(m: &Message) -> bool {
     !m.content.iter().any(|b| match b {
-        Block::Text { text } => {
-            text.is_span() || text.inline_str().is_some_and(|s| !s.trim().is_empty())
-        }
+        Block::Text { text } => text.is_span() || text.inline_str().is_some_and(|s| !s.trim().is_empty()),
         Block::Thinking { text, redacted, .. } => {
             !*redacted && (text.is_span() || text.inline_str().is_some_and(|s| !s.trim().is_empty()))
         }
@@ -371,15 +365,39 @@ mod tests {
     #[test]
     fn chatml_maps_roles_and_folds_tools() {
         let s = session(vec![
-            msg(Role::User, vec![Block::Text { text: "fix the bug".into() }]),
+            msg(
+                Role::User,
+                vec![Block::Text {
+                    text: "fix the bug".into(),
+                }],
+            ),
             msg(
                 Role::Assistant,
                 vec![
-                    Block::Thinking { text: "check the log".into(), signature: None, encrypted: None, redacted: false },
-                    Block::ToolUse { id: "1".into(), name: "Bash".into(), input: json!({"cmd": "grep x"}) },
+                    Block::Thinking {
+                        text: "check the log".into(),
+                        signature: None,
+                        encrypted: None,
+                        redacted: false,
+                    },
+                    Block::ToolUse {
+                        id: "1".into(),
+                        name: "Bash".into(),
+                        input: json!({"cmd": "grep x"}),
+                    },
                 ],
             ),
-            msg(Role::Tool, vec![Block::ToolResult { tool_use_id: "1".into(), content: "found it".into(), is_error: false, tool_name: None, status: None, details: None }]),
+            msg(
+                Role::Tool,
+                vec![Block::ToolResult {
+                    tool_use_id: "1".into(),
+                    content: "found it".into(),
+                    is_error: false,
+                    tool_name: None,
+                    status: None,
+                    details: None,
+                }],
+            ),
         ]);
         let v = to_chatml(&s).expect("non-empty");
         let msgs = v["messages"].as_array().unwrap();
@@ -403,7 +421,12 @@ mod tests {
     #[test]
     fn redacted_record_equals_redact_then_render() {
         let s = session(vec![
-            msg(Role::User, vec![Block::Text { text: "my key is sk-abcDEF1234567890ghijkl ok".into() }]),
+            msg(
+                Role::User,
+                vec![Block::Text {
+                    text: "my key is sk-abcDEF1234567890ghijkl ok".into(),
+                }],
+            ),
             msg(
                 Role::Assistant,
                 vec![
@@ -432,7 +455,12 @@ mod tests {
                 }],
             ),
             // A clean message: must render identically (and untouched) under redaction.
-            msg(Role::User, vec![Block::Text { text: "thanks, looks good".into() }]),
+            msg(
+                Role::User,
+                vec![Block::Text {
+                    text: "thanks, looks good".into(),
+                }],
+            ),
         ]);
         let opts = crate::redact::RedactOptions::default();
 

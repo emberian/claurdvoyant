@@ -54,13 +54,7 @@ fn legacy_sqlite_index_path() -> Option<PathBuf> {
 
 /// Render a slice of cv-search [`cv_search::Hit`]s with harness/short-id/date/title/snippet,
 /// applying the `--harness` filter and `--limit`. `source` labels the empty-result hint.
-fn render_search_hits(
-    hits: &[cv_search::Hit],
-    want: Option<Harness>,
-    limit: usize,
-    query: &str,
-    source: &str,
-) {
+fn render_search_hits(hits: &[cv_search::Hit], want: Option<Harness>, limit: usize, query: &str, source: &str) {
     let rows: Vec<&cv_search::Hit> = hits
         .iter()
         .filter(|h| want.is_none_or(|w| h.harness == w.as_str()))
@@ -131,7 +125,11 @@ fn cmd_search_live(query: &str, want: Option<Harness>, limit: usize) -> Result<(
             continue;
         }
         for r in adapter.discover()? {
-            let mut sink = HaySink { hay: String::new(), first_user: None, resolver: cv_core::Resolver::new(Some(r.path.clone())) };
+            let mut sink = HaySink {
+                hay: String::new(),
+                first_user: None,
+                resolver: cv_core::Resolver::new(Some(r.path.clone())),
+            };
             let meta = match adapter.stream(&r, &ParseOptions::bulk(), &mut sink) {
                 Ok(m) => m,
                 Err(_) => continue,
@@ -238,8 +236,7 @@ fn recall_excerpt(hit: &cv_search::Hit, query: &str) -> String {
         if t.trim().is_empty() {
             continue;
         }
-        let score = words.iter().filter(|w| t.contains(**w)).count() as i64
-            + if t.contains(&needle) { 5 } else { 0 };
+        let score = words.iter().filter(|w| t.contains(**w)).count() as i64 + if t.contains(&needle) { 5 } else { 0 };
         if score > best_score {
             best_score = score;
             best = i;

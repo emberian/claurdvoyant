@@ -405,9 +405,7 @@ fn real_corpus_discovery_metadata_quality() {
 fn claude_parse_str_never_panics() {
     for (label, input) in hostile_inputs() {
         // catch_unwind so a panic surfaces as a clean assertion failure naming the input.
-        let res = std::panic::catch_unwind(|| {
-            cv_core::harness::claude::parse_str("hostile-id", &input, None)
-        });
+        let res = std::panic::catch_unwind(|| cv_core::harness::claude::parse_str("hostile-id", &input, None));
         assert!(res.is_ok(), "claude::parse_str panicked on input `{label}`");
     }
 }
@@ -431,13 +429,8 @@ fn codex_parse_str_never_panics() {
 #[test]
 fn gemini_parse_all_str_never_panics() {
     for (label, input) in hostile_inputs() {
-        let res = std::panic::catch_unwind(|| {
-            cv_core::harness::gemini::parse_all_str(&input, None)
-        });
-        assert!(
-            res.is_ok(),
-            "gemini::parse_all_str panicked on input `{label}`"
-        );
+        let res = std::panic::catch_unwind(|| cv_core::harness::gemini::parse_all_str(&input, None));
+        assert!(res.is_ok(), "gemini::parse_all_str panicked on input `{label}`");
     }
 }
 
@@ -448,7 +441,10 @@ fn ingest_files_never_panics() {
         let files: Vec<(String, Vec<u8>)> = vec![
             (format!("{label}.jsonl"), input.clone().into_bytes()),
             (format!("{label}.json"), input.clone().into_bytes()),
-            ("rollout-2025-01-01T00-00-00-abc.jsonl".into(), input.clone().into_bytes()),
+            (
+                "rollout-2025-01-01T00-00-00-abc.jsonl".into(),
+                input.clone().into_bytes(),
+            ),
             ("session.json".into(), input.clone().into_bytes()),
             (String::new(), input.clone().into_bytes()),
         ];
@@ -462,7 +458,10 @@ fn ingest_files_never_panics() {
         ("all_zero", vec![0x00u8; 4096]),
         ("invalid_utf8", vec![0xC3, 0x28, 0xA0, 0xA1, 0xE2, 0x28, 0xA1]),
         ("lone_surrogate_bytes", vec![0xED, 0xA0, 0x80]),
-        ("random_bytes", (0u32..8192).map(|i| (i.wrapping_mul(2654435761) >> 24) as u8).collect()),
+        (
+            "random_bytes",
+            (0u32..8192).map(|i| (i.wrapping_mul(2654435761) >> 24) as u8).collect(),
+        ),
         ("bom_then_garbage", {
             let mut b = vec![0xEF, 0xBB, 0xBF];
             b.extend_from_slice(&[0x80, 0x81, 0x82, 0x00, 0xFF]);
@@ -528,7 +527,11 @@ fn crlf_and_truncated_final_line_keep_good_records() {
     let sessions = cv_core::harness::gemini::parse_all_str(&crlf, None);
     assert_eq!(sessions.len(), 1);
     assert_eq!(sessions[0].id, "g1");
-    assert_eq!(sessions[0].messages.len(), 1, "gemini: complete record kept, partial skipped");
+    assert_eq!(
+        sessions[0].messages.len(),
+        1,
+        "gemini: complete record kept, partial skipped"
+    );
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -550,8 +553,7 @@ fn emit_and_reparse(target: Harness) -> Option<Session> {
             let home = temp_dir();
             let storage = home.join(".local/share/opencode/storage");
             std::fs::create_dir_all(&storage).unwrap();
-            let res = cv_core::emit::emit(&session, target, &storage, &Default::default())
-                .expect("emit opencode");
+            let res = cv_core::emit::emit(&session, target, &storage, &Default::default()).expect("emit opencode");
 
             let prev = std::env::var_os("HOME");
             // SAFETY: guarded by ENV_LOCK; restored before releasing it.
@@ -573,8 +575,7 @@ fn emit_and_reparse(target: Harness) -> Option<Session> {
         // Hermes resolves its state.db from HERMES_HOME; emit into a dir, then discover from it.
         Harness::Hermes => {
             let _guard = ENV_LOCK.lock().unwrap();
-            let res = cv_core::emit::emit(&session, target, &out, &Default::default())
-                .expect("emit hermes");
+            let res = cv_core::emit::emit(&session, target, &out, &Default::default()).expect("emit hermes");
             let prev = std::env::var_os("HERMES_HOME");
             // SAFETY: guarded by ENV_LOCK; restored before releasing it.
             unsafe { std::env::set_var("HERMES_HOME", &out) }
@@ -610,7 +611,11 @@ fn emit_and_reparse(target: Harness) -> Option<Session> {
                 updated_at: None,
                 message_count: 0,
             };
-            Some(adapter.parse(&r).unwrap_or_else(|e| panic!("parse {target} failed: {e:#}")))
+            Some(
+                adapter
+                    .parse(&r)
+                    .unwrap_or_else(|e| panic!("parse {target} failed: {e:#}")),
+            )
         }
     }
 }
@@ -622,8 +627,8 @@ fn round_trip_all_supported_targets() {
 
     let mut checked = Vec::new();
     for &target in targets {
-        let parsed = emit_and_reparse(target)
-            .unwrap_or_else(|| panic!("{target}: emitted session was not discoverable"));
+        let parsed =
+            emit_and_reparse(target).unwrap_or_else(|| panic!("{target}: emitted session was not discoverable"));
 
         // Two faithful-format quirks among the newer targets:
         //  - LM Studio has no tool structures on disk → tool turns flatten to text (lossy on tools);
@@ -645,7 +650,9 @@ fn round_trip_all_supported_targets() {
                 user_texts(&parsed)
             );
             assert!(
-                assistant_texts(&parsed).iter().any(|t| t.contains("Sure, listing now.")),
+                assistant_texts(&parsed)
+                    .iter()
+                    .any(|t| t.contains("Sure, listing now.")),
                 "{target}: assistant text did not survive round-trip (got {:?})",
                 assistant_texts(&parsed)
             );
@@ -675,14 +682,10 @@ fn round_trip_all_supported_targets() {
         // Hermes stores the result-side tool name in its own column; it must round-trip too
         // (emit used to drop it, so every ported tool turn came back nameless).
         if target == Harness::Hermes {
-            let result_tool_name = parsed
-                .messages
-                .iter()
-                .flat_map(|m| &m.content)
-                .find_map(|b| match b {
-                    Block::ToolResult { tool_name, .. } => tool_name.clone(),
-                    _ => None,
-                });
+            let result_tool_name = parsed.messages.iter().flat_map(|m| &m.content).find_map(|b| match b {
+                Block::ToolResult { tool_name, .. } => tool_name.clone(),
+                _ => None,
+            });
             assert_eq!(
                 result_tool_name.as_deref(),
                 Some("run_shell"),
@@ -693,9 +696,5 @@ fn round_trip_all_supported_targets() {
         checked.push(target.to_string());
     }
 
-    eprintln!(
-        "round-trip OK for {} target(s): {}",
-        checked.len(),
-        checked.join(", ")
-    );
+    eprintln!("round-trip OK for {} target(s): {}", checked.len(), checked.join(", "));
 }

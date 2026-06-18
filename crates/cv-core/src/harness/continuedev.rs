@@ -36,7 +36,7 @@ use crate::stream::{Flow, MessageSink, ParseOptions};
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use serde_json::value::RawValue;
-use serde_json::{Map, Value, json};
+use serde_json::{json, Map, Value};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -126,12 +126,7 @@ impl Adapter for Continue {
     /// and `history` as a `Vec<&RawValue>` slicing the mapped/owned bytes. Each item is then turned
     /// into one small `Value` ([`history_item_to_message`]), emitted to `sink`, and dropped before
     /// the next — so peak memory is O(largest item) + the mmap (reclaimable) + the slice vec.
-    fn stream(
-        &self,
-        r: &SessionRef,
-        _opts: &ParseOptions,
-        sink: &mut dyn MessageSink,
-    ) -> Result<Session> {
+    fn stream(&self, r: &SessionRef, _opts: &ParseOptions, sink: &mut dyn MessageSink) -> Result<Session> {
         let mut s = Session {
             id: r.id.clone(),
             harness: Harness::Continue,
@@ -270,17 +265,10 @@ fn read_bytes(path: &Path) -> Option<Bytes> {
 ///
 /// The parser backfills `cwd`/`title` from the transcript itself, so writing the index is for
 /// `discover()` fidelity, not correctness; we still write it.
-pub fn emit(
-    session: &Session,
-    out_dir: &Path,
-    opts: &crate::emit::EmitOptions,
-) -> Result<super::EmitResult> {
+pub fn emit(session: &Session, out_dir: &Path, opts: &crate::emit::EmitOptions) -> Result<super::EmitResult> {
     use anyhow::Context;
 
-    let new_id = opts
-        .new_id
-        .clone()
-        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let new_id = opts.new_id.clone().unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     let cwd = opts.new_cwd.clone().or_else(|| session.cwd.clone());
     let cwd_str = cwd
         .as_ref()
@@ -312,11 +300,8 @@ pub fn emit(
     transcript.insert("history".into(), Value::Array(history));
 
     let file_path = out_dir.join(format!("{new_id}.json"));
-    fs::write(
-        &file_path,
-        serde_json::to_string_pretty(&Value::Object(transcript))?,
-    )
-    .with_context(|| format!("writing {}", file_path.display()))?;
+    fs::write(&file_path, serde_json::to_string_pretty(&Value::Object(transcript))?)
+        .with_context(|| format!("writing {}", file_path.display()))?;
 
     // ── index: sessions.json (merge-or-create) ──
     let index_path = out_dir.join("sessions.json");
@@ -338,19 +323,13 @@ pub fn emit(
     }
     // `dateCreated` is a string holding millisecond epoch (the older-build shape, which the parser
     // accepts alongside ISO).
-    entry.insert(
-        "dateCreated".into(),
-        json!(created.timestamp_millis().to_string()),
-    );
+    entry.insert("dateCreated".into(), json!(created.timestamp_millis().to_string()));
     if let Some(c) = &cwd_str {
         entry.insert("workspaceDirectory".into(), json!(c));
     }
     entries.push(Value::Object(entry));
-    fs::write(
-        &index_path,
-        serde_json::to_string_pretty(&Value::Array(entries))?,
-    )
-    .with_context(|| format!("writing {}", index_path.display()))?;
+    fs::write(&index_path, serde_json::to_string_pretty(&Value::Array(entries))?)
+        .with_context(|| format!("writing {}", index_path.display()))?;
 
     Ok(super::EmitResult {
         path: file_path,
@@ -435,10 +414,7 @@ fn history_item(msg: &Message, session_model: Option<&str>) -> Value {
     // Carry the model so the parser can backfill it (assistant turns).
     if msg.role == Role::Assistant {
         if let Some(model) = msg.model.as_deref().or(session_model) {
-            item.insert(
-                "promptLogs".into(),
-                json!([{ "modelTitle": model }]),
-            );
+            item.insert("promptLogs".into(), json!([{ "modelTitle": model }]));
         }
     }
     Value::Object(item)
@@ -479,9 +455,7 @@ fn file_name_of(p: &str) -> String {
 fn tool_result_of(content: &[Block]) -> (String, String) {
     for b in content {
         if let Block::ToolResult {
-            tool_use_id,
-            content,
-            ..
+            tool_use_id, content, ..
         } = b
         {
             return (tool_use_id.clone(), content.to_string());
@@ -587,10 +561,7 @@ fn count_history(path: &Path) -> usize {
     let Ok(v) = serde_json::from_str::<Value>(&text) else {
         return 0;
     };
-    v.get("history")
-        .and_then(Value::as_array)
-        .map(|a| a.len())
-        .unwrap_or(0)
+    v.get("history").and_then(Value::as_array).map(|a| a.len()).unwrap_or(0)
 }
 
 // ---------------------------------------------------------------------------
@@ -725,14 +696,8 @@ fn context_item_to_block(ci: &Value) -> Option<Block> {
         .and_then(|u| u.get("value"))
         .and_then(Value::as_str)
         .filter(|s| !s.is_empty());
-    let desc = ci
-        .get("description")
-        .and_then(Value::as_str)
-        .filter(|s| !s.is_empty());
-    let name = ci
-        .get("name")
-        .and_then(Value::as_str)
-        .filter(|s| !s.is_empty());
+    let desc = ci.get("description").and_then(Value::as_str).filter(|s| !s.is_empty());
+    let name = ci.get("name").and_then(Value::as_str).filter(|s| !s.is_empty());
 
     let uri_type = ci
         .get("uri")
@@ -855,10 +820,7 @@ mod tests {
 
     #[test]
     fn workspace_uri_and_plain() {
-        assert_eq!(
-            workspace_to_path("/Users/me/proj"),
-            PathBuf::from("/Users/me/proj")
-        );
+        assert_eq!(workspace_to_path("/Users/me/proj"), PathBuf::from("/Users/me/proj"));
         assert_eq!(
             workspace_to_path("file:///Users/me/proj"),
             PathBuf::from("/Users/me/proj")
@@ -868,10 +830,8 @@ mod tests {
     #[test]
     fn user_string_and_assistant_toolcall() {
         let mut model = None;
-        let user: Value = serde_json::from_str(
-            r#"{"message":{"role":"user","content":"hello"},"contextItems":[]}"#,
-        )
-        .unwrap();
+        let user: Value =
+            serde_json::from_str(r#"{"message":{"role":"user","content":"hello"},"contextItems":[]}"#).unwrap();
         let m = history_item_to_message(&user, &mut model).unwrap();
         assert_eq!(m.role, Role::User);
         assert_eq!(m.text().as_deref(), Some("hello"));
@@ -916,17 +876,14 @@ mod tests {
     #[test]
     fn tool_result_message() {
         let mut model = None;
-        let v: Value = serde_json::from_str(
-            r#"{"message":{"role":"tool","content":"file contents here","toolCallId":"call_1"}}"#,
-        )
-        .unwrap();
+        let v: Value =
+            serde_json::from_str(r#"{"message":{"role":"tool","content":"file contents here","toolCallId":"call_1"}}"#)
+                .unwrap();
         let m = history_item_to_message(&v, &mut model).unwrap();
         assert_eq!(m.role, Role::Tool);
         match &m.content[0] {
             Block::ToolResult {
-                tool_use_id,
-                content,
-                ..
+                tool_use_id, content, ..
             } => {
                 assert_eq!(tool_use_id, "call_1");
                 assert_eq!(content, "file contents here");
@@ -1003,11 +960,7 @@ mod tests {
         use std::sync::atomic::{AtomicU32, Ordering};
         static COUNTER: AtomicU32 = AtomicU32::new(0);
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!(
-            "cv-continue-emit-{}-{}",
-            std::process::id(),
-            n
-        ));
+        let dir = std::env::temp_dir().join(format!("cv-continue-emit-{}-{}", std::process::id(), n));
         let _ = fs::remove_dir_all(&dir);
 
         // Build a small session: user, assistant w/ a tool call, a tool result.
@@ -1032,9 +985,7 @@ mod tests {
         session.messages.push(user);
 
         let mut asst = Message::new(Role::Assistant);
-        asst.content.push(Block::Text {
-            text: "on it".into(),
-        });
+        asst.content.push(Block::Text { text: "on it".into() });
         asst.content.push(Block::ToolUse {
             id: "call_1".into(),
             name: "read_file".into(),
@@ -1129,8 +1080,7 @@ mod tests {
         static COUNTER: AtomicU32 = AtomicU32::new(0);
 
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir()
-            .join(format!("cv-continue-stream-{}-{}", std::process::id(), n));
+        let dir = std::env::temp_dir().join(format!("cv-continue-stream-{}-{}", std::process::id(), n));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("s.json");

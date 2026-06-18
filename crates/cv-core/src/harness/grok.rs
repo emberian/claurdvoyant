@@ -85,12 +85,7 @@ impl Adapter for Grok {
         crate::stream::collect(self, r)
     }
 
-    fn stream(
-        &self,
-        r: &SessionRef,
-        _opts: &ParseOptions,
-        sink: &mut dyn MessageSink,
-    ) -> Result<Session> {
+    fn stream(&self, r: &SessionRef, _opts: &ParseOptions, sink: &mut dyn MessageSink) -> Result<Session> {
         // r.path is the session directory. `summary.json` (small) carries all session-level
         // metadata; the transcript is `chat_history.jsonl`, one record per line — streamed.
         let dir = &r.path;
@@ -108,20 +103,12 @@ impl Adapter for Grok {
                 .map(PathBuf::from)
                 .or_else(|| r.cwd.clone()),
             title: r.title.clone(),
-            created_at: summary
-                .get("created_at")
-                .and_then(Value::as_str)
-                .and_then(parse_ts),
+            created_at: summary.get("created_at").and_then(Value::as_str).and_then(parse_ts),
             updated_at: summary
                 .get("updated_at")
                 .and_then(Value::as_str)
                 .and_then(parse_ts)
-                .or_else(|| {
-                    summary
-                        .get("last_active_at")
-                        .and_then(Value::as_str)
-                        .and_then(parse_ts)
-                }),
+                .or_else(|| summary.get("last_active_at").and_then(Value::as_str).and_then(parse_ts)),
             model: summary
                 .get("current_model_id")
                 .and_then(Value::as_str)
@@ -141,11 +128,9 @@ impl Adapter for Grok {
 
         let file = fs::File::open(dir.join("chat_history.jsonl"))
             .with_context(|| format!("reading chat_history in {}", dir.display()))?;
-        let skipped = super::for_each_json_line(BufReader::new(file), |v| {
-            match chat_message(&v, &enrich) {
-                Some(m) => sink.message(m),
-                None => Flow::Continue,
-            }
+        let skipped = super::for_each_json_line(BufReader::new(file), |v| match chat_message(&v, &enrich) {
+            Some(m) => sink.message(m),
+            None => Flow::Continue,
         });
         super::note_skipped_lines(&mut s, skipped);
         Ok(s)
@@ -275,15 +260,8 @@ fn chat_message(v: &Value, enrich: &HashMap<String, ToolEnrich>) -> Option<Messa
 
     // assistant lines may carry reasoning (summarized text + opaque encrypted blob).
     if let Some(reasoning) = v.get("reasoning") {
-        let text = reasoning
-            .get("text")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string();
-        let encrypted = reasoning
-            .get("encrypted")
-            .and_then(Value::as_str)
-            .map(str::to_string);
+        let text = reasoning.get("text").and_then(Value::as_str).unwrap_or("").to_string();
+        let encrypted = reasoning.get("encrypted").and_then(Value::as_str).map(str::to_string);
         if !text.is_empty() || encrypted.is_some() {
             m.content.push(Block::Thinking {
                 text: text.into(),
@@ -305,16 +283,8 @@ fn chat_message(v: &Value, enrich: &HashMap<String, ToolEnrich>) -> Option<Messa
     // assistant tool_calls → ToolUse blocks (arguments is a JSON *string*).
     if let Some(calls) = v.get("tool_calls").and_then(Value::as_array) {
         for c in calls {
-            let id = c
-                .get("id")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string();
-            let name = c
-                .get("name")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string();
+            let id = c.get("id").and_then(Value::as_str).unwrap_or_default().to_string();
+            let name = c.get("name").and_then(Value::as_str).unwrap_or_default().to_string();
             let input = parse_arguments(c.get("arguments"));
             // Stash sidecar enrichment so nothing is lost (ir.rs has no field for it yet).
             if let Some(e) = enrich.get(&id) {
@@ -350,8 +320,7 @@ fn chat_message(v: &Value, enrich: &HashMap<String, ToolEnrich>) -> Option<Messa
             .insert("model_fingerprint".into(), Value::String(fp.to_string()));
     }
     if let Some(sr) = v.get("synthetic_reason").and_then(Value::as_str) {
-        m.extra
-            .insert("synthetic_reason".into(), Value::String(sr.to_string()));
+        m.extra.insert("synthetic_reason".into(), Value::String(sr.to_string()));
     }
 
     if m.content.is_empty() {
@@ -364,9 +333,7 @@ fn chat_message(v: &Value, enrich: &HashMap<String, ToolEnrich>) -> Option<Messa
 /// otherwise keep the raw string (some tools historically stored a bare string).
 fn parse_arguments(v: Option<&Value>) -> Value {
     match v {
-        Some(Value::String(s)) => {
-            serde_json::from_str(s).unwrap_or_else(|_| Value::String(s.clone()))
-        }
+        Some(Value::String(s)) => serde_json::from_str(s).unwrap_or_else(|_| Value::String(s.clone())),
         Some(other) => other.clone(),
         None => Value::Null,
     }
@@ -399,10 +366,7 @@ fn scan(summary_path: &Path) -> Result<Option<SessionRef>> {
         .or_else(|| dir.file_name().and_then(|n| n.to_str()).map(str::to_string))
         .unwrap_or_default();
 
-    let cwd = summary
-        .pointer("/info/cwd")
-        .and_then(Value::as_str)
-        .map(PathBuf::from);
+    let cwd = summary.pointer("/info/cwd").and_then(Value::as_str).map(PathBuf::from);
 
     // title: explicit summary/generated title, else first user message from chat_history.
     let mut title = summary
@@ -443,20 +407,12 @@ fn scan(summary_path: &Path) -> Result<Option<SessionRef>> {
         path: dir,
         cwd,
         title,
-        created_at: summary
-            .get("created_at")
-            .and_then(Value::as_str)
-            .and_then(parse_ts),
+        created_at: summary.get("created_at").and_then(Value::as_str).and_then(parse_ts),
         updated_at: summary
             .get("updated_at")
             .and_then(Value::as_str)
             .and_then(parse_ts)
-            .or_else(|| {
-                summary
-                    .get("last_active_at")
-                    .and_then(Value::as_str)
-                    .and_then(parse_ts)
-            }),
+            .or_else(|| summary.get("last_active_at").and_then(Value::as_str).and_then(parse_ts)),
         message_count,
     }))
 }
@@ -556,8 +512,7 @@ mod tests {
 
         // tool_result with this id should be flagged as error and carry metadata via the call.
         let res: Value =
-            serde_json::from_str(r#"{"type":"tool_result","tool_call_id":"call-9","content":"boom"}"#)
-                .unwrap();
+            serde_json::from_str(r#"{"type":"tool_result","tool_call_id":"call-9","content":"boom"}"#).unwrap();
         let m = chat_message(&res, &enrich).unwrap();
         match &m.content[0] {
             Block::ToolResult { is_error, .. } => assert!(*is_error),
@@ -586,7 +541,8 @@ mod tests {
 
     #[test]
     fn user_synthetic_reason_preserved() {
-        let line = r#"{"type":"user","content":[{"type":"text","text":"hi"}],"synthetic_reason":"project_instructions"}"#;
+        let line =
+            r#"{"type":"user","content":[{"type":"text","text":"hi"}],"synthetic_reason":"project_instructions"}"#;
         let v: Value = serde_json::from_str(line).unwrap();
         let m = chat_message(&v, &HashMap::new()).unwrap();
         assert_eq!(m.role, Role::User);
@@ -601,8 +557,7 @@ mod tests {
 
     #[test]
     fn parses_fixture_session_v1() {
-        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures/grok/v1_tools");
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/grok/v1_tools");
         if !dir.exists() {
             return; // fixture optional in minimal checkouts
         }
@@ -620,9 +575,7 @@ mod tests {
         let mut saw_call2 = false;
         for m in s.messages.iter().filter(|m| m.role == Role::Tool) {
             if let Block::ToolResult {
-                tool_use_id,
-                is_error,
-                ..
+                tool_use_id, is_error, ..
             } = &m.content[0]
             {
                 match tool_use_id.as_str() {

@@ -108,8 +108,9 @@ impl<'a> SessionFacts<'a> {
 
     /// Per-agent tool histograms across the orchestrator + forest (parses every sub-agent — pricey).
     fn forest(&self) -> &cv_core::tools::ForestTools {
-        self.forest
-            .get_or_init(|| cv_core::tools::forest_tools(self.r).unwrap_or(cv_core::tools::ForestTools { agents: vec![] }))
+        self.forest.get_or_init(|| {
+            cv_core::tools::forest_tools(self.r).unwrap_or(cv_core::tools::ForestTools { agents: vec![] })
+        })
     }
 
     /// The sub-agent forest as lightweight infos (type + ref + journaled outcome).
@@ -132,7 +133,12 @@ impl ExtFacts for SessionFacts<'_> {
     fn text(&self, needle: &str) -> Tri {
         // The id key is the session id; `needle` is already lowercased by the parser, matching the
         // map keys we inserted under.
-        Tri::of(self.text_sets.0.get(needle).is_some_and(|s| s.contains(&self.session.id)))
+        Tri::of(
+            self.text_sets
+                .0
+                .get(needle)
+                .is_some_and(|s| s.contains(&self.session.id)),
+        )
     }
 
     fn tool(&self, name: &str) -> Tri {
@@ -176,14 +182,15 @@ impl ExtFacts for SessionFacts<'_> {
     fn subtool(&self, name: &str) -> Tri {
         // A tool used by any *sub-agent* (skip the orchestrator sentinel).
         Tri::of(self.forest().agents.iter().any(|a| {
-            a.agent != cv_core::tools::ORCHESTRATOR
-                && a.histogram.tools.keys().any(|t| t.to_lowercase().contains(name))
+            a.agent != cv_core::tools::ORCHESTRATOR && a.histogram.tools.keys().any(|t| t.to_lowercase().contains(name))
         }))
     }
 
     fn agent_type(&self, needle: &str) -> Tri {
         Tri::of(self.tree().iter().any(|info| {
-            info.agent_type.as_deref().is_some_and(|t| t.to_lowercase().contains(needle))
+            info.agent_type
+                .as_deref()
+                .is_some_and(|t| t.to_lowercase().contains(needle))
         }))
     }
 
@@ -205,12 +212,11 @@ impl ExtFacts for SessionFacts<'_> {
 }
 
 /// Full evaluation of `query` against a parsed session + its ref, using a [`SessionFacts`] resolver.
-pub(crate) fn matches_full(
-    query: &SessionQuery,
-    r: &SessionRef,
-    session: &Session,
-    text_sets: &TextSets,
-) -> bool {
+pub(crate) fn matches_full(query: &SessionQuery, r: &SessionRef, session: &Session, text_sets: &TextSets) -> bool {
     let facts = SessionFacts::new(r, session, text_sets);
-    query.matches(&Facts { r, session: Some(session), ext: &facts })
+    query.matches(&Facts {
+        r,
+        session: Some(session),
+        ext: &facts,
+    })
 }

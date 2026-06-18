@@ -99,9 +99,7 @@ impl Adapter for OpenClaw {
                 if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
                     continue;
                 }
-                if path.parent().and_then(|p| p.file_name()).and_then(|n| n.to_str())
-                    != Some("sessions")
-                {
+                if path.parent().and_then(|p| p.file_name()).and_then(|n| n.to_str()) != Some("sessions") {
                     continue;
                 }
                 // Skip compaction-checkpoint sidecar transcripts (e.g. `<sid>-compaction-<id>.jsonl`);
@@ -123,12 +121,7 @@ impl Adapter for OpenClaw {
         crate::stream::collect(self, r)
     }
 
-    fn stream(
-        &self,
-        r: &SessionRef,
-        _opts: &ParseOptions,
-        sink: &mut dyn MessageSink,
-    ) -> Result<Session> {
+    fn stream(&self, r: &SessionRef, _opts: &ParseOptions, sink: &mut dyn MessageSink) -> Result<Session> {
         // One record per line; stream them so peak memory is O(largest line), not O(transcript).
         // `filter_map`, not `map_while`: a single undecodable line (stray non-UTF8 bytes) must be
         // skipped like any other corrupt record — `map_while` would silently TRUNCATE the whole
@@ -137,8 +130,7 @@ impl Adapter for OpenClaw {
         // EOF (same tolerance as `for_each_json_line`).
         #[allow(clippy::lines_filter_map_ok)]
         let lines = {
-            let file = fs::File::open(&r.path)
-                .with_context(|| format!("reading {}", r.path.display()))?;
+            let file = fs::File::open(&r.path).with_context(|| format!("reading {}", r.path.display()))?;
             BufReader::new(file).lines().filter_map(Result::ok)
         };
         Ok(stream_core(lines, r, sink))
@@ -162,11 +154,7 @@ fn parse_text(text: &str, r: &SessionRef) -> Session {
 /// Streaming core shared by the on-disk [`Adapter::stream`] and the string-driven `parse_text`:
 /// fold each record's metadata into the session and emit any message to `sink`. Returns the session
 /// with empty `messages`.
-fn stream_core<I: Iterator<Item = String>>(
-    lines: I,
-    r: &SessionRef,
-    sink: &mut dyn MessageSink,
-) -> Session {
+fn stream_core<I: Iterator<Item = String>>(lines: I, r: &SessionRef, sink: &mut dyn MessageSink) -> Session {
     let mut s = Session {
         id: r.id.clone(),
         harness: Harness::OpenClaw,
@@ -297,9 +285,7 @@ fn scan(path: &Path, index: &HashMap<String, Value>) -> Result<SessionRef> {
                 if let Some(ts) = entry_timestamp(&v) {
                     updated_at = Some(ts);
                 }
-                if first_user.is_none()
-                    && v.pointer("/message/role").and_then(Value::as_str) == Some("user")
-                {
+                if first_user.is_none() && v.pointer("/message/role").and_then(Value::as_str) == Some("user") {
                     let t = coerce_content_text(v.pointer("/message/content"));
                     if !t.trim().is_empty() {
                         first_user = Some(crate::ir::truncate(&t, 80));
@@ -389,11 +375,7 @@ fn parse_entry(v: &Value) -> Option<Message> {
 }
 
 fn parse_tool_result(m: &mut Message, msg: &Value) {
-    let tool_use_id = msg
-        .get("toolCallId")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_string();
+    let tool_use_id = msg.get("toolCallId").and_then(Value::as_str).unwrap_or("").to_string();
     m.content.push(Block::ToolResult {
         tool_use_id,
         content: coerce_content_text(msg.get("content")).into(),
@@ -486,8 +468,15 @@ fn parse_bash_execution(m: &mut Message, msg: &Value) {
         text.push_str(output);
     }
     m.content.push(Block::Text { text: text.into() });
-    m.extra.insert("openclaw_message_role".into(), Value::from("bashExecution"));
-    for key in ["exitCode", "cancelled", "truncated", "fullOutputPath", "excludeFromContext"] {
+    m.extra
+        .insert("openclaw_message_role".into(), Value::from("bashExecution"));
+    for key in [
+        "exitCode",
+        "cancelled",
+        "truncated",
+        "fullOutputPath",
+        "excludeFromContext",
+    ] {
         if let Some(val) = msg.get(key) {
             if !val.is_null() {
                 m.extra.insert(snake(key), val.clone());
@@ -498,8 +487,11 @@ fn parse_bash_execution(m: &mut Message, msg: &Value) {
 
 fn parse_branch_summary(m: &mut Message, msg: &Value) {
     let summary = msg.get("summary").and_then(Value::as_str).unwrap_or("");
-    m.content.push(Block::Text { text: summary.to_string().into() });
-    m.extra.insert("openclaw_message_role".into(), Value::from("branchSummary"));
+    m.content.push(Block::Text {
+        text: summary.to_string().into(),
+    });
+    m.extra
+        .insert("openclaw_message_role".into(), Value::from("branchSummary"));
     if let Some(from_id) = msg.get("fromId").and_then(Value::as_str) {
         m.extra.insert("branch_from_id".into(), Value::from(from_id));
     }
@@ -507,8 +499,11 @@ fn parse_branch_summary(m: &mut Message, msg: &Value) {
 
 fn parse_compaction_summary(m: &mut Message, msg: &Value) {
     let summary = msg.get("summary").and_then(Value::as_str).unwrap_or("");
-    m.content.push(Block::Text { text: summary.to_string().into() });
-    m.extra.insert("openclaw_message_role".into(), Value::from("compactionSummary"));
+    m.content.push(Block::Text {
+        text: summary.to_string().into(),
+    });
+    m.extra
+        .insert("openclaw_message_role".into(), Value::from("compactionSummary"));
     for key in ["tokensBefore", "tokensAfter", "firstKeptEntryId"] {
         if let Some(val) = msg.get(key) {
             if !val.is_null() {
@@ -549,7 +544,8 @@ fn content_block(item: &Value) -> Option<Block> {
                 .get("thinking")
                 .and_then(Value::as_str)
                 .unwrap_or("")
-                .to_string().into(),
+                .to_string()
+                .into(),
             // OpenClaw uses `thinkingSignature`; `redacted` flags a server-redacted reasoning block.
             signature: item
                 .get("thinkingSignature")
@@ -560,18 +556,11 @@ fn content_block(item: &Value) -> Option<Block> {
                 .and_then(Value::as_bool)
                 .filter(|&r| r)
                 .map(|_| "redacted".to_string()),
-            redacted: item
-                .get("redacted")
-                .and_then(Value::as_bool)
-                .unwrap_or(false),
+            redacted: item.get("redacted").and_then(Value::as_bool).unwrap_or(false),
         }),
         "toolCall" => Some(Block::ToolUse {
             id: item.get("id").and_then(Value::as_str).unwrap_or("").to_string(),
-            name: item
-                .get("name")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string(),
+            name: item.get("name").and_then(Value::as_str).unwrap_or("").to_string(),
             input: item.get("arguments").cloned().unwrap_or(Value::Null),
         }),
         "image" => Some(Block::Image {
@@ -634,8 +623,7 @@ mod tests {
 
     fn parse_fixture(name: &str) -> Session {
         let r = fixture_ref(name);
-        let text = fs::read_to_string(&r.path)
-            .unwrap_or_else(|e| panic!("reading {}: {e}", r.path.display()));
+        let text = fs::read_to_string(&r.path).unwrap_or_else(|e| panic!("reading {}: {e}", r.path.display()));
         parse_text(&text, &r)
     }
 
@@ -721,7 +709,10 @@ mod tests {
             })
             .collect();
         assert_eq!(kinds, ["thinking", "text", "toolcall"]);
-        if let Block::Thinking { signature, encrypted, .. } = &asst.content[0] {
+        if let Block::Thinking {
+            signature, encrypted, ..
+        } = &asst.content[0]
+        {
             assert_eq!(signature.as_deref(), Some("sig-think"));
             assert_eq!(encrypted.as_deref(), Some("redacted"));
         } else {
@@ -745,7 +736,13 @@ mod tests {
         let tr = &s.messages[2];
         assert_eq!(tr.role, Role::Tool);
         match &tr.content[0] {
-            Block::ToolResult { tool_use_id, content, is_error, tool_name, .. } => {
+            Block::ToolResult {
+                tool_use_id,
+                content,
+                is_error,
+                tool_name,
+                ..
+            } => {
                 assert_eq!(tool_use_id, "call_1");
                 assert_eq!(content, "file contents");
                 assert!(!is_error);
@@ -764,7 +761,10 @@ mod tests {
         // v1 entries have no parentId
         assert!(s.messages[0].parent_id.is_none());
         assert_eq!(
-            s.messages[0].extra.get("openclaw_session_version").and_then(Value::as_i64),
+            s.messages[0]
+                .extra
+                .get("openclaw_session_version")
+                .and_then(Value::as_i64),
             Some(1)
         );
         assert_eq!(s.messages[0].text().as_deref(), Some("legacy first"));
@@ -790,7 +790,10 @@ mod tests {
             branch.extra.get("openclaw_message_role").and_then(Value::as_str),
             Some("branchSummary")
         );
-        assert_eq!(branch.extra.get("branch_from_id").and_then(Value::as_str), Some("abc123"));
+        assert_eq!(
+            branch.extra.get("branch_from_id").and_then(Value::as_str),
+            Some("abc123")
+        );
 
         let compact = &s.messages[2];
         assert_eq!(
@@ -813,10 +816,7 @@ mod tests {
     #[test]
     fn parses_topic_and_acp_session() {
         // topic file: id derives from the `<sid>-topic-<id>` filename when no header id given
-        assert_eq!(
-            session_id_from_filename(Path::new("sess-1-topic-foo.jsonl")),
-            "sess-1"
-        );
+        assert_eq!(session_id_from_filename(Path::new("sess-1-topic-foo.jsonl")), "sess-1");
 
         // a real topic transcript parses like any other thread
         let topic = parse_fixture("sess-1-topic-foo.jsonl");

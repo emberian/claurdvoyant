@@ -52,7 +52,14 @@ pub struct PruneOptions {
 
 impl Default for PruneOptions {
     fn default() -> Self {
-        PruneOptions { min_size: 2048, keep_last: 25, drop: false, new_id: None, copy_resources: false, dry_run: false }
+        PruneOptions {
+            min_size: 2048,
+            keep_last: 25,
+            drop: false,
+            new_id: None,
+            copy_resources: false,
+            dry_run: false,
+        }
     }
 }
 
@@ -93,14 +100,19 @@ struct SidecarEntry {
 
 /// Prune `src_path` (a Claude `<id>.jsonl`) into a new session. Returns what happened.
 pub fn prune_session(src_path: &Path, opts: &PruneOptions) -> Result<PruneResult> {
-    let raw = std::fs::read_to_string(src_path)
-        .with_context(|| format!("reading session {}", src_path.display()))?;
+    let raw = std::fs::read_to_string(src_path).with_context(|| format!("reading session {}", src_path.display()))?;
     let original_size = raw.len() as u64;
     let lines: Vec<&str> = raw.trim_end().split('\n').collect();
 
     let source_id = lines
         .iter()
-        .find_map(|l| serde_json::from_str::<Value>(l).ok()?.get("sessionId")?.as_str().map(String::from))
+        .find_map(|l| {
+            serde_json::from_str::<Value>(l)
+                .ok()?
+                .get("sessionId")?
+                .as_str()
+                .map(String::from)
+        })
         .unwrap_or_default();
     let new_id = opts.new_id.clone().unwrap_or_else(new_uuid);
     if new_id == source_id {
@@ -123,7 +135,11 @@ pub fn prune_session(src_path: &Path, opts: &PruneOptions) -> Result<PruneResult
         .filter(|l| {
             serde_json::from_str::<Value>(l)
                 .ok()
-                .and_then(|v| v.get("type").and_then(Value::as_str).map(|t| t == "user" || t == "assistant"))
+                .and_then(|v| {
+                    v.get("type")
+                        .and_then(Value::as_str)
+                        .map(|t| t == "user" || t == "assistant")
+                })
                 .unwrap_or(false)
         })
         .count();
@@ -158,8 +174,22 @@ pub fn prune_session(src_path: &Path, opts: &PruneOptions) -> Result<PruneResult
         // Only old user messages carry snippable tool results.
         if is_old && ty == "user" {
             let mut modified = false;
-            prune_user_line(&mut v, opts, &tool_names, &new_id, &mut sidecar, &mut pruned_count, &mut image_blocks, &mut est_tokens_saved, &mut modified);
-            out_lines.push(if modified { v.to_string() } else { reserialize_with_id(line, &new_id) });
+            prune_user_line(
+                &mut v,
+                opts,
+                &tool_names,
+                &new_id,
+                &mut sidecar,
+                &mut pruned_count,
+                &mut image_blocks,
+                &mut est_tokens_saved,
+                &mut modified,
+            );
+            out_lines.push(if modified {
+                v.to_string()
+            } else {
+                reserialize_with_id(line, &new_id)
+            });
             continue;
         }
 
@@ -177,7 +207,10 @@ pub fn prune_session(src_path: &Path, opts: &PruneOptions) -> Result<PruneResult
         std::fs::write(&new_path, &new_content)
             .with_context(|| format!("writing new session {}", new_path.display()))?;
         if let Some(p) = &sidecar_out {
-            let body: String = sidecar.iter().map(|e| serde_json::to_string(e).unwrap_or_default() + "\n").collect();
+            let body: String = sidecar
+                .iter()
+                .map(|e| serde_json::to_string(e).unwrap_or_default() + "\n")
+                .collect();
             std::fs::write(p, body).with_context(|| format!("writing sidecar {}", p.display()))?;
         }
         if let Some(dst) = &copied {
@@ -221,7 +254,11 @@ fn prune_user_line(
             if block.get("type").and_then(Value::as_str) != Some("tool_result") {
                 continue;
             }
-            let tuid = block.get("tool_use_id").and_then(Value::as_str).unwrap_or("unknown").to_string();
+            let tuid = block
+                .get("tool_use_id")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown")
+                .to_string();
             if line_tool_id.is_none() {
                 line_tool_id = Some(tuid.clone());
             }
@@ -234,22 +271,37 @@ fn prune_user_line(
                         None
                     } else {
                         let (kind, text, img) = classify(c);
-                        if kind == "none" { None } else { Some((c.clone(), size, kind, text, img)) }
+                        if kind == "none" {
+                            None
+                        } else {
+                            Some((c.clone(), size, kind, text, img))
+                        }
                     }
                 }
                 _ => None,
             };
-            let Some((content, size, kind, text, img)) = committed else { continue };
+            let Some((content, size, kind, text, img)) = committed else {
+                continue;
+            };
             let line_count = if text.is_empty() { 1 } else { text.lines().count() };
-            let (name, input) = tool_names.get(&tuid).cloned().unwrap_or_else(|| ("unknown".into(), Value::Null));
+            let (name, input) = tool_names
+                .get(&tuid)
+                .cloned()
+                .unwrap_or_else(|| ("unknown".into(), Value::Null));
             let marker = build_marker(&tuid, &name, &input, &kind, size, line_count, new_id);
 
             *tokens_saved += est_tokens(&content).saturating_sub(str_tokens(&marker));
             *images += img;
             if !opts.drop {
                 sidecar.push(SidecarEntry {
-                    id: tuid.clone(), slot: "content".into(), name, input,
-                    content, size, line_count, kind,
+                    id: tuid.clone(),
+                    slot: "content".into(),
+                    name,
+                    input,
+                    content,
+                    size,
+                    line_count,
+                    kind,
                 });
             }
             block["content"] = Value::String(marker);
@@ -279,8 +331,14 @@ fn prune_user_line(
         let marker = build_marker(&id, &name, &input, kind, size, line_count, new_id);
         if !opts.drop {
             sidecar.push(SidecarEntry {
-                id, slot: "toolUseResult".into(), name, input,
-                content: tur, size, line_count, kind: kind.into(),
+                id,
+                slot: "toolUseResult".into(),
+                name,
+                input,
+                content: tur,
+                size,
+                line_count,
+                kind: kind.into(),
             });
         }
         v["toolUseResult"] = Value::String(marker);
@@ -292,12 +350,14 @@ fn prune_user_line(
 /// Retrieve a stashed original from a prune sidecar by its `tool_use_id` (or `<id>#tur`). Returns the
 /// verbatim value (string, content-block array incl. images, or the raw toolUseResult object).
 pub fn retrieve(sidecar_path: &Path, id: &str) -> Result<Value> {
-    let raw = std::fs::read_to_string(sidecar_path)
-        .with_context(|| format!("reading sidecar {}", sidecar_path.display()))?;
+    let raw =
+        std::fs::read_to_string(sidecar_path).with_context(|| format!("reading sidecar {}", sidecar_path.display()))?;
     let mut available = Vec::new();
     let mut found = None;
     for line in raw.lines().filter(|l| !l.trim().is_empty()) {
-        let Ok(entry) = serde_json::from_str::<SidecarEntry>(line) else { continue };
+        let Ok(entry) = serde_json::from_str::<SidecarEntry>(line) else {
+            continue;
+        };
         available.push(entry.id.clone());
         if entry.id == id {
             found = Some(entry.content); // last-wins
@@ -330,11 +390,15 @@ fn reserialize_with_id(line: &str, new_id: &str) -> String {
 fn build_tool_name_map(lines: &[&str]) -> HashMap<String, (String, Value)> {
     let mut map = HashMap::new();
     for line in lines {
-        let Ok(v) = serde_json::from_str::<Value>(line) else { continue };
+        let Ok(v) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
         if v.get("type").and_then(Value::as_str) != Some("assistant") {
             continue;
         }
-        let Some(blocks) = v.pointer("/message/content").and_then(Value::as_array) else { continue };
+        let Some(blocks) = v.pointer("/message/content").and_then(Value::as_array) else {
+            continue;
+        };
         for b in blocks {
             if b.get("type").and_then(Value::as_str) == Some("tool_use") {
                 if let Some(id) = b.get("id").and_then(Value::as_str) {
@@ -391,7 +455,11 @@ fn tur_is_image(tur: &Value) -> bool {
         if file.get("base64").is_some() {
             return true;
         }
-        if file.get("type").and_then(Value::as_str).is_some_and(|t| t.starts_with("image/")) {
+        if file
+            .get("type")
+            .and_then(Value::as_str)
+            .is_some_and(|t| t.starts_with("image/"))
+        {
             return true;
         }
     }
@@ -427,8 +495,19 @@ fn est_tokens(content: &Value) -> u64 {
 
 /// A compact key=value summary of the tool's most telling arguments, for the marker.
 fn summarize_args(input: &Value) -> String {
-    let Some(obj) = input.as_object() else { return String::new() };
-    let key_args = ["file_path", "command", "pattern", "query", "url", "path", "description", "prompt"];
+    let Some(obj) = input.as_object() else {
+        return String::new();
+    };
+    let key_args = [
+        "file_path",
+        "command",
+        "pattern",
+        "query",
+        "url",
+        "path",
+        "description",
+        "prompt",
+    ];
     let mut picked: Vec<String> = obj
         .iter()
         .filter(|(k, _)| key_args.contains(&k.as_str()))
@@ -456,7 +535,11 @@ fn fmt_arg(k: &str, v: &Value) -> String {
 
 fn build_marker(id: &str, name: &str, input: &Value, kind: &str, size: usize, lines: usize, session: &str) -> String {
     let args = summarize_args(input);
-    let args = if args.is_empty() { String::new() } else { format!(" {args}") };
+    let args = if args.is_empty() {
+        String::new()
+    } else {
+        format!(" {args}")
+    };
     let label = match kind {
         "image" => "image",
         "mixed" => "text+image",

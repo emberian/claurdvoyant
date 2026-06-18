@@ -90,8 +90,7 @@ fn fields_of(schema: &Schema) -> Result<Fields> {
 /// an older `cv`), it's transparently rebuilt fresh so the binary self-heals on upgrade; the next
 /// `cv index` repopulates it.
 fn open_or_create(dir: &Path) -> Result<(Index, Fields)> {
-    std::fs::create_dir_all(dir)
-        .with_context(|| format!("creating tantivy dir {}", dir.display()))?;
+    std::fs::create_dir_all(dir).with_context(|| format!("creating tantivy dir {}", dir.display()))?;
     let index = match Index::open_in_dir(dir) {
         Ok(idx)
             if idx.schema().get_field("path").is_ok()
@@ -108,8 +107,7 @@ fn open_or_create(dir: &Path) -> Result<(Index, Fields)> {
         // Either no index yet, or one with an incompatible older schema → (re)create fresh.
         _ => {
             let _ = std::fs::remove_dir_all(dir);
-            std::fs::create_dir_all(dir)
-                .with_context(|| format!("recreating tantivy dir {}", dir.display()))?;
+            std::fs::create_dir_all(dir).with_context(|| format!("recreating tantivy dir {}", dir.display()))?;
             Index::create_in_dir(dir, build_schema())
                 .with_context(|| format!("creating tantivy index in {}", dir.display()))?
         }
@@ -154,9 +152,7 @@ pub fn index_all(dir: &Path, rebuild: bool, subagents: bool) -> Result<usize> {
     use cv_core::ParseOptions;
 
     let (index, f) = open_or_create(dir)?;
-    let mut writer: IndexWriter = index
-        .writer(50_000_000)
-        .context("creating tantivy index writer")?;
+    let mut writer: IndexWriter = index.writer(50_000_000).context("creating tantivy index writer")?;
 
     if rebuild {
         writer.delete_all_documents().context("clearing index")?;
@@ -183,14 +179,11 @@ pub fn index_all(dir: &Path, rebuild: bool, subagents: bool) -> Result<usize> {
         total += 1;
         seen.insert(r.id.clone());
         let (mtime, size) = cv_core::offsets::file_sig(&r.path);
-        let fts_fresh = existing
-            .get(&r.id)
-            .is_some_and(|&mt| mt == mtime && mtime != 0);
+        let fts_fresh = existing.get(&r.id).is_some_and(|&mt| mt == mtime && mtime != 0);
         let events_stale = event_sync.needs_ingest(&r, mtime);
         // Message byte offsets (seekable `cv show --range` — see [`cv_core::offsets`]) ride the
         // same pass, for the harnesses whose adapters can stamp them.
-        let offsets_stale =
-            cv_core::offsets::supported(r.harness) && offset_sync.needs_record(&r, mtime, size);
+        let offsets_stale = cv_core::offsets::supported(r.harness) && offset_sync.needs_record(&r, mtime, size);
         // Unchanged on all axes → skip entirely (no re-parse beyond the metadata scan).
         if fts_fresh && !events_stale && !offsets_stale {
             continue;
@@ -278,15 +271,7 @@ pub fn index_all(dir: &Path, rebuild: bool, subagents: bool) -> Result<usize> {
         for r in cv_core::discover_all() {
             for sub in cv_core::subagent_tree_of(&r) {
                 seen.insert(sub.session.id.clone());
-                match index_one_subagent(
-                    &mut writer,
-                    &f,
-                    &r,
-                    &sub,
-                    &existing,
-                    &event_sync,
-                    &offset_sync,
-                ) {
+                match index_one_subagent(&mut writer, &f, &r, &sub, &existing, &event_sync, &offset_sync) {
                     Ok(0) => {}
                     Ok(docs) => {
                         changed += 1;
@@ -392,8 +377,7 @@ fn index_one_subagent(
     let (mtime, size) = cv_core::offsets::file_sig(&sr.path);
     let fts_fresh = existing.get(&sr.id).is_some_and(|&mt| mt == mtime && mtime != 0);
     let events_stale = event_sync.needs_ingest(sr, mtime);
-    let offsets_stale =
-        cv_core::offsets::supported(sr.harness) && offset_sync.needs_record(sr, mtime, size);
+    let offsets_stale = cv_core::offsets::supported(sr.harness) && offset_sync.needs_record(sr, mtime, size);
     if fts_fresh && !events_stale && !offsets_stale {
         return Ok(0);
     }
@@ -736,9 +720,7 @@ fn read_indexed_mtimes(index: &Index, f: &Fields) -> Result<HashMap<String, i64>
 #[cfg(test)]
 pub(crate) fn index_refs(dir: &Path, refs: &[cv_core::SessionRef], catalog: bool) -> Result<usize> {
     let (index, f) = open_or_create(dir)?;
-    let mut writer: IndexWriter = index
-        .writer(50_000_000)
-        .context("creating tantivy index writer")?;
+    let mut writer: IndexWriter = index.writer(50_000_000).context("creating tantivy index writer")?;
     writer.delete_all_documents().context("clearing index")?;
     for r in refs {
         let Some(adapter) = cv_core::harness::for_harness(r.harness) else {
@@ -746,8 +728,7 @@ pub(crate) fn index_refs(dir: &Path, refs: &[cv_core::SessionRef], catalog: bool
         };
         let (mtime, size) = cv_core::offsets::file_sig(&r.path);
         let mut es = catalog.then(|| cv_core::events::EventSink::new(r.cwd.clone()));
-        let mut os = (catalog && cv_core::offsets::supported(r.harness))
-            .then(cv_core::offsets::OffsetSink::new);
+        let mut os = (catalog && cv_core::offsets::supported(r.harness)).then(cv_core::offsets::OffsetSink::new);
         index_session(
             &mut writer,
             &f,
@@ -776,17 +757,11 @@ pub(crate) fn index_refs(dir: &Path, refs: &[cv_core::SessionRef], catalog: bool
 /// each pass into the event catalog (set it only under an isolated `CLAURDVOYANT_HOME`). Returns the
 /// number of sub-agent transcripts folded in.
 #[cfg(test)]
-pub(crate) fn index_refs_with_subagents(
-    dir: &Path,
-    refs: &[cv_core::SessionRef],
-    catalog: bool,
-) -> Result<usize> {
+pub(crate) fn index_refs_with_subagents(dir: &Path, refs: &[cv_core::SessionRef], catalog: bool) -> Result<usize> {
     // First the top-level pass (clears + indexes the parents).
     index_refs(dir, refs, catalog)?;
     let (index, f) = open_or_create(dir)?;
-    let mut writer: IndexWriter = index
-        .writer(50_000_000)
-        .context("creating tantivy index writer")?;
+    let mut writer: IndexWriter = index.writer(50_000_000).context("creating tantivy index writer")?;
     let existing = read_indexed_mtimes(&index, &f).unwrap_or_default();
     let event_sync = cv_core::events::SyncTable::load();
     let offset_sync = cv_core::offsets::SyncTable::load();
@@ -795,15 +770,7 @@ pub(crate) fn index_refs_with_subagents(
         for sub in cv_core::subagent_tree_of(r) {
             // In a no-catalog test the skip tables are empty, so every agent indexes; with a catalog
             // the freshness skip behaves exactly as `index_all` does.
-            let docs = index_one_subagent(
-                &mut writer,
-                &f,
-                r,
-                &sub,
-                &existing,
-                &event_sync,
-                &offset_sync,
-            )?;
+            let docs = index_one_subagent(&mut writer, &f, r, &sub, &existing, &event_sync, &offset_sync)?;
             if docs > 0 {
                 folded += 1;
             }
@@ -823,10 +790,7 @@ pub(crate) fn index_refs_with_subagents(
 /// `harness:claude`, phrases `"foo bar"`, and booleans `a AND b` work too.
 pub fn text_search(dir: &Path, query: &str, limit: usize) -> Result<Vec<Hit>> {
     if !dir.join("meta.json").exists() {
-        anyhow::bail!(
-            "no full-text index at {} — run `index_all` first",
-            dir.display()
-        );
+        anyhow::bail!("no full-text index at {} — run `index_all` first", dir.display());
     }
     let (index, f) = open_or_create(dir)?;
     let reader = index.reader().context("opening index reader")?;
@@ -852,11 +816,8 @@ pub fn text_search(dir: &Path, query: &str, limit: usize) -> Result<Vec<Hit>> {
             break;
         }
         let doc: TantivyDocument = searcher.doc(addr).context("loading stored doc")?;
-        let get_str = |field: Field| -> Option<String> {
-            doc.get_first(field)
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string())
-        };
+        let get_str =
+            |field: Field| -> Option<String> { doc.get_first(field).and_then(|v| v.as_str()).map(|s| s.to_string()) };
         let id = get_str(f.id).unwrap_or_default();
         if !seen.insert(id.clone()) {
             continue; // another chunk of a session we already have
@@ -1189,10 +1150,7 @@ mod tests {
         let b2 = "Loading dataframes and grouping by columns in pandas.";
         let p1 = write_claude(&sdir, "a1", b1);
         let p2 = write_claude(&sdir, "b2", b2);
-        let refs = vec![
-            sref("a1", "Rust tantivy index", p1),
-            sref("b2", "Python pandas", p2),
-        ];
+        let refs = vec![sref("a1", "Rust tantivy index", p1), sref("b2", "Python pandas", p2)];
         let n = index_refs(&dir, &refs, false).unwrap();
         assert_eq!(n, 2);
 
@@ -1531,11 +1489,7 @@ mod tests {
         let h = IsolatedHome::new();
         let dir = tmpdir();
 
-        let pp = write_claude_msgs(
-            &h.home,
-            "evt-parent",
-            &[("user", "spawn an agent to touch a file")],
-        );
+        let pp = write_claude_msgs(&h.home, "evt-parent", &[("user", "spawn an agent to touch a file")]);
         // A sub-agent whose assistant turn edits a file.
         let stem = Path::new(&pp).file_stem().unwrap().to_str().unwrap().to_string();
         let sub_dir = Path::new(&pp).parent().unwrap().join(&stem).join("subagents");
@@ -1600,11 +1554,7 @@ mod tests {
         );
         assert!(hits[0].snippet.ends_with("(source file moved)"));
         // The stored preview itself is capped (marker text rides on top of it).
-        let stored = hits[0]
-            .snippet
-            .trim_end_matches(" (source file moved)")
-            .chars()
-            .count();
+        let stored = hits[0].snippet.trim_end_matches(" (source file moved)").chars().count();
         assert!(stored <= PREVIEW_CHARS, "preview over cap: {stored} chars");
 
         std::fs::remove_dir_all(&dir).ok();

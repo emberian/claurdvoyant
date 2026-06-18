@@ -104,11 +104,8 @@ impl Default for Cursor {
 
 fn open_ro(path: &Path) -> Result<Connection> {
     // immutable so we never lock the user's live DB or get blocked by the WAL.
-    Connection::open_with_flags(
-        path,
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )
-    .with_context(|| format!("opening {}", path.display()))
+    Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX)
+        .with_context(|| format!("opening {}", path.display()))
 }
 
 impl Adapter for Cursor {
@@ -150,12 +147,7 @@ impl Adapter for Cursor {
         crate::stream::collect(self, r)
     }
 
-    fn stream(
-        &self,
-        r: &SessionRef,
-        _opts: &ParseOptions,
-        sink: &mut dyn MessageSink,
-    ) -> Result<Session> {
+    fn stream(&self, r: &SessionRef, _opts: &ParseOptions, sink: &mut dyn MessageSink) -> Result<Session> {
         // `path` is the DB the thread lives in. Legacy refs carry a `legacy:` id prefix.
         let conn = open_ro(&r.path)?;
         if let Some(legacy_id) = r.id.strip_prefix("legacy:") {
@@ -279,15 +271,9 @@ fn ms_to_dt(ms: i64) -> Option<chrono::DateTime<Utc>> {
 // Global (cursorDiskKV) format
 // ---------------------------------------------------------------------------
 
-fn discover_global(
-    conn: &Connection,
-    db: &Path,
-    cwd_map: &HashMap<String, PathBuf>,
-    out: &mut Vec<SessionRef>,
-) {
+fn discover_global(conn: &Connection, db: &Path, cwd_map: &HashMap<String, PathBuf>, out: &mut Vec<SessionRef>) {
     // Bail quietly if this DB has no cursorDiskKV table (older layout).
-    let mut stmt = match conn.prepare("SELECT key, value FROM cursorDiskKV WHERE key LIKE 'composerData:%'")
-    {
+    let mut stmt = match conn.prepare("SELECT key, value FROM cursorDiskKV WHERE key LIKE 'composerData:%'") {
         Ok(s) => s,
         Err(_) => return,
     };
@@ -317,10 +303,7 @@ fn discover_global(
             continue;
         }
         let created = d.get("createdAt").and_then(Value::as_i64);
-        let updated = d
-            .get("lastUpdatedAt")
-            .and_then(Value::as_i64)
-            .or(created);
+        let updated = d.get("lastUpdatedAt").and_then(Value::as_i64).or(created);
         let title = d
             .get("name")
             .and_then(Value::as_str)
@@ -341,10 +324,7 @@ fn discover_global(
 
 /// Number of messages in a composerData record, across both shapes.
 fn conversation_len(d: &Value) -> usize {
-    if let Some(h) = d
-        .get("fullConversationHeadersOnly")
-        .and_then(Value::as_array)
-    {
+    if let Some(h) = d.get("fullConversationHeadersOnly").and_then(Value::as_array) {
         return h.len();
     }
     d.get("conversation")
@@ -355,8 +335,7 @@ fn conversation_len(d: &Value) -> usize {
 
 fn stream_global(conn: &Connection, r: &SessionRef, sink: &mut dyn MessageSink) -> Result<Session> {
     let key = format!("composerData:{}", r.id);
-    let raw = disk_kv_get(conn, &key)
-        .with_context(|| format!("composerData:{} not found", r.id))?;
+    let raw = disk_kv_get(conn, &key).with_context(|| format!("composerData:{} not found", r.id))?;
     let d: Value = serde_json::from_str(&raw).context("composerData JSON")?;
 
     let created = d.get("createdAt").and_then(Value::as_i64);
@@ -398,10 +377,7 @@ fn stream_global(conn: &Connection, r: &SessionRef, sink: &mut dyn MessageSink) 
 
     // Newer shape: headers point at external bubble rows (each a separate DB row, fetched lazily so
     // one bubble is resident at a time). Older shape: inline conversation array.
-    if let Some(headers) = d
-        .get("fullConversationHeadersOnly")
-        .and_then(Value::as_array)
-    {
+    if let Some(headers) = d.get("fullConversationHeadersOnly").and_then(Value::as_array) {
         for h in headers {
             let Some(bubble_id) = h.get("bubbleId").and_then(Value::as_str) else {
                 continue;
@@ -449,18 +425,11 @@ fn bubble_to_message(b: &Value) -> Option<Message> {
         _ => Role::Assistant,
     };
     let mut m = Message::new(role);
-    m.id = b
-        .get("bubbleId")
-        .and_then(Value::as_str)
-        .map(str::to_string);
+    m.id = b.get("bubbleId").and_then(Value::as_str).map(str::to_string);
 
     // Thinking block (assistant): {text: "..."} (and sometimes signature).
     if let Some(th) = b.get("thinking") {
-        let text = th
-            .get("text")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string();
+        let text = th.get("text").and_then(Value::as_str).unwrap_or("").to_string();
         let signature = th
             .get("signature")
             .and_then(Value::as_str)
@@ -519,8 +488,7 @@ fn bubble_to_message(b: &Value) -> Option<Message> {
     }
     if let Some(mode) = b.get("unifiedMode").and_then(Value::as_str) {
         if !mode.is_empty() {
-            m.extra
-                .insert("unifiedMode".into(), Value::String(mode.to_string()));
+            m.extra.insert("unifiedMode".into(), Value::String(mode.to_string()));
         }
     }
 
@@ -530,11 +498,7 @@ fn bubble_to_message(b: &Value) -> Option<Message> {
 /// `toolFormerData` carries a single tool invocation and (usually) its result:
 /// `{name, toolCallId, params|rawArgs (JSON string), result (JSON string), status, error}`.
 fn push_tool_former(m: &mut Message, tf: &Value) {
-    let name = tf
-        .get("name")
-        .and_then(Value::as_str)
-        .unwrap_or("tool")
-        .to_string();
+    let name = tf.get("name").and_then(Value::as_str).unwrap_or("tool").to_string();
     let id = tf
         .get("toolCallId")
         .and_then(Value::as_str)
@@ -562,8 +526,7 @@ fn push_tool_former(m: &mut Message, tf: &Value) {
 
     // Result: a JSON string (or nested obj) plus a status/error flag.
     let status = tf.get("status").and_then(Value::as_str).unwrap_or("");
-    let is_error = status.eq_ignore_ascii_case("error")
-        || tf.get("error").map(|e| !e.is_null()).unwrap_or(false);
+    let is_error = status.eq_ignore_ascii_case("error") || tf.get("error").map(|e| !e.is_null()).unwrap_or(false);
     let result_text = tf
         .get("result")
         .and_then(|r| match r {
@@ -630,12 +593,7 @@ fn collect_lexical_text(node: &Value, out: &mut String) {
 /// Legacy key holding an array of chat tabs in the workspace ItemTable.
 const LEGACY_CHAT_KEY: &str = "workbench.panel.aichat.view.aichat.chatdata";
 
-fn discover_legacy_workspace(
-    conn: &Connection,
-    db: &Path,
-    cwd: Option<&Path>,
-    out: &mut Vec<SessionRef>,
-) {
+fn discover_legacy_workspace(conn: &Connection, db: &Path, cwd: Option<&Path>, out: &mut Vec<SessionRef>) {
     let Some(raw) = item_table_get(conn, LEGACY_CHAT_KEY) else {
         return;
     };
@@ -672,12 +630,7 @@ fn discover_legacy_workspace(
     }
 }
 
-fn stream_legacy(
-    conn: &Connection,
-    r: &SessionRef,
-    tab_id: &str,
-    sink: &mut dyn MessageSink,
-) -> Result<Session> {
+fn stream_legacy(conn: &Connection, r: &SessionRef, tab_id: &str, sink: &mut dyn MessageSink) -> Result<Session> {
     let raw = item_table_get(conn, LEGACY_CHAT_KEY).context("legacy chatdata not found")?;
     let v: Value = serde_json::from_str(&raw).context("legacy chatdata JSON")?;
     let tabs = v
@@ -833,7 +786,10 @@ mod tests {
         let a = &s.messages[1];
         assert_eq!(a.role, Role::Assistant);
         // thinking block present
-        assert!(a.content.iter().any(|b| matches!(b, Block::Thinking { text, .. } if text == "let me think")));
+        assert!(a
+            .content
+            .iter()
+            .any(|b| matches!(b, Block::Thinking { text, .. } if text == "let me think")));
         // text block present
         assert_eq!(a.text().as_deref(), Some("Here is how."));
         // tool use + result
@@ -845,7 +801,10 @@ mod tests {
         assert_eq!(name, "run_terminal_cmd");
         assert_eq!(tid, "t1");
         assert_eq!(input.get("command").and_then(Value::as_str), Some("cargo test"));
-        assert!(a.content.iter().any(|b| matches!(b, Block::ToolResult { tool_use_id, content, is_error, .. }
+        assert!(a
+            .content
+            .iter()
+            .any(|b| matches!(b, Block::ToolResult { tool_use_id, content, is_error, .. }
             if tool_use_id == "t1" && content.contains("ok") && !is_error)));
         // usage mapped
         assert_eq!(a.usage.as_ref().unwrap().input_tokens, Some(10));
@@ -883,7 +842,11 @@ mod tests {
             r#"{"composerId":"comp-cfg","_v":3,"modelConfig":{"modelName":"gpt-5"},
                 "fullConversationHeadersOnly":[{"bubbleId":"b1","type":1}]}"#,
         );
-        put(&conn, &format!("bubbleId:{cid}:b1"), r#"{"bubbleId":"b1","type":1,"text":"hi"}"#);
+        put(
+            &conn,
+            &format!("bubbleId:{cid}:b1"),
+            r#"{"bubbleId":"b1","type":1,"text":"hi"}"#,
+        );
         let s = parse_global(&conn, &sref(cid)).unwrap();
         assert_eq!(s.model.as_deref(), Some("gpt-5"));
     }
@@ -975,7 +938,8 @@ mod tests {
     fn missing_table_does_not_panic() {
         // A DB with no cursorDiskKV table at all (older layout) must yield no rows, not error.
         let conn = Connection::open_in_memory().unwrap();
-        conn.execute("CREATE TABLE ItemTable (key TEXT, value BLOB)", []).unwrap();
+        conn.execute("CREATE TABLE ItemTable (key TEXT, value BLOB)", [])
+            .unwrap();
         let mut out = Vec::new();
         let map = HashMap::new();
         discover_global(&conn, Path::new(":memory:"), &map, &mut out);

@@ -125,7 +125,10 @@ pub struct OffsetSink {
 
 impl OffsetSink {
     pub fn new() -> Self {
-        OffsetSink { stamped: true, ..Default::default() }
+        OffsetSink {
+            stamped: true,
+            ..Default::default()
+        }
     }
 
     /// Whether the stream produced a usable offset for every message (and no replay hazard).
@@ -289,7 +292,9 @@ pub fn stream_range(
     // The seek target plus how many same-line messages precede `start` (records that yield
     // several messages). If every inspected entry shares the line and more could precede it,
     // the skip can't be bounded — fall back.
-    let Some(&target) = row.window.last() else { return Ok(false) };
+    let Some(&target) = row.window.last() else {
+        return Ok(false);
+    };
     let skip = row.window[..row.window.len() - 1]
         .iter()
         .rev()
@@ -302,13 +307,19 @@ pub fn stream_range(
     match r.harness {
         Harness::Claude => {
             use std::io::Seek;
-            let Ok(mut f) = std::fs::File::open(&r.path) else { return Ok(false) };
+            let Ok(mut f) = std::fs::File::open(&r.path) else {
+                return Ok(false);
+            };
             if f.seek(std::io::SeekFrom::Start(target)).is_err() {
                 return Ok(false);
             }
             // claude itself never emits meta; deliver the synthetic one first (see meta_session).
             sink.meta(&meta);
-            let mut win = WindowSink { inner: sink, skip, remaining };
+            let mut win = WindowSink {
+                inner: sink,
+                skip,
+                remaining,
+            };
             crate::harness::claude::stream_reader_from(
                 &r.id,
                 std::io::BufReader::new(f),
@@ -321,14 +332,20 @@ pub fn stream_range(
         }
         #[cfg(feature = "mmap")]
         Harness::Codex => {
-            let Ok(file) = std::fs::File::open(&r.path) else { return Ok(false) };
-            let Ok(map) = (unsafe { memmap2::Mmap::map(&file) }) else { return Ok(false) };
+            let Ok(file) = std::fs::File::open(&r.path) else {
+                return Ok(false);
+            };
+            let Ok(map) = (unsafe { memmap2::Mmap::map(&file) }) else {
+                return Ok(false);
+            };
             if map.len() as i64 != size || target >= map.len() as u64 {
                 return Ok(false); // raced a file change since the stat — stale, fall back
             }
             // `has_events` is a head property (bounded detector) — one extra small read.
             let has_events = {
-                let Ok(head) = std::fs::File::open(&r.path) else { return Ok(false) };
+                let Ok(head) = std::fs::File::open(&r.path) else {
+                    return Ok(false);
+                };
                 crate::harness::codex::detect_has_events(std::io::BufReader::new(head))
             };
             // Replay meta in recorded order: before the window if the stream delivered it by
@@ -343,7 +360,11 @@ pub fn stream_range(
             // hazard rule, so the first/meta model is the model everywhere).
             let seed_model = if meta_first { row.meta_model.clone() } else { None };
             {
-                let mut win = WindowSink { inner: sink, skip, remaining };
+                let mut win = WindowSink {
+                    inner: sink,
+                    skip,
+                    remaining,
+                };
                 crate::harness::codex::stream_spans_from(
                     &map,
                     target,
@@ -390,10 +411,8 @@ mod db {
     /// bump). `None` on any error; callers degrade to "no offsets".
     fn open() -> Option<Connection> {
         let conn = crate::catalog::open_db()?;
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS msg_offsets_schema(version INTEGER NOT NULL)",
-        )
-        .ok()?;
+        conn.execute_batch("CREATE TABLE IF NOT EXISTS msg_offsets_schema(version INTEGER NOT NULL)")
+            .ok()?;
         let version: Option<i64> = conn
             .query_row("SELECT version FROM msg_offsets_schema", [], |r| r.get(0))
             .optional()
@@ -442,7 +461,11 @@ mod db {
         }
         let Some(conn) = open() else { return };
         let seekable = sink.seekable();
-        let blob = if seekable { encode_offsets(&sink.offs) } else { Vec::new() };
+        let blob = if seekable {
+            encode_offsets(&sink.offs)
+        } else {
+            Vec::new()
+        };
         let _ = conn.execute(
             "INSERT OR REPLACE INTO msg_offsets
              (harness,id,path,mtime_ns,size,msg_count,seekable,offsets,
@@ -532,12 +555,7 @@ mod db {
     /// Fetch the seekable row for `r` **iff** its stored signature matches `(mtime_ns, size)`
     /// (staleness is decided inside the query). `substr()` slices only the needed window out of
     /// the BLOB, so a 37k-message session ships ≤72 bytes of offsets, not 300 KB.
-    pub(super) fn seek_row(
-        r: &SessionRef,
-        mtime_ns: i64,
-        size: i64,
-        start: usize,
-    ) -> Option<SeekRow> {
+    pub(super) fn seek_row(r: &SessionRef, mtime_ns: i64, size: i64, start: usize) -> Option<SeekRow> {
         let conn = open()?;
         let window_start = start.saturating_sub(SHARED_LINE_WINDOW);
         // SQLite substr is 1-based; clamp the slice to the blob (start ≥ msg_count reads short).

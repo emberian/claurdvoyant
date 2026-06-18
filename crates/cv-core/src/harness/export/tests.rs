@@ -24,7 +24,9 @@ fn chatgpt_walks_mapping_active_branch() {
     assert_eq!(msgs[1].role, Role::Assistant);
     assert!(msgs[0].text().unwrap().contains("how to brew"));
     assert!(msgs[1].text().unwrap().contains("soak the beans"));
-    assert!(!msgs.iter().any(|m| m.text().unwrap_or_default().contains("DEAD BRANCH")));
+    assert!(!msgs
+        .iter()
+        .any(|m| m.text().unwrap_or_default().contains("DEAD BRANCH")));
 
     let r = conv_ref(Kind::ChatGpt, std::path::Path::new("/x/conversations.json"), &conv).unwrap();
     assert_eq!(r.id, "c1");
@@ -53,8 +55,14 @@ fn chatgpt_tool_call_and_image() {
                 "content": { "content_type": "multimodal_text", "parts": [ {"content_type":"image_asset_pointer","asset_pointer":"file-service://abc"}, "see image" ] } } }
     }});
     let m2 = &chatgpt_messages(&conv2)[0];
-    assert!(m2.content.iter().any(|b| matches!(b, Block::Image { data_ref: Some(p), .. } if p == "file-service://abc")));
-    assert!(m2.content.iter().any(|b| matches!(b, Block::Text { text } if text.to_string().contains("see image"))));
+    assert!(m2
+        .content
+        .iter()
+        .any(|b| matches!(b, Block::Image { data_ref: Some(p), .. } if p == "file-service://abc")));
+    assert!(m2
+        .content
+        .iter()
+        .any(|b| matches!(b, Block::Text { text } if text.to_string().contains("see image"))));
 }
 
 #[test]
@@ -71,12 +79,22 @@ fn chatgpt_tool_call_links_to_result() {
     let msgs = chatgpt_messages(&conv);
     assert_eq!(msgs.len(), 2);
     // the call
-    let Block::ToolUse { id, name, input } = &msgs[0].content[0] else { panic!("expected ToolUse") };
+    let Block::ToolUse { id, name, input } = &msgs[0].content[0] else {
+        panic!("expected ToolUse")
+    };
     assert_eq!(id, "call");
     assert_eq!(name, "browser");
     assert!(input.to_string().contains("search")); // raw content kept as input
-    // the result, wired back to the call id by tool name
-    let Block::ToolResult { tool_use_id, content, tool_name, .. } = &msgs[1].content[0] else { panic!("expected ToolResult") };
+                                                   // the result, wired back to the call id by tool name
+    let Block::ToolResult {
+        tool_use_id,
+        content,
+        tool_name,
+        ..
+    } = &msgs[1].content[0]
+    else {
+        panic!("expected ToolResult")
+    };
     assert_eq!(tool_use_id, "call", "result linked to the matching call");
     assert_eq!(tool_name.as_deref(), Some("browser"));
     assert!(content.to_string().contains("the answer is 42"));
@@ -129,8 +147,14 @@ fn parse_ref_finds_conversation_in_file_and_sniffs_kind() {
     assert!(first.get("chat_messages").is_some() && first.get("mapping").is_none());
 
     let r = SessionRef {
-        id: "b".into(), harness: Harness::ClaudeExport, path: path.clone(),
-        cwd: None, title: Some("second".into()), created_at: None, updated_at: None, message_count: 1,
+        id: "b".into(),
+        harness: Harness::ClaudeExport,
+        path: path.clone(),
+        cwd: None,
+        title: Some("second".into()),
+        created_at: None,
+        updated_at: None,
+        message_count: 1,
     };
     let s = parse_ref(Kind::Claude, &r).unwrap();
     assert_eq!(s.id, "b");
@@ -151,8 +175,19 @@ fn real_downloads_exports_parse() {
         eprintln!("{:?}: {} conversation(s)", kind, refs.len());
         if let Some(r) = refs.iter().find(|r| r.message_count > 0) {
             let s = parse_ref(kind, r).unwrap();
-            let tools = s.messages.iter().flat_map(|m| &m.content).filter(|b| matches!(b, Block::ToolUse { .. } | Block::ToolResult { .. })).count();
-            eprintln!("  parsed {} -> {} msgs ({} tool blocks), model {:?}", &r.id[..8.min(r.id.len())], s.messages.len(), tools, s.model);
+            let tools = s
+                .messages
+                .iter()
+                .flat_map(|m| &m.content)
+                .filter(|b| matches!(b, Block::ToolUse { .. } | Block::ToolResult { .. }))
+                .count();
+            eprintln!(
+                "  parsed {} -> {} msgs ({} tool blocks), model {:?}",
+                &r.id[..8.min(r.id.len())],
+                s.messages.len(),
+                tools,
+                s.model
+            );
             assert!(!s.messages.is_empty());
         }
     }

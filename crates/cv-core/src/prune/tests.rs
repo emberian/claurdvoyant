@@ -36,7 +36,14 @@ fn prunes_old_payloads_into_new_session_keeping_recent() {
     let big = "X".repeat(5000); // > default min_size 2048
     let src = fixture(&dir, &big);
 
-    let opts = PruneOptions { min_size: 2048, keep_last: 2, drop: false, new_id: None, copy_resources: false, dry_run: false };
+    let opts = PruneOptions {
+        min_size: 2048,
+        keep_last: 2,
+        drop: false,
+        new_id: None,
+        copy_resources: false,
+        dry_run: false,
+    };
     let r = prune_session(&src, &opts).unwrap();
 
     // new session, distinct id + file
@@ -55,10 +62,16 @@ fn prunes_old_payloads_into_new_session_keeping_recent() {
     // the RECENT tool_result (toolu_2, within keep_last=2) is spared — its big payload survives
     // somewhere in the output (its tool_result line is left verbatim).
     assert!(out.contains(&big), "recent payload must be kept verbatim");
-    let recent_result = out.lines().find(|l| l.contains("tool_result") && l.contains("toolu_2")).unwrap();
+    let recent_result = out
+        .lines()
+        .find(|l| l.contains("tool_result") && l.contains("toolu_2"))
+        .unwrap();
     assert!(recent_result.contains(&big), "recent tool_result kept");
     // old tool_result line no longer carries the raw payload
-    let old_result = out.lines().find(|l| l.contains("tool_result") && l.contains("toolu_1")).unwrap();
+    let old_result = out
+        .lines()
+        .find(|l| l.contains("tool_result") && l.contains("toolu_1"))
+        .unwrap();
     assert!(!old_result.contains(&big));
 
     // sidecar holds the original, retrievable byte-faithfully
@@ -82,7 +95,14 @@ fn drop_mode_writes_no_sidecar() {
     let big = "Y".repeat(5000);
     let src = fixture(&dir, &big);
     // keep_last 0 → every turn is "old", so the drop removes ALL big payloads.
-    let opts = PruneOptions { min_size: 2048, keep_last: 0, drop: true, new_id: Some("aaaa".into()), copy_resources: false, dry_run: false };
+    let opts = PruneOptions {
+        min_size: 2048,
+        keep_last: 0,
+        drop: true,
+        new_id: Some("aaaa".into()),
+        copy_resources: false,
+        dry_run: false,
+    };
     let r = prune_session(&src, &opts).unwrap();
     assert_eq!(r.new_id, "aaaa");
     assert!(r.sidecar_path.is_none());
@@ -98,7 +118,11 @@ fn dry_run_writes_nothing() {
     let dir = tmpdir();
     let big = "Z".repeat(5000);
     let src = fixture(&dir, &big);
-    let opts = PruneOptions { dry_run: true, keep_last: 2, ..Default::default() };
+    let opts = PruneOptions {
+        dry_run: true,
+        keep_last: 2,
+        ..Default::default()
+    };
     let r = prune_session(&src, &opts).unwrap();
     assert!(r.pruned_count >= 1);
     assert!(!r.new_path.exists(), "dry run must not write the new session");
@@ -110,7 +134,10 @@ fn keep_last_large_spares_everything() {
     let dir = tmpdir();
     let big = "Q".repeat(5000);
     let src = fixture(&dir, &big);
-    let opts = PruneOptions { keep_last: 100, ..Default::default() };
+    let opts = PruneOptions {
+        keep_last: 100,
+        ..Default::default()
+    };
     let r = prune_session(&src, &opts).unwrap();
     assert_eq!(r.pruned_count, 0, "nothing is old enough to snip");
     std::fs::remove_dir_all(&dir).ok();

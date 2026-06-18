@@ -72,7 +72,10 @@ impl ParseOptions {
     /// Full fidelity: every harness-specific field materialized, inline content. Used by [`collect`]
     /// / `parse` and by conversion/round-trip paths that must lose nothing.
     pub fn full() -> Self {
-        ParseOptions { extra: true, ..Default::default() }
+        ParseOptions {
+            extra: true,
+            ..Default::default()
+        }
     }
 
     /// The lean bulk-text pass: faithful message text, no fat `extra` sidecars, inline content
@@ -85,13 +88,20 @@ impl ParseOptions {
     /// other passes skip), inline content. For `parse → emit` round-trips that must reproduce the
     /// source losslessly. The strongest fidelity setting.
     pub fn complete() -> Self {
-        ParseOptions { extra: true, complete: true, ..Default::default() }
+        ParseOptions {
+            extra: true,
+            complete: true,
+            ..Default::default()
+        }
     }
 
     /// Partial-access pass: lazy content [`Span`](crate::lazy::Span)s so unread giant fields are
     /// never materialized. For windowed reads / pagination (Phase 2).
     pub fn lazy() -> Self {
-        ParseOptions { spans: true, ..Default::default() }
+        ParseOptions {
+            spans: true,
+            ..Default::default()
+        }
     }
 
     /// [`lazy()`](ParseOptions::lazy) **plus** the harness-specific `extra` sidecars — giant content
@@ -99,14 +109,22 @@ impl ParseOptions {
     /// (`subtype`, `compactMetadata`, `isCompactSummary`, attribution, …) is still materialized.
     /// For consumers that scan record *metadata* over a huge file (e.g. compaction detection).
     pub fn lazy_extra() -> Self {
-        ParseOptions { spans: true, extra: true, ..Default::default() }
+        ParseOptions {
+            spans: true,
+            extra: true,
+            ..Default::default()
+        }
     }
 
     /// [`lazy()`](ParseOptions::lazy) plus per-message byte-offset stamping — the **recording**
     /// pass `cv index` makes so [`offsets`](crate::offsets) can persist seek points. Everything
     /// else should use plain `lazy()`.
     pub fn lazy_offsets() -> Self {
-        ParseOptions { spans: true, offsets: true, ..Default::default() }
+        ParseOptions {
+            spans: true,
+            offsets: true,
+            ..Default::default()
+        }
     }
 }
 
@@ -160,7 +178,12 @@ pub struct TeeSink<'a> {
 
 impl<'a> TeeSink<'a> {
     pub fn new(a: &'a mut dyn MessageSink, b: &'a mut dyn MessageSink) -> Self {
-        TeeSink { a, b, a_stopped: false, b_stopped: false }
+        TeeSink {
+            a,
+            b,
+            a_stopped: false,
+            b_stopped: false,
+        }
     }
 }
 
@@ -260,8 +283,14 @@ mod tests {
 
     #[test]
     fn tee_feeds_both_until_both_stop_and_never_calls_a_stopped_sink() {
-        let mut a = Probe { seen: Vec::new(), stop_after: 1 };
-        let mut b = Probe { seen: Vec::new(), stop_after: 3 };
+        let mut a = Probe {
+            seen: Vec::new(),
+            stop_after: 1,
+        };
+        let mut b = Probe {
+            seen: Vec::new(),
+            stop_after: 3,
+        };
         let mut tee = TeeSink::new(&mut a, &mut b);
         // a stops after the first message; the tee keeps going for b until *it* stops.
         assert_eq!(tee.message(text_msg("one")), Flow::Continue);

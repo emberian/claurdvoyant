@@ -16,10 +16,17 @@ pub(crate) fn cmd_convert(
 ) -> Result<()> {
     let from_h = parse_harness(&from)?;
     let to_h = Harness::parse(to).with_context(|| format!("unknown target harness: {to}"))?;
-    let (r, adapter) =
-        cv_core::find(id, from_h)?.with_context(|| format!("no session matching {id:?}"))?;
+    let (r, adapter) = cv_core::find(id, from_h)?.with_context(|| format!("no session matching {id:?}"))?;
     let session = adapter.parse(&r)?;
-    emit_session(&session, to_h, out, EmitOptions { new_cwd: cwd, new_id: None })
+    emit_session(
+        &session,
+        to_h,
+        out,
+        EmitOptions {
+            new_cwd: cwd,
+            new_id: None,
+        },
+    )
 }
 
 pub(crate) fn cmd_port(
@@ -31,8 +38,7 @@ pub(crate) fn cmd_port(
     no_context: bool,
 ) -> Result<()> {
     let from_h = parse_harness(&from)?;
-    let (r, adapter) =
-        cv_core::find(id, from_h)?.with_context(|| format!("no session matching {id:?}"))?;
+    let (r, adapter) = cv_core::find(id, from_h)?.with_context(|| format!("no session matching {id:?}"))?;
     let session = adapter.parse(&r)?;
     // Default to the same harness — a pure rehome.
     let to_h = match to {
@@ -40,7 +46,15 @@ pub(crate) fn cmd_port(
         None => session.harness,
     };
     let new_cwd = to_dir.clone();
-    emit_session(&session, to_h, out, EmitOptions { new_cwd: to_dir, new_id: None })?;
+    emit_session(
+        &session,
+        to_h,
+        out,
+        EmitOptions {
+            new_cwd: to_dir,
+            new_id: None,
+        },
+    )?;
 
     // Carry the project's context files to the new home, so the ported session keeps its memory.
     if !no_context {
@@ -88,12 +102,7 @@ fn carry_context(src: &Path, dst: &Path) {
     }
 }
 
-pub(crate) fn emit_session(
-    session: &Session,
-    to_h: Harness,
-    out: Option<PathBuf>,
-    opts: EmitOptions,
-) -> Result<()> {
+pub(crate) fn emit_session(session: &Session, to_h: Harness, out: Option<PathBuf>, opts: EmitOptions) -> Result<()> {
     if !cv_core::emit::supported_targets().contains(&to_h) {
         bail!(
             "emitting to {to_h} isn't supported yet — the source parses fine ({} messages), but the \
@@ -110,9 +119,7 @@ pub(crate) fn emit_session(
         Some(d) => d,
         None => cv_core::harness::for_harness(to_h)
             .and_then(|a| a.storage_root())
-            .with_context(|| {
-                format!("{to_h} doesn't appear installed; pass --out <dir> to write somewhere")
-            })?,
+            .with_context(|| format!("{to_h} doesn't appear installed; pass --out <dir> to write somewhere"))?,
     };
     let res = cv_core::emit(session, to_h, &out_dir, &opts)?;
     println!("✦ wrote {} ({})", res.path.display(), res.new_id);
@@ -126,19 +133,15 @@ pub(crate) fn emit_session(
 
 pub(crate) fn cmd_resume(id: &str, harness: Option<String>, launch: bool) -> Result<()> {
     let want = parse_harness(&harness)?;
-    let (r, _adapter) =
-        cv_core::find(id, want)?.with_context(|| format!("no session matching {id:?}"))?;
+    let (r, _adapter) = cv_core::find(id, want)?.with_context(|| format!("no session matching {id:?}"))?;
     let cwd = r.cwd.clone();
     let (program, args) = resume_command(r.harness, &r.id);
 
     if launch {
-        let dir = cwd.clone().unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-        eprintln!(
-            "✦ launching: (cd {}) {} {}",
-            home_rel(&dir),
-            program,
-            args.join(" ")
-        );
+        let dir = cwd
+            .clone()
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+        eprintln!("✦ launching: (cd {}) {} {}", home_rel(&dir), program, args.join(" "));
         let status = std::process::Command::new(&program)
             .args(&args)
             .current_dir(&dir)

@@ -130,7 +130,10 @@ fn blame_end_to_end() {
     assert!(out.contains("blame-e2"), "{out}");
     assert!(out.contains(&format!("edit at msg {edit_idx}")), "{out}");
     assert!(out.contains("8m before commit"), "{out}");
-    assert!(out.contains("other checkout"), "suffix-only match should be labeled:\n{out}");
+    assert!(
+        out.contains("other checkout"),
+        "suffix-only match should be labeled:\n{out}"
+    );
     let (lo, hi) = ((edit_idx - 3).max(0), edit_idx + 3);
     assert!(out.contains(&format!("--range {lo}-{hi}")), "{out}");
     assert!(out.contains("1 of 2 commit(s) matched an agent session"), "{out}");
@@ -145,7 +148,10 @@ fn blame_end_to_end() {
     // --- --show: the range hint indexing must line up with `cv show --range` ---
     // The rendered window around msg `edit_idx` must contain the Edit tool_use itself.
     let (out, err) = cv(&home, &repo, &["blame", "src/widget.rs", "--show"]);
-    assert!(out.contains("conversation around the edit"), "stdout:\n{out}\nstderr:\n{err}");
+    assert!(
+        out.contains("conversation around the edit"),
+        "stdout:\n{out}\nstderr:\n{err}"
+    );
     assert!(
         out.contains("[tool_use Edit]"),
         "event msg_idx is misaligned with show --range indexing:\n{out}"
@@ -154,7 +160,10 @@ fn blame_end_to_end() {
 
     // --- not a git repo: degrades to pure event-catalog mode with the same hints ---
     let (out, err) = cv(&home, &base, &["blame", "src/widget.rs"]);
-    assert!(out.contains("not inside a git repository"), "stdout:\n{out}\nstderr:\n{err}");
+    assert!(
+        out.contains("not inside a git repository"),
+        "stdout:\n{out}\nstderr:\n{err}"
+    );
     assert!(out.contains("blame-e2"), "{out}");
     assert!(out.contains("last edit at msg"), "{out}");
     assert!(out.contains("cv show"), "{out}");

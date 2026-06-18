@@ -114,12 +114,7 @@ pub struct RedactStats {
 impl RedactStats {
     /// Total number of redactions across all classes.
     pub fn total(&self) -> usize {
-        self.api_keys
-            + self.private_keys
-            + self.jwts
-            + self.emails
-            + self.blobs
-            + self.assignments
+        self.api_keys + self.private_keys + self.jwts + self.emails + self.blobs + self.assignments
     }
 }
 
@@ -164,9 +159,7 @@ pub fn redact_message(msg: &mut Message, opts: &RedactOptions, stats: &mut Redac
             Block::ToolUse { input, .. } => {
                 scrub_value(input, opts, stats);
             }
-            Block::ToolResult {
-                content, details, ..
-            } => {
+            Block::ToolResult { content, details, .. } => {
                 if let Cow::Owned(scrubbed) = scrub_cow(content, opts, stats) {
                     *content = scrubbed.into();
                 }
@@ -445,10 +438,7 @@ fn match_authorization_header(s: &str, i: usize) -> Option<Match> {
     }
     let rest = &s[i..];
     let prefix = "Authorization:";
-    if !rest
-        .get(..prefix.len())
-        .is_some_and(|p| p.eq_ignore_ascii_case(prefix))
-    {
+    if !rest.get(..prefix.len()).is_some_and(|p| p.eq_ignore_ascii_case(prefix)) {
         return None;
     }
     let bytes = rest.as_bytes();
@@ -722,9 +712,7 @@ fn match_assignment(s: &str, i: usize) -> Option<Match> {
     } else {
         // unquoted: value runs to whitespace / end-of-line / common delimiters
         let mut k = value_start;
-        while k < bytes.len()
-            && !matches!(bytes[k], b' ' | b'\t' | b'\n' | b'\r' | b',' | b';' | b')')
-        {
+        while k < bytes.len() && !matches!(bytes[k], b' ' | b'\t' | b'\n' | b'\r' | b',' | b';' | b')') {
             k += 1;
         }
         (value_start, k)
@@ -805,7 +793,17 @@ fn keyword_before(s: &str, i: usize, window: usize) -> bool {
         start -= 1;
     }
     let ctx = s[start..i].to_ascii_lowercase();
-    const NEEDLES: &[&str] = &["secret", "token", "password", "passwd", "api_key", "apikey", "key", "credential", "auth"];
+    const NEEDLES: &[&str] = &[
+        "secret",
+        "token",
+        "password",
+        "passwd",
+        "api_key",
+        "apikey",
+        "key",
+        "credential",
+        "auth",
+    ];
     NEEDLES.iter().any(|n| ctx.contains(n))
 }
 
@@ -910,7 +908,13 @@ mod tests {
             text: "ping a@b.com".into(),
         });
         sess.messages.push(m);
-        let (out, _stats) = redact_with(&sess, &RedactOptions { keep_emails: true, ..Default::default() });
+        let (out, _stats) = redact_with(
+            &sess,
+            &RedactOptions {
+                keep_emails: true,
+                ..Default::default()
+            },
+        );
         let t = out.messages[0].text().unwrap();
         assert!(t.contains("a@b.com"), "got: {t}");
     }
@@ -937,7 +941,11 @@ mod tests {
     fn parse_only_rejects_garbage_and_trims_plurals() {
         assert_eq!(
             RedactClasses::parse_only("private_keys, emails").unwrap(),
-            RedactClasses { private_keys: true, emails: true, ..RedactClasses::none() }
+            RedactClasses {
+                private_keys: true,
+                emails: true,
+                ..RedactClasses::none()
+            }
         );
         assert!(RedactClasses::parse_only("nope").is_err());
     }

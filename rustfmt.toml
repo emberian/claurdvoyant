@@ -1,0 +1,2 @@
+# Wider than rustfmt default (100) — this codebase is hand-written at ~110 cols.
+max_width = 120

@@ -98,13 +98,7 @@ pub fn splice(spans: &[Span<'_>], new_id: Option<String>, harness: Harness) -> S
 ///
 /// Indices clamp safely: `at` saturates to `base`'s length, `from` to `graft_src`'s length.
 /// The new session's harness defaults to `base`'s.
-pub fn graft(
-    base: &Session,
-    at: usize,
-    graft_src: &Session,
-    from: usize,
-    new_id: Option<String>,
-) -> Session {
+pub fn graft(base: &Session, at: usize, graft_src: &Session, from: usize, new_id: Option<String>) -> Session {
     splice(
         &[
             Span {
@@ -226,14 +220,8 @@ mod tests {
 
         // created/updated bounds from included timestamps:
         // A#1=1001, A#2=1002, B#0=1000, B#1=1001 → min 1000, max 1002.
-        assert_eq!(
-            spliced.created_at,
-            Some(Utc.timestamp_opt(1_000, 0).unwrap())
-        );
-        assert_eq!(
-            spliced.updated_at,
-            Some(Utc.timestamp_opt(1_002, 0).unwrap())
-        );
+        assert_eq!(spliced.created_at, Some(Utc.timestamp_opt(1_000, 0).unwrap()));
+        assert_eq!(spliced.updated_at, Some(Utc.timestamp_opt(1_002, 0).unwrap()));
     }
 
     #[test]

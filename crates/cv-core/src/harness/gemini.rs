@@ -75,9 +75,7 @@ impl Adapter for Gemini {
             .map(|e| e.into_path())
             .collect();
         Ok(crate::par_flat_map(paths, |path| {
-            crate::discover_cache::cached_scan_many(&path, || {
-                scan_session_file(&path, Harness::Gemini)
-            })
+            crate::discover_cache::cached_scan_many(&path, || scan_session_file(&path, Harness::Gemini))
         }))
     }
 
@@ -85,12 +83,7 @@ impl Adapter for Gemini {
         crate::stream::collect(self, r)
     }
 
-    fn stream(
-        &self,
-        r: &SessionRef,
-        opts: &ParseOptions,
-        sink: &mut dyn MessageSink,
-    ) -> Result<Session> {
+    fn stream(&self, r: &SessionRef, opts: &ParseOptions, sink: &mut dyn MessageSink) -> Result<Session> {
         stream_for(Harness::Gemini, r, opts, sink)
     }
 
@@ -192,8 +185,7 @@ pub(crate) fn stream_for(
 /// `logs.json` (many sessions per file — picks the one matching `r.id`). These are small enough
 /// to materialize. Also handles the rare case where a chat-recording path didn't stream.
 fn parse_bounded(r: &SessionRef, name: &str) -> Result<Session> {
-    let text = fs::read_to_string(&r.path)
-        .with_context(|| format!("reading {}", r.path.display()))?;
+    let text = fs::read_to_string(&r.path).with_context(|| format!("reading {}", r.path.display()))?;
 
     // A chat recording that the streaming paths couldn't handle (shouldn't normally happen) —
     // fall back to the pure parser so we never silently lose a session.
@@ -234,10 +226,7 @@ fn is_chat_recording(path: &Path) -> bool {
     if !in_chats {
         return false;
     }
-    matches!(
-        path.extension().and_then(|e| e.to_str()),
-        Some("json") | Some("jsonl")
-    )
+    matches!(path.extension().and_then(|e| e.to_str()), Some("json") | Some("jsonl"))
 }
 
 fn is_checkpoint(name: &str) -> bool {
@@ -259,10 +248,7 @@ fn is_checkpoint(name: &str) -> bool {
 ///
 /// Returns `Ok(None)` if the bytes aren't the single-document shape (e.g. a `.json`-named JSONL log),
 /// so the caller can fall back to the JSONL path.
-fn stream_legacy_json_recording(
-    path: &Path,
-    sink: &mut dyn MessageSink,
-) -> Result<Option<Session>> {
+fn stream_legacy_json_recording(path: &Path, sink: &mut dyn MessageSink) -> Result<Option<Session>> {
     use serde::Deserialize;
     use serde_json::value::RawValue;
 
@@ -341,13 +327,11 @@ fn stream_legacy_json_recording(
 fn map_file(path: &Path) -> Result<FileBytes> {
     #[cfg(feature = "mmap")]
     {
-        let file = fs::File::open(path)
-            .with_context(|| format!("opening {}", path.display()))?;
+        let file = fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
         // Safety: cv reads its own on-disk transcripts; we treat the mapping as immutable bytes and
         // never alias it mutably. A concurrent external truncation is the documented mmap caveat and
         // not a case cv creates.
-        let mmap = unsafe { memmap2::Mmap::map(&file) }
-            .with_context(|| format!("mmapping {}", path.display()))?;
+        let mmap = unsafe { memmap2::Mmap::map(&file) }.with_context(|| format!("mmapping {}", path.display()))?;
         Ok(FileBytes::Mapped(mmap))
     }
     #[cfg(not(feature = "mmap"))]
@@ -388,12 +372,8 @@ impl std::ops::Deref for FileBytes {
 ///
 /// Returns `Ok(None)` if the file is not a recording (no metadata line and no message records), so
 /// the caller can fall back.
-fn stream_jsonl_recording(
-    path: &Path,
-    sink: &mut dyn MessageSink,
-) -> Result<Option<Session>> {
-    let file = fs::File::open(path)
-        .with_context(|| format!("opening {}", path.display()))?;
+fn stream_jsonl_recording(path: &Path, sink: &mut dyn MessageSink) -> Result<Option<Session>> {
+    let file = fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
 
     let mut replay = RecordingReplay::default();
     super::for_each_json_line(BufReader::new(file), |rec| {
@@ -534,9 +514,10 @@ pub fn parse_all_str(text: &str, source_path: Option<PathBuf>) -> Vec<Session> {
     // Array: either a logs.json (entries have messageId/message) or a bare checkpoint Content[].
     if trimmed.starts_with('[') {
         if let Ok(Value::Array(items)) = serde_json::from_str::<Value>(text) {
-            let looks_logs = items.iter().take(8).any(|it| {
-                it.get("messageId").is_some() && it.get("message").is_some()
-            });
+            let looks_logs = items
+                .iter()
+                .take(8)
+                .any(|it| it.get("messageId").is_some() && it.get("message").is_some());
             if looks_logs {
                 return parse_logs_str(text, source_path);
             }
@@ -567,11 +548,7 @@ fn parse_logs_str(text: &str, source_path: Option<PathBuf>) -> Vec<Session> {
 
     let mut by_session: BTreeMap<String, Vec<&Value>> = BTreeMap::new();
     for e in &entries {
-        let sid = e
-            .get("sessionId")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string();
+        let sid = e.get("sessionId").and_then(Value::as_str).unwrap_or("").to_string();
         by_session.entry(sid).or_default().push(e);
     }
 
@@ -611,11 +588,7 @@ fn parse_logs_str(text: &str, source_path: Option<PathBuf>) -> Vec<Session> {
                 Some("system") => Role::System,
                 _ => Role::User,
             };
-            let text = e
-                .get("message")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string();
+            let text = e.get("message").and_then(Value::as_str).unwrap_or("").to_string();
             if text.is_empty() {
                 continue;
             }
@@ -663,11 +636,7 @@ fn parse_chat_recording(text: &str, source_path: Option<PathBuf>) -> Option<Sess
 
     // Reassemble a ConversationRecord-shaped map.
     let mut metadata = replay.metadata;
-    let messages: Vec<Value> = replay
-        .order
-        .iter()
-        .filter_map(|id| replay.msgs.remove(id))
-        .collect();
+    let messages: Vec<Value> = replay.order.iter().filter_map(|id| replay.msgs.remove(id)).collect();
     metadata.insert("messages".into(), Value::Array(messages));
     Some(record_to_session(&metadata, source_path))
 }
@@ -676,27 +645,11 @@ fn parse_chat_recording(text: &str, source_path: Option<PathBuf>) -> Option<Sess
 /// top-level fields. `title` is the record's `summary` when present; the per-message scan fills in a
 /// first-user-turn fallback and the session `model`. `messages` is left empty — the caller streams
 /// them via [`emit_record_message`].
-fn record_metadata(
-    rec: &serde_json::Map<String, Value>,
-    source_path: Option<PathBuf>,
-) -> Session {
-    let id = rec
-        .get("sessionId")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_string();
-    let created_at = rec
-        .get("startTime")
-        .and_then(Value::as_str)
-        .and_then(parse_ts);
-    let updated_at = rec
-        .get("lastUpdated")
-        .and_then(Value::as_str)
-        .and_then(parse_ts);
-    let title = rec
-        .get("summary")
-        .and_then(Value::as_str)
-        .map(str::to_string);
+fn record_metadata(rec: &serde_json::Map<String, Value>, source_path: Option<PathBuf>) -> Session {
+    let id = rec.get("sessionId").and_then(Value::as_str).unwrap_or("").to_string();
+    let created_at = rec.get("startTime").and_then(Value::as_str).and_then(parse_ts);
+    let updated_at = rec.get("lastUpdated").and_then(Value::as_str).and_then(parse_ts);
+    let title = rec.get("summary").and_then(Value::as_str).map(str::to_string);
 
     // cwd: gemini stores only an opaque projectHash, but `directories[]` (added via /dir) may carry
     // real absolute paths; use the first as a best-effort cwd.
@@ -794,15 +747,9 @@ fn emit_record_message(
                         input,
                     });
                     let status = c.get("status").and_then(Value::as_str);
-                    let is_error = status
-                        .map(|s| s.eq_ignore_ascii_case("error"))
-                        .unwrap_or(false);
+                    let is_error = status.map(|s| s.eq_ignore_ascii_case("error")).unwrap_or(false);
                     let content = tool_result_text(c.get("result"))
-                        .or_else(|| {
-                            c.get("resultDisplay")
-                                .and_then(Value::as_str)
-                                .map(str::to_string)
-                        })
+                        .or_else(|| c.get("resultDisplay").and_then(Value::as_str).map(str::to_string))
                         .unwrap_or_default();
                     if !content.is_empty() {
                         tool_results.push(Block::ToolResult {
@@ -865,10 +812,7 @@ fn emit_record_message(
 ///
 /// `summary` (when present) is the title and overrides the first-user-turn fallback that the message
 /// scan fills in — same precedence as before this was split for streaming.
-fn record_to_session(
-    rec: &serde_json::Map<String, Value>,
-    source_path: Option<PathBuf>,
-) -> Session {
+fn record_to_session(rec: &serde_json::Map<String, Value>, source_path: Option<PathBuf>) -> Session {
     let mut session = record_metadata(rec, source_path);
     let summary = session.title.take();
 
@@ -915,7 +859,9 @@ fn push_content_blocks(out: &mut Vec<Block>, content: Option<&Value>) {
 fn push_part(out: &mut Vec<Block>, part: &Value) {
     if let Some(s) = part.as_str() {
         if !s.is_empty() {
-            out.push(Block::Text { text: s.to_string().into() });
+            out.push(Block::Text {
+                text: s.to_string().into(),
+            });
         }
         return;
     }
@@ -942,10 +888,7 @@ fn push_part(out: &mut Vec<Block>, part: &Value) {
             .and_then(Value::as_str)
             .map(str::to_string)
             .unwrap_or_else(|| format!("{name}-call"));
-        let content = fr
-            .get("response")
-            .map(value_to_text)
-            .unwrap_or_default();
+        let content = fr.get("response").map(value_to_text).unwrap_or_default();
         out.push(Block::ToolResult {
             tool_use_id: id,
             content: content.into(),
@@ -984,7 +927,9 @@ fn push_part(out: &mut Vec<Block>, part: &Value) {
                 redacted: false,
             });
         } else {
-            out.push(Block::Text { text: text.to_string().into() });
+            out.push(Block::Text {
+                text: text.to_string().into(),
+            });
         }
     }
 }
@@ -1152,11 +1097,7 @@ mod tests {
     use super::*;
 
     fn fixture(name: &str) -> String {
-        let path = format!(
-            "{}/tests/fixtures/gemini/{}",
-            env!("CARGO_MANIFEST_DIR"),
-            name
-        );
+        let path = format!("{}/tests/fixtures/gemini/{}", env!("CARGO_MANIFEST_DIR"), name);
         fs::read_to_string(&path).unwrap_or_else(|e| panic!("reading {path}: {e}"))
     }
 
@@ -1180,7 +1121,10 @@ mod tests {
         let s = &sessions[0];
         assert_eq!(s.id, "9aeb2942-7c46-47b7-aded-13772d4d4e63");
         assert_eq!(s.model.as_deref(), Some("gemini-3-flash-preview"));
-        assert_eq!(s.title.as_deref(), Some("Investigated whether brorb is a useful meditation aid."));
+        assert_eq!(
+            s.title.as_deref(),
+            Some("Investigated whether brorb is a useful meditation aid.")
+        );
         assert!(s.created_at.is_some() && s.updated_at.is_some());
 
         // user, gemini(with thinking+text+tooluse), tool(result), gemini(text), info(system)
@@ -1201,7 +1145,10 @@ mod tests {
 
         // tool result carried in the following Tool turn
         let tool = &s.messages[2];
-        let got = tool.content.iter().any(|b| matches!(b, Block::ToolResult { content, .. } if content.contains("meditation timer")));
+        let got = tool
+            .content
+            .iter()
+            .any(|b| matches!(b, Block::ToolResult { content, .. } if content.contains("meditation timer")));
         assert!(got, "tool result text should be extracted");
 
         // info message kept as System with a kind marker
@@ -1234,7 +1181,9 @@ mod tests {
             .iter()
             .any(|b| matches!(b, Block::ToolUse { name, .. } if name == "list_directory"))));
         assert!(s.messages.iter().any(|m| m.role == Role::Tool
-            && m.content.iter().any(|b| matches!(b, Block::ToolResult { content, .. } if content.contains("main.py")))));
+            && m.content
+                .iter()
+                .any(|b| matches!(b, Block::ToolResult { content, .. } if content.contains("main.py")))));
     }
 
     #[test]
@@ -1244,10 +1193,7 @@ mod tests {
         assert_eq!(s.id, "checkpoint-my tag");
         // user, model(text+thinking+tooluse), tool(result), model(text)
         let roles: Vec<Role> = s.messages.iter().map(|m| m.role).collect();
-        assert_eq!(
-            roles,
-            vec![Role::User, Role::Assistant, Role::Tool, Role::Assistant]
-        );
+        assert_eq!(roles, vec![Role::User, Role::Assistant, Role::Tool, Role::Assistant]);
         let model_turn = &s.messages[1];
         assert!(model_turn.content.iter().any(|b| matches!(b, Block::Thinking { .. })));
         assert!(model_turn

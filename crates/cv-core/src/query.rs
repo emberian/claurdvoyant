@@ -295,7 +295,11 @@ impl Tri {
     }
     /// Lift a definite boolean into a [`Tri`].
     pub fn of(b: bool) -> Tri {
-        if b { Tri::True } else { Tri::False }
+        if b {
+            Tri::True
+        } else {
+            Tri::False
+        }
     }
 }
 
@@ -353,7 +357,11 @@ pub struct Facts<'a> {
 impl<'a> Facts<'a> {
     /// A cheap, ref-only fact set: no parse, external predicates `Unknown`.
     pub fn from_ref(r: &'a SessionRef) -> Facts<'a> {
-        Facts { r, session: None, ext: &NoExt }
+        Facts {
+            r,
+            session: None,
+            ext: &NoExt,
+        }
     }
 }
 
@@ -379,7 +387,10 @@ impl SessionQuery {
         } else {
             let e = p.parse_or()?;
             if p.i < p.toks.len() {
-                return Err(format!("unexpected {:?} (unbalanced parens?) — see `cv query`", p.toks[p.i]));
+                return Err(format!(
+                    "unexpected {:?} (unbalanced parens?) — see `cv query`",
+                    p.toks[p.i]
+                ));
             }
             e
         };
@@ -437,7 +448,11 @@ impl SessionQuery {
     /// Convenience: full match against a parsed [`Session`] (external predicates `Unknown`). Use
     /// [`matches`](Self::matches) with a real [`ExtFacts`] when the query has `text:`/`tool:` leaves.
     pub fn matches_session(&self, s: &Session) -> bool {
-        let facts = Facts { r: &session_as_ref(s), session: Some(s), ext: &NoExt };
+        let facts = Facts {
+            r: &session_as_ref(s),
+            session: Some(s),
+            ext: &NoExt,
+        };
         eval(&self.expr, &facts) == Tri::True
     }
 }
@@ -464,7 +479,11 @@ fn collect_costs(e: &Expr, out: &mut Vec<Cost>) {
     match e {
         Expr::All => {}
         Expr::Term(t) => {
-            let c = FIELDS.iter().find(|f| f.id == t.field).map(|f| f.cost).unwrap_or(Cost::Catalog);
+            let c = FIELDS
+                .iter()
+                .find(|f| f.id == t.field)
+                .map(|f| f.cost)
+                .unwrap_or(Cost::Catalog);
             if !out.contains(&c) {
                 out.push(c);
             }
@@ -532,7 +551,12 @@ fn eval_term(t: &Term, f: &Facts) -> Tri {
             None => Tri::Unknown,
             Some(s) => {
                 let hay = s.git.as_ref().map(|g| {
-                    format!("{} {}", g.branch.clone().unwrap_or_default(), g.remote.clone().unwrap_or_default()).to_lowercase()
+                    format!(
+                        "{} {}",
+                        g.branch.clone().unwrap_or_default(),
+                        g.remote.clone().unwrap_or_default()
+                    )
+                    .to_lowercase()
                 });
                 str_contains_any(&t.val, hay)
             }
@@ -551,12 +575,10 @@ fn eval_term(t: &Term, f: &Facts) -> Tri {
         FieldId::Subtool => or_over(&t.val, |n| f.ext.subtool(n)),
         FieldId::Agent => or_over(&t.val, |n| f.ext.agent_type(n)),
         FieldId::Workflow => or_over(&t.val, |n| f.ext.workflow(n)),
-        FieldId::Agents | FieldId::Workflows | FieldId::Compactions => {
-            match f.ext.count(t.field) {
-                Some(n) => num_match(t.op, &t.val, n),
-                None => Tri::Unknown,
-            }
-        }
+        FieldId::Agents | FieldId::Workflows | FieldId::Compactions => match f.ext.count(t.field) {
+            Some(n) => num_match(t.op, &t.val, n),
+            None => Tri::Unknown,
+        },
     }
 }
 
@@ -667,9 +689,10 @@ fn match_from(
 fn step_matches(m: &Message, step: &ThreadStep, resolver: &crate::lazy::Resolver) -> bool {
     match step {
         ThreadStep::Role(r) => m.role == *r,
-        ThreadStep::Tool(n) => m.content.iter().any(|b| {
-            matches!(b, crate::ir::Block::ToolUse { name, .. } if name.to_lowercase().contains(n))
-        }),
+        ThreadStep::Tool(n) => m
+            .content
+            .iter()
+            .any(|b| matches!(b, crate::ir::Block::ToolUse { name, .. } if name.to_lowercase().contains(n))),
         ThreadStep::Text(t) => m.content.iter().any(|b| match b {
             crate::ir::Block::Text { text } => text.resolve(resolver).to_lowercase().contains(t),
             _ => false,
@@ -697,7 +720,7 @@ fn session_as_ref(s: &Session) -> SessionRef {
 
 #[derive(Debug, Clone, PartialEq)]
 enum Tok {
-    Word(String),   // a bare/quoted chunk (may contain a field:op:value)
+    Word(String), // a bare/quoted chunk (may contain a field:op:value)
     And,
     Or,
     Not,
@@ -787,7 +810,11 @@ impl Parser {
             self.i += 1;
             terms.push(self.parse_and()?);
         }
-        Ok(if terms.len() == 1 { terms.pop().unwrap() } else { Expr::Or(terms) })
+        Ok(if terms.len() == 1 {
+            terms.pop().unwrap()
+        } else {
+            Expr::Or(terms)
+        })
     }
 
     fn parse_and(&mut self) -> Result<Expr, String> {
@@ -805,7 +832,11 @@ impl Parser {
                 _ => break,
             }
         }
-        Ok(if terms.len() == 1 { terms.pop().unwrap() } else { Expr::And(terms) })
+        Ok(if terms.len() == 1 {
+            terms.pop().unwrap()
+        } else {
+            Expr::And(terms)
+        })
     }
 
     fn parse_unary(&mut self) -> Result<Expr, String> {
@@ -851,22 +882,36 @@ fn parse_term(w: &str) -> Result<Expr, String> {
                 if !matches!(op, Op::Contains) {
                     return Err("thread: only takes `:` — see `cv query`".to_string());
                 }
-                return Ok(Expr::Term(Term { field: FieldId::Thread, op, val: parse_thread(value)? }));
+                return Ok(Expr::Term(Term {
+                    field: FieldId::Thread,
+                    op,
+                    val: parse_thread(value)?,
+                }));
             }
             // `~` (regex): only on local (catalog/parse) string fields — the external resolvers
             // (`text:`/`tool:`/`touched:`) take plain needles, not patterns.
             if op == Op::Match {
-                if !matches!(def.kind, Kind::Str | Kind::Path) || matches!(def.cost, Cost::Index | Cost::Events | Cost::Forest) {
+                if !matches!(def.kind, Kind::Str | Kind::Path)
+                    || matches!(def.cost, Cost::Index | Cost::Events | Cost::Forest)
+                {
                     return Err(format!("`~` (regex) isn't valid on {} — see `cv query`", def.name));
                 }
                 let re = regex::RegexBuilder::new(value)
                     .case_insensitive(true)
                     .build()
                     .map_err(|e| format!("bad regex {value:?}: {e} — see `cv query`"))?;
-                return Ok(Expr::Term(Term { field: def.id, op, val: Val::Regex(re) }));
+                return Ok(Expr::Term(Term {
+                    field: def.id,
+                    op,
+                    val: Val::Regex(re),
+                }));
             }
             if !matches!(def.kind, Kind::Num | Kind::Date) && !matches!(op, Op::Contains | Op::Eq) {
-                return Err(format!("operator {} isn't valid on {} (string field) — see `cv query`", op.as_str(), def.name));
+                return Err(format!(
+                    "operator {} isn't valid on {} (string field) — see `cv query`",
+                    op.as_str(),
+                    def.name
+                ));
             }
             let val = parse_value(def, op, value)?;
             // Sugar: before:/after: map onto updated< / updated>=.
@@ -899,7 +944,11 @@ fn parse_thread(raw: &str) -> Result<Val, String> {
                 "role" => ThreadStep::Role(parse_role(val)?),
                 "tool" => ThreadStep::Tool(val.to_lowercase()),
                 "text" => ThreadStep::Text(val.to_lowercase()),
-                other => return Err(format!("unknown thread step key {other:?} (role/tool/text) — see `cv query`")),
+                other => {
+                    return Err(format!(
+                        "unknown thread step key {other:?} (role/tool/text) — see `cv query`"
+                    ))
+                }
             }
         } else if let Ok(role) = parse_role(tok) {
             ThreadStep::Role(role)
@@ -918,7 +967,11 @@ fn parse_role(s: &str) -> Result<crate::ir::Role, String> {
         "assistant" | "agent" => Role::Assistant,
         "tool" => Role::Tool,
         "system" => Role::System,
-        other => return Err(format!("unknown role {other:?} (user/assistant/tool/system) — see `cv query`")),
+        other => {
+            return Err(format!(
+                "unknown role {other:?} (user/assistant/tool/system) — see `cv query`"
+            ))
+        }
     })
 }
 
@@ -926,9 +979,21 @@ fn parse_role(s: &str) -> Result<crate::ir::Role, String> {
 fn bare(w: &str) -> Expr {
     let needle = vec![w.to_lowercase()];
     Expr::Or(vec![
-        Expr::Term(Term { field: FieldId::Title, op: Op::Contains, val: Val::Strs(needle.clone()) }),
-        Expr::Term(Term { field: FieldId::Cwd, op: Op::Contains, val: Val::Strs(needle.clone()) }),
-        Expr::Term(Term { field: FieldId::Id, op: Op::Contains, val: Val::Strs(needle) }),
+        Expr::Term(Term {
+            field: FieldId::Title,
+            op: Op::Contains,
+            val: Val::Strs(needle.clone()),
+        }),
+        Expr::Term(Term {
+            field: FieldId::Cwd,
+            op: Op::Contains,
+            val: Val::Strs(needle.clone()),
+        }),
+        Expr::Term(Term {
+            field: FieldId::Id,
+            op: Op::Contains,
+            val: Val::Strs(needle),
+        }),
     ])
 }
 
@@ -953,7 +1018,11 @@ fn parse_value(def: &FieldDef, _op: Op, raw: &str) -> Result<Val, String> {
             }
         }
         Kind::HarnessEnum => {
-            let names: Vec<String> = raw.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+            let names: Vec<String> = raw
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
             for n in &names {
                 if Harness::parse(n).is_none() {
                     return Err(format!("unknown harness {n:?} — see `cv query`"));
@@ -962,17 +1031,27 @@ fn parse_value(def: &FieldDef, _op: Op, raw: &str) -> Result<Val, String> {
             Ok(Val::Strs(names))
         }
         Kind::Flag => {
-            let flags: Vec<String> = raw.split(',').map(|s| s.trim().to_lowercase()).filter(|s| !s.is_empty()).collect();
+            let flags: Vec<String> = raw
+                .split(',')
+                .map(|s| s.trim().to_lowercase())
+                .filter(|s| !s.is_empty())
+                .collect();
             for fl in &flags {
                 if !HAS_FLAGS.iter().any(|(n, _)| n == fl) {
-                    return Err(format!("unknown has-flag {fl:?} (try {}) — see `cv query`",
-                        HAS_FLAGS.iter().map(|(n, _)| *n).collect::<Vec<_>>().join("/")));
+                    return Err(format!(
+                        "unknown has-flag {fl:?} (try {}) — see `cv query`",
+                        HAS_FLAGS.iter().map(|(n, _)| *n).collect::<Vec<_>>().join("/")
+                    ));
                 }
             }
             Ok(Val::Strs(flags))
         }
         Kind::Str | Kind::Path => {
-            let strs: Vec<String> = raw.split(',').map(|s| s.trim().to_lowercase()).filter(|s| !s.is_empty()).collect();
+            let strs: Vec<String> = raw
+                .split(',')
+                .map(|s| s.trim().to_lowercase())
+                .filter(|s| !s.is_empty())
+                .collect();
             if strs.is_empty() {
                 return Err(format!("empty value for {} — see `cv query`", def.name));
             }
@@ -982,7 +1061,9 @@ fn parse_value(def: &FieldDef, _op: Op, raw: &str) -> Result<Val, String> {
 }
 
 fn parse_u64(s: &str, def: &FieldDef) -> Result<u64, String> {
-    s.trim().parse::<u64>().map_err(|_| format!("{} wants a number, got {s:?} — see `cv query`", def.name))
+    s.trim()
+        .parse::<u64>()
+        .map_err(|_| format!("{} wants a number, got {s:?} — see `cv query`", def.name))
 }
 
 fn parse_date(val: &str) -> Result<DateTime<Utc>, String> {
@@ -1043,7 +1124,14 @@ pub fn reference() -> String {
     let w = FIELDS.iter().map(|f| f.name.len()).max().unwrap_or(7);
     for f in FIELDS {
         let cost = cost_label(f.cost);
-        s.push_str(&format!("  {:<w$}  [{:<7}] {}\n      e.g. {}\n", f.name, cost, f.desc, f.example, w = w));
+        s.push_str(&format!(
+            "  {:<w$}  [{:<7}] {}\n      e.g. {}\n",
+            f.name,
+            cost,
+            f.desc,
+            f.example,
+            w = w
+        ));
         if !f.aliases.is_empty() {
             s.push_str(&format!("      aliases: {}\n", f.aliases.join(", ")));
         }
@@ -1065,35 +1153,38 @@ pub fn reference() -> String {
 /// The machine-readable schema (for `cv query --json`) — fields, types, operators, costs, examples.
 pub fn schema_json() -> serde_json::Value {
     use serde_json::json;
-    let fields: Vec<_> = FIELDS.iter().map(|f| {
-        let kind = match f.kind {
-            Kind::Str => "string",
-            Kind::HarnessEnum => "harness",
-            Kind::Num => "number",
-            Kind::Date => "date",
-            Kind::Path => "path",
-            Kind::Flag => "flag",
-        };
-        let ops: Vec<&str> = if f.id == FieldId::Thread {
-            vec![":"] // a path sub-grammar, not a plain string
-        } else if matches!(f.kind, Kind::Num | Kind::Date) {
-            vec![":", "=", ">", ">=", "<", "<="]
-        } else if matches!(f.kind, Kind::Str | Kind::Path) && matches!(f.cost, Cost::Catalog | Cost::Parse) {
-            vec![":", "=", "~"]
-        } else {
-            vec![":", "="]
-        };
-        let cost = cost_label(f.cost);
-        json!({
-            "name": f.name, "aliases": f.aliases, "type": kind, "ops": ops,
-            "cost": cost, "desc": f.desc, "example": f.example,
-            "values": if matches!(f.kind, Kind::HarnessEnum) {
-                json!(Harness::ALL.iter().map(|h| h.as_str()).collect::<Vec<_>>())
-            } else if matches!(f.kind, Kind::Flag) {
-                json!(HAS_FLAGS.iter().map(|(n, _)| *n).collect::<Vec<_>>())
-            } else { serde_json::Value::Null },
+    let fields: Vec<_> = FIELDS
+        .iter()
+        .map(|f| {
+            let kind = match f.kind {
+                Kind::Str => "string",
+                Kind::HarnessEnum => "harness",
+                Kind::Num => "number",
+                Kind::Date => "date",
+                Kind::Path => "path",
+                Kind::Flag => "flag",
+            };
+            let ops: Vec<&str> = if f.id == FieldId::Thread {
+                vec![":"] // a path sub-grammar, not a plain string
+            } else if matches!(f.kind, Kind::Num | Kind::Date) {
+                vec![":", "=", ">", ">=", "<", "<="]
+            } else if matches!(f.kind, Kind::Str | Kind::Path) && matches!(f.cost, Cost::Catalog | Cost::Parse) {
+                vec![":", "=", "~"]
+            } else {
+                vec![":", "="]
+            };
+            let cost = cost_label(f.cost);
+            json!({
+                "name": f.name, "aliases": f.aliases, "type": kind, "ops": ops,
+                "cost": cost, "desc": f.desc, "example": f.example,
+                "values": if matches!(f.kind, Kind::HarnessEnum) {
+                    json!(Harness::ALL.iter().map(|h| h.as_str()).collect::<Vec<_>>())
+                } else if matches!(f.kind, Kind::Flag) {
+                    json!(HAS_FLAGS.iter().map(|(n, _)| *n).collect::<Vec<_>>())
+                } else { serde_json::Value::Null },
+            })
         })
-    }).collect();
+        .collect();
     json!({
         "grammar": {
             "combine": ["implicit-AND", "AND", "OR", "|", "NOT", "-", "( )"],

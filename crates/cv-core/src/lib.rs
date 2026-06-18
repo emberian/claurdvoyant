@@ -8,13 +8,12 @@
 
 pub mod board;
 pub mod catalog;
-pub mod config;
 pub mod compaction;
+pub mod config;
 pub mod dataset;
 pub mod discover_cache;
 pub mod emit;
 pub mod events;
-pub mod offsets;
 pub mod harmony;
 pub mod harness;
 pub mod html;
@@ -22,6 +21,7 @@ pub mod ingest;
 pub mod ir;
 pub mod lazy;
 pub mod loom;
+pub mod offsets;
 pub mod prune;
 pub mod query;
 pub mod redact;
@@ -30,7 +30,7 @@ pub mod stream;
 pub mod tools;
 pub mod watch;
 
-pub use emit::{EmitOptions, emit};
+pub use emit::{emit, EmitOptions};
 pub use harness::{Adapter, EmitResult};
 pub use ir::*;
 pub use lazy::{Resolver, Span, Text, INLINE_MAX};
@@ -121,8 +121,7 @@ fn sessions_impl() -> (Vec<SessionRef>, bool) {
         .ok()
         .and_then(|s| s.parse::<i64>().ok())
         .unwrap_or(900);
-    let fresh_enough = catalog::last_full_sync()
-        .is_some_and(|t| (chrono::Utc::now().timestamp() - t) < max_stale);
+    let fresh_enough = catalog::last_full_sync().is_some_and(|t| (chrono::Utc::now().timestamp() - t) < max_stale);
     if fresh_enough {
         if let Some(stale) = catalog::probe_stale() {
             if !stale.is_empty() {
@@ -316,9 +315,7 @@ fn resolve_id(
 
 /// The "ambiguous prefix" error shared by `find`'s fast and slow paths.
 fn ambiguous<'a>(id: &str, hits: impl Iterator<Item = &'a SessionRef>) -> anyhow::Error {
-    let mut ids: Vec<String> = hits
-        .map(|r| format!("{}:{}", r.harness.as_str(), r.id))
-        .collect();
+    let mut ids: Vec<String> = hits.map(|r| format!("{}:{}", r.harness.as_str(), r.id)).collect();
     ids.sort();
     anyhow::anyhow!(
         "ambiguous session id {id:?} matches {} sessions: {} — pass a longer id or --harness",

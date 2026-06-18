@@ -98,11 +98,8 @@ fn threads_db() -> Option<PathBuf> {
 }
 
 fn open_ro(path: &Path) -> Result<Connection> {
-    Connection::open_with_flags(
-        path,
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )
-    .with_context(|| format!("opening {}", path.display()))
+    Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX)
+        .with_context(|| format!("opening {}", path.display()))
 }
 
 impl Adapter for Zed {
@@ -126,12 +123,7 @@ impl Adapter for Zed {
         crate::stream::collect(self, r)
     }
 
-    fn stream(
-        &self,
-        r: &SessionRef,
-        _opts: &ParseOptions,
-        sink: &mut dyn MessageSink,
-    ) -> Result<Session> {
+    fn stream(&self, r: &SessionRef, _opts: &ParseOptions, sink: &mut dyn MessageSink) -> Result<Session> {
         let conn = open_ro(&r.path)?;
         stream_thread(&conn, r, sink)
     }
@@ -159,7 +151,11 @@ fn discover_db(conn: &Connection, db: &Path) -> Result<Vec<SessionRef>> {
          FROM threads ORDER BY updated_at DESC",
         created = if has("created_at") { "created_at" } else { "NULL" },
         folders = if has("folder_paths") { "folder_paths" } else { "NULL" },
-        order = if has("folder_paths_order") { "folder_paths_order" } else { "NULL" },
+        order = if has("folder_paths_order") {
+            "folder_paths_order"
+        } else {
+            "NULL"
+        },
     );
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map([], |row| {
@@ -220,7 +216,11 @@ fn stream_thread(conn: &Connection, r: &SessionRef, sink: &mut dyn MessageSink) 
         created = if has("created_at") { "created_at" } else { "NULL" },
         parent = if has("parent_id") { "parent_id" } else { "NULL" },
         folders = if has("folder_paths") { "folder_paths" } else { "NULL" },
-        order = if has("folder_paths_order") { "folder_paths_order" } else { "NULL" },
+        order = if has("folder_paths_order") {
+            "folder_paths_order"
+        } else {
+            "NULL"
+        },
     );
     /// One optional value per column the metadata SELECT reads (the blob last).
     type Row = (
@@ -477,7 +477,9 @@ fn legacy_message(m: &Value, tool_names: &mut HashMap<String, String>, f: &mut d
         }
     } else if let Some(text) = m.get("text").and_then(Value::as_str) {
         if !text.is_empty() {
-            msg.content.push(Block::Text { text: text.to_string().into() });
+            msg.content.push(Block::Text {
+                text: text.to_string().into(),
+            });
         }
     }
 
@@ -499,7 +501,9 @@ fn legacy_message(m: &Value, tool_names: &mut HashMap<String, String>, f: &mut d
     // 0.2.0→0.3.0 upgrade); otherwise preserve it in extra.
     if let Some(ctx) = m.get("context").and_then(Value::as_str).filter(|c| !c.is_empty()) {
         if msg.content.is_empty() {
-            msg.content.push(Block::Text { text: ctx.to_string().into() });
+            msg.content.push(Block::Text {
+                text: ctx.to_string().into(),
+            });
         } else {
             msg.extra.insert("context".into(), Value::String(ctx.to_string()));
         }
@@ -655,7 +659,9 @@ fn modern_message(m: &Value, f: &mut dyn FnMut(Message) -> Flow) -> Flow {
             .filter(|s| !s.trim().is_empty())
         {
             let mut msg = Message::new(Role::System);
-            msg.content.push(Block::Text { text: text.to_string().into() });
+            msg.content.push(Block::Text {
+                text: text.to_string().into(),
+            });
             msg.extra.insert("compaction".into(), Value::Bool(true));
             return f(msg);
         }
@@ -666,7 +672,9 @@ fn modern_message(m: &Value, f: &mut dyn FnMut(Message) -> Flow) -> Flow {
 
 fn user_content_block(item: &Value) -> Option<Block> {
     if let Some(text) = item.get("Text").and_then(Value::as_str) {
-        return (!text.is_empty()).then(|| Block::Text { text: text.to_string().into() });
+        return (!text.is_empty()).then(|| Block::Text {
+            text: text.to_string().into(),
+        });
     }
     if let Some(mention) = item.get("Mention") {
         // The mention's resolved `content` (an attached file's whole body) is dropped — the URI is
@@ -676,7 +684,11 @@ fn user_content_block(item: &Value) -> Option<Block> {
             Some(other) => other.to_string(),
             None => return None,
         };
-        return Some(Block::File { mime: None, path: None, source: Some(uri) });
+        return Some(Block::File {
+            mime: None,
+            path: None,
+            source: Some(uri),
+        });
     }
     if let Some(img) = item.get("Image") {
         // LanguageModelImage: {source: <base64>, size}.
@@ -693,7 +705,9 @@ fn user_content_block(item: &Value) -> Option<Block> {
 
 fn agent_content_block(item: &Value) -> Option<Block> {
     if let Some(text) = item.get("Text").and_then(Value::as_str) {
-        return (!text.is_empty()).then(|| Block::Text { text: text.to_string().into() });
+        return (!text.is_empty()).then(|| Block::Text {
+            text: text.to_string().into(),
+        });
     }
     if let Some(th) = item.get("Thinking") {
         return Some(Block::Thinking {
@@ -979,10 +993,12 @@ mod tests {
             && input.get("path").and_then(Value::as_str) == Some("foo.rs")));
         let t = &s.messages[2];
         assert_eq!(t.role, Role::Tool);
-        assert!(matches!(&t.content[0], Block::ToolResult { tool_use_id, content, is_error, tool_name, details, .. }
+        assert!(
+            matches!(&t.content[0], Block::ToolResult { tool_use_id, content, is_error, tool_name, details, .. }
             if tool_use_id == "toolu_1" && content == "fn test_foo() {}" && !is_error
             && tool_name.as_deref() == Some("read_file")
-            && details.as_ref().and_then(|d| d.get("lines")).and_then(Value::as_i64) == Some(1)));
+            && details.as_ref().and_then(|d| d.get("lines")).and_then(Value::as_i64) == Some(1))
+        );
         assert_eq!(s.messages[3].text().as_deref(), Some("It races on the shared tempdir."));
     }
 
@@ -1018,9 +1034,11 @@ mod tests {
         assert!(matches!(&a.content[2], Block::ToolUse { id, name, .. } if id == "toolu_9" && name == "edit_file"));
         let t = &s.messages[2];
         assert_eq!(t.role, Role::Tool);
-        assert!(matches!(&t.content[0], Block::ToolResult { tool_use_id, content, is_error, tool_name, .. }
+        assert!(
+            matches!(&t.content[0], Block::ToolResult { tool_use_id, content, is_error, tool_name, .. }
             if tool_use_id == "toolu_9" && content == "permission denied" && *is_error
-            && tool_name.as_deref() == Some("edit_file")));
+            && tool_name.as_deref() == Some("edit_file"))
+        );
     }
 
     #[test]
@@ -1047,8 +1065,10 @@ mod tests {
         assert_eq!(s.messages.len(), 2, "no empty user turn; results become a Tool turn");
         assert_eq!(s.messages[0].role, Role::Assistant);
         assert_eq!(s.messages[1].role, Role::Tool);
-        assert!(matches!(&s.messages[1].content[0], Block::ToolResult { tool_name, content, .. }
-            if tool_name.as_deref() == Some("shell") && content == "file_a"));
+        assert!(
+            matches!(&s.messages[1].content[0], Block::ToolResult { tool_name, content, .. }
+            if tool_name.as_deref() == Some("shell") && content == "file_a")
+        );
     }
 
     #[test]
@@ -1190,9 +1210,7 @@ mod tests {
         for r in &refs {
             let parsed = zed.parse(r).unwrap();
             let mut sink = crate::stream::CollectSink::default();
-            let mut streamed = zed
-                .stream(r, &crate::stream::ParseOptions::full(), &mut sink)
-                .unwrap();
+            let mut streamed = zed.stream(r, &crate::stream::ParseOptions::full(), &mut sink).unwrap();
             streamed.messages = sink.messages;
             assert_eq!(
                 serde_json::to_value(&parsed).unwrap(),

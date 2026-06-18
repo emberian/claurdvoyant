@@ -21,27 +21,25 @@ pub mod continuedev;
 #[cfg(feature = "sqlite")]
 pub mod cursor;
 pub mod export;
+pub mod gemini;
 #[cfg(feature = "sqlite")]
 pub mod goose;
-pub mod roo;
-pub mod gemini;
 pub mod grok;
 #[cfg(feature = "sqlite")]
 pub mod hermes;
 pub mod kimi;
 pub mod lmstudio;
-pub mod opencode;
 pub mod openclaw;
+pub mod opencode;
 pub mod qwen;
+pub mod roo;
 #[cfg(feature = "sqlite")]
 pub mod zed;
 
 /// Parse an RFC3339 timestamp into UTC — the timestamp shape nearly every harness writes. Shared
 /// here so adapters don't each carry a copy.
 pub(crate) fn parse_ts(s: &str) -> Option<DateTime<Utc>> {
-    DateTime::parse_from_rfc3339(s)
-        .ok()
-        .map(|d| d.with_timezone(&Utc))
+    DateTime::parse_from_rfc3339(s).ok().map(|d| d.with_timezone(&Utc))
 }
 
 /// Flexible timestamp from a JSON value: an RFC3339 string, epoch **milliseconds**, or epoch
@@ -109,8 +107,7 @@ fn each_json_line_inner(line: &str, skipped: &mut u64, f: &mut impl FnMut(Value)
 /// clean sessions stay byte-identical). The count is a *lower bound* when a pass stopped early.
 pub(crate) fn note_skipped_lines(s: &mut Session, skipped: u64) {
     if skipped > 0 {
-        s.extra
-            .insert("skipped_lines".into(), Value::Number(skipped.into()));
+        s.extra.insert("skipped_lines".into(), Value::Number(skipped.into()));
     }
 }
 
@@ -153,12 +150,7 @@ pub trait Adapter: Send + Sync {
     /// The default bridges through [`parse`](Adapter::parse): correct for any adapter, but with no
     /// memory savings (it materializes the whole `Session` first). Override with a native streaming
     /// parse to get the savings — see [`claude`](crate::harness::claude) for the reference.
-    fn stream(
-        &self,
-        r: &SessionRef,
-        _opts: &ParseOptions,
-        sink: &mut dyn MessageSink,
-    ) -> Result<Session> {
+    fn stream(&self, r: &SessionRef, _opts: &ParseOptions, sink: &mut dyn MessageSink) -> Result<Session> {
         let mut session = self.parse(r)?;
         let messages = std::mem::take(&mut session.messages);
         // The full session is already parsed, so its metadata (model/cwd/title) is known up front —

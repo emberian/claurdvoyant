@@ -98,18 +98,12 @@ impl Adapter for Codex {
     fn parse(&self, r: &SessionRef) -> Result<Session> {
         // Concrete full parse (used directly for full-fidelity ops, and by `stream`'s legacy-JSON
         // branch). `stream` is the memory-light path for the bulk consumers.
-        let text = fs::read_to_string(&r.path)
-            .with_context(|| format!("reading {}", r.path.display()))?;
+        let text = fs::read_to_string(&r.path).with_context(|| format!("reading {}", r.path.display()))?;
         let is_jsonl = r.path.extension().and_then(|e| e.to_str()) == Some("jsonl");
         Ok(parse_str(&r.id, &text, is_jsonl, Some(r.path.clone())))
     }
 
-    fn stream(
-        &self,
-        r: &SessionRef,
-        opts: &ParseOptions,
-        sink: &mut dyn MessageSink,
-    ) -> Result<Session> {
+    fn stream(&self, r: &SessionRef, opts: &ParseOptions, sink: &mut dyn MessageSink) -> Result<Session> {
         let is_jsonl = r.path.extension().and_then(|e| e.to_str()) == Some("jsonl");
         if !is_jsonl {
             // 2025 legacy layout is a single JSON document — inherently whole-file. Reuse the full
@@ -129,8 +123,7 @@ impl Adapter for Codex {
         // then a second streaming pass that emits one record's messages at a time. Both passes are
         // O(largest line); the previous `parse_str` collected the entire file into a `Vec<Value>`.
         let has_events = {
-            let f = fs::File::open(&r.path)
-                .with_context(|| format!("opening {}", r.path.display()))?;
+            let f = fs::File::open(&r.path).with_context(|| format!("opening {}", r.path.display()))?;
             detect_has_events(BufReader::new(f))
         };
         // Span path (partial-access / chunked index): mmap the file and emit a lazy `Span` for a giant
@@ -150,8 +143,7 @@ impl Adapter for Codex {
                 }
             }
         }
-        let f = fs::File::open(&r.path)
-            .with_context(|| format!("opening {}", r.path.display()))?;
+        let f = fs::File::open(&r.path).with_context(|| format!("opening {}", r.path.display()))?;
         Ok(stream_jsonl(
             &r.id,
             BufReader::new(f),
@@ -208,10 +200,7 @@ pub fn parse_str(id: &str, text: &str, is_jsonl: bool, source_path: Option<PathB
         s.messages = out;
     } else if let Ok(root) = serde_json::from_str::<Value>(text) {
         apply_meta(&mut s, root.get("session"));
-        let items = root
-            .get("items")
-            .and_then(Value::as_array)
-            .or_else(|| root.as_array());
+        let items = root.get("items").and_then(Value::as_array).or_else(|| root.as_array());
         if let Some(items) = items {
             for it in items {
                 handle_item(Some(it), false, None, &mut s.messages);
@@ -449,7 +438,15 @@ pub(crate) fn stream_spans_from(
     sink: &mut dyn MessageSink,
 ) -> Session {
     stream_spans_core(
-        "", data, start_off, source_path, has_events, seed_model, false, stamp_offsets, sink,
+        "",
+        data,
+        start_off,
+        source_path,
+        has_events,
+        seed_model,
+        false,
+        stamp_offsets,
+        sink,
     )
 }
 
@@ -497,8 +494,12 @@ fn stream_spans_core(
         let line_off = off;
         off += raw_line.len() as u64 + 1; // +1 for the consumed '\n'
         let lead = raw_line.iter().take_while(|b| b.is_ascii_whitespace()).count();
-        let endw =
-            raw_line.len() - raw_line[lead..].iter().rev().take_while(|b| b.is_ascii_whitespace()).count();
+        let endw = raw_line.len()
+            - raw_line[lead..]
+                .iter()
+                .rev()
+                .take_while(|b| b.is_ascii_whitespace())
+                .count();
         if lead >= endw {
             continue;
         }
@@ -519,8 +520,7 @@ fn stream_spans_core(
             // see [`crate::offsets::OFFSET_KEY`]). Messages a later record amends (token_count
             // usage) keep their creating record's offset, which is the correct replay point.
             for m in &mut scratch[before..] {
-                m.extra
-                    .insert(crate::offsets::OFFSET_KEY.into(), base_off.into());
+                m.extra.insert(crate::offsets::OFFSET_KEY.into(), base_off.into());
             }
         }
         if emit_meta && !meta_sent && s.model.is_some() {
@@ -580,10 +580,7 @@ fn giant_fco_span(slice: &[u8], base_off: u64, s: &mut Session) -> Option<Messag
         output: Option<&'a RawValue>,
     }
     let pay: Pay = serde_json::from_str(payload.get()).ok()?;
-    if !matches!(
-        pay.pty,
-        Some("function_call_output") | Some("custom_tool_call_output")
-    ) {
+    if !matches!(pay.pty, Some("function_call_output") | Some("custom_tool_call_output")) {
         return None;
     }
     // Only a plain *string* output spans (object/array output is transformed by coerce_output → fall
@@ -624,14 +621,8 @@ fn apply_meta(s: &mut Session, payload: Option<&Value>) {
         if let Some(g) = p.get("git") {
             s.git = Some(GitInfo {
                 branch: g.get("branch").and_then(Value::as_str).map(str::to_string),
-                commit: g
-                    .get("commit_hash")
-                    .and_then(Value::as_str)
-                    .map(str::to_string),
-                remote: g
-                    .get("repository_url")
-                    .and_then(Value::as_str)
-                    .map(str::to_string),
+                commit: g.get("commit_hash").and_then(Value::as_str).map(str::to_string),
+                remote: g.get("repository_url").and_then(Value::as_str).map(str::to_string),
             });
         }
     }
@@ -640,12 +631,7 @@ fn apply_meta(s: &mut Session, payload: Option<&Value>) {
 /// `turn_context` records persist per-turn config (model, cwd, sandbox/approval). We seed the
 /// session-level `model`/`cwd` from the first one, and emit a lightweight system marker whenever the
 /// effective model changes mid-session so that drift survives into the IR.
-fn apply_turn_context(
-    s: &mut Session,
-    out: &mut Vec<Message>,
-    payload: Option<&Value>,
-    ts: Option<DateTime<Utc>>,
-) {
+fn apply_turn_context(s: &mut Session, out: &mut Vec<Message>, payload: Option<&Value>, ts: Option<DateTime<Utc>>) {
     let Some(p) = payload else { return };
     if s.cwd.is_none() {
         s.cwd = p.get("cwd").and_then(Value::as_str).map(PathBuf::from);
@@ -663,8 +649,7 @@ fn apply_turn_context(
             });
             msg.extra
                 .insert("codex_event".into(), Value::String("turn_context".into()));
-            msg.extra
-                .insert("model".into(), Value::String(m.to_string()));
+            msg.extra.insert("model".into(), Value::String(m.to_string()));
             if let Some(cwd) = p.get("cwd").and_then(Value::as_str) {
                 msg.extra.insert("cwd".into(), Value::String(cwd.into()));
             }
@@ -681,12 +666,7 @@ fn apply_turn_context(
 /// attach `token_count` usage/rate-limit info to the assistant message it trails. Other events
 /// (exec_command_*, web_search_*, task_started/complete, …) are intentionally not turned into
 /// messages: their structured equivalents arrive as `response_item`s.
-fn handle_event(
-    payload: Option<&Value>,
-    has_events: bool,
-    ts: Option<DateTime<Utc>>,
-    out: &mut Vec<Message>,
-) {
+fn handle_event(payload: Option<&Value>, has_events: bool, ts: Option<DateTime<Utc>>, out: &mut Vec<Message>) {
     let Some(p) = payload else { return };
     match p.get("type").and_then(Value::as_str) {
         Some("user_message") if has_events => {
@@ -720,10 +700,8 @@ fn handle_event(
             if let Some(id) = p.get("call_id").and_then(Value::as_str) {
                 m.extra.insert("call_id".into(), Value::String(id.into()));
             }
-            m.extra.insert(
-                "codex_event".into(),
-                Value::String("view_image_tool_call".into()),
-            );
+            m.extra
+                .insert("codex_event".into(), Value::String("view_image_tool_call".into()));
             out.push(m);
         }
         Some("token_count") => {
@@ -739,9 +717,7 @@ fn handle_event(
 /// Pull `last_token_usage` into IR [`Usage`] and stash rate-limit / context-window info in `extra`.
 fn apply_token_count(p: &Value, ts: Option<DateTime<Utc>>, out: &mut Vec<Message>) {
     let info = p.get("info");
-    let usage = info
-        .and_then(|i| i.get("last_token_usage"))
-        .and_then(parse_usage);
+    let usage = info.and_then(|i| i.get("last_token_usage")).and_then(parse_usage);
     let rate_limits = p.get("rate_limits").filter(|v| !v.is_null()).cloned();
     let ctx_window = info
         .and_then(|i| i.get("model_context_window"))
@@ -807,24 +783,16 @@ fn handle_compacted(payload: Option<&Value>, ts: Option<DateTime<Utc>>, out: &mu
         format!("[history compacted]\n{summary}")
     };
     m.content.push(Block::Text { text: text.into() });
-    m.extra
-        .insert("codex_event".into(), Value::String("compacted".into()));
+    m.extra.insert("codex_event".into(), Value::String("compacted".into()));
     if let Some(rh) = p.get("replacement_history").and_then(Value::as_array) {
-        m.extra.insert(
-            "replacement_history_len".into(),
-            Value::Number(rh.len().into()),
-        );
+        m.extra
+            .insert("replacement_history_len".into(), Value::Number(rh.len().into()));
     }
     out.push(m);
 }
 
 /// Handle a `response_item` payload or a legacy `items[]` entry.
-fn handle_item(
-    payload: Option<&Value>,
-    has_events: bool,
-    ts: Option<DateTime<Utc>>,
-    out: &mut Vec<Message>,
-) {
+fn handle_item(payload: Option<&Value>, has_events: bool, ts: Option<DateTime<Utc>>, out: &mut Vec<Message>) {
     let Some(p) = payload else { return };
     let ty = p.get("type").and_then(Value::as_str).unwrap_or("");
     let str_field = |k: &str| p.get(k).and_then(Value::as_str).unwrap_or("").to_string();
@@ -860,10 +828,7 @@ fn handle_item(
             let summary = join_text(p.get("summary"));
             let raw = join_text(p.get("content"));
             let text = if !raw.is_empty() { raw } else { summary.clone() };
-            let encrypted = p
-                .get("encrypted_content")
-                .and_then(Value::as_str)
-                .map(str::to_string);
+            let encrypted = p.get("encrypted_content").and_then(Value::as_str).map(str::to_string);
             if !text.is_empty() || encrypted.is_some() {
                 let mut m = Message::new(Role::Assistant);
                 m.timestamp = ts;
@@ -969,10 +934,7 @@ fn handle_item(
         }
         "tool_search_output" => {
             let call_id = str_field("call_id");
-            let content = p
-                .get("tools")
-                .map(|t| t.to_string())
-                .unwrap_or_else(|| "[]".into());
+            let content = p.get("tools").map(|t| t.to_string()).unwrap_or_else(|| "[]".into());
             let mut m = Message::new(Role::Tool);
             m.timestamp = ts;
             m.content.push(Block::ToolResult {
@@ -1010,8 +972,7 @@ fn handle_item(
             let mut m = Message::new(Role::Assistant);
             m.timestamp = ts;
             if let Some(rp) = p.get("revised_prompt").and_then(Value::as_str) {
-                m.extra
-                    .insert("revised_prompt".into(), Value::String(rp.into()));
+                m.extra.insert("revised_prompt".into(), Value::String(rp.into()));
             }
             // `result` is base64 image data; record a reference, not the bytes.
             m.content.push(Block::Image {
@@ -1031,8 +992,7 @@ fn handle_item(
             m.content.push(Block::Text {
                 text: "[history compacted]".into(),
             });
-            m.extra
-                .insert("codex_event".into(), Value::String(ty.into()));
+            m.extra.insert("codex_event".into(), Value::String(ty.into()));
             if p.get("encrypted_content").and_then(Value::as_str).is_some() {
                 m.extra.insert("encrypted".into(), Value::Bool(true));
             }
@@ -1089,10 +1049,7 @@ fn image_block(it: &Value) -> Block {
             u.to_string()
         }
     });
-    Block::Image {
-        media_type,
-        data_ref,
-    }
+    Block::Image { media_type, data_ref }
 }
 
 /// Join the `text` fields of a `[{... text}]` array (used for reasoning summary/content).
@@ -1230,10 +1187,7 @@ impl CodexScan {
                     }
                 }
                 if self.cwd.is_none() {
-                    self.cwd = p
-                        .and_then(|p| p.get("cwd"))
-                        .and_then(Value::as_str)
-                        .map(PathBuf::from);
+                    self.cwd = p.and_then(|p| p.get("cwd")).and_then(Value::as_str).map(PathBuf::from);
                 }
             }
             Some("event_msg") => {
@@ -1247,9 +1201,7 @@ impl CodexScan {
                     self.message_count += 1;
                 }
             }
-            Some("response_item")
-                if v.pointer("/payload/type").and_then(Value::as_str) == Some("message") =>
-            {
+            Some("response_item") if v.pointer("/payload/type").and_then(Value::as_str) == Some("message") => {
                 self.message_count += 1;
                 if v.pointer("/payload/role").and_then(Value::as_str) == Some("user") {
                     self.consider_title(&coerce_content(v.pointer("/payload/content")));
@@ -1355,11 +1307,7 @@ fn scan(path: &Path) -> Result<SessionRef> {
     }
 
     if s.id.is_empty() {
-        s.id = path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("")
-            .to_string();
+        s.id = path.file_stem().and_then(|s| s.to_str()).unwrap_or("").to_string();
     }
 
     Ok(SessionRef {
@@ -1468,7 +1416,12 @@ mod tests {
             _ => unreachable!(),
         }
         match first_block(&s, |b| matches!(b, Block::ToolResult { .. })) {
-            Block::ToolResult { tool_use_id, content, is_error, .. } => {
+            Block::ToolResult {
+                tool_use_id,
+                content,
+                is_error,
+                ..
+            } => {
                 assert_eq!(tool_use_id, "c1");
                 assert_eq!(content, "boom");
                 assert!(is_error);
@@ -1489,7 +1442,10 @@ mod tests {
             }
             _ => unreachable!(),
         }
-        assert_eq!(s.messages[0].extra.get("status").and_then(Value::as_str), Some("completed"));
+        assert_eq!(
+            s.messages[0].extra.get("status").and_then(Value::as_str),
+            Some("completed")
+        );
     }
 
     #[test]
@@ -1528,7 +1484,9 @@ mod tests {
             r#"{"timestamp":"2026-04-28T00:00:01Z","type":"response_item","payload":{"type":"tool_search_output","call_id":"t1","status":"completed","execution":"client","tools":[]}}"#,
         ]);
         assert!(matches!(&s.messages[0].content[0], Block::ToolUse { name, .. } if name == "tool_search"));
-        assert!(matches!(&s.messages[1].content[0], Block::ToolResult { tool_use_id, content, .. } if tool_use_id == "t1" && content == "[]"));
+        assert!(
+            matches!(&s.messages[1].content[0], Block::ToolResult { tool_use_id, content, .. } if tool_use_id == "t1" && content == "[]")
+        );
     }
 
     #[test]
@@ -1594,7 +1552,11 @@ mod tests {
             .expect("tool result present");
         assert!(content.is_span(), "giant fco output should be a span");
         let resolver = s.resolver();
-        assert_eq!(content.resolve(&resolver), body.as_str(), "span must resolve to the exact output");
+        assert_eq!(
+            content.resolve(&resolver),
+            body.as_str(),
+            "span must resolve to the exact output"
+        );
 
         // And it matches the inline (bulk) parse of the same record.
         let inline = parse_str("fallback", &String::from_utf8(data).unwrap(), true, Some(path.clone()));
@@ -1753,8 +1715,7 @@ mod tests {
                 r#"{{"timestamp":"2026-01-01T00:00:00Z","type":"response_item","payload":{{"type":"message","role":"user","content":[{{"type":"input_text","text":"{text}"}}]}}}}"#
             )
         };
-        let event_user =
-            r#"{"timestamp":"2026-01-01T00:00:01Z","type":"event_msg","payload":{"type":"user_message","message":"hi"}}"#;
+        let event_user = r#"{"timestamp":"2026-01-01T00:00:01Z","type":"event_msg","payload":{"type":"user_message","message":"hi"}}"#;
         let filler =
             r#"{"timestamp":"2026-01-01T00:00:02Z","type":"event_msg","payload":{"type":"token_count","info":null}}"#;
 
@@ -1781,7 +1742,10 @@ mod tests {
         let mut fed = 0u32;
         loop {
             fed += 1;
-            assert!(fed <= EventDetector::LOOKAHEAD + 1, "detector must stop within the window");
+            assert!(
+                fed <= EventDetector::LOOKAHEAD + 1,
+                "detector must stop within the window"
+            );
             if det.feed(&fill) == Flow::Stop {
                 break;
             }
@@ -1858,7 +1822,10 @@ mod tests {
         assert_eq!(s.model.as_deref(), Some("gpt-5.3-codex-high"));
         let note = s.messages.iter().find(|m| m.role == Role::System).unwrap();
         assert!(note.text().unwrap().contains("model changed"));
-        assert_eq!(note.extra.get("model").and_then(Value::as_str), Some("gpt-5.3-codex-high"));
+        assert_eq!(
+            note.extra.get("model").and_then(Value::as_str),
+            Some("gpt-5.3-codex-high")
+        );
     }
 
     #[test]
@@ -1868,8 +1835,14 @@ mod tests {
         assert_eq!(s.id, "legacy-1");
         // user text, reasoning, tool use, tool result => 4 messages (no event_msg dedup in legacy).
         assert_eq!(s.messages.len(), 4);
-        assert!(s.messages.iter().any(|m| matches!(m.content.first(), Some(Block::Thinking { .. }))));
-        assert!(s.messages.iter().any(|m| matches!(m.content.first(), Some(Block::ToolResult { content, .. }) if content == "ok")));
+        assert!(s
+            .messages
+            .iter()
+            .any(|m| matches!(m.content.first(), Some(Block::Thinking { .. }))));
+        assert!(s
+            .messages
+            .iter()
+            .any(|m| matches!(m.content.first(), Some(Block::ToolResult { content, .. }) if content == "ok")));
     }
 
     /// Developer smoke test against the real on-disk corpus (run with `--ignored`). Parses every
@@ -1899,9 +1872,7 @@ mod tests {
                 }
             }
         }
-        eprintln!(
-            "tool_uses={tool_uses} tool_results={tool_results} images={images} thinking={thinking}"
-        );
+        eprintln!("tool_uses={tool_uses} tool_results={tool_results} images={images} thinking={thinking}");
         assert!(tool_uses > 0, "expected some tool calls in the corpus");
     }
 
@@ -1912,6 +1883,8 @@ mod tests {
         ]);
         let m = &s.messages[0];
         assert!(matches!(&m.content[0], Block::ToolResult { content, .. } if content == "here"));
-        assert!(matches!(&m.content[1], Block::Image { media_type, .. } if media_type.as_deref() == Some("image/jpeg")));
+        assert!(
+            matches!(&m.content[1], Block::Image { media_type, .. } if media_type.as_deref() == Some("image/jpeg"))
+        );
     }
 }

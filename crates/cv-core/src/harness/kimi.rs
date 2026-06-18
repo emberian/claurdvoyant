@@ -157,12 +157,7 @@ impl Adapter for Kimi {
         crate::stream::collect(self, r)
     }
 
-    fn stream(
-        &self,
-        r: &SessionRef,
-        _opts: &ParseOptions,
-        sink: &mut dyn MessageSink,
-    ) -> Result<Session> {
+    fn stream(&self, r: &SessionRef, _opts: &ParseOptions, sink: &mut dyn MessageSink) -> Result<Session> {
         // r.path is the session dir (modern) or the hash dir (legacy). Locate the transcript.
         let (transcript, wire) = locate_transcript(&r.path, &r.id);
 
@@ -193,10 +188,8 @@ impl Adapter for Kimi {
         // Note archived compaction segments (context_1.jsonl…), if any, for fidelity bookkeeping.
         let seg_count = count_segments(&r.path);
         if seg_count > 0 {
-            s.extra.insert(
-                "compaction_segments".into(),
-                Value::Number(seg_count.into()),
-            );
+            s.extra
+                .insert("compaction_segments".into(), Value::Number(seg_count.into()));
         }
 
         // Session metadata is known up front; hand it to the sink before the body.
@@ -213,32 +206,30 @@ impl Adapter for Kimi {
         let mut statuses = enrich.statuses.iter();
         let first_wire_ts = enrich.msg_timestamps.first().copied();
         let mut first_user_seen = false;
-        let skipped = super::for_each_json_line(BufReader::new(file), |v| {
-            match context_message(&v, &enrich) {
-                Some(mut m) => {
-                    match m.role {
-                        Role::Assistant => {
-                            if let Some(st) = statuses.next() {
-                                if m.usage.is_none() {
-                                    m.usage = st.usage.clone();
-                                }
-                                if m.id.is_none() {
-                                    m.id = st.message_id.clone();
-                                }
+        let skipped = super::for_each_json_line(BufReader::new(file), |v| match context_message(&v, &enrich) {
+            Some(mut m) => {
+                match m.role {
+                    Role::Assistant => {
+                        if let Some(st) = statuses.next() {
+                            if m.usage.is_none() {
+                                m.usage = st.usage.clone();
+                            }
+                            if m.id.is_none() {
+                                m.id = st.message_id.clone();
                             }
                         }
-                        Role::User if !first_user_seen => {
-                            first_user_seen = true;
-                            if m.timestamp.is_none() {
-                                m.timestamp = first_wire_ts;
-                            }
-                        }
-                        _ => {}
                     }
-                    sink.message(m)
+                    Role::User if !first_user_seen => {
+                        first_user_seen = true;
+                        if m.timestamp.is_none() {
+                            m.timestamp = first_wire_ts;
+                        }
+                    }
+                    _ => {}
                 }
-                None => Flow::Continue,
+                sink.message(m)
             }
+            None => Flow::Continue,
         });
         super::note_skipped_lines(&mut s, skipped);
 
@@ -275,15 +266,8 @@ impl Adapter for Kimi {
 /// Parts are `type`-tagged (`text`/`think`/`image_url`/`audio_url`/`video_url`). The `wire.jsonl`
 /// sidecar carries a `metadata` header, one `StatusUpdate` per assistant turn (token usage +
 /// `message_id`), one `ToolResult` per tool turn, and per-turn timestamps.
-pub fn emit(
-    session: &Session,
-    out_dir: &Path,
-    opts: &crate::emit::EmitOptions,
-) -> Result<crate::harness::EmitResult> {
-    let new_id = opts
-        .new_id
-        .clone()
-        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+pub fn emit(session: &Session, out_dir: &Path, opts: &crate::emit::EmitOptions) -> Result<crate::harness::EmitResult> {
+    let new_id = opts.new_id.clone().unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     let cwd = opts.new_cwd.clone().or_else(|| session.cwd.clone());
     let cwd_str = cwd
         .as_ref()
@@ -292,14 +276,10 @@ pub fn emit(
     let hash = md5_hex(cwd_str.as_bytes());
 
     let session_dir = out_dir.join("sessions").join(&hash).join(&new_id);
-    fs::create_dir_all(&session_dir)
-        .map_err(|e| anyhow::anyhow!("creating {}: {e}", session_dir.display()))?;
+    fs::create_dir_all(&session_dir).map_err(|e| anyhow::anyhow!("creating {}: {e}", session_dir.display()))?;
 
     // Base timestamp for any turn lacking its own.
-    let base_ts = session
-        .created_at
-        .or(session.updated_at)
-        .unwrap_or_else(Utc::now);
+    let base_ts = session.created_at.or(session.updated_at).unwrap_or_else(Utc::now);
 
     // ── context.jsonl (the transcript) ──
     let mut ctx_lines: Vec<Value> = Vec::new();
@@ -425,9 +405,7 @@ fn register_work_dir(root: &Path, cwd: &str, session_id: &str) -> Result<()> {
         doc = serde_json::json!({});
     }
     let obj = doc.as_object_mut().expect("doc is object");
-    let dirs = obj
-        .entry("work_dirs")
-        .or_insert_with(|| Value::Array(Vec::new()));
+    let dirs = obj.entry("work_dirs").or_insert_with(|| Value::Array(Vec::new()));
     let arr = match dirs.as_array_mut() {
         Some(a) => a,
         None => {
@@ -437,8 +415,7 @@ fn register_work_dir(root: &Path, cwd: &str, session_id: &str) -> Result<()> {
     };
     // Update existing local entry for this path, else append.
     let existing = arr.iter_mut().find(|e| {
-        e.get("path").and_then(Value::as_str) == Some(cwd)
-            && e.get("kaos").and_then(Value::as_str) == Some("local")
+        e.get("path").and_then(Value::as_str) == Some(cwd) && e.get("kaos").and_then(Value::as_str) == Some("local")
     });
     match existing {
         Some(e) => {
@@ -769,19 +746,11 @@ fn context_message(v: &Value, enrich: &WireEnrich) -> Option<Message> {
             (!m.content.is_empty()).then_some(m)
         }
         "tool" => {
-            let tool_use_id = v
-                .get("tool_call_id")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string();
+            let tool_use_id = v.get("tool_call_id").and_then(Value::as_str).unwrap_or("").to_string();
             // Prefer the richer wire return_value if we have it; else the context text parts.
             let we = enrich.tool_results.get(&tool_use_id);
             let (content, is_error, details) = match we {
-                Some(tr) => (
-                    tr.output.clone(),
-                    tr.is_error,
-                    tr.extras.clone(),
-                ),
+                Some(tr) => (tr.output.clone(), tr.is_error, tr.extras.clone()),
                 None => (coerce_content_text(v.get("content")), false, None),
             };
             let status = Some(if is_error { "error" } else { "completed" }.to_string());
@@ -937,11 +906,7 @@ fn read_wire_enrichment(wire: &PathBuf) -> WireEnrich {
         match mty {
             "ToolResult" => {
                 if let Some(p) = payload {
-                    let id = p
-                        .get("tool_call_id")
-                        .and_then(Value::as_str)
-                        .unwrap_or("")
-                        .to_string();
+                    let id = p.get("tool_call_id").and_then(Value::as_str).unwrap_or("").to_string();
                     let rv = p.get("return_value");
                     let is_error = rv
                         .and_then(|r| r.get("is_error"))
@@ -954,10 +919,7 @@ fn read_wire_enrichment(wire: &PathBuf) -> WireEnrich {
                         .or_else(|| rv.and_then(|r| r.get("message")).and_then(Value::as_str))
                         .unwrap_or("")
                         .to_string();
-                    let extras = rv
-                        .and_then(|r| r.get("extras"))
-                        .filter(|x| !x.is_null())
-                        .cloned();
+                    let extras = rv.and_then(|r| r.get("extras")).filter(|x| !x.is_null()).cloned();
                     if !id.is_empty() {
                         e.tool_results.insert(
                             id,
@@ -973,10 +935,7 @@ fn read_wire_enrichment(wire: &PathBuf) -> WireEnrich {
             "StatusUpdate" => {
                 if let Some(p) = payload {
                     let usage = p.get("token_usage").map(wire_usage);
-                    let message_id = p
-                        .get("message_id")
-                        .and_then(Value::as_str)
-                        .map(str::to_string);
+                    let message_id = p.get("message_id").and_then(Value::as_str).map(str::to_string);
                     e.statuses.push(WireStatus { usage, message_id });
                 }
             }
@@ -1038,20 +997,74 @@ fn md5_hex(data: &[u8]) -> String {
     let mut d0: u32 = 0x1032_5476;
 
     const S: [u32; 64] = [
-        7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 5, 9, 14, 20, 5, 9, 14, 20, 5,
-        9, 14, 20, 5, 9, 14, 20, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 6, 10,
-        15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21,
+        7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14,
+        20, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6,
+        10, 15, 21,
     ];
     const K: [u32; 64] = [
-        0xd76a_a478, 0xe8c7_b756, 0x2420_70db, 0xc1bd_ceee, 0xf57c_0faf, 0x4787_c62a, 0xa830_4613,
-        0xfd46_9501, 0x6980_98d8, 0x8b44_f7af, 0xffff_5bb1, 0x895c_d7be, 0x6b90_1122, 0xfd98_7193,
-        0xa679_438e, 0x49b4_0821, 0xf61e_2562, 0xc040_b340, 0x265e_5a51, 0xe9b6_c7aa, 0xd62f_105d,
-        0x0244_1453, 0xd8a1_e681, 0xe7d3_fbc8, 0x21e1_cde6, 0xc337_07d6, 0xf4d5_0d87, 0x455a_14ed,
-        0xa9e3_e905, 0xfcef_a3f8, 0x676f_02d9, 0x8d2a_4c8a, 0xfffa_3942, 0x8771_f681, 0x6d9d_6122,
-        0xfde5_380c, 0xa4be_ea44, 0x4bde_cfa9, 0xf6bb_4b60, 0xbebf_bc70, 0x289b_7ec6, 0xeaa1_27fa,
-        0xd4ef_3085, 0x0488_1d05, 0xd9d4_d039, 0xe6db_99e5, 0x1fa2_7cf8, 0xc4ac_5665, 0xf429_2244,
-        0x432a_ff97, 0xab94_23a7, 0xfc93_a039, 0x655b_59c3, 0x8f0c_cc92, 0xffef_f47d, 0x8584_5dd1,
-        0x6fa8_7e4f, 0xfe2c_e6e0, 0xa301_4314, 0x4e08_11a1, 0xf753_7e82, 0xbd3a_f235, 0x2ad7_d2bb,
+        0xd76a_a478,
+        0xe8c7_b756,
+        0x2420_70db,
+        0xc1bd_ceee,
+        0xf57c_0faf,
+        0x4787_c62a,
+        0xa830_4613,
+        0xfd46_9501,
+        0x6980_98d8,
+        0x8b44_f7af,
+        0xffff_5bb1,
+        0x895c_d7be,
+        0x6b90_1122,
+        0xfd98_7193,
+        0xa679_438e,
+        0x49b4_0821,
+        0xf61e_2562,
+        0xc040_b340,
+        0x265e_5a51,
+        0xe9b6_c7aa,
+        0xd62f_105d,
+        0x0244_1453,
+        0xd8a1_e681,
+        0xe7d3_fbc8,
+        0x21e1_cde6,
+        0xc337_07d6,
+        0xf4d5_0d87,
+        0x455a_14ed,
+        0xa9e3_e905,
+        0xfcef_a3f8,
+        0x676f_02d9,
+        0x8d2a_4c8a,
+        0xfffa_3942,
+        0x8771_f681,
+        0x6d9d_6122,
+        0xfde5_380c,
+        0xa4be_ea44,
+        0x4bde_cfa9,
+        0xf6bb_4b60,
+        0xbebf_bc70,
+        0x289b_7ec6,
+        0xeaa1_27fa,
+        0xd4ef_3085,
+        0x0488_1d05,
+        0xd9d4_d039,
+        0xe6db_99e5,
+        0x1fa2_7cf8,
+        0xc4ac_5665,
+        0xf429_2244,
+        0x432a_ff97,
+        0xab94_23a7,
+        0xfc93_a039,
+        0x655b_59c3,
+        0x8f0c_cc92,
+        0xffef_f47d,
+        0x8584_5dd1,
+        0x6fa8_7e4f,
+        0xfe2c_e6e0,
+        0xa301_4314,
+        0x4e08_11a1,
+        0xf753_7e82,
+        0xbd3a_f235,
+        0x2ad7_d2bb,
         0xeb86_d391,
     ];
 
@@ -1067,12 +1080,7 @@ fn md5_hex(data: &[u8]) -> String {
     for chunk in msg.chunks_exact(64) {
         let mut m = [0u32; 16];
         for (i, w) in m.iter_mut().enumerate() {
-            *w = u32::from_le_bytes([
-                chunk[i * 4],
-                chunk[i * 4 + 1],
-                chunk[i * 4 + 2],
-                chunk[i * 4 + 3],
-            ]);
+            *w = u32::from_le_bytes([chunk[i * 4], chunk[i * 4 + 1], chunk[i * 4 + 2], chunk[i * 4 + 3]]);
         }
         let (mut a, mut b, mut c, mut d) = (a0, b0, c0, d0);
         for i in 0..64 {
@@ -1082,10 +1090,7 @@ fn md5_hex(data: &[u8]) -> String {
                 32..=47 => (b ^ c ^ d, (3 * i + 5) % 16),
                 _ => (c ^ (b | !d), (7 * i) % 16),
             };
-            let f = f
-                .wrapping_add(a)
-                .wrapping_add(K[i])
-                .wrapping_add(m[g]);
+            let f = f.wrapping_add(a).wrapping_add(K[i]).wrapping_add(m[g]);
             a = d;
             d = c;
             c = b;
@@ -1135,10 +1140,7 @@ mod tests {
         );
         // non-local KAOS → "<kaos>_<md5>"
         let h = md5_hex(b"/remote/proj");
-        assert_eq!(
-            map.get(&format!("box_{h}")).unwrap(),
-            &PathBuf::from("/remote/proj")
-        );
+        assert_eq!(map.get(&format!("box_{h}")).unwrap(), &PathBuf::from("/remote/proj"));
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -1155,8 +1157,7 @@ mod tests {
 
     #[test]
     fn user_bare_string_and_list() {
-        let bare: Value =
-            serde_json::from_str(r#"{"role":"user","content":"hello"}"#).unwrap();
+        let bare: Value = serde_json::from_str(r#"{"role":"user","content":"hello"}"#).unwrap();
         let m = context_message(&bare, &WireEnrich::default()).unwrap();
         assert_eq!(m.role, Role::User);
         assert_eq!(m.text().as_deref(), Some("hello"));
@@ -1183,7 +1184,12 @@ mod tests {
         let m = context_message(&v, &WireEnrich::default()).unwrap();
         assert_eq!(m.role, Role::Assistant);
         match &m.content[0] {
-            Block::Thinking { text, encrypted, signature, .. } => {
+            Block::Thinking {
+                text,
+                encrypted,
+                signature,
+                ..
+            } => {
                 assert_eq!(text, "reasoning");
                 assert_eq!(encrypted.as_deref(), Some("BLOB"));
                 assert_eq!(signature.as_deref(), Some("BLOB"));
@@ -1204,12 +1210,19 @@ mod tests {
     #[test]
     fn tool_result_bare_string_and_wire_enrichment() {
         // context.jsonl tool record (bare-string content), no wire → uses context text.
-        let line = r#"{"role":"tool","content":"<system>Command executed successfully.</system>","tool_call_id":"tool_1"}"#;
+        let line =
+            r#"{"role":"tool","content":"<system>Command executed successfully.</system>","tool_call_id":"tool_1"}"#;
         let v: Value = serde_json::from_str(line).unwrap();
         let m = context_message(&v, &WireEnrich::default()).unwrap();
         assert_eq!(m.role, Role::Tool);
         match &m.content[0] {
-            Block::ToolResult { tool_use_id, content, is_error, status, .. } => {
+            Block::ToolResult {
+                tool_use_id,
+                content,
+                is_error,
+                status,
+                ..
+            } => {
                 assert_eq!(tool_use_id, "tool_1");
                 assert!(content.contains("Command executed successfully"));
                 assert!(!is_error);
@@ -1230,7 +1243,13 @@ mod tests {
         );
         let m = context_message(&v, &enrich).unwrap();
         match &m.content[0] {
-            Block::ToolResult { content, is_error, status, details, .. } => {
+            Block::ToolResult {
+                content,
+                is_error,
+                status,
+                details,
+                ..
+            } => {
                 assert_eq!(content, "boom");
                 assert!(is_error);
                 assert_eq!(status.as_deref(), Some("error"));
@@ -1262,8 +1281,7 @@ mod tests {
             let v: Value = serde_json::from_str(line).unwrap();
             assert!(context_message(&v, &WireEnrich::default()).is_none());
         }
-        let sp: Value =
-            serde_json::from_str(r#"{"role":"_system_prompt","content":"You are Kimi."}"#).unwrap();
+        let sp: Value = serde_json::from_str(r#"{"role":"_system_prompt","content":"You are Kimi."}"#).unwrap();
         let m = context_message(&sp, &WireEnrich::default()).unwrap();
         assert_eq!(m.role, Role::System);
         assert_eq!(m.text().as_deref(), Some("You are Kimi."));
@@ -1290,7 +1308,10 @@ mod tests {
             updated_at: None,
             message_count: 0,
         };
-        let adapter = Kimi { sessions: None, root: None };
+        let adapter = Kimi {
+            sessions: None,
+            root: None,
+        };
         let parsed = adapter.parse(&r).unwrap();
 
         let mut sink = crate::stream::CollectSink::default();
@@ -1305,11 +1326,7 @@ mod tests {
             "kimi parse() and collect(stream()) must agree"
         );
         // And the enrichment is actually present on the streamed side (not just both-empty).
-        let asst = streamed
-            .messages
-            .iter()
-            .find(|m| m.role == Role::Assistant)
-            .unwrap();
+        let asst = streamed.messages.iter().find(|m| m.role == Role::Assistant).unwrap();
         assert_eq!(asst.usage.as_ref().and_then(|u| u.output_tokens), Some(42));
         assert_eq!(asst.id.as_deref(), Some("chatcmpl-abc"));
         let first_user = streamed.messages.iter().find(|m| m.role == Role::User).unwrap();
@@ -1336,7 +1353,12 @@ mod tests {
             updated_at: None,
             message_count: 0,
         };
-        let s = Kimi { sessions: None, root: None }.parse(&r).unwrap();
+        let s = Kimi {
+            sessions: None,
+            root: None,
+        }
+        .parse(&r)
+        .unwrap();
         assert!(s.messages.iter().any(|m| m.role == Role::System));
         assert!(s.messages.iter().any(|m| m.role == Role::User));
         // assistant with a tool_use, and a tool result enriched from wire (is_error=false).
@@ -1380,7 +1402,12 @@ mod tests {
             updated_at: None,
             message_count: 0,
         };
-        let s = Kimi { sessions: None, root: None }.parse(&r).unwrap();
+        let s = Kimi {
+            sessions: None,
+            root: None,
+        }
+        .parse(&r)
+        .unwrap();
         assert!(s.messages.iter().any(|m| m.role == Role::User));
         assert!(s.messages.iter().any(|m| m.role == Role::Assistant));
     }
@@ -1390,11 +1417,7 @@ mod tests {
         use std::sync::atomic::{AtomicU64, Ordering};
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let d = std::env::temp_dir().join(format!(
-            "cv-kimi-emit-{}-{}",
-            std::process::id(),
-            n
-        ));
+        let d = std::env::temp_dir().join(format!("cv-kimi-emit-{}-{}", std::process::id(), n));
         fs::create_dir_all(&d).unwrap();
         d
     }
@@ -1403,10 +1426,14 @@ mod tests {
     fn emit_round_trips_through_parse() {
         // Build a small session: system + user + assistant(think+text+tool_use) + tool result.
         let mut sys = Message::new(Role::System);
-        sys.content.push(Block::Text { text: "You are Kimi.".into() });
+        sys.content.push(Block::Text {
+            text: "You are Kimi.".into(),
+        });
 
         let mut user = Message::new(Role::User);
-        user.content.push(Block::Text { text: "list files".into() });
+        user.content.push(Block::Text {
+            text: "list files".into(),
+        });
 
         let mut asst = Message::new(Role::Assistant);
         asst.id = Some("chatcmpl-xyz".into());
@@ -1422,7 +1449,9 @@ mod tests {
             encrypted: Some("BLOB".into()),
             redacted: false,
         });
-        asst.content.push(Block::Text { text: "Running ls.".into() });
+        asst.content.push(Block::Text {
+            text: "Running ls.".into(),
+        });
         asst.content.push(Block::ToolUse {
             id: "tool_1".into(),
             name: "Shell".into(),
@@ -1470,15 +1499,17 @@ mod tests {
             updated_at: None,
             message_count: 0,
         };
-        let parsed = Kimi { sessions: None, root: None }.parse(&r).unwrap();
+        let parsed = Kimi {
+            sessions: None,
+            root: None,
+        }
+        .parse(&r)
+        .unwrap();
 
         // Message count + roles round-trip.
         assert_eq!(parsed.messages.len(), 4);
         let roles: Vec<Role> = parsed.messages.iter().map(|m| m.role).collect();
-        assert_eq!(
-            roles,
-            vec![Role::System, Role::User, Role::Assistant, Role::Tool]
-        );
+        assert_eq!(roles, vec![Role::System, Role::User, Role::Assistant, Role::Tool]);
 
         // First text (system prompt) round-trips.
         assert_eq!(parsed.messages[0].text().as_deref(), Some("You are Kimi."));
@@ -1486,8 +1517,14 @@ mod tests {
 
         // Assistant: thinking + text + tool_use survive; usage + message_id come back via wire.
         let a = &parsed.messages[2];
-        assert!(a.content.iter().any(|b| matches!(b, Block::Thinking { text, .. } if text == "let me think")));
-        assert!(a.content.iter().any(|b| matches!(b, Block::Text { text } if text == "Running ls.")));
+        assert!(a
+            .content
+            .iter()
+            .any(|b| matches!(b, Block::Thinking { text, .. } if text == "let me think")));
+        assert!(a
+            .content
+            .iter()
+            .any(|b| matches!(b, Block::Text { text } if text == "Running ls.")));
         match a.content.iter().find(|b| matches!(b, Block::ToolUse { .. })).unwrap() {
             Block::ToolUse { id, name, input } => {
                 assert_eq!(id, "tool_1");
@@ -1501,7 +1538,12 @@ mod tests {
 
         // Tool result round-trips (content from context, enriched by wire).
         match parsed.messages[3].content.first().unwrap() {
-            Block::ToolResult { tool_use_id, content, is_error, .. } => {
+            Block::ToolResult {
+                tool_use_id,
+                content,
+                is_error,
+                ..
+            } => {
                 assert_eq!(tool_use_id, "tool_1");
                 assert!(content.contains("README.md"));
                 assert!(!is_error);

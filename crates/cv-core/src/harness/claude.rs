@@ -70,7 +70,11 @@ impl Adapter for Claude {
             .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("jsonl"))
             // `cv prune` writes a `<id>.flat.jsonl` sidecar next to the session it creates; it has the
             // `.jsonl` extension but is NOT a session (it holds stashed tool payloads), so exclude it.
-            .filter(|p| !p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.ends_with(".flat.jsonl")))
+            .filter(|p| {
+                !p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.ends_with(".flat.jsonl"))
+            })
             .collect();
         Ok(crate::par_filter_map(paths, |path| {
             crate::discover_cache::cached_scan(&path, || match scan(&path) {
@@ -87,18 +91,12 @@ impl Adapter for Claude {
         crate::stream::collect(self, r)
     }
 
-    fn stream(
-        &self,
-        r: &SessionRef,
-        opts: &ParseOptions,
-        sink: &mut dyn MessageSink,
-    ) -> Result<Session> {
+    fn stream(&self, r: &SessionRef, opts: &ParseOptions, sink: &mut dyn MessageSink) -> Result<Session> {
         // Stream the transcript line-by-line — a single Claude session can be >1 GB, and
         // `read_to_string` would resident-spike the whole file (this OOM-killed cv on the
         // 1.35 GB polyana transcript). `BufReader::lines()` keeps peak at O(largest line); handing
         // each message to `sink` (instead of accumulating a `Vec`) keeps it at O(largest message).
-        let file = fs::File::open(&r.path)
-            .with_context(|| format!("opening {}", r.path.display()))?;
+        let file = fs::File::open(&r.path).with_context(|| format!("opening {}", r.path.display()))?;
         Ok(stream_reader(
             &r.id,
             BufReader::new(file),
@@ -269,7 +267,11 @@ fn ingest_value(
                 session.title = Some(t.to_string());
             }
             // In `complete` mode, also carry the record itself so it round-trips.
-            return if opts.complete { sink.message(carrier_record(v)) } else { Flow::Continue };
+            return if opts.complete {
+                sink.message(carrier_record(v))
+            } else {
+                Flow::Continue
+            };
         }
         // `summary`/`last-prompt` carry a title-ish/leaf pointer but no message body.
         // `summary` lines have a `summary` string we can fall back to for the title.
@@ -279,16 +281,32 @@ fn ingest_value(
                     session.title = Some(t.to_string());
                 }
             }
-            return if opts.complete { sink.message(carrier_record(v)) } else { Flow::Continue };
+            return if opts.complete {
+                sink.message(carrier_record(v))
+            } else {
+                Flow::Continue
+            };
         }
         // Pure bookkeeping / live-process records with no conversational payload.
         // `progress`, `started`, `result` are sub-agent hook/streaming telemetry;
         // `queue-operation` is the input queue; `mode`/`permission-mode`/`attachment`/
         // `last-prompt` are UI state. The lean passes drop them; `complete` carries them verbatim as
         // round-trippable carrier messages (unknown types still fall through and are ignored).
-        "mode" | "permission-mode" | "last-prompt" | "attachment" | "progress" | "started"
-        | "result" | "queue-operation" | "x-quota" | "file-history-snapshot" => {
-            return if opts.complete { sink.message(carrier_record(v)) } else { Flow::Continue };
+        "mode"
+        | "permission-mode"
+        | "last-prompt"
+        | "attachment"
+        | "progress"
+        | "started"
+        | "result"
+        | "queue-operation"
+        | "x-quota"
+        | "file-history-snapshot" => {
+            return if opts.complete {
+                sink.message(carrier_record(v))
+            } else {
+                Flow::Continue
+            };
         }
         _ => {}
     }
@@ -317,8 +335,7 @@ fn ingest_value(
         // carries the offset); ordinary lazy/bulk/full streams never set `opts.offsets`.
         if opts.offsets {
             if let Some(ctx) = span {
-                msg.extra
-                    .insert(crate::offsets::OFFSET_KEY.into(), ctx.base_off.into());
+                msg.extra.insert(crate::offsets::OFFSET_KEY.into(), ctx.base_off.into());
             }
         }
         if session.model.is_none() {
@@ -438,17 +455,9 @@ pub fn subagent_tree(parent_path: &std::path::Path) -> Vec<SubagentInfo> {
     // each annotated with the result the workflow `journal.jsonl` recorded for its agentId.
     let wf_root = base.join("workflows");
     if let Ok(rd) = fs::read_dir(&wf_root) {
-        let wf_dirs: Vec<PathBuf> = rd
-            .flatten()
-            .map(|e| e.path())
-            .filter(|p| p.is_dir())
-            .collect();
+        let wf_dirs: Vec<PathBuf> = rd.flatten().map(|e| e.path()).filter(|p| p.is_dir()).collect();
         let groups = crate::par_flat_map(wf_dirs, |wf_dir| {
-            let run_id = wf_dir
-                .file_name()
-                .and_then(|s| s.to_str())
-                .unwrap_or("")
-                .to_string();
+            let run_id = wf_dir.file_name().and_then(|s| s.to_str()).unwrap_or("").to_string();
             let journal = read_workflow_journal(&wf_dir.join("journal.jsonl"));
             agents_in_dir(&wf_dir, Some((&run_id, &journal)))
         });
@@ -466,10 +475,7 @@ type JournalResults = std::collections::HashMap<String, (Option<String>, Option<
 /// Scan one directory for `agent-*.jsonl` transcripts, pairing each with its `*.meta.json` sidecar
 /// and (for workflow dirs) the journaled result for its agentId. `wf` is `Some((run_id, journal))`
 /// for a workflow dir, `None` for the top-level `subagents/` dir.
-fn agents_in_dir(
-    dir: &std::path::Path,
-    wf: Option<(&str, &JournalResults)>,
-) -> Vec<SubagentInfo> {
+fn agents_in_dir(dir: &std::path::Path, wf: Option<(&str, &JournalResults)>) -> Vec<SubagentInfo> {
     let mut paths: Vec<PathBuf> = Vec::new();
     if let Ok(rd) = fs::read_dir(dir) {
         for e in rd.flatten() {
@@ -488,9 +494,7 @@ fn agents_in_dir(
         let session = scan(&p).ok()?;
         let meta = read_meta(&p.with_extension("meta.json"));
         let agent_id = session.id.strip_prefix("agent-").unwrap_or(&session.id).to_string();
-        let (status, summary) = wf
-            .and_then(|(_, j)| j.get(&agent_id).cloned())
-            .unwrap_or((None, None));
+        let (status, summary) = wf.and_then(|(_, j)| j.get(&agent_id).cloned()).unwrap_or((None, None));
         Some(SubagentInfo {
             session,
             agent_type: meta.0,
@@ -590,11 +594,7 @@ pub fn subagent_return(path: &std::path::Path) -> Option<String> {
 
 /// Cheap metadata-only scan for `discover`.
 fn scan(path: &std::path::Path) -> Result<SessionRef> {
-    let id = path
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("")
-        .to_string();
+    let id = path.file_stem().and_then(|s| s.to_str()).unwrap_or("").to_string();
     let file = fs::File::open(path)?;
     let reader = BufReader::new(file);
 
@@ -653,14 +653,8 @@ fn parse_message(ty: &str, v: &Value, opts: &ParseOptions, span: Option<&SpanCtx
     };
 
     let msg = v.get("message")?;
-    let id = v
-        .get("uuid")
-        .and_then(Value::as_str)
-        .map(str::to_string);
-    let parent_id = v
-        .get("parentUuid")
-        .and_then(Value::as_str)
-        .map(str::to_string);
+    let id = v.get("uuid").and_then(Value::as_str).map(str::to_string);
+    let parent_id = v.get("parentUuid").and_then(Value::as_str).map(str::to_string);
     let timestamp = v.get("timestamp").and_then(Value::as_str).and_then(parse_ts);
     let model = msg.get("model").and_then(Value::as_str).map(str::to_string);
     let usage = msg.get("usage").map(parse_usage);
@@ -693,16 +687,12 @@ fn parse_message(ty: &str, v: &Value, opts: &ParseOptions, span: Option<&SpanCtx
     }
 
     // A `user` line carrying only tool results is really a Tool turn.
-    let role = if role == Role::User
-        && !blocks.is_empty()
-        && blocks
-            .iter()
-            .all(|b| matches!(b, Block::ToolResult { .. }))
-    {
-        Role::Tool
-    } else {
-        role
-    };
+    let role =
+        if role == Role::User && !blocks.is_empty() && blocks.iter().all(|b| matches!(b, Block::ToolResult { .. })) {
+            Role::Tool
+        } else {
+            role
+        };
 
     let mut extra = Map::new();
     if opts.extra {
@@ -792,10 +782,7 @@ fn parse_system_message(v: &Value, opts: &ParseOptions, span: Option<&SpanCtx>) 
 /// identical id/parent/timestamp/`extra` handling.
 fn system_msg(v: &Value, text: Text, subtype: &str, opts: &ParseOptions) -> Option<Message> {
     let id = v.get("uuid").and_then(Value::as_str).map(str::to_string);
-    let parent_id = v
-        .get("parentUuid")
-        .and_then(Value::as_str)
-        .map(str::to_string);
+    let parent_id = v.get("parentUuid").and_then(Value::as_str).map(str::to_string);
     let timestamp = v.get("timestamp").and_then(Value::as_str).and_then(parse_ts);
 
     let mut extra = Map::new();
@@ -856,11 +843,17 @@ fn render_hook_summary(v: &Value) -> Option<String> {
     let errors = v.get("hookErrors").and_then(Value::as_array);
     let has_errors = errors.is_some_and(|e| !e.is_empty());
     let has_output = v.get("hasOutput").and_then(Value::as_bool).unwrap_or(false)
-        || v.get("hookAdditionalContext").and_then(Value::as_str).is_some_and(|s| !s.is_empty());
+        || v.get("hookAdditionalContext")
+            .and_then(Value::as_str)
+            .is_some_and(|s| !s.is_empty());
     if !has_errors && !has_output {
         return None;
     }
-    let label = if count == 1 { "hook".to_string() } else { format!("{count} hooks") };
+    let label = if count == 1 {
+        "hook".to_string()
+    } else {
+        format!("{count} hooks")
+    };
     let mut s = format!("⛓ stop {label}");
     if let Some(infos) = v.get("hookInfos").and_then(Value::as_array) {
         // Name each fired hook by the head of its command (the most legible identifier).
@@ -873,7 +866,11 @@ fn render_hook_summary(v: &Value) -> Option<String> {
             s.push_str(&format!(": {}", names.join(" · ")));
         }
     }
-    if let Some(ctx) = v.get("hookAdditionalContext").and_then(Value::as_str).filter(|c| !c.is_empty()) {
+    if let Some(ctx) = v
+        .get("hookAdditionalContext")
+        .and_then(Value::as_str)
+        .filter(|c| !c.is_empty())
+    {
         s.push_str(&format!("\n  ↳ {}", truncate(ctx.trim(), 200)));
     }
     if let Some(errs) = errors.filter(|e| !e.is_empty()) {
@@ -1014,10 +1011,7 @@ fn parse_block(item: &Value, span_field: Option<(&RawValue, &SpanCtx)>) -> Optio
                 "thinking",
                 span_field,
             ),
-            signature: item
-                .get("signature")
-                .and_then(Value::as_str)
-                .map(str::to_string),
+            signature: item.get("signature").and_then(Value::as_str).map(str::to_string),
             encrypted: None,
             redacted: false,
         }),
@@ -1026,19 +1020,12 @@ fn parse_block(item: &Value, span_field: Option<(&RawValue, &SpanCtx)>) -> Optio
         "redacted_thinking" => Some(Block::Thinking {
             text: String::new().into(),
             signature: None,
-            encrypted: item
-                .get("data")
-                .and_then(Value::as_str)
-                .map(str::to_string),
+            encrypted: item.get("data").and_then(Value::as_str).map(str::to_string),
             redacted: true,
         }),
         "tool_use" => Some(Block::ToolUse {
             id: item.get("id").and_then(Value::as_str).unwrap_or("").to_string(),
-            name: item
-                .get("name")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string(),
+            name: item.get("name").and_then(Value::as_str).unwrap_or("").to_string(),
             input: item.get("input").cloned().unwrap_or(Value::Null),
         }),
         "tool_result" => {
@@ -1048,9 +1035,7 @@ fn parse_block(item: &Value, span_field: Option<(&RawValue, &SpanCtx)>) -> Optio
             // back to exactly `coerced`); array/mixed content is transformed by `coerce_text`, so it
             // can't be a verbatim slice — keep it inline.
             let content = match span_field {
-                Some((raw, ctx))
-                    if coerced.len() > INLINE_MAX && matches!(cv, Some(Value::String(_))) =>
-                {
+                Some((raw, ctx)) if coerced.len() > INLINE_MAX && matches!(cv, Some(Value::String(_))) => {
                     span_of_string_field(raw, "content", ctx)
                         .inspect(|sp| debug_assert_span(sp, ctx, &coerced))
                         .map(Text::Span)
@@ -1082,20 +1067,14 @@ fn parse_block(item: &Value, span_field: Option<(&RawValue, &SpanCtx)>) -> Optio
             // the bytes.
             let data_ref = source.and_then(|s| match s.get("type").and_then(Value::as_str) {
                 Some("url") => s.get("url").and_then(Value::as_str).map(str::to_string),
-                Some("file") => s
-                    .get("file_id")
-                    .and_then(Value::as_str)
-                    .map(|id| format!("file:{id}")),
+                Some("file") => s.get("file_id").and_then(Value::as_str).map(|id| format!("file:{id}")),
                 Some("base64") | None => s
                     .get("data")
                     .and_then(Value::as_str)
                     .map(|_| "base64:inline".to_string()),
                 Some(other) => Some(other.to_string()),
             });
-            Some(Block::Image {
-                media_type,
-                data_ref,
-            })
+            Some(Block::Image { media_type, data_ref })
         }
         // Some user turns embed a `document` block (PDF/text attachments); surface it as a File.
         "document" => {
@@ -1104,16 +1083,10 @@ fn parse_block(item: &Value, span_field: Option<(&RawValue, &SpanCtx)>) -> Optio
                 .and_then(|s| s.get("media_type"))
                 .and_then(Value::as_str)
                 .map(str::to_string);
-            let path = item
-                .get("title")
-                .and_then(Value::as_str)
-                .map(str::to_string);
+            let path = item.get("title").and_then(Value::as_str).map(str::to_string);
             let data = source.and_then(|s| match s.get("type").and_then(Value::as_str) {
                 Some("url") => s.get("url").and_then(Value::as_str).map(str::to_string),
-                Some("file") => s
-                    .get("file_id")
-                    .and_then(Value::as_str)
-                    .map(|id| format!("file:{id}")),
+                Some("file") => s.get("file_id").and_then(Value::as_str).map(|id| format!("file:{id}")),
                 _ => None,
             });
             Some(Block::File {
@@ -1144,8 +1117,7 @@ fn spanned_or_inline(s: &str, field: &str, span_field: Option<(&RawValue, &SpanC
 /// The byte span of a string `field` inside a content item's raw JSON (`item_raw`), as an absolute
 /// file offset. `None` if the field is absent or isn't a JSON string.
 fn span_of_string_field(item_raw: &RawValue, field: &str, ctx: &SpanCtx) -> Option<Span> {
-    let map: std::collections::HashMap<&str, &RawValue> =
-        serde_json::from_str(item_raw.get()).ok()?;
+    let map: std::collections::HashMap<&str, &RawValue> = serde_json::from_str(item_raw.get()).ok()?;
     raw_string_span(map.get(field)?, ctx)
 }
 
@@ -1292,14 +1264,22 @@ mod tests {
         // Default (full, not complete): meta records dropped — only the 2 conversational turns.
         let mut sink = CollectSink::default();
         stream_str(sid, &text, None, &ParseOptions::full(), &mut sink);
-        let convo: Vec<_> = sink.messages.iter().filter(|m| m.extra.contains_key(CARRIER_KEY)).collect();
+        let convo: Vec<_> = sink
+            .messages
+            .iter()
+            .filter(|m| m.extra.contains_key(CARRIER_KEY))
+            .collect();
         assert_eq!(sink.messages.len(), 2, "full mode keeps only conversational turns");
         assert_eq!(convo.len(), 0, "no carriers in full mode");
 
         // Complete: every record present; the 3 meta records become carriers holding the original.
         let mut sink = CollectSink::default();
         let session = stream_str(sid, &text, None, &ParseOptions::complete(), &mut sink);
-        let carriers: Vec<_> = sink.messages.iter().filter(|m| m.extra.contains_key(CARRIER_KEY)).collect();
+        let carriers: Vec<_> = sink
+            .messages
+            .iter()
+            .filter(|m| m.extra.contains_key(CARRIER_KEY))
+            .collect();
         assert_eq!(sink.messages.len(), 5, "complete mode carries every record");
         assert_eq!(carriers.len(), 3, "mode + queue-operation + ai-title carried");
         // carriers stash the verbatim original record
@@ -1307,7 +1287,10 @@ mod tests {
             .iter()
             .filter_map(|m| m.extra.get(CARRIER_KEY)?.get("type")?.as_str())
             .collect();
-        assert!(types.contains(&"mode") && types.contains(&"queue-operation") && types.contains(&"ai-title"), "got {types:?}");
+        assert!(
+            types.contains(&"mode") && types.contains(&"queue-operation") && types.contains(&"ai-title"),
+            "got {types:?}"
+        );
         // ai-title still sets the session title (IR convenience) AND round-trips as a carrier
         assert_eq!(session.title.as_deref(), Some("My Session"));
         // carriers are empty-content System turns, so message_count (user+assistant) is unaffected
@@ -1324,8 +1307,11 @@ mod tests {
         fs::write(
             proj.join(format!("{sid}.jsonl")),
             serde_json::json!({"type":"user","sessionId":sid,"uuid":"u0","timestamp":"2026-06-16T00:00:00Z",
-                "message":{"role":"user","content":"hi"}}).to_string() + "\n",
-        ).unwrap();
+                "message":{"role":"user","content":"hi"}})
+            .to_string()
+                + "\n",
+        )
+        .unwrap();
         // ...and a prune sidecar sitting right next to it (must NOT be discovered as a session).
         fs::write(
             proj.join(format!("{sid}.flat.jsonl")),
@@ -1340,8 +1326,7 @@ mod tests {
 
     fn fixture(name: &str) -> String {
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/claude/");
-        std::fs::read_to_string(format!("{path}{name}"))
-            .unwrap_or_else(|e| panic!("reading fixture {name}: {e}"))
+        std::fs::read_to_string(format!("{path}{name}")).unwrap_or_else(|e| panic!("reading fixture {name}: {e}"))
     }
 
     #[test]
@@ -1380,18 +1365,18 @@ mod tests {
 
         // image + document.
         let media = &s.messages[3];
-        assert!(matches!(&media.content[0], Block::Image { media_type: Some(m), data_ref: Some(r) } if m == "image/png" && r == "base64:inline"));
-        assert!(matches!(&media.content[1], Block::File { mime: Some(m), path: Some(p), .. } if m == "application/pdf" && p == "spec.pdf"));
+        assert!(
+            matches!(&media.content[0], Block::Image { media_type: Some(m), data_ref: Some(r) } if m == "image/png" && r == "base64:inline")
+        );
+        assert!(
+            matches!(&media.content[1], Block::File { mime: Some(m), path: Some(p), .. } if m == "application/pdf" && p == "spec.pdf")
+        );
     }
 
     #[test]
     fn system_lines_variant() {
         let s = parse_str("s2", &fixture("system_lines.jsonl"), None);
-        let systems: Vec<_> = s
-            .messages
-            .iter()
-            .filter(|m| m.role == Role::System)
-            .collect();
+        let systems: Vec<_> = s.messages.iter().filter(|m| m.role == Role::System).collect();
         // compact_boundary, away_summary, local_command, api_error surface; turn_duration +
         // agents_killed (bodyless) are dropped.
         assert_eq!(systems.len(), 4);
@@ -1405,12 +1390,12 @@ mod tests {
             .any(|m| m.extra.get("subtype").unwrap() == "away_summary"));
         assert!(systems
             .iter()
-            .any(|m| m.extra.get("subtype").unwrap() == "api_error"
-                && m.extra.get("level").unwrap() == "error"));
+            .any(|m| m.extra.get("subtype").unwrap() == "api_error" && m.extra.get("level").unwrap() == "error"));
         // no bodyless subtypes leaked in.
-        assert!(!systems
-            .iter()
-            .any(|m| matches!(m.extra.get("subtype").and_then(Value::as_str), Some("turn_duration" | "agents_killed"))));
+        assert!(!systems.iter().any(|m| matches!(
+            m.extra.get("subtype").and_then(Value::as_str),
+            Some("turn_duration" | "agents_killed")
+        )));
     }
 
     #[test]
@@ -1429,20 +1414,34 @@ mod tests {
         let s = parse_str("hooks", &text, None);
         let systems: Vec<_> = s.messages.iter().filter(|m| m.role == Role::System).collect();
         // The hook-with-output and the refusal surface; the no-op hook does not.
-        assert_eq!(systems.len(), 2, "got {:?}", systems.iter().map(|m| m.text()).collect::<Vec<_>>());
+        assert_eq!(
+            systems.len(),
+            2,
+            "got {:?}",
+            systems.iter().map(|m| m.text()).collect::<Vec<_>>()
+        );
 
-        let hook = systems.iter().find(|m| m.extra.get("subtype").and_then(Value::as_str) == Some("stop_hook_summary")).unwrap();
+        let hook = systems
+            .iter()
+            .find(|m| m.extra.get("subtype").and_then(Value::as_str) == Some("stop_hook_summary"))
+            .unwrap();
         let body = hook.text().unwrap();
         assert!(body.starts_with("⛓ stop hook"), "hook body: {body:?}");
         assert!(body.contains("best of luck"), "hook command surfaced: {body:?}");
-        assert!(body.contains("keep working all night"), "hook context surfaced: {body:?}");
+        assert!(
+            body.contains("keep working all night"),
+            "hook context surfaced: {body:?}"
+        );
         // Hook metadata preserved in extra.
         assert_eq!(hook.extra.get("hookCount").unwrap(), 1);
         assert!(hook.extra.get("hookInfos").is_some());
         assert_eq!(hook.extra.get("stopReason").unwrap(), "hook");
 
         // Refusal-fallback metadata preserved.
-        let refusal = systems.iter().find(|m| m.extra.get("subtype").and_then(Value::as_str) == Some("model_refusal_fallback")).unwrap();
+        let refusal = systems
+            .iter()
+            .find(|m| m.extra.get("subtype").and_then(Value::as_str) == Some("model_refusal_fallback"))
+            .unwrap();
         assert_eq!(refusal.extra.get("originalModel").unwrap(), "claude-fable-5[1m]");
         assert_eq!(refusal.extra.get("fallbackModel").unwrap(), "claude-opus-4-8");
     }
@@ -1459,10 +1458,7 @@ mod tests {
         assert_eq!(first.extra.get("agentId").unwrap(), "a4a55af");
         assert_eq!(first.extra.get("slug").unwrap(), "magical-wondering-rabbit");
         // attribution metadata on the assistant turn.
-        assert_eq!(
-            s.messages[1].extra.get("attributionAgent").unwrap(),
-            "general-purpose"
-        );
+        assert_eq!(s.messages[1].extra.get("attributionAgent").unwrap(), "general-purpose");
     }
 
     #[test]
@@ -1488,9 +1484,17 @@ mod tests {
         let s = parse_str("slash", &text, None);
         let bodies: Vec<String> = s.messages.iter().filter_map(|m| m.text()).collect();
         assert!(bodies.iter().any(|b| b == "⌘ /usage --verbose"), "got {bodies:?}");
-        assert!(bodies.iter().any(|b| b.starts_with("⌘ stdout:") && b.contains("Settings dialog dismissed")), "got {bodies:?}");
+        assert!(
+            bodies
+                .iter()
+                .any(|b| b.starts_with("⌘ stdout:") && b.contains("Settings dialog dismissed")),
+            "got {bodies:?}"
+        );
         // The raw tag text must NOT survive into the rendered body.
-        assert!(!bodies.iter().any(|b| b.contains("<command-name>")), "raw tag leaked: {bodies:?}");
+        assert!(
+            !bodies.iter().any(|b| b.contains("<command-name>")),
+            "raw tag leaked: {bodies:?}"
+        );
     }
 
     #[test]
@@ -1502,13 +1506,24 @@ mod tests {
         let mut f = std::fs::File::create(&jpath).unwrap();
         // Object form (status + summary), a started-only agent (no result), and a string form.
         writeln!(f, r#"{{"type":"started","key":"k1","agentId":"aaa"}}"#).unwrap();
-        writeln!(f, r#"{{"type":"result","key":"k1","agentId":"aaa","result":{{"status":"done","summary":"closed the lane"}}}}"#).unwrap();
+        writeln!(
+            f,
+            r#"{{"type":"result","key":"k1","agentId":"aaa","result":{{"status":"done","summary":"closed the lane"}}}}"#
+        )
+        .unwrap();
         writeln!(f, r#"{{"type":"started","key":"k2","agentId":"bbb"}}"#).unwrap();
-        writeln!(f, r#"{{"type":"result","key":"k3","agentId":"ccc","result":"freeform return text"}}"#).unwrap();
+        writeln!(
+            f,
+            r#"{{"type":"result","key":"k3","agentId":"ccc","result":"freeform return text"}}"#
+        )
+        .unwrap();
         drop(f);
 
         let map = read_workflow_journal(&jpath);
-        assert_eq!(map.get("aaa"), Some(&(Some("done".to_string()), Some("closed the lane".to_string()))));
+        assert_eq!(
+            map.get("aaa"),
+            Some(&(Some("done".to_string()), Some("closed the lane".to_string())))
+        );
         // started-only agent has no journaled result.
         assert!(!map.contains_key("bbb"));
         // string result becomes the summary, with no status.
@@ -1525,24 +1540,48 @@ mod tests {
         let proj = root.join("projects").join("-enc");
         std::fs::create_dir_all(&proj).unwrap();
         let parent = proj.join("sess.jsonl");
-        std::fs::write(&parent, "{\"type\":\"user\",\"uuid\":\"u\",\"message\":{\"role\":\"user\",\"content\":\"go\"}}\n").unwrap();
+        std::fs::write(
+            &parent,
+            "{\"type\":\"user\",\"uuid\":\"u\",\"message\":{\"role\":\"user\",\"content\":\"go\"}}\n",
+        )
+        .unwrap();
 
         let subs = proj.join("sess").join("subagents");
         std::fs::create_dir_all(&subs).unwrap();
         // Tier 1: a direct Agent sub-agent + its meta sidecar.
         let a1 = subs.join("agent-a111.jsonl");
         std::fs::write(&a1, "{\"type\":\"user\",\"uuid\":\"x\",\"message\":{\"role\":\"user\",\"content\":\"task one\"}}\n{\"type\":\"assistant\",\"uuid\":\"y\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"done one\"}]}}\n").unwrap();
-        std::fs::write(subs.join("agent-a111.meta.json"), r#"{"agentType":"general-purpose","description":"do task one","toolUseId":"toolu_77"}"#).unwrap();
+        std::fs::write(
+            subs.join("agent-a111.meta.json"),
+            r#"{"agentType":"general-purpose","description":"do task one","toolUseId":"toolu_77"}"#,
+        )
+        .unwrap();
 
         // Tier 2: a workflow dir with two agents and a journal.
         let wf = subs.join("workflows").join("wf_abc-123");
         std::fs::create_dir_all(&wf).unwrap();
-        std::fs::write(wf.join("agent-a222.jsonl"), "{\"type\":\"user\",\"uuid\":\"p\",\"message\":{\"role\":\"user\",\"content\":\"wtask\"}}\n").unwrap();
-        std::fs::write(wf.join("agent-a222.meta.json"), r#"{"agentType":"workflow-subagent","description":"wf task"}"#).unwrap();
-        std::fs::write(wf.join("agent-a333.jsonl"), "{\"type\":\"user\",\"uuid\":\"q\",\"message\":{\"role\":\"user\",\"content\":\"wtask2\"}}\n").unwrap();
+        std::fs::write(
+            wf.join("agent-a222.jsonl"),
+            "{\"type\":\"user\",\"uuid\":\"p\",\"message\":{\"role\":\"user\",\"content\":\"wtask\"}}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            wf.join("agent-a222.meta.json"),
+            r#"{"agentType":"workflow-subagent","description":"wf task"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            wf.join("agent-a333.jsonl"),
+            "{\"type\":\"user\",\"uuid\":\"q\",\"message\":{\"role\":\"user\",\"content\":\"wtask2\"}}\n",
+        )
+        .unwrap();
         std::fs::write(wf.join("agent-a333.meta.json"), r#"{"agentType":"workflow-subagent"}"#).unwrap();
         let mut jf = std::fs::File::create(wf.join("journal.jsonl")).unwrap();
-        writeln!(jf, r#"{{"type":"result","agentId":"a222","result":{{"status":"GREEN","summary":"wf agent did it"}}}}"#).unwrap();
+        writeln!(
+            jf,
+            r#"{{"type":"result","agentId":"a222","result":{{"status":"GREEN","summary":"wf agent did it"}}}}"#
+        )
+        .unwrap();
         writeln!(jf, r#"{{"type":"result","agentId":"a333","result":"string return"}}"#).unwrap();
         drop(jf);
 
@@ -1555,7 +1594,7 @@ mod tests {
         assert_eq!(direct.tool_use_id.as_deref(), Some("toolu_77"));
         assert!(direct.workflow.is_none());
         assert_eq!(direct.result_status, None); // direct agents report via parent tool_result
-        // its return value = the last assistant text turn.
+                                                // its return value = the last assistant text turn.
         assert_eq!(subagent_return(&direct.session.path).as_deref(), Some("done one"));
 
         let w1 = tree.iter().find(|s| s.agent_id() == "a222").expect("wf agent 1");
@@ -1789,7 +1828,10 @@ mod tests {
         let streamed = parse_reader("s1", std::io::Cursor::new(text.as_bytes()), None);
         assert_eq!(whole.title, streamed.title);
         assert_eq!(whole.cwd, streamed.cwd);
-        assert_eq!(whole.git.as_ref().map(|g| g.branch.clone()), streamed.git.as_ref().map(|g| g.branch.clone()));
+        assert_eq!(
+            whole.git.as_ref().map(|g| g.branch.clone()),
+            streamed.git.as_ref().map(|g| g.branch.clone())
+        );
         assert_eq!(whole.model, streamed.model);
         assert_eq!(whole.created_at, streamed.created_at);
         assert_eq!(whole.updated_at, streamed.updated_at);

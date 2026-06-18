@@ -71,11 +71,7 @@ fn main() -> Result<()> {
 
     match cli.command {
         Command::Sync => cmd_sync(&archive),
-        Command::Watch {
-            interval,
-            harness,
-            cwd,
-        } => cmd_watch(&archive, interval, harness, cwd),
+        Command::Watch { interval, harness, cwd } => cmd_watch(&archive, interval, harness, cwd),
         Command::Serve { port, host, web } => serve::run(&host, port, web),
         Command::Ls => cmd_ls(&archive),
         Command::Path => {
@@ -123,19 +119,12 @@ fn cmd_sync(archive: &Archive) -> Result<()> {
     if failed > 0 {
         eprintln!("cvd: {failed} session(s) failed (logged above)");
     }
-    println!(
-        "sync complete: {archived} archived, {skipped} skipped (unchanged) of {total} discovered"
-    );
+    println!("sync complete: {archived} archived, {skipped} skipped (unchanged) of {total} discovered");
     println!("archive: {}", archive.home().display());
     Ok(())
 }
 
-fn cmd_watch(
-    archive: &Archive,
-    interval: u64,
-    harness: Option<String>,
-    cwd: Option<String>,
-) -> Result<()> {
+fn cmd_watch(archive: &Archive, interval: u64, harness: Option<String>, cwd: Option<String>) -> Result<()> {
     let filter = Filter {
         harness: match harness {
             Some(h) => Some(parse_harness(&h)?),
@@ -183,12 +172,7 @@ fn archive_event(archive: &Archive, r: &SessionRef, kind: EventKind, delta: usiz
                 EventKind::New => "new",
                 EventKind::Updated => "archived",
             };
-            eprintln!(
-                "[{verb}] {} {}  +{delta} msgs  {}",
-                r.harness,
-                short(&r.id),
-                ref_cwd(r)
-            );
+            eprintln!("[{verb}] {} {}  +{delta} msgs  {}", r.harness, short(&r.id), ref_cwd(r));
             // Mirror the event onto the coordination board's #fleet channel: a live, centralized
             // activity feed across every machine pointed at this archive.
             let _ = cv_core::board::post(
