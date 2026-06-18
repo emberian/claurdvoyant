@@ -96,15 +96,20 @@ impl Adapter for ClaudeExport {
 
 // ── Discovery ─────────────────────────────────────────────────────────────────
 
-/// Where to look for export archives: `$CV_EXPORTS` (`:`-separated dirs or files). **Opt-in** — when
-/// it's unset, export discovery is a no-op, so the default `cv ls`/`discover_all` never pays to scan
-/// (account exports are huge: enumerating thousands of conversations across multi-MB files takes
-/// seconds). Point it at your Downloads or a tighter dir to enable: `CV_EXPORTS=~/Downloads`.
+/// Where to look for export archives — the registered sources from the config file
+/// (`cv config --add-export <path>`; see [`crate::config`]), unioned with `$CV_EXPORTS` (a
+/// `:`-separated ad-hoc list). **Opt-in**: with nothing registered and the env unset, export discovery
+/// is a no-op, so the default `cv ls`/`discover_all` never pays to scan (account exports are huge —
+/// enumerating thousands of conversations across multi-MB files takes seconds).
 fn export_dirs() -> Vec<PathBuf> {
-    match std::env::var("CV_EXPORTS") {
-        Ok(spec) => spec.split(':').filter(|s| !s.is_empty()).map(PathBuf::from).filter(|p| p.exists()).collect(),
-        Err(_) => Vec::new(),
+    let mut dirs = crate::config::load().exports;
+    if let Ok(spec) = std::env::var("CV_EXPORTS") {
+        dirs.extend(spec.split(':').filter(|s| !s.is_empty()).map(PathBuf::from));
     }
+    dirs.retain(|p| p.exists());
+    dirs.sort();
+    dirs.dedup();
+    dirs
 }
 
 /// Every `conversations*.json` under the export dirs (depth ≤ 2; a dir entry is scanned, a file entry

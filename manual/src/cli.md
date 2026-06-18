@@ -26,6 +26,7 @@ cv <cmd> --help    # flags for any one subcommand
 | | [`tools`](#cv-tools) | cross-agent tool analytics over the whole sub-agent forest |
 | | [`compaction`](#cv-compaction) | every context-compaction seam + the summary it left |
 | **selecting** | [`query`](#cv-query) | the `-q` query-calculus reference (fields, operators, schema) |
+| **config** | [`config`](#cv-config) | view config; register account-export sources to discover |
 | **sharing** | [`share`](share.md) | one redacted, self-contained HTML artifact |
 | | [`pack`](pack.md) | compile past-session context for a new task |
 | | [`dataset`](#cv-dataset) | export the corpus as a fine-tuning dataset (JSONL) |
@@ -344,6 +345,21 @@ cv compaction 77230e3d --json     # boundaries + each one's pre-compaction span
 To *read* the span a compaction discarded, jump straight to it with [`cv show --pre-compaction`](#cv-show) — it sets the message window to the messages before the boundary for you.
 
 ---
+
+## Config
+
+### `cv config`
+
+View the user config (`$XDG_CONFIG_HOME/claurdvoyant/config.toml`, falling back to `~/.config/…`) and manage the **export-source index**. Account data exports (the ChatGPT / Claude.ai "Export data" archives) have no fixed home, so you register where they live and the [`chatgpt-export`](harnesses.md)/[`claude-export`](harnesses.md) harnesses discover them from there.
+
+```sh
+cv config                              # print the config path + registered export sources
+cv config --add-export ~/Downloads     # register a dir to scan (or a specific conversations.json)
+cv config --add-export ~/exports/chatgpt-2026/conversations.json
+cv config --rm-export ~/Downloads      # unregister
+```
+
+The file is plain TOML (`exports = ["…", "…"]`) — edit it by hand if you prefer. `$CV_EXPORTS` (a `:`-separated list) is honored as an ad-hoc union on top, for one-off runs without touching the config. With nothing registered, export discovery is a no-op, so it never slows the default `cv ls` (these archives are large).
 
 ## Selecting
 

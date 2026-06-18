@@ -15,7 +15,7 @@ pub(crate) use util::short_id;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use cmd::live::BoardCmd;
-use cmd::{browse, compose, convert, live, pack, provenance, query, search, share, view, workflow};
+use cmd::{browse, compose, config, convert, live, pack, provenance, query, search, share, view, workflow};
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -322,6 +322,18 @@ enum Cmd {
         #[arg(long)]
         dry_run: bool,
     },
+    /// View the user config (`~/.config/claurdvoyant/config.toml`) and manage the export-source index.
+    /// With no flag, prints the config path + registered export sources. Account data exports
+    /// (ChatGPT/Claude.ai `conversations.json`) have no fixed home, so register the dirs/files you want
+    /// the `chatgpt-export`/`claude-export` harnesses to discover.
+    Config {
+        /// Register an export source (a dir to scan, or a `conversations.json` file).
+        #[arg(long, value_name = "PATH")]
+        add_export: Option<PathBuf>,
+        /// Unregister a previously-added export source.
+        #[arg(long, value_name = "PATH")]
+        rm_export: Option<PathBuf>,
+    },
     /// The query-calculus reference: every field, operator, and example. `--json` emits the machine
     /// schema. The `-q` flag on ls/dataset/timeline/stats speaks this language.
     Query {
@@ -539,6 +551,7 @@ fn main() -> Result<()> {
         Cmd::Prune { id, harness, retrieve, min_size, keep_last, to, drop, copy_resources, dry_run } => {
             compose::cmd_prune(&id, harness, retrieve, min_size, keep_last, to, drop, copy_resources, dry_run)
         }
+        Cmd::Config { add_export, rm_export } => config::cmd_config(add_export, rm_export),
         Cmd::Query { json } => query::cmd_query(json),
         Cmd::Resume { id, harness, launch } => convert::cmd_resume(&id, harness, launch),
         Cmd::Tree { id, harness } => view::cmd_tree(&id, harness),

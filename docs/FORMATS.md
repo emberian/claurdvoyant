@@ -258,15 +258,17 @@ decouples them via a unified IR.
   (URI kept as a File block), and `creases` semantics aren't modeled; legacy `context` and 0.3.0
   `reasoning_details` ride in `extra`. We decode blobs with pure-Rust `ruzstd` (no C cross-compile cost).
 
-## Account data exports — `$CV_EXPORTS` (opt-in; e.g. `~/Downloads`)
+## Account data exports — registered in `config.toml` (opt-in)
 
 The archives you download via "Export data". One file (`conversations.json`, often split
 `conversations-000.json … -NNN.json`) holds **many** conversations, so one file → many `SessionRef`s.
-Distinct from the `claude`/`claude-app`/`chatgpt-app` harnesses. Discovery is **opt-in** via the
-`CV_EXPORTS` env var (`:`-separated dirs/files) — unset = no scan (these archives are large; enumerating
-thousands of conversations costs seconds). Conversations are **deduped by id** (overlapping exports
-repeat them). Both adapters parse-only (no emit). The two shapes are sniffed by content (a file's first
-conversation): `mapping` ⇒ ChatGPT, `chat_messages` ⇒ Claude.
+Distinct from the `claude`/`claude-app`/`chatgpt-app` harnesses. Account exports have no fixed home, so
+discovery is **opt-in via the config index**: register source dirs/files with `cv config --add-export
+<path>` (stored in `$XDG_CONFIG_HOME/claurdvoyant/config.toml` as `exports = [...]`; `$CV_EXPORTS`, a
+`:`-separated list, is honored as an ad-hoc union on top). With nothing registered, no scan happens —
+these archives are large and enumerating thousands of conversations costs seconds. Conversations are
+**deduped by id** (overlapping exports repeat them). Both adapters parse-only (no emit). The two shapes
+are sniffed by content (a file's first conversation): `mapping` ⇒ ChatGPT, `chat_messages` ⇒ Claude.
 
 - **`chatgpt-export`** — each conversation: `{id|conversation_id, title, create_time, update_time,
   default_model_slug, current_node, mapping}`. `mapping` is a **DAG**: `node_id → {id, parent,

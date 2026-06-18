@@ -8,6 +8,7 @@
 
 pub mod board;
 pub mod catalog;
+pub mod config;
 pub mod compaction;
 pub mod dataset;
 pub mod discover_cache;
