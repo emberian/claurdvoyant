@@ -58,6 +58,31 @@ fn chatgpt_tool_call_and_image() {
 }
 
 #[test]
+fn chatgpt_tool_call_links_to_result() {
+    // assistant(recipient=browser, code) → tool(author.name=browser, result), linked by name+order.
+    let conv = json!({ "id": "c4", "current_node": "r1", "mapping": {
+        "call": { "id": "call", "parent": null, "children": ["r1"],
+            "message": { "author": { "role": "assistant" }, "recipient": "browser",
+                "content": { "content_type": "code", "text": "search(\"x\")" } } },
+        "r1": { "id": "r1", "parent": "call", "children": [],
+            "message": { "author": { "role": "tool", "name": "browser" }, "recipient": "all",
+                "content": { "content_type": "tether_quote", "text": "the answer is 42" } } }
+    }});
+    let msgs = chatgpt_messages(&conv);
+    assert_eq!(msgs.len(), 2);
+    // the call
+    let Block::ToolUse { id, name, input } = &msgs[0].content[0] else { panic!("expected ToolUse") };
+    assert_eq!(id, "call");
+    assert_eq!(name, "browser");
+    assert!(input.to_string().contains("search")); // raw content kept as input
+    // the result, wired back to the call id by tool name
+    let Block::ToolResult { tool_use_id, content, tool_name, .. } = &msgs[1].content[0] else { panic!("expected ToolResult") };
+    assert_eq!(tool_use_id, "call", "result linked to the matching call");
+    assert_eq!(tool_name.as_deref(), Some("browser"));
+    assert!(content.to_string().contains("the answer is 42"));
+}
+
+#[test]
 fn claude_export_blocks() {
     let conv = json!({
         "uuid": "u1", "name": "Refactor chat", "created_at": "2026-01-01T00:00:00Z",
@@ -119,13 +144,17 @@ fn parse_ref_finds_conversation_in_file_and_sniffs_kind() {
 #[test]
 #[ignore]
 fn real_downloads_exports_parse() {
+    // discovery is opt-in; point it at Downloads for this machine-specific probe.
+    std::env::set_var("CV_EXPORTS", dirs::home_dir().unwrap().join("Downloads"));
     for kind in [Kind::ChatGpt, Kind::Claude] {
         let refs = discover_kind(kind);
         eprintln!("{:?}: {} conversation(s)", kind, refs.len());
         if let Some(r) = refs.iter().find(|r| r.message_count > 0) {
             let s = parse_ref(kind, r).unwrap();
-            eprintln!("  parsed {} -> {} msgs, model {:?}", &r.id[..8.min(r.id.len())], s.messages.len(), s.model);
+            let tools = s.messages.iter().flat_map(|m| &m.content).filter(|b| matches!(b, Block::ToolUse { .. } | Block::ToolResult { .. })).count();
+            eprintln!("  parsed {} -> {} msgs ({} tool blocks), model {:?}", &r.id[..8.min(r.id.len())], s.messages.len(), tools, s.model);
             assert!(!s.messages.is_empty());
         }
     }
+    std::env::remove_var("CV_EXPORTS");
 }

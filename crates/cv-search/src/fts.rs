@@ -1095,6 +1095,32 @@ mod tests {
         d
     }
 
+    /// Indexing tees events into the catalog, whose path comes from the process-global
+    /// `CLAURDVOYANT_HOME`. Tests that index MUST isolate it to a temp dir — otherwise they write to
+    /// (and read from) the shared real catalog, racing each other and the other crates' test binaries.
+    /// This RAII guard serializes those tests on one lock AND points the catalog at a private temp
+    /// home for the test's duration; both are released (and the home removed) on drop.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct IsolatedHome {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        home: std::path::PathBuf,
+    }
+    impl IsolatedHome {
+        fn new() -> Self {
+            let lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let home = tmpdir();
+            std::env::set_var("CLAURDVOYANT_HOME", &home);
+            IsolatedHome { _lock: lock, home }
+        }
+    }
+    impl Drop for IsolatedHome {
+        fn drop(&mut self) {
+            std::env::remove_var("CLAURDVOYANT_HOME");
+            std::fs::remove_dir_all(&self.home).ok();
+        }
+    }
+
     /// Write a minimal one-message Claude transcript so `live_snippet` has a real file to re-read,
     /// and return its path. `body` becomes the single user message's text.
     fn write_claude(dir: &Path, id: &str, body: &str) -> String {
@@ -1156,6 +1182,7 @@ mod tests {
 
     #[test]
     fn index_and_search_with_live_snippets() {
+        let _home = IsolatedHome::new();
         let dir = tmpdir();
         let sdir = tmpdir();
         let b1 = "We built a full text search engine with tantivy and BM25 scoring.";
@@ -1200,6 +1227,7 @@ mod tests {
 
     #[test]
     fn incremental_skips_unchanged_and_reaps_missing() {
+        let _home = IsolatedHome::new();
         let dir = tmpdir();
         let sdir = tmpdir();
         let p = write_claude(&sdir, "x", "alpha beta gamma");
@@ -1222,6 +1250,7 @@ mod tests {
     /// late chunk, and (b) dedup a term present in *every* chunk back to a single row per id.
     #[test]
     fn oversized_body_is_chunked_yet_dedups_to_one_hit() {
+        let _home = IsolatedHome::new();
         let dir = tmpdir();
         let sdir = tmpdir();
         // ~5.6 MB of a repeated common token (lands in every chunk) with a unique marker at the very
@@ -1316,6 +1345,7 @@ mod tests {
     /// snippet must silently fall back to the head of the body, not panic or come back empty.
     #[test]
     fn all_fielded_query_snippets_fall_back_to_head() {
+        let _home = IsolatedHome::new();
         assert!(query_terms("harness:claude AND cwd:proj").is_empty());
         assert_eq!(make_snippet("hello world", "harness:claude"), "hello world");
         assert_eq!(
@@ -1343,6 +1373,7 @@ mod tests {
     /// marker explaining why there's no live context.
     #[test]
     fn missing_source_falls_back_to_stored_preview_with_marker() {
+        let _home = IsolatedHome::new();
         let dir = tmpdir();
         let sdir = tmpdir();
         let body = "We built a full text\nsearch engine   with tantivy and BM25 scoring.";
@@ -1381,12 +1412,11 @@ mod tests {
     /// (isolated via `CLAURDVOYANT_HOME`).
     #[test]
     fn indexing_tees_events_into_the_catalog() {
+        let h = IsolatedHome::new();
         let dir = tmpdir();
-        let home = tmpdir();
-        std::env::set_var("CLAURDVOYANT_HOME", &home);
 
         // A claude transcript whose assistant turn edits a file and runs a command.
-        let p = home.join("tee-evt.jsonl");
+        let p = h.home.join("tee-evt.jsonl");
         let lines = [
             serde_json::json!({
                 "type": "user", "uuid": "u0", "sessionId": "tee-evt",
@@ -1429,9 +1459,8 @@ mod tests {
         assert_eq!(touched[0].session_id, "tee-evt");
         assert_eq!(touched[0].edits, 1);
 
-        std::env::remove_var("CLAURDVOYANT_HOME");
         std::fs::remove_dir_all(&dir).ok();
-        std::fs::remove_dir_all(&home).ok();
+        // `h` drops here: removes CLAURDVOYANT_HOME, deletes the temp home, releases the lock.
     }
 
     /// Write a sub-agent transcript in the on-disk layout `subagent_tree_of` expects:
@@ -1459,6 +1488,7 @@ mod tests {
     /// (`index_one_subagent`), not a parallel one.
     #[test]
     fn subagent_forest_is_searchable_and_provenance_tagged_only_when_folded() {
+        let _home = IsolatedHome::new();
         let dir = tmpdir();
         let sdir = tmpdir();
         // Parent transcript + a sub-agent whose body alone holds the unique marker.
@@ -1498,12 +1528,11 @@ mod tests {
     /// sub-agent edited surfaces in `cv touched`, attributed to the agent + its parent.
     #[test]
     fn subagent_events_ride_along_with_provenance() {
+        let h = IsolatedHome::new();
         let dir = tmpdir();
-        let home = tmpdir();
-        std::env::set_var("CLAURDVOYANT_HOME", &home);
 
         let pp = write_claude_msgs(
-            &home,
+            &h.home,
             "evt-parent",
             &[("user", "spawn an agent to touch a file")],
         );
@@ -1542,15 +1571,14 @@ mod tests {
         assert_eq!(edit.parent_id.as_deref(), Some("evt-parent"));
         assert_eq!(edit.agent_id.as_deref(), Some("ed1"));
 
-        std::env::remove_var("CLAURDVOYANT_HOME");
         std::fs::remove_dir_all(&dir).ok();
-        std::fs::remove_dir_all(&home).ok();
     }
 
     /// The preview rides only the session's *first* chunk doc, but a hit can score on a *later*
     /// chunk — the fallback must still find the preview via the by-id lookup. Also caps length.
     #[test]
     fn preview_fallback_found_even_when_hit_is_a_late_chunk() {
+        let _home = IsolatedHome::new();
         let dir = tmpdir();
         let sdir = tmpdir();
         // Marker only in the trailing chunk, so the sole matching doc has no preview field.

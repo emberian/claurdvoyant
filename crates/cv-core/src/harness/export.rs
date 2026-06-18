@@ -286,38 +286,62 @@ fn chatgpt_active_chain(conv: &Value) -> Vec<&Value> {
     chain
 }
 
-/// ChatGPT: walk the active branch of the `mapping` DAG into ordered turns.
+/// ChatGPT: walk the active branch of the `mapping` DAG into ordered turns. Stateful, because tool
+/// calls and their results are separate turns linked only by tool *name* + order (ChatGPT carries no
+/// explicit `tool_use_id`): we remember the last call per tool name and wire each result back to it.
 fn chatgpt_messages(conv: &Value) -> Vec<Message> {
-    chatgpt_active_chain(conv)
-        .into_iter()
-        .filter_map(|node| {
-            let msg = node.get("message")?;
-            let role = convo_role(Some(msg))?;
-            let text = chatgpt_content_text(msg.get("content"));
-            // recipient ≠ "all" on an assistant turn ⇒ a tool call to that tool.
-            let recipient = msg.get("recipient").and_then(Value::as_str).unwrap_or("all");
-            let mut content = Vec::new();
+    let mut out = Vec::new();
+    let mut last_call: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for node in chatgpt_active_chain(conv) {
+        let Some(msg) = node.get("message") else { continue };
+        let Some(role) = convo_role(Some(msg)) else { continue };
+        let node_id = node.get("id").and_then(Value::as_str).unwrap_or("").to_string();
+        let recipient = msg.get("recipient").and_then(Value::as_str).unwrap_or("all");
+        let text = chatgpt_content_text(msg.get("content"));
+
+        let mut content = Vec::new();
+        if role == Role::Assistant && recipient != "all" {
+            // A tool call. `name` = the tool (recipient); `input` = the raw content object (the call
+            // payload — code/query string — kept verbatim, lossless).
+            content.push(Block::ToolUse {
+                id: node_id.clone(),
+                name: recipient.to_string(),
+                input: msg.get("content").cloned().unwrap_or(Value::Null),
+            });
+            last_call.insert(recipient.to_string(), node_id.clone());
+        } else if role == Role::Tool {
+            // A tool result. Link it to the most recent call of the same tool (author.name).
+            let tool = msg.get("author").and_then(|a| a.get("name")).and_then(Value::as_str).unwrap_or("");
+            content.push(Block::ToolResult {
+                tool_use_id: last_call.get(tool).cloned().unwrap_or_default(),
+                content: text.clone().into(),
+                is_error: false,
+                tool_name: (!tool.is_empty()).then(|| tool.to_string()),
+                status: None,
+                details: None,
+            });
+            for ptr in chatgpt_image_pointers(msg.get("content")) {
+                content.push(Block::Image { media_type: None, data_ref: Some(ptr) });
+            }
+        } else {
             if !text.trim().is_empty() {
-                if role == Role::Assistant && recipient != "all" {
-                    content.push(Block::ToolUse { id: node.get("id").and_then(Value::as_str).unwrap_or("").to_string(), name: recipient.to_string(), input: serde_json::json!({ "text": text }) });
-                } else {
-                    content.push(Block::Text { text: text.into() });
-                }
+                content.push(Block::Text { text: text.into() });
             }
             for ptr in chatgpt_image_pointers(msg.get("content")) {
                 content.push(Block::Image { media_type: None, data_ref: Some(ptr) });
             }
-            if content.is_empty() {
-                return None;
-            }
-            let mut m = Message::new(role);
-            m.id = node.get("id").and_then(Value::as_str).map(str::to_string);
-            m.parent_id = node.get("parent").and_then(Value::as_str).map(str::to_string);
-            m.timestamp = msg.get("create_time").and_then(ts_from_value);
-            m.content = content;
-            Some(m)
-        })
-        .collect()
+        }
+        if content.is_empty() {
+            continue;
+        }
+        let mut m = Message::new(role);
+        m.id = (!node_id.is_empty()).then(|| node_id.clone());
+        m.parent_id = node.get("parent").and_then(Value::as_str).map(str::to_string);
+        m.timestamp = msg.get("create_time").and_then(ts_from_value);
+        m.content = content;
+        out.push(m);
+    }
+    out
 }
 
 /// Role of a ChatGPT mapping node's `message` (None if no message / unknown author).
