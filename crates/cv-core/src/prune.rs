@@ -330,7 +330,7 @@ pub fn prune_session(src_path: &Path, opts: &PruneOptions) -> Result<PruneResult
     // `--revive`: correct the stale recorded context size so the resume gate reads the honest
     // post-prune figure. Runs on the already-flattened lines, so the number reflects what's left.
     let (usage_rewritten, revive_tokens, revive_old_tokens) =
-        if opts.revive { revive_usage(&mut out_lines) } else { (0, None, None) };
+        if opts.revive { revive_usage(&mut out_lines, windowing) } else { (0, None, None) };
 
     let new_content = out_lines.join("\n") + "\n";
     let new_size = new_content.len() as u64;
@@ -384,20 +384,28 @@ pub fn prune_session(src_path: &Path, opts: &PruneOptions) -> Result<PruneResult
 /// boundary, which is what Claude actually re-sends on resume — and rewrite every usage record in that
 /// window that still over-reports, pinning it to the honest figure with the cache counters zeroed (a
 /// fresh resume has no live cache anyway). Returns `(records rewritten, honest tokens, stale max)`.
-fn revive_usage(out_lines: &mut [String]) -> (usize, Option<u64>, Option<u64>) {
+fn revive_usage(out_lines: &mut [String], windowed: bool) -> (usize, Option<u64>, Option<u64>) {
     let parsed: Vec<Option<Value>> = out_lines.iter().map(|l| serde_json::from_str::<Value>(l).ok()).collect();
 
     // Claude re-sends only what follows the last compaction boundary; before the first, the whole file.
-    let window = parsed
-        .iter()
-        .rposition(|p| {
-            p.as_ref().is_some_and(|v| {
-                v.get("type").and_then(Value::as_str) == Some("system")
-                    && v.get("subtype").and_then(Value::as_str) == Some("compact_boundary")
+    // BUT a `--window`/`--range` tail IS the whole resumable session — and it can still contain OLDER
+    // compaction boundaries whose turns kept their original near-wall usage numbers. Honoring "last
+    // boundary" there would leave those stale highs in place (Claude reads one ⇒ "0% remaining"). So
+    // when windowed, treat the entire tail as the loaded window and pin EVERY over-reporting record.
+    let window = if windowed {
+        0
+    } else {
+        parsed
+            .iter()
+            .rposition(|p| {
+                p.as_ref().is_some_and(|v| {
+                    v.get("type").and_then(Value::as_str) == Some("system")
+                        && v.get("subtype").and_then(Value::as_str) == Some("compact_boundary")
+                })
             })
-        })
-        .map(|i| i + 1)
-        .unwrap_or(0);
+            .map(|i| i + 1)
+            .unwrap_or(0)
+    };
 
     // Honest size of the loaded window: the tokens Claude will actually re-send (message.content).
     let honest: u64 = parsed[window..]
