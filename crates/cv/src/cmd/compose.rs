@@ -90,9 +90,16 @@ pub(crate) fn cmd_prune(
         res.est_context_tokens_saved,
     );
     if res.dropped_turns > 0 {
+        let sized = match res.window_real_tokens {
+            Some(real) => format!(
+                " · kept ~{}k REAL tokens (Claude's recorded counts; resume loads ≈ this + ~30k overhead)",
+                real / 1000
+            ),
+            None => " (sized by byte estimate — no usage records)".to_string(),
+        };
         eprintln!(
-            "  sliding window: dropped {} older turn(s) — the source keeps the full history",
-            res.dropped_turns
+            "  sliding window: dropped {} older turn(s){} — the source keeps the full history",
+            res.dropped_turns, sized
         );
     }
     if revive {

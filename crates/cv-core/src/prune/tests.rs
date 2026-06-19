@@ -30,6 +30,40 @@ fn tmpdir() -> PathBuf {
     d
 }
 
+fn assistant_usage(total: u64) -> String {
+    serde_json::json!({"type":"assistant",
+        "message":{"usage":{"input_tokens":total,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}})
+    .to_string()
+}
+
+#[test]
+fn window_cutoff_sizes_by_real_recorded_usage() {
+    // 5 assistant turns, cumulative usage 100k..500k (one compaction segment).
+    let lines: Vec<String> = (1..=5).map(|k| assistant_usage(k * 100_000)).collect();
+    let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+    // budget 250k → newest turns summing ≥250k are turns 2,3,4 (300k real); keep from turn 2.
+    assert_eq!(usage_window_cutoff(&refs, 250_000), Some((2, 300_000)));
+    // budget beyond the whole session → keep everything.
+    assert_eq!(usage_window_cutoff(&refs, 9_000_000), Some((0, 500_000)));
+    // no usage records → None (caller falls back to a byte estimate).
+    assert_eq!(usage_window_cutoff(&["{\"type\":\"user\"}"], 100), None);
+}
+
+#[test]
+fn window_cutoff_reads_stashed_usage_after_revive() {
+    // A revived session: usage was pinned to 50k, but the real count is in `_cv_orig_ctx`.
+    let mk = |orig: u64| {
+        serde_json::json!({"type":"assistant","_cv_orig_ctx":orig,
+            "message":{"usage":{"input_tokens":50_000,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}})
+        .to_string()
+    };
+    let lines = [mk(100_000), mk(200_000), mk(300_000)];
+    let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+    // Sizing must use the stashed 100/200/300k, NOT the pinned 50k — else windowing a chained
+    // (already-revived) session would size by garbage.
+    assert_eq!(usage_window_cutoff(&refs, 150_000), Some((1, 200_000)));
+}
+
 #[test]
 fn prunes_old_payloads_into_new_session_keeping_recent() {
     let dir = tmpdir();

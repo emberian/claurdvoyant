@@ -104,6 +104,10 @@ pub struct PruneResult {
     /// `--window`/`--range`: conversational turns dropped from the head/tail by the selection (0 if
     /// neither was used). The kept turns form the new session; the source keeps everything.
     pub dropped_turns: usize,
+    /// `--window`: the real content-token size of the kept tail, from Claude's recorded `usage`
+    /// (the figure the API will report on resume, ± system overhead). `None` for `--range`, or when
+    /// the session had no usage records and the byte-estimate fallback was used.
+    pub window_real_tokens: Option<u64>,
     /// `--revive`: the honest post-prune context-token figure written (None if revive off / nothing to do).
     pub revive_tokens: Option<u64>,
     /// `--revive`: the stale figure it replaced — the largest pre-revive usage total in the loaded window.
@@ -130,35 +134,128 @@ struct SidecarEntry {
     kind: String, // "text" | "image" | "mixed"
 }
 
-/// Resolve which conversational turns (`[start, end)` indices) a `--window`/`--range` prune keeps.
-/// `--range` is explicit; `--window` keeps the newest turns whose content sums to ≤ budget, snapped
-/// back to a user turn so the tail opens on a prompt. Neither set ⇒ the whole session.
-fn select_kept_turns(lines: &[&str], opts: &PruneOptions, total_turns: usize) -> (usize, usize) {
-    if let Some((s, e)) = opts.keep_range {
-        let end = e.unwrap_or(total_turns).min(total_turns);
-        return (s.min(end), end);
-    }
-    let Some(budget) = opts.window else {
-        return (0, total_turns);
-    };
-    // Per-turn content tokens + whether each turn is a user turn.
-    let mut per_turn: Vec<u64> = Vec::with_capacity(total_turns);
-    let mut is_user: Vec<bool> = Vec::with_capacity(total_turns);
+/// Size a `--window` tail by Claude's OWN recorded token counts — no estimator. Returns the turn to
+/// keep from and the real content-token size of that tail, or `None` if the session has no `usage`
+/// records (then the caller falls back to a byte estimate).
+///
+/// Why this is exact (not a guess): within the last compaction segment, a turn's recorded `usage`
+/// (input + cache) IS the real context size at that point, monotonically increasing. The standalone
+/// size of the tail kept from turn S is therefore `usage_end - usage[S-1]` — the shared prefix
+/// cancels — so we pick the largest tail whose real size ≤ budget. Capped at the last segment so the
+/// cancellation holds (older segments were compacted away and aren't a clean prefix). This is the
+/// same arithmetic that predicts a resume exactly: a 250k-byte-estimate tail that loads as 373k real
+/// is just `usage_end - usage[cutoff]`, which no byte ratio can know but the recorded numbers do.
+fn usage_window_cutoff(lines: &[&str], budget: u64) -> Option<(usize, u64)> {
+    // Per assistant turn that carries a usage record: (turn index, cumulative usage, starts a new
+    // compaction segment). Cumulative usage is monotonic WITHIN a segment but resets across a
+    // compaction boundary, so we can't subtract across the whole session — we work in per-turn deltas.
+    let mut ti = 0usize;
+    let mut recs: Vec<(usize, u64, bool)> = Vec::new();
+    let mut boundary_pending = false;
     for line in lines {
         let Ok(v) = serde_json::from_str::<Value>(line) else {
             continue;
         };
-        if let Some(t @ ("user" | "assistant")) = v.get("type").and_then(Value::as_str) {
-            let toks = v
-                .get("message")
-                .and_then(|m| m.get("content"))
-                .map(est_tokens)
-                .unwrap_or(0);
-            per_turn.push(toks);
-            is_user.push(t == "user");
+        match v.get("type").and_then(Value::as_str) {
+            Some("user") | Some("assistant") => {
+                // Prefer `_cv_orig_ctx` (the real count a prior revive stashed) over the live usage,
+                // which revive may have overwritten with a pinned figure.
+                let tot = v
+                    .get("_cv_orig_ctx")
+                    .and_then(Value::as_u64)
+                    .or_else(|| {
+                        v.get("message")
+                            .and_then(|m| m.get("usage"))
+                            .and_then(Value::as_object)
+                            .map(usage_total)
+                    })
+                    .unwrap_or(0);
+                if tot > 0 {
+                    recs.push((ti, tot, boundary_pending));
+                    boundary_pending = false;
+                }
+                ti += 1;
+            }
+            Some("system")
+                if v.get("subtype").and_then(Value::as_str) == Some("compact_boundary") =>
+            {
+                boundary_pending = true;
+            }
+            _ => {}
         }
     }
-    // Accumulate from the newest turn backward until the budget is met.
+    if recs.is_empty() {
+        return None;
+    }
+    // Real token cost contributed by each recorded turn: within a segment it's the usage delta from
+    // the previous record; at a segment start it's the whole post-compaction context (summary + that
+    // turn) — real content that a resumed tail must re-send.
+    let mut costs: Vec<(usize, u64)> = Vec::with_capacity(recs.len());
+    let mut prev = 0u64;
+    for (t, u, seg_start) in &recs {
+        let cost = if *seg_start { *u } else { u.saturating_sub(prev) };
+        costs.push((*t, cost));
+        prev = *u;
+    }
+    // Accumulate real cost from the newest turn backward until the budget is met — this spans
+    // compaction boundaries correctly (each segment's content counted once, via its deltas).
+    let mut acc = 0u64;
+    let mut start = recs.last().unwrap().0 + 1;
+    for (t, c) in costs.iter().rev() {
+        acc += c;
+        start = *t;
+        if acc >= budget {
+            break;
+        }
+    }
+    Some((start, acc))
+}
+
+/// Resolve which conversational turns (`[start, end)`) a `--window`/`--range` prune keeps, plus the
+/// real token size of the kept tail when known (from `usage`). `--range` is explicit; `--window`
+/// sizes by Claude's recorded usage (falling back to a byte estimate only when usage is absent),
+/// snapped back to a user turn so the tail opens on a prompt. Neither set ⇒ the whole session.
+fn select_kept_turns(
+    lines: &[&str],
+    opts: &PruneOptions,
+    total_turns: usize,
+) -> (usize, usize, Option<u64>) {
+    if let Some((s, e)) = opts.keep_range {
+        let end = e.unwrap_or(total_turns).min(total_turns);
+        return (s.min(end), end, None);
+    }
+    let Some(budget) = opts.window else {
+        return (0, total_turns, None);
+    };
+
+    let is_user: Vec<bool> = lines
+        .iter()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .filter_map(|v| match v.get("type").and_then(Value::as_str) {
+            Some(t @ ("user" | "assistant")) => Some(t == "user"),
+            _ => None,
+        })
+        .collect();
+    let snap = |mut start: usize| {
+        // Snap back to a user turn so the tail opens on a prompt, not a bare assistant reply.
+        while start > 0 && !is_user.get(start).copied().unwrap_or(true) {
+            start -= 1;
+        }
+        start
+    };
+
+    // PRINCIPLED path: size by Claude's own recorded token counts.
+    if let Some((start, real)) = usage_window_cutoff(lines, budget) {
+        return (snap(start), total_turns, Some(real));
+    }
+
+    // Fallback (no usage records): byte estimate of message.content, newest-backward to budget.
+    let per_turn: Vec<u64> = lines
+        .iter()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .filter(|v| matches!(v.get("type").and_then(Value::as_str), Some("user" | "assistant")))
+        .map(|v| v.get("message").and_then(|m| m.get("content")).map(est_tokens).unwrap_or(0))
+        .collect();
     let mut acc = 0u64;
     let mut start = per_turn.len();
     for i in (0..per_turn.len()).rev() {
@@ -168,11 +265,7 @@ fn select_kept_turns(lines: &[&str], opts: &PruneOptions, total_turns: usize) ->
             break;
         }
     }
-    // Snap back to a user turn so the kept tail opens on a prompt, not a bare assistant reply.
-    while start > 0 && !is_user.get(start).copied().unwrap_or(true) {
-        start -= 1;
-    }
-    (start, total_turns)
+    (snap(start), total_turns, None)
 }
 
 /// Prune `src_path` (a Claude `<id>.jsonl`) into a new session. Returns what happened.
@@ -224,7 +317,7 @@ pub fn prune_session(src_path: &Path, opts: &PruneOptions) -> Result<PruneResult
 
     // `--window`/`--range`: select which conversational turns survive; the rest are dropped and the
     // first survivor is re-rooted after the loop. Defaults to the whole session (no-op).
-    let (keep_start, keep_end) = select_kept_turns(&lines, opts, total_turns);
+    let (keep_start, keep_end, window_real) = select_kept_turns(&lines, opts, total_turns);
     let windowing = keep_start > 0 || keep_end < total_turns;
     let mut dropped_turns = 0usize;
 
@@ -330,7 +423,7 @@ pub fn prune_session(src_path: &Path, opts: &PruneOptions) -> Result<PruneResult
     // `--revive`: correct the stale recorded context size so the resume gate reads the honest
     // post-prune figure. Runs on the already-flattened lines, so the number reflects what's left.
     let (usage_rewritten, revive_tokens, revive_old_tokens) =
-        if opts.revive { revive_usage(&mut out_lines, windowing) } else { (0, None, None) };
+        if opts.revive { revive_usage(&mut out_lines, windowing, window_real) } else { (0, None, None) };
 
     let new_content = out_lines.join("\n") + "\n";
     let new_size = new_content.len() as u64;
@@ -367,6 +460,7 @@ pub fn prune_session(src_path: &Path, opts: &PruneOptions) -> Result<PruneResult
         est_context_tokens_saved: est_tokens_saved,
         usage_rewritten,
         dropped_turns,
+        window_real_tokens: window_real,
         revive_tokens,
         revive_old_tokens,
         dry_run: opts.dry_run,
@@ -384,7 +478,11 @@ pub fn prune_session(src_path: &Path, opts: &PruneOptions) -> Result<PruneResult
 /// boundary, which is what Claude actually re-sends on resume — and rewrite every usage record in that
 /// window that still over-reports, pinning it to the honest figure with the cache counters zeroed (a
 /// fresh resume has no live cache anyway). Returns `(records rewritten, honest tokens, stale max)`.
-fn revive_usage(out_lines: &mut [String], windowed: bool) -> (usize, Option<u64>, Option<u64>) {
+fn revive_usage(
+    out_lines: &mut [String],
+    windowed: bool,
+    real_override: Option<u64>,
+) -> (usize, Option<u64>, Option<u64>) {
     let parsed: Vec<Option<Value>> = out_lines.iter().map(|l| serde_json::from_str::<Value>(l).ok()).collect();
 
     // Claude re-sends only what follows the last compaction boundary; before the first, the whole file.
@@ -407,13 +505,16 @@ fn revive_usage(out_lines: &mut [String], windowed: bool) -> (usize, Option<u64>
             .unwrap_or(0)
     };
 
-    // Honest size of the loaded window: the tokens Claude will actually re-send (message.content).
-    let honest: u64 = parsed[window..]
-        .iter()
-        .flatten()
-        .filter_map(|v| v.get("message").and_then(|m| m.get("content")))
-        .map(est_tokens)
-        .sum();
+    // Honest size of the loaded window: the tokens Claude will actually re-send. Prefer the REAL
+    // figure derived from recorded `usage` (passed for `--window`); otherwise estimate from bytes.
+    let honest: u64 = real_override.unwrap_or_else(|| {
+        parsed[window..]
+            .iter()
+            .flatten()
+            .filter_map(|v| v.get("message").and_then(|m| m.get("content")))
+            .map(est_tokens)
+            .sum()
+    });
 
     let mut rewritten = 0usize;
     let mut stale_max = 0u64;
@@ -428,6 +529,12 @@ fn revive_usage(out_lines: &mut [String], windowed: bool) -> (usize, Option<u64>
         }
         stale_max = stale_max.max(total);
         let mut v = v.clone();
+        // Stash the ORIGINAL recorded context size before overwriting it, so a future `--window`
+        // can still size this (now-revived) session by Claude's real counts instead of falling back
+        // to a byte estimate. (Revive otherwise destroys the ground truth that windowing needs.)
+        if v.get("_cv_orig_ctx").is_none() {
+            v["_cv_orig_ctx"] = Value::from(total);
+        }
         if let Some(u) = v.pointer_mut("/message/usage").and_then(Value::as_object_mut) {
             u.insert("input_tokens".into(), Value::from(honest));
             u.insert("cache_read_input_tokens".into(), Value::from(0u64));

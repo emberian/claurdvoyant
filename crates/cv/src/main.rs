@@ -342,10 +342,11 @@ enum Cmd {
         /// figure — a no-op when the recorded size is already honest. (Source untouched.)
         #[arg(long)]
         no_revive: bool,
-        /// Sliding window: keep only the NEWEST turns whose content sums to ≤ this many tokens,
-        /// dropping older turns (lossy — but the source keeps the full history). Re-roots the kept
-        /// tail into a standalone resumable session. The cv-doctor estimate is accurate here (no
-        /// multi-compaction window to confuse it), so the budget lands true.
+        /// Sliding window: keep only the NEWEST turns totalling ≤ this many REAL tokens, dropping
+        /// older turns (lossy — the source keeps the full history). Sized from Claude's OWN recorded
+        /// `usage` counts (no byte/tokenizer estimation), so the budget lands true; the resumed
+        /// session loads ≈ this budget + ~30k system overhead. Re-roots the kept tail into a
+        /// standalone resumable session.
         #[arg(long, value_name = "TOKENS")]
         window: Option<u64>,
         /// Keep an explicit message subrange instead: `START-END` turn indices (END optional —
