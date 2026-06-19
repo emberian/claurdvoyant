@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Default capability for the claurdvoyant desktop window.",
+  "description": "Default capability for the clustervision desktop window.",
   "windows": [
     "main"
   ],

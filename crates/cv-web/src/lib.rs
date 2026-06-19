@@ -1,4 +1,4 @@
-//! cv-web — WASM bindings for claurdvoyant.
+//! cv-web — WASM bindings for clustervision.
 //!
 //! The browser app uploads a harness directory as a `.zip`; we unzip it entirely in memory (no
 //! filesystem), sniff + parse each entry via [`cv_core::ingest`], and hand back the sessions as a

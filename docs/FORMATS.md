@@ -4,7 +4,7 @@ This is the ground-truth catalog of how each harness stores sessions on disk, re
 real machine (2026-05-29). It drives the adapters in `cv-core`. Keep it accurate; it is the spec.
 
 The unifying insight: **all harnesses encode the working directory (cwd) into where/how they store a
-session.** That cwd-coupling is exactly why sessions are "dir-jailed" and hard to find. claurdvoyant
+session.** That cwd-coupling is exactly why sessions are "dir-jailed" and hard to find. clustervision
 decouples them via a unified IR.
 
 ---
@@ -264,7 +264,7 @@ The archives you download via "Export data". One file (`conversations.json`, oft
 `conversations-000.json … -NNN.json`) holds **many** conversations, so one file → many `SessionRef`s.
 Distinct from the `claude`/`claude-app`/`chatgpt-app` harnesses. Account exports have no fixed home, so
 discovery is **opt-in via the config index**: register source dirs/files with `cv config --add-export
-<path>` (stored in `$XDG_CONFIG_HOME/claurdvoyant/config.toml` as `exports = [...]`; `$CV_EXPORTS`, a
+<path>` (stored in `$XDG_CONFIG_HOME/clustervision/config.toml` as `exports = [...]`; `$CV_EXPORTS`, a
 `:`-separated list, is honored as an ad-hoc union on top). With nothing registered, no scan happens —
 these archives are large and enumerating thousands of conversations costs seconds. Conversations are
 **deduped by id** (overlapping exports repeat them). Both adapters parse-only (no emit). The two shapes
@@ -294,5 +294,5 @@ are sniffed by content (a file's first conversation): `mapping` ⇒ ChatGPT, `ch
 - `agent-transcript-parser` (Python) — Claude↔Codex conversion, "lossless on round-trip". Only those two.
 - `trail-cli`, Contextify, Automagik, `claude_codex_bridge` — Python, 2–3 harnesses, mostly read/HTML.
 
-Gap claurdvoyant fills: one **Rust** IR across **all of them** (10 harnesses) with **index + search + port +
+Gap clustervision fills: one **Rust** IR across **all of them** (10 harnesses) with **index + search + port +
 convert + live-follow + an MCP server + a coordination board**.

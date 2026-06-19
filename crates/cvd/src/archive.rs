@@ -44,21 +44,21 @@ pub enum StoreOutcome {
     Skipped,
 }
 
-/// Handle to the archive root (`$CLAURDVOYANT_HOME` or `~/.claurdvoyant`, overridable by `--home`).
+/// Handle to the archive root (`$CLUSTERVISION_HOME` or `~/.clustervision`, overridable by `--home`).
 pub struct Archive {
     home: PathBuf,
 }
 
 impl Archive {
-    /// Resolve the archive home: explicit `--home`, else `$CLAURDVOYANT_HOME`, else `~/.claurdvoyant`.
+    /// Resolve the archive home: explicit `--home`, else `$CLUSTERVISION_HOME`, else `~/.clustervision`.
     pub fn resolve(explicit: Option<PathBuf>) -> Result<Self> {
         let home = if let Some(p) = explicit {
             p
-        } else if let Some(env) = std::env::var_os("CLAURDVOYANT_HOME") {
+        } else if let Some(env) = std::env::var_os("CLUSTERVISION_HOME") {
             PathBuf::from(env)
         } else {
             let base = dirs::home_dir().context("could not determine home directory")?;
-            base.join(".claurdvoyant")
+            base.join(".clustervision")
         };
         Ok(Archive { home })
     }

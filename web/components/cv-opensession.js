@@ -159,8 +159,8 @@ class CvOpenSession extends HTMLElement {
           <div class="os-hero-glow" aria-hidden="true"></div>
           <div class="os-emoji">🧬</div>
           <h2>OpenSession</h2>
-          <p class="os-sub">An interchange format for agent sessions. <em>Draft 0.2 — a claurdvoyant proposal.</em></p>
-          <div class="os-pills" aria-label="harnesses claurdvoyant ingests">
+          <p class="os-sub">An interchange format for agent sessions. <em>Draft 0.2 — a clustervision proposal.</em></p>
+          <div class="os-pills" aria-label="harnesses clustervision ingests">
             ${HARNESSES.map(([k, label]) =>
               `<span class="os-pill" data-harness="${esc(k)}">${esc(label)}</span>`).join("")}
             <span class="os-pill os-pill-arrow" aria-hidden="true">→</span>
@@ -175,7 +175,7 @@ class CvOpenSession extends HTMLElement {
           opaque protobuf, Hermes uses SQLite, OpenClaw uses yet another JSONL dialect. We've parsed all of them — and the
           striking thing is <strong>how similar they actually are underneath</strong>.</p>
           <p>OpenSession writes those ideas down. It's the format the harnesses would have agreed on if they'd talked first.
-          claurdvoyant ingests any of them and can <strong>export OpenSession</strong> from any session or the loom.</p>
+          clustervision ingests any of them and can <strong>export OpenSession</strong> from any session or the loom.</p>
         </section>
 
         <section class="os-section">

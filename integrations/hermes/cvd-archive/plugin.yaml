@@ -1,7 +1,7 @@
 name: cvd-archive
 version: 0.1.0
-description: "claurdvoyant: archive every harness's agent sessions and post fleet-board status when a Hermes session ends."
-author: "claurdvoyant"
+description: "clustervision: archive every harness's agent sessions and post fleet-board status when a Hermes session ends."
+author: "clustervision"
 requires_env: []
 hooks:
   - on_session_end

@@ -21,7 +21,7 @@ fn active_claims_on_fresh_home_is_empty_not_an_error() {
             .unwrap()
             .as_nanos()
     ));
-    // The board dir does NOT exist — the state of every fresh $CLAURDVOYANT_HOME.
+    // The board dir does NOT exist — the state of every fresh $CLUSTERVISION_HOME.
     let board = dir.join("board");
     assert!(!board.exists());
 

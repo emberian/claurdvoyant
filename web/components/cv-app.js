@@ -92,7 +92,7 @@ class CvApp extends HTMLElement {
           : "Showing the bundled sample dataset — drop one or more .zip / .json files to load your own.");
       }
     } catch (e) {
-      console.warn("[claurdvoyant] failed to load sample:", e);
+      console.warn("[clustervision] failed to load sample:", e);
     }
   }
 
@@ -127,7 +127,7 @@ class CvApp extends HTMLElement {
       return true;
     } catch (e) {
       // cvd not running (normal for the static web deploy) — caller falls back to the sample.
-      console.info("[claurdvoyant] no local cvd, using fallback:", e?.message ?? e);
+      console.info("[clustervision] no local cvd, using fallback:", e?.message ?? e);
       return false;
     }
   }
@@ -194,7 +194,7 @@ class CvApp extends HTMLElement {
         s._paged = null; // endpoint gone or nothing left — stop offering more
       }
     } catch (e) {
-      console.warn("[claurdvoyant] load-more failed:", e);
+      console.warn("[clustervision] load-more failed:", e);
       s._paged = null;
     }
     this._transcript.notifyAppended();
@@ -224,7 +224,7 @@ class CvApp extends HTMLElement {
       try {
         full = await this._hydrate(session);
       } catch (e) {
-        console.error("[claurdvoyant] hydrate failed:", e);
+        console.error("[clustervision] hydrate failed:", e);
         this._setStatus(`Couldn't load that transcript from cvd (${e?.message ?? e}).`, "error");
         return;
       }
@@ -252,7 +252,7 @@ class CvApp extends HTMLElement {
         }
         this._setStatus(`Loaded ${sessions.length} session${sessions.length === 1 ? "" : "s"} from File → Open.`, "ok");
       } catch (err) {
-        console.error("[claurdvoyant] cv://open-sessions failed:", err);
+        console.error("[clustervision] cv://open-sessions failed:", err);
         this._setStatus("Could not load the opened sessions.", "error");
       }
     });
@@ -264,15 +264,15 @@ class CvApp extends HTMLElement {
         <div class="brand">
           <span class="logo" aria-hidden="true">🔮</span>
           <div class="brand-text">
-            <h1>claurdvoyant</h1>
+            <h1>clustervision</h1>
             <p class="tagline">Browse, splice &amp; loom agent sessions — entirely in your browser.</p>
           </div>
         </div>
         <div class="header-actions">
           <button type="button" class="icon-btn help-btn" title="Keyboard shortcuts (?)" aria-label="Keyboard shortcuts">?</button>
           <button type="button" class="icon-btn theme-toggle" title="Toggle theme — dark / light / auto (t)" aria-label="Toggle theme">◐</button>
-          <a class="repo-link" href="https://emberian.github.io/claurdvoyant/manual/" target="_blank" rel="noopener" title="User manual">manual</a>
-          <a class="repo-link" href="https://github.com/emberian/claurdvoyant" target="_blank" rel="noopener" title="Project repository">source</a>
+          <a class="repo-link" href="https://emberian.github.io/clustervision/manual/" target="_blank" rel="noopener" title="User manual">manual</a>
+          <a class="repo-link" href="https://github.com/emberian/clustervision" target="_blank" rel="noopener" title="Project repository">source</a>
         </div>
       </header>
 
@@ -516,7 +516,7 @@ class CvApp extends HTMLElement {
             <button type="button" class="mini-btn help-close" aria-label="Close">esc ✕</button></div>
           <table class="help-table">${rows.map(([k, d]) =>
             `<tr><td class="help-key">${k.split(/\s+/).map((p) => /^[·–]$/.test(p) ? esc(p) : `<kbd>${esc(p)}</kbd>`).join(" ")}</td><td>${esc(d)}</td></tr>`).join("")}</table>
-          <p class="help-foot muted">claurdvoyant runs entirely in your browser — nothing is uploaded.</p>
+          <p class="help-foot muted">clustervision runs entirely in your browser — nothing is uploaded.</p>
         </div>`;
       overlay.addEventListener("click", (e) => { if (e.target === overlay) this._toggleHelp(false); });
       overlay.querySelector(".help-close").addEventListener("click", () => this._toggleHelp(false));

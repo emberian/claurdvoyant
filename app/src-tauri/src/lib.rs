@@ -1,7 +1,7 @@
-//! claurdvoyant desktop app — the Tauri v2 runtime.
+//! clustervision desktop app — the Tauri v2 runtime.
 //!
 //! This crate is a thin native shell around the *existing* static web UI
-//! (`/Users/ember/pug/claurdvoyant/web/`, wired via `frontendDist` in `tauri.conf.json`).
+//! (`/Users/ember/pug/clustervision/web/`, wired via `frontendDist` in `tauri.conf.json`).
 //! It adds the things the browser-only app can't do:
 //!
 //!   1. **Launches `cvd serve --port 7777` on startup** so the bundled fleet dashboard
@@ -48,7 +48,7 @@ const CVD_PORT: u16 = 7777;
 const OPEN_SESSIONS_EVENT: &str = "cv://open-sessions";
 
 /// The public web demo, opened from Help → Open the web demo.
-const WEB_DEMO_URL: &str = "https://emberian.github.io/claurdvoyant/";
+const WEB_DEMO_URL: &str = "https://emberian.github.io/clustervision/";
 
 /// Handle to the spawned `cvd serve` child, kept in Tauri managed state so we can kill it on exit
 /// (and toggle it from the menu).
@@ -442,7 +442,7 @@ fn provider_info() -> ProviderInfo {
 fn build_menu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
     // --- File
     let open_zip = MenuItem::with_id(app, "file.open_zip", "Open zip…", true, Some("CmdOrCtrl+O"))?;
-    let quit = PredefinedMenuItem::quit(app, Some("Quit claurdvoyant"))?;
+    let quit = PredefinedMenuItem::quit(app, Some("Quit clustervision"))?;
     let file = Submenu::with_items(app, "File", true, &[&open_zip, &quit])?;
 
     // --- Edit: without these, macOS gives the webview no Cmd+C/Cmd+V/Cmd+A — a real problem for a
@@ -489,13 +489,13 @@ fn build_menu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
 
     // --- Help
     let about_meta = AboutMetadataBuilder::new()
-        .name(Some("claurdvoyant"))
+        .name(Some("clustervision"))
         .version(Some(env!("CARGO_PKG_VERSION")))
         .comments(Some(
             "Cross-harness AI session viewer with native distill, redact, and generative loom.",
         ))
         .build();
-    let about = PredefinedMenuItem::about(app, Some("About claurdvoyant"), Some(about_meta))?;
+    let about = PredefinedMenuItem::about(app, Some("About clustervision"), Some(about_meta))?;
     let web_demo = MenuItem::with_id(app, "help.web_demo", "Open the web demo", true, None::<&str>)?;
     let help = Submenu::with_items(app, "Help", true, &[&about, &web_demo])?;
 
@@ -568,7 +568,7 @@ fn open_zip_via_dialog<R: Runtime>(app: &AppHandle<R>) {
         match result {
             Ok(sessions_json) => {
                 if let Err(e) = app.emit(OPEN_SESSIONS_EVENT, sessions_json) {
-                    eprintln!("claurdvoyant: failed to emit {OPEN_SESSIONS_EVENT}: {e}");
+                    eprintln!("clustervision: failed to emit {OPEN_SESSIONS_EVENT}: {e}");
                 }
             }
             Err(e) => {
@@ -591,8 +591,8 @@ fn open_zip_via_dialog<R: Runtime>(app: &AppHandle<R>) {
 /// Locate the `cvd` binary: the repo's build outputs relative to this crate's manifest dir first
 /// (so a dev `cargo build -p cvd` works without installing anything), then a bare `cvd` on PATH.
 fn cvd_binary() -> std::path::PathBuf {
-    // CARGO_MANIFEST_DIR is `.../claurdvoyant/app/src-tauri`; the workspace target dir is
-    // `.../claurdvoyant/target`.
+    // CARGO_MANIFEST_DIR is `.../clustervision/app/src-tauri`; the workspace target dir is
+    // `.../clustervision/target`.
     let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     if let Some(root) = manifest.parent().and_then(|p| p.parent()) {
         for profile in ["release", "debug"] {
@@ -618,7 +618,7 @@ fn spawn_cvd_serve() -> Option<Child> {
     {
         Ok(child) => {
             eprintln!(
-                "claurdvoyant: launched `{} serve --port {CVD_PORT}` (pid {})",
+                "clustervision: launched `{} serve --port {CVD_PORT}` (pid {})",
                 bin.display(),
                 child.id()
             );
@@ -626,7 +626,7 @@ fn spawn_cvd_serve() -> Option<Child> {
         }
         Err(e) => {
             eprintln!(
-                "claurdvoyant: could not launch cvd serve ({}): {e}. The fleet dashboard at \
+                "clustervision: could not launch cvd serve ({}): {e}. The fleet dashboard at \
                  http://localhost:{CVD_PORT} will be unavailable (non-fatal). Build it with \
                  `cargo build -p cvd --release` or put `cvd` on PATH.",
                 bin.display()
@@ -643,7 +643,7 @@ fn toggle_cvd_serve<R: Runtime>(app: &AppHandle<R>) {
     if let Some(mut child) = guard.take() {
         let _ = child.kill();
         let _ = child.wait();
-        eprintln!("claurdvoyant: stopped cvd serve via menu toggle.");
+        eprintln!("clustervision: stopped cvd serve via menu toggle.");
     } else {
         *guard = spawn_cvd_serve();
     }
@@ -685,7 +685,7 @@ pub fn run() {
             Ok(())
         })
         .build(tauri::generate_context!())
-        .expect("error while building claurdvoyant")
+        .expect("error while building clustervision")
         .run(|app_handle, event| {
             // On exit, reap the cvd child so we don't leave an orphaned server on :7777.
             if let RunEvent::Exit = event {

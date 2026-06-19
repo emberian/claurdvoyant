@@ -43,12 +43,12 @@ pub(crate) fn cmd_search(query: &str, harness: Option<String>, limit: usize, sem
     cmd_search_live(query, want, limit)
 }
 
-/// Where the retired sqlite FTS index used to live: `$CLAURDVOYANT_HOME/index.sqlite` or
-/// `~/.claurdvoyant/index.sqlite`. Only used to nudge cleanup of a stale file.
+/// Where the retired sqlite FTS index used to live: `$CLUSTERVISION_HOME/index.sqlite` or
+/// `~/.clustervision/index.sqlite`. Only used to nudge cleanup of a stale file.
 fn legacy_sqlite_index_path() -> Option<PathBuf> {
-    std::env::var_os("CLAURDVOYANT_HOME")
+    std::env::var_os("CLUSTERVISION_HOME")
         .map(PathBuf::from)
-        .or_else(|| dirs_home().map(|h| h.join(".claurdvoyant")))
+        .or_else(|| dirs_home().map(|h| h.join(".clustervision")))
         .map(|d| d.join("index.sqlite"))
 }
 

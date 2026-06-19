@@ -3,7 +3,7 @@
 Every agent harness stores its sessions a little differently — Claude Code threads JSONL
 by `parentUuid`, Codex writes dated `rollout-*.jsonl` files, OpenCode shards messages and
 parts across directories, Cline buries the working directory inside the first user message.
-claurdvoyant's trick is that it never converts harness-A-format *directly* into
+clustervision's trick is that it never converts harness-A-format *directly* into
 harness-B-format. Instead, **every harness parses _into_ one unified IR**, and conversion
 is just:
 
@@ -117,7 +117,7 @@ This copy is strictly best-effort: it **never overwrites** an existing file at t
 The IR is deliberately a *superset* — fields a given harness lacks are simply `None`/empty,
 and harness-specific extras ride along in `Message::extra`. So a clean round-trip is the
 common case. But some target formats genuinely cannot represent some IR content, and
-claurdvoyant tells you when that happens instead of pretending otherwise.
+clustervision tells you when that happens instead of pretending otherwise.
 
 ### Verified emits
 

@@ -1,9 +1,9 @@
 # Harnesses & where they store sessions
 
-claurdvoyant currently understands **20 harnesses** 🔮 (incl. the ChatGPT & Claude.ai account data
+clustervision currently understands **20 harnesses** 🔮 (incl. the ChatGPT & Claude.ai account data
 exports — `chatgpt-export`/`claude-export`, register via `cv config --add-export`). Every one of them couples a session to a
 working directory — they encode the `cwd` into the path, the filename, a hash, or a DB column — which
-is exactly why your sessions feel "dir-jailed" and impossible to find later. claurdvoyant reads them
+is exactly why your sessions feel "dir-jailed" and impossible to find later. clustervision reads them
 all into one unified IR so that coupling stops mattering.
 
 This chapter is the field guide: for each harness, *where* it keeps sessions on disk, whether we can
@@ -11,7 +11,7 @@ This chapter is the field guide: for each harness, *where* it keeps sessions on 
 [conversion](conversion.md) target).
 
 The ground-truth catalog these adapters are built from lives in
-[`docs/FORMATS.md`](https://github.com/emberian/claurdvoyant/blob/main/docs/FORMATS.md), reverse-engineered
+[`docs/FORMATS.md`](https://github.com/emberian/clustervision/blob/main/docs/FORMATS.md), reverse-engineered
 from a real machine. The table below is the centerpiece; per-harness notes follow.
 
 ## The master table
@@ -54,7 +54,7 @@ write back to), the two desktop apps below, and the two account-data **exports**
 
 ## Sub-agents
 
-Several harnesses spawn child agents, and claurdvoyant surfaces those as nested sessions you can browse
+Several harnesses spawn child agents, and clustervision surfaces those as nested sessions you can browse
 as a tree — see [sub-agent trees in the app](app.md).
 
 - **Claude Code** writes Task sub-agents to a sibling `<sid>/subagents/agent-<id>.jsonl` (each with a

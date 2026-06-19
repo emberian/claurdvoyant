@@ -1,6 +1,8 @@
 <div align="center">
 
-# 🔮 claurdvoyant
+# 🔮 clustervision
+
+### *Vibecoding is a clusterfuck. When it gets hazy, you need clustervision.*
 
 ### Your AI coding sessions are gold. Stop letting them rot in scattered folders.
 
@@ -12,7 +14,7 @@
 
 <br>
 
-<img src="docs/screenshot-timeline.png" alt="claurdvoyant timeline — a GitHub-style activity heatmap of every agent session across every harness, with a constellation feed below" width="840">
+<img src="docs/screenshot-timeline.png" alt="clustervision timeline — a GitHub-style activity heatmap of every agent session across every harness, with a constellation feed below" width="840">
 
 <sub>the desktop app reading 2,245 real local sessions across 8 harnesses — heatmap, harness legend, and a live feed</sub>
 
@@ -28,7 +30,7 @@ You spent three hours teaching an agent your codebase. That context — the dead
 - ⛓️ **It's trapped.** Most harnesses only resume a session from the *exact directory* it ran in. Move the project, lose the thread.
 - 🏝️ **It's stranded.** Started in Claude Code but want to continue in Codex? Tough. Every tool speaks its own dialect and none of them talk.
 
-Restarting from scratch is the most expensive thing you do all day. **claurdvoyant makes sure you never have to.**
+Restarting from scratch is the most expensive thing you do all day. **clustervision makes sure you never have to.**
 
 ## What you can actually do with it
 
@@ -80,7 +82,7 @@ cv scry
 - **🔮 Recall** — semantic "have I solved this before?" — as a `cv recall` command *and* an MCP tool that hands a running agent the relevant past span.
 - **🧬 Provenance** — search answers what was *said*; the **event catalog** answers what was *done*. Every tool call across every session is classified and queryable: `cv touched <file>` lists every session that ever edited a file, and **`cv blame <file>`** ties a file's git history back to the agent conversation that wrote it — "why does this code exist?", answered by the actual reasoning that produced it (with a `cv show --range` jump to the moment of the edit).
 - **🌳 Anatomy of a run** — a deep agent session isn't a flat transcript, it's a *forest*. **`cv workflow <id>`** renders a `Workflow`-tool run as its real shape — the phase tree, the agents under each phase, their journaled outcomes/tokens/tool-calls, and the driving script. **`cv tools <id>`** is cross-agent tool analytics over the whole orchestrator+sub-agent forest (per-agent histograms, *which agent used what*, a wall-clock timeline). **`cv compaction <id>`** finds every context-compaction seam — trigger, pre-compaction size, and the summary that seeded the next window — and `cv show --pre-compaction` reads back the span the continued agent *lost*. (`cv dataset --subagents` pulls the whole forest into a training set.)
-- **✂️ Prune** — `cv prune <id>` is *custom compaction*: instead of abandoning a giant session to the summarizer (which rewrites your history into a lossy paragraph), it snips the bulky **old** tool payloads — large file reads, command logs, screenshots — into a sidecar and leaves a tiny `[PRUNED id=…]` marker, producing a **new, resumable** session (`claude --resume <new-id>`). Your prompts and the exact flow stay verbatim; the most recent turns stay sharp; originals are one `cv prune … --retrieve` away. (Algorithm adapted from the validated [flatten-mcp](https://github.com/shayaShav/flatten-mcp).)
+- **✂️ Prune** — `cv prune <id>` is *custom compaction*: instead of abandoning a giant session to the summarizer (which rewrites your history into a lossy paragraph), it snips the bulky **old** tool payloads — large file reads, command logs, screenshots — into a sidecar and leaves a tiny `[PRUNED id=…]` marker, producing a **new, resumable** session (`claude --resume <new-id>`). Your prompts and the exact flow stay verbatim; the most recent turns stay sharp; originals are one `cv prune … --retrieve` away. Add `--thinking` to also lift the oldest reasoning, and `--revive` to **resurrect a session already stuck at the context wall** — Claude Code's resume gate trusts a stale `usage` number recorded in the file, so a maxed session refuses to reopen even once its real content fits; `--revive` rewrites that number to the honest post-prune size and the gate lets you back in. (Algorithm adapted from the validated [flatten-mcp](https://github.com/shayaShav/flatten-mcp).)
 - **🔒 Redact** — `cv redact <id>` scrubs secrets/PII so a transcript is safe to share.
 - **🎁 Share** — `cv share <id>` → one self-contained, redacted-by-default HTML artifact: dark crystal-ball theme, collapsible thinking/tool folds, opens offline in any browser, uploads nothing (CSP-pinned so it *can't*).
 - **📦 Pack** — `cv pack "<task>"` compiles a context bundle from your whole corpus: relevant past spans + what files those sessions actually touched (event catalog), as a CLAUDE.md digest, a system prompt, or a synthetic *resumable session* in any harness. Never explain your codebase to an agent twice.
@@ -93,18 +95,18 @@ cv scry
   - a **Structure** explorer (`<cv-forest>`) — Overview / Forest / Workflows / Tools / Compaction tabs that turn a run's anatomy into something you can drill through.
 
   The browser build is zero-install — drop a harness zip, nothing uploaded (all WASM).
-- **🔌 Harness integrations** — plug claurdvoyant into the agents' own hooks/MCP/plugins ([`integrations/`](integrations/)): SessionEnd → archive + distill, SessionStart → recall, events → the board.
+- **🔌 Harness integrations** — plug clustervision into the agents' own hooks/MCP/plugins ([`integrations/`](integrations/)): SessionEnd → archive + distill, SessionStart → recall, events → the board.
 
 ## 📖 Manual
 
-Full docs — every CLI command, the MCP tools, the daemon's HTTP API, the app, cross-harness conversion, and the harness table — live in the **[user manual](https://emberian.github.io/claurdvoyant/manual/)** (mdBook, also under `manual/`).
+Full docs — every CLI command, the MCP tools, the daemon's HTTP API, the app, cross-harness conversion, and the harness table — live in the **[user manual](https://emberian.github.io/clustervision/manual/)** (mdBook, also under `manual/`).
 
 ## 🛠️ Install
 
-**Prebuilt binaries** for macOS / Linux / Windows (arm64 · x64 · x86) ship on every release — grab the latest from **[Releases](https://github.com/emberian/claurdvoyant/releases/latest)** (`cv` · `cv-mcp` · `cvd` · `cv-tui` · `cv-search`), or one-line it:
+**Prebuilt binaries** for macOS / Linux / Windows (arm64 · x64 · x86) ship on every release — grab the latest from **[Releases](https://github.com/emberian/clustervision/releases/latest)** (`cv` · `cv-mcp` · `cvd` · `cv-tui` · `cv-search`), or one-line it:
 
 ```sh
-curl --proto '=https' --tlsv1.2 -LsSf https://github.com/emberian/claurdvoyant/releases/latest/download/cv-installer.sh | sh
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/emberian/clustervision/releases/latest/download/cv-installer.sh | sh
 ```
 
 Or from source:
@@ -116,7 +118,7 @@ cargo build --release          # → target/release/{cv, cv-mcp, cvd, cv-tui, cv
 ## 🧠 Let agents read each other's minds (MCP)
 
 ```sh
-claude mcp add claurdvoyant -- /path/to/target/release/cv-mcp
+claude mcp add clustervision -- /path/to/target/release/cv-mcp
 ```
 
 18 tools, incl: `list_sessions` · `search_sessions` · `read_session` · `project_sessions` · **`recall`** (semantic "where was this solved before") · **`await_omen`** (block until a session matches a regex) · `board_post/read/await` + `board_claim/release/who` (coordination + distributed locks).
@@ -124,13 +126,13 @@ claude mcp add claurdvoyant -- /path/to/target/release/cv-mcp
 ## 📡 Archive your whole fleet (`cvd`)
 
 ```sh
-cvd sync     # snapshot every session into ~/.claurdvoyant
+cvd sync     # snapshot every session into ~/.clustervision
 cvd watch    # follow live + archive as sessions change → a fleet activity feed
 ```
 
 ## 🧬 The OpenSession standard
 
-After staring into seven different transcript formats, we wrote down the one they *should* have agreed on: **[OpenSession](docs/OPENSESSION.md)** — a small, honest, harness-neutral interchange format (the key heresy: *cwd is metadata, not identity*). claurdvoyant's IR is its reference implementation. If you ship a harness, emit OpenSession and everyone's sessions become portable by construction. 🤝
+After staring into seven different transcript formats, we wrote down the one they *should* have agreed on: **[OpenSession](docs/OPENSESSION.md)** — a small, honest, harness-neutral interchange format (the key heresy: *cwd is metadata, not identity*). clustervision's IR is its reference implementation. If you ship a harness, emit OpenSession and everyone's sessions become portable by construction. 🤝
 
 ## 🏗️ Under the hood
 

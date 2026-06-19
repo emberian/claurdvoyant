@@ -1,4 +1,4 @@
-# claurdvoyant MCP server for Hermes.
+# clustervision MCP server for Hermes.
 #
 # Hermes connects to external MCP servers via the `mcp_servers:` block in its config
 # (cli-config.yaml). Stdio servers use `command` + `args` (+ optional `env`). Confirmed
@@ -6,6 +6,6 @@
 # stdio servers spawn a subprocess with command/args/env). Merge this into your
 # ~/.hermes config (or cli-config.yaml). Replace the command path with your cv-mcp binary.
 mcp_servers:
-  claurdvoyant:
+  clustervision:
     command: "/path/to/target/release/cv-mcp"
     args: []

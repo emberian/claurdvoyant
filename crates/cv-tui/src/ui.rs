@@ -39,10 +39,10 @@ pub fn draw(f: &mut Frame, app: &mut App) {
 
 fn draw_header(f: &mut Frame, app: &App, area: Rect) {
     let title = match app.view {
-        View::List if app.showing_search => " 🔮 claurdvoyant · search results ",
-        View::List => " 🔮 claurdvoyant · sessions ",
-        View::Transcript => " 🔮 claurdvoyant · transcript ",
-        View::Board => " 🔮 claurdvoyant · board ",
+        View::List if app.showing_search => " 🔮 clustervision · search results ",
+        View::List => " 🔮 clustervision · sessions ",
+        View::Transcript => " 🔮 clustervision · transcript ",
+        View::Board => " 🔮 clustervision · board ",
     };
     let p = Paragraph::new(Line::from(vec![Span::styled(
         title,
@@ -333,7 +333,7 @@ fn draw_help_overlay(f: &mut Frame, area: Rect) {
 
     let help = vec![
         Line::from(Span::styled(
-            "claurdvoyant TUI — keybindings",
+            "clustervision TUI — keybindings",
             Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD),
         )),
         Line::from(""),

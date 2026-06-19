@@ -1,6 +1,6 @@
 # MCP — agents reading each other's minds
 
-Most of claurdvoyant is about *you* reading sessions after the fact. `cv-mcp` is the
+Most of clustervision is about *you* reading sessions after the fact. `cv-mcp` is the
 other direction: it hands the same powers to a **running coding agent** so it can read
 *other* agents' sessions — within this project, back through time, and across harnesses
 — and coordinate with siblings live. 🔮
@@ -29,7 +29,7 @@ Build the binary, then register it with your host. For Claude Code:
 
 ```sh
 cargo build -p cv-mcp --release
-claude mcp add claurdvoyant -- /absolute/path/to/cv-mcp
+claude mcp add clustervision -- /absolute/path/to/cv-mcp
 ```
 
 Any MCP host works — give it the absolute path to the `cv-mcp` binary as the command

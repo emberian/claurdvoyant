@@ -1,0 +1,12 @@
+{
+  "name": "cv-clustervision",
+  "version": "0.1.0",
+  "description": "clustervision: cross-harness session memory + coordination. Exposes the cv-mcp server (recall / search_sessions / project_sessions / board_*) and ships lifecycle hooks that archive sessions and surface prior context.",
+  "contextFileName": "GEMINI.md",
+  "mcpServers": {
+    "clustervision": {
+      "command": "/path/to/target/release/cv-mcp",
+      "args": []
+    }
+  }
+}

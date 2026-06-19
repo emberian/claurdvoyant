@@ -1,4 +1,4 @@
-//! `cv config` — view the user config (`~/.config/claurdvoyant/config.toml`) and manage the **export
+//! `cv config` — view the user config (`~/.config/clustervision/config.toml`) and manage the **export
 //! source index** (where the `chatgpt-export`/`claude-export` harnesses look for account data exports).
 
 use anyhow::Result;

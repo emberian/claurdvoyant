@@ -1,4 +1,6 @@
-# 🔮 claurdvoyant
+# 🔮 clustervision
+
+> *Vibecoding is a clusterfuck. When it gets hazy, you need clustervision.*
 
 **Find, read, search, port, and visualize every AI coding-agent session you've ever run — across every harness.**
 
@@ -6,7 +8,7 @@
 
 You spend hours teaching an agent your codebase — the dead ends, the decisions, the hard-won understanding. Then it becomes one of hundreds of `.jsonl` files in a folder named after a path, and you never find it again. Most harnesses only resume from the *exact directory* a session ran in. And every tool speaks its own dialect, so a Claude session can't be continued in Codex.
 
-claurdvoyant fixes all three. It parses **17 harnesses** into one unified representation, then lets you:
+clustervision fixes all three. It parses **17 harnesses** into one unified representation, then lets you:
 
 - 🔎 **Search** every session — by keyword or by *meaning*.
 - 🖥️ **Browse** your whole corpus in a desktop/web app — a Projects lens, an activity heatmap, side-by-side compare, stats, and **sub-agent trees**.

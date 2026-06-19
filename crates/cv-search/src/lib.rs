@@ -1,6 +1,6 @@
 //! # cv-search
 //!
-//! Pure-Rust search over claurdvoyant sessions, in two flavours:
+//! Pure-Rust search over clustervision sessions, in two flavours:
 //!
 //! 1. **Full-text** via [`tantivy`] (a Lucene-like inverted index) — `index_all` builds a
 //!    persistent index, `text_search` queries it and returns highlighted snippets. This is a
@@ -14,7 +14,7 @@
 //!    cargo feature (default-on, since model2vec is lightweight); a minimal FTS-only build is
 //!    `cargo build -p cv-search --no-default-features`.
 //!
-//! Both indexes live under `$CLAURDVOYANT_HOME` (or `~/.claurdvoyant`): the tantivy index in
+//! Both indexes live under `$CLUSTERVISION_HOME` (or `~/.clustervision`): the tantivy index in
 //! `…/tantivy/` and the embedding store in `…/embeddings.bin`.
 
 use anyhow::Result;
@@ -56,12 +56,25 @@ pub struct Hit {
     pub workflow: Option<String>,
 }
 
-/// Root directory for cv-search's on-disk state: `$CLAURDVOYANT_HOME` or `~/.claurdvoyant`.
+/// Root directory for cv-search's on-disk state: `$CLUSTERVISION_HOME` or `~/.clustervision`.
+///
+/// Back-compat: the project was once "claurdvoyant", so we still honor `$CLAURDVOYANT_HOME` and an
+/// existing `~/.claurdvoyant` (kept only if the new dir hasn't been created) — so a previously-built
+/// index/embedding store isn't orphaned by the rename.
 pub fn home_dir() -> PathBuf {
-    std::env::var_os("CLAURDVOYANT_HOME")
-        .map(PathBuf::from)
-        .or_else(|| dirs::home_dir().map(|h| h.join(".claurdvoyant")))
-        .unwrap_or_else(|| PathBuf::from("."))
+    if let Some(v) = std::env::var_os("CLUSTERVISION_HOME").or_else(|| std::env::var_os("CLAURDVOYANT_HOME")) {
+        return PathBuf::from(v);
+    }
+    let Some(home) = dirs::home_dir() else {
+        return PathBuf::from(".");
+    };
+    let new = home.join(".clustervision");
+    let legacy = home.join(".claurdvoyant");
+    if !new.exists() && legacy.exists() {
+        legacy
+    } else {
+        new
+    }
 }
 
 /// Default location of the tantivy full-text index.

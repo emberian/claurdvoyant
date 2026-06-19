@@ -1,6 +1,6 @@
 //! Integration tests for the cvd daemon binary: `sync` idempotency against a fixture corpus and
 //! the `serve` HTTP endpoints (status codes, JSON shapes, query parsing) — all hermetic via a
-//! temp `$HOME` + `$CLAURDVOYANT_HOME` passed only to child processes.
+//! temp `$HOME` + `$CLUSTERVISION_HOME` passed only to child processes.
 
 use serde_json::{json, Value};
 use std::fs;
@@ -69,7 +69,7 @@ impl World {
         let mut c = Command::new(env!("CARGO_BIN_EXE_cvd"));
         c.current_dir(&self.base)
             .env("HOME", &self.home)
-            .env("CLAURDVOYANT_HOME", &self.cv_home)
+            .env("CLUSTERVISION_HOME", &self.cv_home)
             .env("XDG_CACHE_HOME", self.home.join(".cache"))
             .env("XDG_CONFIG_HOME", self.home.join(".config"))
             .env("XDG_DATA_HOME", self.home.join(".local/share"));

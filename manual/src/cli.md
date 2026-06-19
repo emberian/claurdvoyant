@@ -1,6 +1,6 @@
 # The CLI: `cv`
 
-`cv` is the front door to claurdvoyant. One small binary that can find, read, search, convert, port, splice, and stream every AI coding session on your machine — across every harness it knows how to parse.
+`cv` is the front door to clustervision. One small binary that can find, read, search, convert, port, splice, and stream every AI coding session on your machine — across every harness it knows how to parse.
 
 Everything `cv` does, it does over your *real* local session storage (`~/.claude`, `~/.codex`, `~/.config/opencode`, and friends). There's no database to set up and nothing to import; discovery happens by scanning the harnesses you already have installed. (Search gets an optional index — more on that below.)
 
@@ -101,15 +101,15 @@ The same corpus, but read as a *feed*: oldest → newest, grouped by day. Good f
 
 ```sh
 cv timeline
-cv timeline --harness codex --cwd claurdvoyant --limit 80
+cv timeline --harness codex --cwd clustervision --limit 80
 ```
 
 ```text
 ── 2026-05-27 ──
-  09:14  codex     019e75e0  ~/pug/claurdvoyant       porting the parser to nom
-  16:40  claude    4f2a0c11  ~/pug/claurdvoyant       wiring up the MCP server
+  09:14  codex     019e75e0  ~/pug/clustervision       porting the parser to nom
+  16:40  claude    4f2a0c11  ~/pug/clustervision       wiring up the MCP server
 ── 2026-05-28 ──
-  11:02  claude    da9174f4  ~/pug/claurdvoyant       the flux inference refactor
+  11:02  claude    da9174f4  ~/pug/clustervision       the flux inference refactor
 
 2245 session(s)
 ```
@@ -125,7 +125,7 @@ cv stats
 ```
 
 ```text
-✦ claurdvoyant fleet stats
+✦ clustervision fleet stats
 
 2245 session(s) · 318940 message(s)
 
@@ -136,7 +136,7 @@ by harness:
   …
 
 top cwds:
-    412  ~/pug/claurdvoyant
+    412  ~/pug/clustervision
     188  ~/work/api
   …
 
@@ -184,7 +184,7 @@ cv recall "auth token bug" --harness claude
 ```
 
 ```text
-claude    da9174f4   0.842  the flux inference refactor  ·  ~/pug/claurdvoyant
+claude    da9174f4   0.842  the flux inference refactor  ·  ~/pug/clustervision
       user: why did we move inference out of the type-walker?
       assistant: because the walker couldn't see flux constraints …
 ```
@@ -206,9 +206,9 @@ cv index --subagents    # also fold the sub-agent / workflow forest into the ind
 
 ```text
 ✦ building full-text index…
-indexed 2245 session(s) → ~/.cache/claurdvoyant/tantivy
+indexed 2245 session(s) → ~/.cache/clustervision/tantivy
 ✦ embedding sessions (downloads a small model on first use)…
-embedded 2245 session(s) → ~/.cache/claurdvoyant/embeddings.bin
+embedded 2245 session(s) → ~/.cache/clustervision/embeddings.bin
 ```
 
 - `--semantic` — also compute embeddings (downloads a ~30 MB model the first time).
@@ -285,6 +285,7 @@ cv prune 3b829648 --keep-last 40 --min-size 4096   # spare more recent context; 
 cv prune 3b829648 --dry-run                        # report the savings without writing
 cv prune 3b829648 --to my-tidy-session             # choose the new id
 cv prune 3b829648 --drop                           # hard-drop payloads (no sidecar, irreversible)
+cv prune 3b829648 --thinking --revive              # the resurrection: flatten + correct the stale size in one go
 
 cv prune <new-id> --retrieve toolu_abc123          # fetch a stashed original back out
 ```
@@ -295,6 +296,7 @@ cv prune <new-id> --retrieve toolu_abc123          # fetch a stashed original ba
 - `--thinking` — also flatten the **oldest** assistant reasoning (thinking blocks); recent thinking (within `--keep-last`) stays verbatim. On a long Claude session the chain-of-thought *signatures* dominate the loaded context (Claude keeps a ~600-byte signature per thinking turn even when the reasoning text is omitted), so this is the biggest lever for shrinking what a resume loads. Lossless (stashed in the sidecar). Real example: it took a 976k-token session from ~98% to ~36% of a 1M window.
 - `--drop` — discard payloads entirely instead of stashing them (smallest output, irreversible; the source session is never touched regardless).
 - `--copy-resources` — also copy the session's `subagents/`/`workflows/` dir under the new id (off by default; can be hundreds of MB for big sessions). `claude --resume` doesn't need it — only cv's forest features (`cv workflow`/`cv tools`) on the pruned session do.
+- `--revive` — **resurrect an already-maxed session.** Claude Code's resume gate reads the last turn's *recorded* `usage` (input + cache tokens) as the session's current size — and checks it *before* re-sending anything, so a session sitting at the wall refuses to resume even after pruning has made the real content fit. `--revive` recomputes the honest size of the loaded window (everything after the last compaction boundary — what Claude actually re-sends) and rewrites the stale `usage` records to that figure, so the gate lets you back in. Pair with `--thinking` to flatten *and* revive in one command. Real example: a session stuck at "979.7k / context limit reached" → recorded 149k, resumes clean. (Edits recorded metadata, not just content; the source is still never touched — new id only.)
 - `--dry-run` — compute and report without writing.
 - `--retrieve <tool_use_id>` — instead of pruning, print the stashed original for that id from `<id>.flat.jsonl`.
 
@@ -351,7 +353,7 @@ To *read* the span a compaction discarded, jump straight to it with [`cv show --
 
 ### `cv config`
 
-View the user config (`$XDG_CONFIG_HOME/claurdvoyant/config.toml`, falling back to `~/.config/…`) and manage the **export-source index**. Account data exports (the ChatGPT / Claude.ai "Export data" archives) have no fixed home, so you register where they live and the [`chatgpt-export`](harnesses.md)/[`claude-export`](harnesses.md) harnesses discover them from there.
+View the user config (`$XDG_CONFIG_HOME/clustervision/config.toml`, falling back to `~/.config/…`) and manage the **export-source index**. Account data exports (the ChatGPT / Claude.ai "Export data" archives) have no fixed home, so you register where they live and the [`chatgpt-export`](harnesses.md)/[`claude-export`](harnesses.md) harnesses discover them from there.
 
 ```sh
 cv config                              # print the config path + registered export sources
@@ -530,7 +532,7 @@ cv redact da9174f4 --format json --stats
 
 ## Converting & porting
 
-This is claurdvoyant's headline trick. See [Cross-harness conversion](conversion.md) for which harnesses can emit and the gory IR details.
+This is clustervision's headline trick. See [Cross-harness conversion](conversion.md) for which harnesses can emit and the gory IR details.
 
 ### `cv convert`
 
@@ -582,7 +584,7 @@ cv resume da9174f4
 ```
 
 ```text
-cd ~/pug/claurdvoyant
+cd ~/pug/clustervision
 claude --resume da9174f4-…
 ```
 
@@ -688,16 +690,16 @@ Same provider requirement as `--generate` above; if no provider is configured it
 
 ```sh
 cv scry
-cv scry --harness claude --cwd claurdvoyant
+cv scry --harness claude --cwd clustervision
 cv scry --existing            # also emit sessions already present at startup
 cv scry --interval 1.0
 ```
 
 ```text
 ✦ scrying for agent activity… (Ctrl-C to stop)
-✷ new  claude   da9174f4  ~/pug/claurdvoyant  (3 msg)
+✷ new  claude   da9174f4  ~/pug/clustervision  (3 msg)
       user walk the type checker and find where flux is ignored
-   +  claude   da9174f4  ~/pug/claurdvoyant  (1 msg)
+   +  claude   da9174f4  ~/pug/clustervision  (1 msg)
       assistant found it — the walker drops flux constraints here …
 ```
 

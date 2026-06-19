@@ -1,6 +1,6 @@
 [package]
 name = "cv-web"
-description = "WASM bindings for claurdvoyant — ingest an uploaded harness zip in the browser and return sessions as JSON."
+description = "WASM bindings for clustervision — ingest an uploaded harness zip in the browser and return sessions as JSON."
 version.workspace = true
 edition.workspace = true
 license.workspace = true

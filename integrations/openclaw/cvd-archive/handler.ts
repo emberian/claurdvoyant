@@ -1,5 +1,5 @@
 /**
- * claurdvoyant archive hook for OpenClaw.
+ * clustervision archive hook for OpenClaw.
  *
  * OpenClaw internal hooks are a directory with HOOK.md (metadata, declaring `events`) and
  * handler.ts (default export `(event) => Promise<void>`). The handler receives an event
@@ -8,7 +8,7 @@
  * don't push to `event.messages`. Confirmed in docs/automation/hooks.md.
  *
  * On the subscribed lifecycle events we archive every harness's sessions (`cvd sync`) and
- * post a status note to the claurdvoyant `fleet` board (`cv board post`).
+ * post a status note to the clustervision `fleet` board (`cv board post`).
  */
 
 import { execFile } from "node:child_process"

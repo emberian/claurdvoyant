@@ -12,13 +12,13 @@ export const SAMPLE_SESSIONS = [
   {
     id: "c0ffee-claude-001",
     harness: "claude",
-    cwd: "/Users/ember/pug/claurdvoyant",
+    cwd: "/Users/ember/pug/clustervision",
     title: "Wire up the WASM ingest contract",
     created_at: "2026-05-28T17:12:04Z",
     updated_at: "2026-05-28T17:41:55Z",
     model: "claude-opus-4-8",
-    git: { branch: "dev", commit: "a1b2c3d", remote: "git@github.com:ember/claurdvoyant.git" },
-    source_path: ".claude/projects/-Users-ember-pug-claurdvoyant/c0ffee.jsonl",
+    git: { branch: "dev", commit: "a1b2c3d", remote: "git@github.com:ember/clustervision.git" },
+    source_path: ".claude/projects/-Users-ember-pug-clustervision/c0ffee.jsonl",
     messages: [
       {
         id: "m1",
@@ -140,7 +140,7 @@ export const SAMPLE_SESSIONS = [
   {
     id: "claude-loom-branch-a",
     harness: "claude",
-    cwd: "/Users/ember/pug/claurdvoyant",
+    cwd: "/Users/ember/pug/clustervision",
     title: "Wire up the WASM ingest contract (branch A)",
     created_at: "2026-05-28T17:12:04Z",
     updated_at: "2026-05-28T17:30:00Z",

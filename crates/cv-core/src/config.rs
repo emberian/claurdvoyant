@@ -1,5 +1,5 @@
-//! User config — a human-editable TOML file at `$XDG_CONFIG_HOME/claurdvoyant/config.toml` (falling
-//! back to `~/.config/claurdvoyant/config.toml`).
+//! User config — a human-editable TOML file at `$XDG_CONFIG_HOME/clustervision/config.toml` (falling
+//! back to `~/.config/clustervision/config.toml`).
 //!
 //! Today it holds the **export source index**: the dirs (or `conversations.json` files) where your
 //! account data exports (ChatGPT / Claude.ai) live. Account exports have no fixed home like the CLI
@@ -19,13 +19,18 @@ pub struct Config {
     pub exports: Vec<PathBuf>,
 }
 
-/// `$XDG_CONFIG_HOME/claurdvoyant` (or `~/.config/claurdvoyant`). `None` only if there's no home.
+/// `$XDG_CONFIG_HOME/clustervision` (or `~/.config/clustervision`). `None` only if there's no home.
+///
+/// Back-compat: if the legacy `…/claurdvoyant` dir still exists and the new one hasn't been created,
+/// keep using it — so registered export sources survive the rename without a manual move.
 pub fn config_dir() -> Option<PathBuf> {
-    std::env::var_os("XDG_CONFIG_HOME")
+    let base = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .filter(|p| !p.as_os_str().is_empty())
-        .or_else(|| dirs::home_dir().map(|h| h.join(".config")))
-        .map(|c| c.join("claurdvoyant"))
+        .or_else(|| dirs::home_dir().map(|h| h.join(".config")))?;
+    let new = base.join("clustervision");
+    let legacy = base.join("claurdvoyant");
+    Some(if !new.exists() && legacy.exists() { legacy } else { new })
 }
 
 /// The config file path.

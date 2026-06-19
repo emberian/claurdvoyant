@@ -1,4 +1,4 @@
-# claurdvoyant × Hermes (Nous)
+# clustervision × Hermes (Nous)
 
 Hermes is extensible via a **Python plugin system with lifecycle hooks** and via **MCP**.
 Both are wired here.
@@ -33,7 +33,7 @@ hermes plugins list        # confirm cvd-archive is discovered/enabled
 
 ### 2. MCP server — [`cli-config.yaml`](./cli-config.yaml)
 
-Merge the `mcp_servers.claurdvoyant` block into your Hermes config so a running Hermes
+Merge the `mcp_servers.clustervision` block into your Hermes config so a running Hermes
 agent can call `recall`, `search_sessions`, `project_sessions`, `read_session`, and the
 `board_*` tools.
 

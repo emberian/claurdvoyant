@@ -715,7 +715,7 @@ fn read_indexed_mtimes(index: &Index, f: &Fields) -> Result<HashMap<String, i64>
 /// prior contents first. Used by tests so date-field (and chunk) indexing is exercised against the
 /// code that actually ships rather than a parallel per-doc path. `catalog = true` additionally tees
 /// each pass into the event catalog and (for supported harnesses) the message-offsets store, like
-/// `index_all` does (only set it under an isolated `CLAURDVOYANT_HOME` — it writes the shared
+/// `index_all` does (only set it under an isolated `CLUSTERVISION_HOME` — it writes the shared
 /// catalog db).
 #[cfg(test)]
 pub(crate) fn index_refs(dir: &Path, refs: &[cv_core::SessionRef], catalog: bool) -> Result<usize> {
@@ -754,7 +754,7 @@ pub(crate) fn index_refs(dir: &Path, refs: &[cv_core::SessionRef], catalog: bool
 /// Index `refs` (top-level) **and** their sub-agent forests, exercising the exact production forest
 /// path [`index_one_subagent`] that `index_all(.., subagents=true)` drives — minus only the global
 /// `discover_all()` scan (which can't be pointed at a temp dir in a unit test). `catalog = true` tees
-/// each pass into the event catalog (set it only under an isolated `CLAURDVOYANT_HOME`). Returns the
+/// each pass into the event catalog (set it only under an isolated `CLUSTERVISION_HOME`). Returns the
 /// number of sub-agent transcripts folded in.
 #[cfg(test)]
 pub(crate) fn index_refs_with_subagents(dir: &Path, refs: &[cv_core::SessionRef], catalog: bool) -> Result<usize> {
@@ -1057,7 +1057,7 @@ mod tests {
     }
 
     /// Indexing tees events into the catalog, whose path comes from the process-global
-    /// `CLAURDVOYANT_HOME`. Tests that index MUST isolate it to a temp dir — otherwise they write to
+    /// `CLUSTERVISION_HOME`. Tests that index MUST isolate it to a temp dir — otherwise they write to
     /// (and read from) the shared real catalog, racing each other and the other crates' test binaries.
     /// This RAII guard serializes those tests on one lock AND points the catalog at a private temp
     /// home for the test's duration; both are released (and the home removed) on drop.
@@ -1071,13 +1071,13 @@ mod tests {
         fn new() -> Self {
             let lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
             let home = tmpdir();
-            std::env::set_var("CLAURDVOYANT_HOME", &home);
+            std::env::set_var("CLUSTERVISION_HOME", &home);
             IsolatedHome { _lock: lock, home }
         }
     }
     impl Drop for IsolatedHome {
         fn drop(&mut self) {
-            std::env::remove_var("CLAURDVOYANT_HOME");
+            std::env::remove_var("CLUSTERVISION_HOME");
             std::fs::remove_dir_all(&self.home).ok();
         }
     }
@@ -1367,7 +1367,7 @@ mod tests {
 
     /// The event ride-along, end to end through the production `index_session` tee: one indexing
     /// pass writes BOTH searchable tantivy docs and queryable event rows in the catalog db
-    /// (isolated via `CLAURDVOYANT_HOME`).
+    /// (isolated via `CLUSTERVISION_HOME`).
     #[test]
     fn indexing_tees_events_into_the_catalog() {
         let h = IsolatedHome::new();
@@ -1418,7 +1418,7 @@ mod tests {
         assert_eq!(touched[0].edits, 1);
 
         std::fs::remove_dir_all(&dir).ok();
-        // `h` drops here: removes CLAURDVOYANT_HOME, deletes the temp home, releases the lock.
+        // `h` drops here: removes CLUSTERVISION_HOME, deletes the temp home, releases the lock.
     }
 
     /// Write a sub-agent transcript in the on-disk layout `subagent_tree_of` expects:

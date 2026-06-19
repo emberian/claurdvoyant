@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "claurdvoyant",
+  "productName": "clustervision",
   "version": "0.9.11",
-  "identifier": "town.lunar.claurdvoyant",
+  "identifier": "town.lunar.clustervision",
   "build": {
     "frontendDist": "../../web"
   },
@@ -10,7 +10,7 @@
     "withGlobalTauri": true,
     "windows": [
       {
-        "title": "claurdvoyant",
+        "title": "clustervision",
         "width": 1280,
         "height": 860,
         "minWidth": 720,
@@ -31,6 +31,6 @@
     ],
     "category": "DeveloperTool",
     "shortDescription": "Cross-harness AI session viewer + native distill/redact/loom.",
-    "longDescription": "claurdvoyant wraps the static web session viewer (timeline, compare, stats, splice/loom composer, fleet dashboard) and launches a local `cvd serve` API on startup, plus native commands for distillation, redaction, and generative looming."
+    "longDescription": "clustervision wraps the static web session viewer (timeline, compare, stats, splice/loom composer, fleet dashboard) and launches a local `cvd serve` API on startup, plus native commands for distillation, redaction, and generative looming."
   }
 }

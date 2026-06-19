@@ -1,4 +1,4 @@
-//! cv-tui — a delightful terminal browser for claurdvoyant sessions.
+//! cv-tui — a delightful terminal browser for clustervision sessions.
 //!
 //! Architecture:
 //! - [`app::App`] holds all UI state and the bulk of the input/business logic.

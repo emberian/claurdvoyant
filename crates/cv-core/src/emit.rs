@@ -669,7 +669,7 @@ fn emit_codex(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<E
         meta.insert("cwd".into(), json!(c.to_string_lossy()));
     }
     meta.insert("source".into(), json!("cli"));
-    meta.insert("originator".into(), json!("claurdvoyant"));
+    meta.insert("originator".into(), json!("clustervision"));
     meta.insert("cli_version".into(), json!(env!("CARGO_PKG_VERSION")));
     if let Some(model) = &session.model {
         meta.insert("model_provider".into(), json!(model));
@@ -1845,13 +1845,13 @@ fn emit_hermes(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<
 
     // Format-complete: pull the captured per-session columns back out of `Session.extra` (written
     // by the Hermes parser under `SESSION_META_KEY`) so the round-trip reproduces every session-row
-    // value. Anything absent falls back to a sensible default (e.g. `source = "claurdvoyant"`).
+    // value. Anything absent falls back to a sensible default (e.g. `source = "clustervision"`).
     use crate::harness::hermes::{RAW_REASONING_CONTENT_KEY, RAW_REASONING_KEY, SESSION_META_KEY};
     let smeta = session.extra.get(SESSION_META_KEY).and_then(Value::as_object);
     let smeta_str =
         |k: &str| -> Option<String> { smeta.and_then(|m| m.get(k)).and_then(Value::as_str).map(str::to_string) };
     let smeta_int = |k: &str| -> i64 { smeta.and_then(|m| m.get(k)).and_then(Value::as_i64).unwrap_or(0) };
-    let source = smeta_str("source").unwrap_or_else(|| "claurdvoyant".to_string());
+    let source = smeta_str("source").unwrap_or_else(|| "clustervision".to_string());
     let user_id = smeta_str("user_id");
     let model_config = smeta_str("model_config");
     let system_prompt = smeta_str("system_prompt");

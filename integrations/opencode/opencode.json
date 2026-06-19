@@ -1,8 +1,8 @@
 {
   "$schema": "https://opencode.ai/config.json",
-  "//": "Optional: register claurdvoyant's MCP server so a running OpenCode agent can read OTHER agents' sessions and use the coordination board. Merge this `mcp` block into ~/.config/opencode/opencode.json (or a project opencode.json). Replace the command path with your built cv-mcp binary.",
+  "//": "Optional: register clustervision's MCP server so a running OpenCode agent can read OTHER agents' sessions and use the coordination board. Merge this `mcp` block into ~/.config/opencode/opencode.json (or a project opencode.json). Replace the command path with your built cv-mcp binary.",
   "mcp": {
-    "claurdvoyant": {
+    "clustervision": {
       "type": "local",
       "command": ["/path/to/target/release/cv-mcp"],
       "enabled": true

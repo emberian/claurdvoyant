@@ -1,8 +1,8 @@
 //! 📣 The coordination board — a lightweight append-only message bus for agents.
 //!
-//! claurdvoyant lets agents *read* each other's sessions; the board lets them *talk*: post status,
+//! clustervision lets agents *read* each other's sessions; the board lets them *talk*: post status,
 //! leave notes, request/answer, broadcast events. A "channel" is a room (often a project path or a
-//! named topic). Messages are appended to `$CLAURDVOYANT_HOME/board/<channel>.jsonl`. The daemon
+//! named topic). Messages are appended to `$CLUSTERVISION_HOME/board/<channel>.jsonl`. The daemon
 //! (`cvd`) can mirror session activity onto channels to build a fleet activity feed; the MCP server
 //! exposes post/read and an await-until-regex on top of `read`.
 //!
@@ -35,11 +35,11 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-/// Root dir for board channels: `$CLAURDVOYANT_HOME/board` (or `~/.claurdvoyant/board`).
+/// Root dir for board channels: `$CLUSTERVISION_HOME/board` (or `~/.clustervision/board`).
 pub fn board_dir() -> PathBuf {
-    std::env::var_os("CLAURDVOYANT_HOME")
+    std::env::var_os("CLUSTERVISION_HOME")
         .map(PathBuf::from)
-        .or_else(|| dirs::home_dir().map(|h| h.join(".claurdvoyant")))
+        .or_else(|| dirs::home_dir().map(|h| h.join(".clustervision")))
         .unwrap_or_else(|| PathBuf::from("."))
         .join("board")
 }
@@ -542,7 +542,7 @@ pub fn active_claims(channel: &str) -> Result<Vec<(String, String, DateTime<Utc>
 pub fn active_claims_in_dir(dir: &Path, channel: &str) -> Result<Vec<(String, String, DateTime<Utc>)>> {
     // A board dir that was never created means nobody ever claimed anything — empty, not an
     // error. (Without this, acquiring the lock `create_new`s a file inside the missing dir and
-    // fails with NotFound — the one reader that errored on a fresh $CLAURDVOYANT_HOME.)
+    // fails with NotFound — the one reader that errored on a fresh $CLUSTERVISION_HOME.)
     if !dir.exists() {
         return Ok(Vec::new());
     }

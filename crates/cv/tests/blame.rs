@@ -1,6 +1,6 @@
 //! End-to-end `cv blame`: a real (temp) git repo with controlled commit times + a temp
-//! CLAURDVOYANT_HOME whose catalog is fed by ingesting a synthetic claude session — then the
-//! actual binary is run against it. Everything lives in ONE test fn because CLAURDVOYANT_HOME is
+//! CLUSTERVISION_HOME whose catalog is fed by ingesting a synthetic claude session — then the
+//! actual binary is run against it. Everything lives in ONE test fn because CLUSTERVISION_HOME is
 //! process-global state for the in-process cv-core calls (parallel test fns would race it).
 
 use std::path::Path;
@@ -34,7 +34,7 @@ fn cv(home: &Path, dir: &Path, args: &[&str]) -> (String, String) {
     let out = Command::new(env!("CARGO_BIN_EXE_cv"))
         .args(args)
         .current_dir(dir)
-        .env("CLAURDVOYANT_HOME", home)
+        .env("CLUSTERVISION_HOME", home)
         .output()
         .expect("cv should run");
     (
@@ -98,7 +98,7 @@ fn blame_end_to_end() {
     let body: String = lines.iter().map(|l| format!("{l}\n")).collect();
     fs::write(&jsonl, body).unwrap();
 
-    std::env::set_var("CLAURDVOYANT_HOME", &home);
+    std::env::set_var("CLUSTERVISION_HOME", &home);
     let r = cv_core::ir::SessionRef {
         id: "blame-e2e".into(),
         harness: cv_core::ir::Harness::Claude,
@@ -116,7 +116,7 @@ fn blame_end_to_end() {
         .first()
         .expect("edit event ingested")
         .msg_idx;
-    std::env::remove_var("CLAURDVOYANT_HOME");
+    std::env::remove_var("CLUSTERVISION_HOME");
 
     // --- whole-file blame: both commits newest-first, only the first one matched ---
     let (out, err) = cv(&home, &repo, &["blame", "src/widget.rs"]);

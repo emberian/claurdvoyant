@@ -1,6 +1,6 @@
-# claurdvoyant is available
+# clustervision is available
 
-This project has the **claurdvoyant** MCP server (`claurdvoyant`) connected. It lets you
+This project has the **clustervision** MCP server (`clustervision`) connected. It lets you
 read **other agents' sessions** — across harnesses (Claude Code, Codex, OpenCode, …) and
 back through time — and coordinate with sibling agents via a shared board.
 

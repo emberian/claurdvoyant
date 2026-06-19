@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# claurdvoyant notify hook for Codex.
+# clustervision notify hook for Codex.
 #
 # Codex's `notify` config spawns this program after each completed turn, appending a
 # JSON payload (e.g. {"type":"agent-turn-complete", ...}) as the final argument.
-# We ignore the payload and just refresh the claurdvoyant archive + post to the board.
+# We ignore the payload and just refresh the clustervision archive + post to the board.
 #
 # Wire it up in ~/.codex/config.toml:
 #   notify = ["/path/to/integrations/codex/notify-cvd.sh"]

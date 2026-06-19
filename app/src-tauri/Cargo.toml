@@ -1,14 +1,14 @@
-# Standalone cargo workspace for the claurdvoyant Tauri v2 desktop app.
+# Standalone cargo workspace for the clustervision Tauri v2 desktop app.
 #
 # This deliberately declares its OWN `[workspace]` so it is EXCLUDED from the main
-# claurdvoyant workspace at the repo root — building/CI of the main crates can't be
+# clustervision workspace at the repo root — building/CI of the main crates can't be
 # affected by (and isn't affected by) this app, and vice-versa. The app depends on the
 # main crates by relative path (`../../crates/...`).
 [workspace]
 
 [package]
-name = "claurdvoyant-app"
-description = "claurdvoyant desktop app — Tauri v2 shell around the web UI + native cv-core/cv-llm power."
+name = "clustervision-app"
+description = "clustervision desktop app — Tauri v2 shell around the web UI + native cv-core/cv-llm power."
 version = "0.9.11"
 edition = "2021"
 license = "MIT OR Apache-2.0"
@@ -16,7 +16,7 @@ authors = ["ember"]
 
 # The Tauri runtime lives in lib.rs (so mobile targets can reuse it); main.rs is a thin wrapper.
 [lib]
-name = "claurdvoyant_app_lib"
+name = "clustervision_app_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]

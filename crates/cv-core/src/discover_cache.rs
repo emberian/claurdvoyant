@@ -38,7 +38,7 @@ static CACHE: OnceLock<Cache> = OnceLock::new();
 
 /// One-time nudge about the pre-0.9.12 JSON cache this module replaced.
 fn note_legacy_json() {
-    let Some(path) = dirs::cache_dir().map(|d| d.join("claurdvoyant").join("discover.json")) else {
+    let Some(path) = dirs::cache_dir().map(|d| d.join("clustervision").join("discover.json")) else {
         return;
     };
     if path.exists() {

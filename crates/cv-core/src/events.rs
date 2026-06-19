@@ -1147,7 +1147,7 @@ mod tests {
         assert!(ev[0].detail.as_ref().unwrap().chars().count() <= DETAIL_MAX);
     }
 
-    /// `CLAURDVOYANT_HOME` is process-global state — the temp-home tests serialize on this.
+    /// `CLUSTERVISION_HOME` is process-global state — the temp-home tests serialize on this.
     #[cfg(feature = "sqlite")]
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -1159,7 +1159,7 @@ mod tests {
         let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let home = std::env::temp_dir().join(format!("cv-events-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&home).unwrap();
-        std::env::set_var("CLAURDVOYANT_HOME", &home);
+        std::env::set_var("CLUSTERVISION_HOME", &home);
 
         let sdir = home.join("sessions");
         std::fs::create_dir_all(&sdir).unwrap();
@@ -1248,7 +1248,7 @@ mod tests {
         assert_eq!(edits.len(), 1);
         assert!(edits_touching_file("/repo/src/other.rs", "src/other.rs").is_empty());
 
-        std::env::remove_var("CLAURDVOYANT_HOME");
+        std::env::remove_var("CLUSTERVISION_HOME");
         std::fs::remove_dir_all(&home).ok();
     }
 
@@ -1262,7 +1262,7 @@ mod tests {
         let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let home = std::env::temp_dir().join(format!("cv-events-mig-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&home).unwrap();
-        std::env::set_var("CLAURDVOYANT_HOME", &home);
+        std::env::set_var("CLUSTERVISION_HOME", &home);
 
         const V1_DDL: &str = "CREATE TABLE events(
                  harness    TEXT NOT NULL,
@@ -1355,7 +1355,7 @@ mod tests {
         ingest_ref(&r).unwrap();
         assert_eq!(events_for("claude", "mig-e2e", None).len(), 1);
 
-        std::env::remove_var("CLAURDVOYANT_HOME");
+        std::env::remove_var("CLUSTERVISION_HOME");
         std::fs::remove_dir_all(&home).ok();
     }
 }

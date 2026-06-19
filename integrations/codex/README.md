@@ -1,4 +1,4 @@
-# claurdvoyant × Codex CLI
+# clustervision × Codex CLI
 
 Codex is one of the more deeply extensible harnesses — it exposes **MCP servers**,
 a **Claude-Code-compatible lifecycle hooks system**, *and* a `notify` callback.
@@ -8,7 +8,7 @@ a **Claude-Code-compatible lifecycle hooks system**, *and* a `notify` callback.
 Codex registers stdio MCP servers under `[mcp_servers.<name>]` with
 `command` / `args` / optional `env` / `enabled`. Confirmed against the live
 `~/.codex/config.toml` on this machine (existing entries like `[mcp_servers.playwright]`,
-`[mcp_servers.anna-mcp]`). Merge the `[mcp_servers.claurdvoyant]` block into your
+`[mcp_servers.anna-mcp]`). Merge the `[mcp_servers.clustervision]` block into your
 `~/.codex/config.toml`, pointing `command` at your built `cv-mcp`. A running Codex agent
 then gets `recall`, `search_sessions`, `project_sessions`, `read_session`, and the
 `board_*` coordination tools.

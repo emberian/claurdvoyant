@@ -48,9 +48,17 @@ mod imp {
     const WATCH_FUDGE: Duration = Duration::from_secs(2);
 
     fn db_path() -> Option<PathBuf> {
-        let dir = std::env::var_os("CLAURDVOYANT_HOME")
+        // Back-compat: also honor the legacy `$CLAURDVOYANT_HOME` / `claurdvoyant` cache dir so a
+        // catalog built before the rename keeps being used.
+        let dir = std::env::var_os("CLUSTERVISION_HOME")
+            .or_else(|| std::env::var_os("CLAURDVOYANT_HOME"))
             .map(PathBuf::from)
-            .or_else(|| dirs::cache_dir().map(|d| d.join("claurdvoyant")))?;
+            .or_else(|| {
+                let cache = dirs::cache_dir()?;
+                let new = cache.join("clustervision");
+                let legacy = cache.join("claurdvoyant");
+                Some(if !new.exists() && legacy.exists() { legacy } else { new })
+            })?;
         let _ = std::fs::create_dir_all(&dir);
         Some(dir.join("catalog.db"))
     }

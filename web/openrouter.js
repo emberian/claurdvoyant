@@ -126,8 +126,8 @@ export async function generate({ messages, model, key, signal, onToken } = {}) {
       "Content-Type": "application/json",
       "Authorization": `Bearer ${apiKey}`,
       // Optional attribution headers OpenRouter recommends; harmless if ignored.
-      "HTTP-Referer": location.origin || "https://github.com/emberian/claurdvoyant",
-      "X-Title": "claurdvoyant",
+      "HTTP-Referer": location.origin || "https://github.com/emberian/clustervision",
+      "X-Title": "clustervision",
     },
     body: JSON.stringify({ model: useModel, messages: chat, stream }),
   });

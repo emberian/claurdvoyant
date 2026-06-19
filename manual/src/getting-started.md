@@ -2,11 +2,11 @@
 
 ## Install
 
-**Prebuilt binaries** (macOS / Linux / Windows · arm64 · x64 · x86) ship on every [release](https://github.com/emberian/claurdvoyant/releases/latest). One-liner:
+**Prebuilt binaries** (macOS / Linux / Windows · arm64 · x64 · x86) ship on every [release](https://github.com/emberian/clustervision/releases/latest). One-liner:
 
 ```sh
 curl --proto '=https' --tlsv1.2 -LsSf \
-  https://github.com/emberian/claurdvoyant/releases/latest/download/cv-installer.sh | sh
+  https://github.com/emberian/clustervision/releases/latest/download/cv-installer.sh | sh
 ```
 
 This installs `cv`, `cv-mcp`, `cvd`, `cv-tui`, and `cv-search`.
@@ -14,7 +14,7 @@ This installs `cv`, `cv-mcp`, `cvd`, `cv-tui`, and `cv-search`.
 Or build from source (needs a recent Rust toolchain):
 
 ```sh
-git clone https://github.com/emberian/claurdvoyant && cd claurdvoyant
+git clone https://github.com/emberian/clustervision && cd clustervision
 cargo build --release      # → target/release/{cv, cv-mcp, cvd, cv-tui, cv-search}
 ```
 

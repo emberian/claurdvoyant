@@ -1,4 +1,4 @@
-//! cv-llm — LLM-backed features over claurdvoyant sessions (distillation), via OpenRouter / Anthropic.
+//! cv-llm — LLM-backed features over clustervision sessions (distillation), via OpenRouter / Anthropic.
 //!
 //! The entry point is [`distill`], which renders a [`cv_core::Session`] to Markdown, wraps it in a
 //! distillation prompt, and asks a cheap/fast model to extract durable project memory (the kind of
@@ -212,8 +212,8 @@ fn call_model(provider: &Provider, model: &str, prompt: &str) -> Result<String> 
             let resp = client
                 .post("https://openrouter.ai/api/v1/chat/completions")
                 .bearer_auth(key)
-                .header("HTTP-Referer", "https://github.com/emberian/claurdvoyant")
-                .header("X-Title", "claurdvoyant")
+                .header("HTTP-Referer", "https://github.com/emberian/clustervision")
+                .header("X-Title", "clustervision")
                 .json(&body)
                 .send()
                 .context("POST to OpenRouter")?;
@@ -403,8 +403,8 @@ fn call_chat(
         if let Some(b) = bearer {
             req = req
                 .bearer_auth(b)
-                .header("HTTP-Referer", "https://github.com/emberian/claurdvoyant")
-                .header("X-Title", "claurdvoyant");
+                .header("HTTP-Referer", "https://github.com/emberian/clustervision")
+                .header("X-Title", "clustervision");
         }
         let resp = req.send().with_context(|| format!("POST to {url}"))?;
         let v = read_json(resp, "chat")?;

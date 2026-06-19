@@ -116,7 +116,7 @@ pub const FIELDS: &[FieldDef] = &[
     FieldDef { id: FieldId::Model, name: "model", aliases: &["m"], kind: Kind::Str, cost: Cost::Parse,
         desc: "Any turn's model id (substring). Parse-required — pair with a cheap term to stay fast.", example: "model:fable" },
     FieldDef { id: FieldId::Cwd, name: "cwd", aliases: &["dir"], kind: Kind::Path, cost: Cost::Catalog,
-        desc: "Working directory (substring).", example: "cwd:/pug/claurdvoyant" },
+        desc: "Working directory (substring).", example: "cwd:/pug/clustervision" },
     FieldDef { id: FieldId::Title, name: "title", aliases: &[], kind: Kind::Str, cost: Cost::Catalog,
         desc: "Session title (substring).", example: "title:\"fix the bug\"" },
     FieldDef { id: FieldId::Id, name: "id", aliases: &[], kind: Kind::Str, cost: Cost::Catalog,

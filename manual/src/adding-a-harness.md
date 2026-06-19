@@ -2,7 +2,7 @@
 
 Got a coding agent we don't support yet? Adding one is a single new module implementing the
 [`Adapter`](architecture.md) trait. The full walkthrough is in
-**[ADDING_HARNESS.md](https://github.com/emberian/claurdvoyant/blob/main/ADDING_HARNESS.md)**; the shape:
+**[ADDING_HARNESS.md](https://github.com/emberian/clustervision/blob/main/ADDING_HARNESS.md)**; the shape:
 
 1. **`discover()`** — cheaply enumerate sessions on disk into `SessionRef`s (id, path, cwd, title,
    timestamps, a message count). No full parse.

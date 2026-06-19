@@ -1,7 +1,7 @@
 //! Protocol-level integration tests for the cv-mcp stdio JSON-RPC server: spawn the real binary,
 //! run the MCP handshake, list tools, and call them against a temp-home fixture corpus.
 //!
-//! Hermetic: a fake `$HOME` carries the claude fixtures and `$CLAURDVOYANT_HOME` the index/board
+//! Hermetic: a fake `$HOME` carries the claude fixtures and `$CLUSTERVISION_HOME` the index/board
 //! state; both are passed only to the child process's environment.
 
 use serde_json::{json, Value};
@@ -65,7 +65,7 @@ impl Server {
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .env("HOME", &home)
-            .env("CLAURDVOYANT_HOME", &cv_home)
+            .env("CLUSTERVISION_HOME", &cv_home)
             .env("XDG_CACHE_HOME", home.join(".cache"))
             .env("XDG_CONFIG_HOME", home.join(".config"))
             .env("XDG_DATA_HOME", home.join(".local/share"))
@@ -149,7 +149,7 @@ fn handshake_and_tool_schemas() {
     let resp = s.request(1, "initialize", json!({"protocolVersion": "2025-06-18"}));
     let r = &resp["result"];
     assert!(r["protocolVersion"].is_string(), "{resp}");
-    assert_eq!(r["serverInfo"]["name"], "claurdvoyant", "{resp}");
+    assert_eq!(r["serverInfo"]["name"], "clustervision", "{resp}");
     assert!(r["capabilities"]["tools"].is_object(), "{resp}");
 
     // The initialized notification must produce no response — the next reply must be for id 2.

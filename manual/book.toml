@@ -1,5 +1,5 @@
 [book]
-title = "claurdvoyant — the manual"
+title = "clustervision — the manual"
 authors = ["ember"]
 description = "Find, read, search, port, and visualize every AI coding-agent session, across every harness."
 src = "src"
@@ -8,8 +8,8 @@ language = "en"
 [output.html]
 default-theme = "navy"
 preferred-dark-theme = "navy"
-git-repository-url = "https://github.com/emberian/claurdvoyant"
-edit-url-template = "https://github.com/emberian/claurdvoyant/edit/main/manual/{path}"
+git-repository-url = "https://github.com/emberian/clustervision"
+edit-url-template = "https://github.com/emberian/clustervision/edit/main/manual/{path}"
 additional-css = ["theme/cv.css"]
 
 [output.html.fold]

@@ -1,4 +1,4 @@
-//! Production-robustness integration tests for claurdvoyant.
+//! Production-robustness integration tests for clustervision.
 //!
 //! These use ONLY the public `cv_core` API so they survive in-flight additive IR changes:
 //!   1. real-corpus smoke (`#[ignore]`d — needs ~2000 local sessions; parse errors OK, panics not),

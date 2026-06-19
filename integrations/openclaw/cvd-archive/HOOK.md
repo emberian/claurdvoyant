@@ -1,6 +1,6 @@
 ---
 name: cvd-archive
-description: "Archive agent sessions into claurdvoyant and post fleet-board status on lifecycle events"
+description: "Archive agent sessions into clustervision and post fleet-board status on lifecycle events"
 metadata:
   {
     "openclaw":
@@ -14,9 +14,9 @@ metadata:
 
 # cvd-archive
 
-A claurdvoyant internal hook for OpenClaw. On the lifecycle events it subscribes to, it
-runs `cvd sync` to archive every harness's sessions into `~/.claurdvoyant`, and posts a
-status note to the claurdvoyant `fleet` coordination board so sibling agents (and
+A clustervision internal hook for OpenClaw. On the lifecycle events it subscribes to, it
+runs `cvd sync` to archive every harness's sessions into `~/.clustervision`, and posts a
+status note to the clustervision `fleet` coordination board so sibling agents (and
 `cvd watch`) see the activity live.
 
 ## Events
@@ -28,7 +28,7 @@ status note to the claurdvoyant `fleet` coordination board so sibling agents (an
 
 ## Install
 
-1. Build claurdvoyant (`cargo build --release`) and make sure `cv` and `cvd` are on PATH
+1. Build clustervision (`cargo build --release`) and make sure `cv` and `cvd` are on PATH
    (or set `CV_BIN` / `CVD_BIN`).
 2. Copy this `cvd-archive/` directory into one of OpenClaw's hook directories (e.g.
    `~/.openclaw/hooks/cvd-archive/`), then enable it:

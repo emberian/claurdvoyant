@@ -1,4 +1,4 @@
-# claurdvoyant × Codex CLI — MCP server registration.
+# clustervision × Codex CLI — MCP server registration.
 #
 # Merge this block into ~/.codex/config.toml. Codex registers stdio MCP servers under
 # [mcp_servers.<name>] with `command` / `args` / optional `env` / `enabled`.
@@ -9,7 +9,7 @@
 # agent call recall / search_sessions / project_sessions / read_session / board_* —
 # i.e. read OTHER agents' sessions across harnesses.
 
-[mcp_servers.claurdvoyant]
+[mcp_servers.clustervision]
 command = "/path/to/target/release/cv-mcp"
 args = []
 enabled = true

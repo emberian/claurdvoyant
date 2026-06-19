@@ -2,7 +2,7 @@
 //! cold-catalog transparency, new-file / appended-file / vanished-dir detection, and the
 //! staleness-backstop escape hatch.
 //!
-//! These tests mutate process-global env (`HOME`, `CLAURDVOYANT_HOME`), so every test holds a
+//! These tests mutate process-global env (`HOME`, `CLUSTERVISION_HOME`), so every test holds a
 //! static mutex for its whole body (the `World` guard). They also `sleep` past the probe's 2s
 //! watch-fudge window where a test needs recorded (non-zero) watch mtimes to be the thing that
 //! detects a change.
@@ -39,11 +39,11 @@ impl World {
         fs::create_dir_all(home.join(".claude/projects/-work-proj")).unwrap();
         fs::create_dir_all(&cv_home).unwrap();
         std::env::set_var("HOME", &home);
-        std::env::set_var("CLAURDVOYANT_HOME", &cv_home);
+        std::env::set_var("CLUSTERVISION_HOME", &cv_home);
         std::env::set_var("XDG_CACHE_HOME", home.join(".cache"));
         std::env::set_var("XDG_CONFIG_HOME", home.join(".config"));
         std::env::set_var("XDG_DATA_HOME", home.join(".local/share"));
-        std::env::remove_var("CLAURDVOYANT_MAX_STALE_SECS");
+        std::env::remove_var("CLUSTERVISION_MAX_STALE_SECS");
         std::env::remove_var("CURSOR_USER_DIR");
         World {
             base,
@@ -186,7 +186,7 @@ fn vanished_sessions_dropped() {
 }
 
 /// The warm path really reads the catalog (a row only the catalog knows shows up), and forcing a
-/// full discovery — what `cv ls --fresh` and `CLAURDVOYANT_MAX_STALE_SECS=0` do — heals it.
+/// full discovery — what `cv ls --fresh` and `CLUSTERVISION_MAX_STALE_SECS=0` do — heals it.
 #[test]
 fn warm_path_reads_catalog_and_full_discovery_heals() {
     let w = World::new("warm");
@@ -216,9 +216,9 @@ fn warm_path_reads_catalog_and_full_discovery_heals() {
     );
 
     // Staleness backstop at 0 = every read is a full discovery; the replace-sync drops the phantom.
-    std::env::set_var("CLAURDVOYANT_MAX_STALE_SECS", "0");
+    std::env::set_var("CLUSTERVISION_MAX_STALE_SECS", "0");
     let refs = cv_core::sessions();
-    std::env::remove_var("CLAURDVOYANT_MAX_STALE_SECS");
+    std::env::remove_var("CLUSTERVISION_MAX_STALE_SECS");
     assert_eq!(ids(&refs), vec!["alphasess"], "full discovery heals phantom rows");
 
     // And discover_all() itself (the `--fresh` path) returns only what's on disk.

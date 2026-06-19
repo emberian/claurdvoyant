@@ -1,6 +1,6 @@
 # 🧬 OpenSession — an interchange format for agent sessions
 
-*Status: draft 0.2 · a claurdvoyant proposal · feedback very welcome*
+*Status: draft 0.2 · a clustervision proposal · feedback very welcome*
 
 Every coding-agent harness records its conversations, and **every single one invented its own format**:
 Claude threads by UUID, Codex emits an event stream (twice — once for the UI, once for the model),
@@ -10,7 +10,7 @@ uses yet another JSONL dialect. We've now parsed all of them (see [`FORMATS.md`]
 striking thing is **how similar they actually are underneath**. They all encode the same handful of ideas.
 
 OpenSession writes those ideas down. It is the format the harnesses would have agreed on if they'd talked
-first. claurdvoyant's in-memory IR is the reference implementation, and `cv export --format json` emits it.
+first. clustervision's in-memory IR is the reference implementation, and `cv export --format json` emits it.
 
 ## Design principles (the lessons, earned the hard way)
 
@@ -89,7 +89,7 @@ flag, and a session-level `extra` bag — all additive over v0.1.
 - **System prompts / tool schemas** — huge, harness-specific, and rarely portable. Out of scope for now
   (a harness may stash them in `extra`).
 - **Project context files** (`CLAUDE.md`, `MEMORY.md`, `AGENTS.md`) — these live *next to* a session, not
-  inside it. claurdvoyant's `cv port` carries them alongside; OpenSession may grow an optional `attachments`
+  inside it. clustervision's `cv port` carries them alongside; OpenSession may grow an optional `attachments`
   array later.
 - **Billing/cost** — recorded by some harnesses; belongs in `extra` until there's demand.
 

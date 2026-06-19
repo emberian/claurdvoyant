@@ -1,8 +1,8 @@
 /**
- * claurdvoyant plugin for OpenCode.
+ * clustervision plugin for OpenCode.
  *
  * On every `session.idle` event it archives all harness sessions (`cvd sync`) and posts
- * a status note to the claurdvoyant coordination board's `fleet` channel, so the session
+ * a status note to the clustervision coordination board's `fleet` channel, so the session
  * becomes searchable/portable and sibling agents (and `cvd watch`) see the activity live.
  *
  * OpenCode plugin API (confirmed in packages/plugin/src/index.ts of the opencode source):
@@ -13,8 +13,8 @@
  *     carries `{ type: "session.idle", properties: { sessionID } }` and fires when a session
  *     stops working — our "session finished" signal.
  *
- * Install: drop this file at `~/.config/opencode/plugin/claurdvoyant.ts` (global) or
- * `<project>/.opencode/plugin/claurdvoyant.ts` (per project). OpenCode auto-loads files under
+ * Install: drop this file at `~/.config/opencode/plugin/clustervision.ts` (global) or
+ * `<project>/.opencode/plugin/clustervision.ts` (per project). OpenCode auto-loads files under
  * a `plugin/` directory; no entry in opencode.json is required for local plugin files.
  * Replace the paths below (or set CV_BIN / CVD_BIN env vars) with your built binaries.
  */
@@ -24,12 +24,12 @@ import type { Plugin } from "@opencode-ai/plugin"
 const CV = process.env.CV_BIN ?? "cv"
 const CVD = process.env.CVD_BIN ?? "cvd"
 
-export const ClaurdvoyantPlugin: Plugin = async ({ $, directory }) => {
+export const ClusterVisionPlugin: Plugin = async ({ $, directory }) => {
   return {
     event: async ({ event }) => {
       if (event.type !== "session.idle") return
 
-      // 1) Archive every harness session into ~/.claurdvoyant (idempotent, fast).
+      // 1) Archive every harness session into ~/.clustervision (idempotent, fast).
       //    `.nothrow()` so a missing binary or transient error never disrupts OpenCode.
       await $`${CVD} sync`.quiet().nothrow()
 
@@ -42,4 +42,4 @@ export const ClaurdvoyantPlugin: Plugin = async ({ $, directory }) => {
   }
 }
 
-export default ClaurdvoyantPlugin
+export default ClusterVisionPlugin

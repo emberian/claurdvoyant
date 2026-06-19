@@ -1,6 +1,6 @@
 // tauri.js — graceful Tauri desktop integration.
 //
-// When claurdvoyant runs inside the Tauri shell (the `app/` desktop wrapper),
+// When clustervision runs inside the Tauri shell (the `app/` desktop wrapper),
 // `window.__TAURI__` is present. We then:
 //   (a) route distill / redact / generate through native commands via
 //       `window.__TAURI__.core.invoke(...)` — no API key needed; the desktop
@@ -60,7 +60,7 @@ export async function listen(event, handler) {
     const unlisten = await ev.listen(event, (e) => handler(e?.payload));
     return typeof unlisten === "function" ? unlisten : () => {};
   } catch (err) {
-    console.warn("[claurdvoyant] Tauri event listen failed:", err);
+    console.warn("[clustervision] Tauri event listen failed:", err);
     return () => {};
   }
 }

@@ -1,4 +1,4 @@
-# claurdvoyant × OpenClaw
+# clustervision × OpenClaw
 
 OpenClaw is richly extensible: it has a **directory-based internal hooks system** and
 **consumes external MCP servers**. Both surfaces are wired here.
@@ -12,7 +12,7 @@ OpenClaw is richly extensible: it has a **directory-based internal hooks system*
   `gateway:startup/shutdown`, `message:*`. Managed with `openclaw hooks enable <name>`.
   Confirmed in `docs/automation/hooks.md` (event table, HOOK.md format, handler signature,
   event context fields).
-- **External MCP servers** (so OpenClaw can *use* claurdvoyant): declared under
+- **External MCP servers** (so OpenClaw can *use* clustervision): declared under
   `mcp.servers.<name>` (stdio: `command` + `args`; remote: `url` + `transport`).
   Confirmed in `docs/gateway/configuration-reference.md` ("## MCP", `mcp.servers`).
 
@@ -35,8 +35,8 @@ Make `cv`/`cvd` available on `PATH` (or set `CV_BIN`/`CVD_BIN`).
 
 ### 2. MCP server — [`config.json5`](./config.json5)
 
-Merge the `mcp.servers.claurdvoyant` block into your OpenClaw gateway config (or run
-`openclaw mcp set claurdvoyant ...`) so a running OpenClaw agent can call `recall`,
+Merge the `mcp.servers.clustervision` block into your OpenClaw gateway config (or run
+`openclaw mcp set clustervision ...`) so a running OpenClaw agent can call `recall`,
 `search_sessions`, `project_sessions`, `read_session`, and the `board_*` tools.
 
 ## Notes

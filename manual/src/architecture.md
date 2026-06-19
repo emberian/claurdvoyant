@@ -1,8 +1,8 @@
 # Architecture
 
-This chapter is for contributors and the curious: how claurdvoyant is built, and why it's shaped the way it is. 🔮
+This chapter is for contributors and the curious: how clustervision is built, and why it's shaped the way it is. 🔮
 
-The whole project rests on one idea. Every harness — Claude Code, Codex, Gemini, Cursor, seventeen of them and counting — stores its sessions in a different on-disk dialect. claurdvoyant parses every one of those dialects **into a single unified representation** (the IR), and then *everything else* — search, conversion, porting, distillation, the board, the app — is just a function over that IR. The data-flow one-liner is:
+The whole project rests on one idea. Every harness — Claude Code, Codex, Gemini, Cursor, seventeen of them and counting — stores its sessions in a different on-disk dialect. clustervision parses every one of those dialects **into a single unified representation** (the IR), and then *everything else* — search, conversion, porting, distillation, the board, the app — is just a function over that IR. The data-flow one-liner is:
 
 ```text
 parse(any harness) → IR → search · convert · port · loom · distill · archive · coordinate · view
@@ -12,7 +12,7 @@ Get the IR right and the rest composes. So we start there.
 
 ## The unified IR
 
-The IR lives in [`cv-core/src/ir.rs`](https://github.com/emberian/claurdvoyant/blob/main/crates/cv-core/src/ir.rs). It is deliberately a **superset** of what any single harness records: fields a harness doesn't have are `None`/empty, and anything harness-specific that doesn't have a first-class home rides along in an `extra` map so conversions stay as lossless as the target allows.
+The IR lives in [`cv-core/src/ir.rs`](https://github.com/emberian/clustervision/blob/main/crates/cv-core/src/ir.rs). It is deliberately a **superset** of what any single harness records: fields a harness doesn't have are `None`/empty, and anything harness-specific that doesn't have a first-class home rides along in an `extra` map so conversions stay as lossless as the target allows.
 
 The spine is `Session → Message → Block`:
 
@@ -71,7 +71,7 @@ A few supporting types complete the picture:
 
 ## The `Adapter` trait
 
-Every harness is one `Adapter` ([`cv-core/src/harness/mod.rs`](https://github.com/emberian/claurdvoyant/blob/main/crates/cv-core/src/harness/mod.rs)). The trait is small on purpose:
+Every harness is one `Adapter` ([`cv-core/src/harness/mod.rs`](https://github.com/emberian/clustervision/blob/main/crates/cv-core/src/harness/mod.rs)). The trait is small on purpose:
 
 ```rust
 pub trait Adapter: Send + Sync {
@@ -140,7 +140,7 @@ A failing adapter logs and contributes an empty list rather than sinking the who
 
 Cold discovery of a large corpus means reading and JSON-parsing every transcript just to pull a handful of metadata fields. That's slow. But transcripts only change by being **appended to**, so a file whose `(mtime, size)` is unchanged since last time has unchanged metadata.
 
-That's the whole trick behind [`discover_cache.rs`](https://github.com/emberian/claurdvoyant/blob/main/crates/cv-core/src/discover_cache.rs): a persistent JSON cache under the user's cache dir, keyed on `(mtime_ns, size)`, storing the `SessionRef`s each file produced. A hit returns the stored refs **without touching the file** — steady-state discovery costs one `stat` per file instead of a full read+parse. In practice that's the difference between **~37s cold and ~0.25s warm**.
+That's the whole trick behind [`discover_cache.rs`](https://github.com/emberian/clustervision/blob/main/crates/cv-core/src/discover_cache.rs): a persistent JSON cache under the user's cache dir, keyed on `(mtime_ns, size)`, storing the `SessionRef`s each file produced. A hit returns the stored refs **without touching the file** — steady-state discovery costs one `stat` per file instead of a full read+parse. In practice that's the difference between **~37s cold and ~0.25s warm**.
 
 Adapters opt in by wrapping their per-file scan in `cached_scan` / `cached_scan_many`:
 
@@ -174,7 +174,7 @@ Sub-agent sessions (currently Claude Code's `Task` sub-agents) are **not** in th
 
 ## The crates
 
-claurdvoyant is a Rust workspace. `cv-core` is the library every other crate is built on; the rest are thin front-ends over it.
+clustervision is a Rust workspace. `cv-core` is the library every other crate is built on; the rest are thin front-ends over it.
 
 ```text
                          ┌─────────────────────────────────────────────┐

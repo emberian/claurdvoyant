@@ -1,6 +1,6 @@
-# claurdvoyant × Claude Code
+# clustervision × Claude Code
 
-Wire Claude Code into claurdvoyant so the harness **feeds** the archive on the way
+Wire Claude Code into clustervision so the harness **feeds** the archive on the way
 out and **surfaces prior context** on the way in — and lets a running agent read
 other agents' minds over MCP.
 
@@ -22,7 +22,7 @@ Claude Code's extension points used here:
 - **Project commands** as Markdown files in `.claude/commands/<name>.md` with optional
   YAML frontmatter (`description`, `argument-hint`). Confirmed against the on-disk
   `~/.claude/commands/*.md` (e.g. `crate.md`) on this machine.
-- **MCP servers** registered with `claude mcp add <name> -- <binary>`. claurdvoyant
+- **MCP servers** registered with `claude mcp add <name> -- <binary>`. clustervision
   ships a stdio MCP server (`cv-mcp`).
 
 ## Install
@@ -43,14 +43,14 @@ Claude Code's extension points used here:
      prior sessions for this project + recent fleet activity into the new session's
      context. (Deeper recall is available on demand via the MCP `recall` tool / the
      `/recall` command below.)
-   - **SessionEnd** → runs `cvd sync` to archive every session into `~/.claurdvoyant`.
+   - **SessionEnd** → runs `cvd sync` to archive every session into `~/.clustervision`.
    - **Stop** → posts `"claude finished in <cwd>"` to the `fleet` board channel so
      sibling agents (and `cvd watch`) see it live.
 
 3. **MCP server** — let a running Claude read *other* agents' sessions:
 
    ```sh
-   claude mcp add claurdvoyant -- /path/to/target/release/cv-mcp
+   claude mcp add clustervision -- /path/to/target/release/cv-mcp
    ```
 
    Tools exposed: `recall`, `search_sessions`, `project_sessions`, `read_session`,

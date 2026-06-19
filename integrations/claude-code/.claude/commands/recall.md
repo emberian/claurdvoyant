@@ -1,9 +1,9 @@
 ---
-description: Recall prior cross-harness work relevant to the current task (via claurdvoyant)
+description: Recall prior cross-harness work relevant to the current task (via clustervision)
 argument-hint: <what you're trying to do>
 ---
 
-Use the claurdvoyant MCP server to find prior work — across every harness and every
+Use the clustervision MCP server to find prior work — across every harness and every
 past session — relevant to: **$ARGUMENTS**
 
 Do this:

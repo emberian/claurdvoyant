@@ -98,7 +98,7 @@ pub fn discover_all() -> Vec<SessionRef> {
 ///
 /// Freshness model, in order:
 /// 1. **Cold or overaged catalog** (never fully synced, or the last full sync is older than
-///    `CLAURDVOYANT_MAX_STALE_SECS`, default 900): transparently runs [`discover_all`] — identical
+///    `CLUSTERVISION_MAX_STALE_SECS`, default 900): transparently runs [`discover_all`] — identical
 ///    results, identical cost to today.
 /// 2. **Probe** ([`catalog::probe_stale`]): re-stat the recorded watch set (session-bearing dirs +
 ///    their ancestors + sqlite db files) and the top-50 most-recently-updated session files. Any
@@ -109,7 +109,7 @@ pub fn discover_all() -> Vec<SessionRef> {
 /// probe's documented blind spots (see [`catalog::probe_stale`]): chiefly, an in-place append to a
 /// session outside the top-50 shows a stale `updated_at`/`message_count` until the staleness
 /// backstop, and brand-new sessions are always seen (new files change a watched dir mtime). Set
-/// `CLAURDVOYANT_MAX_STALE_SECS=0` (or pass `cv ls --fresh`) to force the full scan.
+/// `CLUSTERVISION_MAX_STALE_SECS=0` (or pass `cv ls --fresh`) to force the full scan.
 pub fn sessions() -> Vec<SessionRef> {
     sessions_impl().0
 }
@@ -117,7 +117,8 @@ pub fn sessions() -> Vec<SessionRef> {
 /// [`sessions`] plus whether the answer came from a full [`discover_all`] (so `find` knows not to
 /// escalate to a second full scan).
 fn sessions_impl() -> (Vec<SessionRef>, bool) {
-    let max_stale = std::env::var("CLAURDVOYANT_MAX_STALE_SECS")
+    let max_stale = std::env::var("CLUSTERVISION_MAX_STALE_SECS")
+        .or_else(|_| std::env::var("CLAURDVOYANT_MAX_STALE_SECS")) // back-compat with the old name
         .ok()
         .and_then(|s| s.parse::<i64>().ok())
         .unwrap_or(900);

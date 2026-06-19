@@ -1,6 +1,6 @@
 # The daemon: `cvd`
 
-`cvd` is the claurdvoyant daemon — the piece that turns a pile of per-machine, per-harness session
+`cvd` is the clustervision daemon — the piece that turns a pile of per-machine, per-harness session
 files into a single durable **archive** and a live **fleet feed**. Where [`cv`](cli.md) is your
 interactive map of *this* machine, `cvd` is the long-running thing that watches every harness's
 on-disk storage, snapshots sessions into a central store, and (optionally) serves that state as JSON
@@ -19,20 +19,20 @@ Plus two small utilities: `cvd ls` (list what's in the archive) and `cvd path` (
 Everything `cvd` persists lands under one **archive home**, resolved in this order:
 
 1. the `--home <DIR>` flag (global — works on every subcommand),
-2. the `$CLAURDVOYANT_HOME` environment variable,
-3. otherwise `~/.claurdvoyant`.
+2. the `$CLUSTERVISION_HOME` environment variable,
+3. otherwise `~/.clustervision`.
 
 Inside it:
 
 ```
-~/.claurdvoyant/
+~/.clustervision/
 ├── catalog.jsonl                 # cheap metadata, one row per (harness, id)
 └── archive/
     └── <harness>/<id>.json       # the full parsed session, harness-agnostic IR
 ```
 
 `catalog.jsonl` is an append-only JSONL index — lightweight rows for listings and search — while the
-full transcript for each session lives in `archive/<harness>/<id>.json` as claurdvoyant's unified
+full transcript for each session lives in `archive/<harness>/<id>.json` as clustervision's unified
 representation. Storing is **idempotent**: if a session's serialized bytes are byte-identical to
 what's already on disk, `cvd` skips the write entirely. The catalog dedupes by `(harness, id)` with
 the newest `archived_at` winning, and self-compacts once it's carrying too many superseded lines.
@@ -56,7 +56,7 @@ representation, and stores it. It's a one-shot: it archives, prints a summary, a
 
 ```text
 sync complete: 42 archived, 318 skipped (unchanged) of 360 discovered
-archive: /Users/you/.claurdvoyant
+archive: /Users/you/.clustervision
 ```
 
 `skipped` means "already archived and unchanged" (the idempotent fast path), so re-running `sync`
@@ -70,7 +70,7 @@ process.
 cvd watch                          # follow everything
 cvd watch --interval 5             # poll every 5s (default 3)
 cvd watch --harness claude         # only one harness
-cvd watch --cwd claurdvoyant       # only sessions whose cwd contains this substring
+cvd watch --cwd clustervision       # only sessions whose cwd contains this substring
 ```
 
 `watch` is the resident counterpart to `sync`. On its first poll it archives whatever already
@@ -80,8 +80,8 @@ re-archives each session as it changes. It runs until you kill it.
 Every time it archives a changed session it logs the delta to stderr:
 
 ```text
-cvd: watching (interval 3s) -> /Users/you/.claurdvoyant
-[new] claude   a1b2c3d4  +12 msgs  ~/code/claurdvoyant
+cvd: watching (interval 3s) -> /Users/you/.clustervision
+[new] claude   a1b2c3d4  +12 msgs  ~/code/clustervision
 [archived] codex    9f8e7d6c  +3 msgs  ~/code/other-project
 ```
 
@@ -158,7 +158,7 @@ curl 'http://127.0.0.1:7777/api/sessions?harness=claude&limit=2'
   {
     "id": "a1b2c3d4-5e6f-7890-abcd-ef0123456789",
     "harness": "claude",
-    "cwd": "/Users/you/code/claurdvoyant",
+    "cwd": "/Users/you/code/clustervision",
     "title": "wire up the fleet dashboard",
     "updated_at": "2026-05-30T18:42:10Z",
     "created_at": "2026-05-30T17:05:01Z",

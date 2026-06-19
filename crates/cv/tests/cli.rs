@@ -3,7 +3,7 @@
 //! never a panic).
 //!
 //! Hermetic: every test builds its own temp `HOME` (harness discovery roots hang off the home
-//! dir) and temp `CLAURDVOYANT_HOME` (catalog/index/board), and only ever passes them to the
+//! dir) and temp `CLUSTERVISION_HOME` (catalog/index/board), and only ever passes them to the
 //! spawned binary's environment — no process-global `set_var`, so tests run in parallel safely.
 
 use std::path::PathBuf;
@@ -13,7 +13,7 @@ use std::{fs, str};
 /// A planted secret that `cv redact` must scrub (matches cv_core::redact's sk- recognizer).
 const SECRET: &str = "sk-abcDEF1234567890ghijkl";
 
-/// One temp world: a fake `$HOME` (with `.claude/projects` fixtures) + a `$CLAURDVOYANT_HOME`.
+/// One temp world: a fake `$HOME` (with `.claude/projects` fixtures) + a `$CLUSTERVISION_HOME`.
 struct World {
     base: PathBuf,
     home: PathBuf,
@@ -54,7 +54,7 @@ impl World {
             .args(args)
             .current_dir(&self.base)
             .env("HOME", &self.home)
-            .env("CLAURDVOYANT_HOME", &self.cv_home)
+            .env("CLUSTERVISION_HOME", &self.cv_home)
             // Linux fallbacks for dirs::cache_dir / config_dir; harmless on macOS.
             .env("XDG_CACHE_HOME", self.home.join(".cache"))
             .env("XDG_CONFIG_HOME", self.home.join(".config"))

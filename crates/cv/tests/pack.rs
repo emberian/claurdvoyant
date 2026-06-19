@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::{fs, str};
 
-/// One temp world: a fake `$HOME` (with `.claude/projects` fixtures) + a `$CLAURDVOYANT_HOME`.
+/// One temp world: a fake `$HOME` (with `.claude/projects` fixtures) + a `$CLUSTERVISION_HOME`.
 struct World {
     base: PathBuf,
     home: PathBuf,
@@ -45,7 +45,7 @@ impl World {
             .args(args)
             .current_dir(&self.base)
             .env("HOME", &self.home)
-            .env("CLAURDVOYANT_HOME", &self.cv_home)
+            .env("CLUSTERVISION_HOME", &self.cv_home)
             .env_remove("CV_PACK_LLM") // tests must exercise the zero-network digest
             .env("XDG_CACHE_HOME", self.home.join(".cache"))
             .env("XDG_CONFIG_HOME", self.home.join(".config"))

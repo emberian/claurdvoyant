@@ -3,7 +3,7 @@
 //! (transcript + the `<sid>/workflows/` state/scripts + `<sid>/subagents/` agent transcripts +
 //! journal) under a temp `$HOME`, then drives the real binary and asserts on its output.
 //!
-//! Mirrors `cli.rs`'s hermetic World (own `$HOME` + `$CLAURDVOYANT_HOME`, env-only, parallel-safe).
+//! Mirrors `cli.rs`'s hermetic World (own `$HOME` + `$CLUSTERVISION_HOME`, env-only, parallel-safe).
 
 use std::fs;
 use std::path::PathBuf;
@@ -78,7 +78,7 @@ impl World {
             .args(args)
             .current_dir(&self.base)
             .env("HOME", &self.home)
-            .env("CLAURDVOYANT_HOME", &self.cv_home)
+            .env("CLUSTERVISION_HOME", &self.cv_home)
             .env("XDG_CACHE_HOME", self.home.join(".cache"))
             .env("XDG_CONFIG_HOME", self.home.join(".config"))
             .env("XDG_DATA_HOME", self.home.join(".local/share"))

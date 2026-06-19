@@ -834,7 +834,7 @@ mod tests {
     use super::*;
     use std::io::Write;
 
-    /// `CLAURDVOYANT_HOME` is process-global — these are the only env-touching unit tests in
+    /// `CLUSTERVISION_HOME` is process-global — these are the only env-touching unit tests in
     /// this binary, serialized against each other.
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -876,7 +876,7 @@ mod tests {
     fn windowed_render_is_byte_identical_via_seek_and_full_stream() {
         let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let home = temp_home("claude");
-        std::env::set_var("CLAURDVOYANT_HOME", &home);
+        std::env::set_var("CLUSTERVISION_HOME", &home);
 
         let path = home.join("s.jsonl");
         let big = "long \"quoted\" content\n".repeat(400);
@@ -927,11 +927,11 @@ mod tests {
         // recorded metadata on the seek path. Compare against the full stream with no catalog.
         for range in [(3usize, Some(6usize)), (2, Some(11)), (5, None), (1, Some(2))] {
             let seeked = render(&r, Some((range.0, range.1)));
-            std::env::remove_var("CLAURDVOYANT_HOME");
-            std::env::set_var("CLAURDVOYANT_HOME", temp_home("claude-empty"));
+            std::env::remove_var("CLUSTERVISION_HOME");
+            std::env::set_var("CLUSTERVISION_HOME", temp_home("claude-empty"));
             assert!(!seekable(&r, range.0), "empty catalog must fall back");
             let full = render(&r, Some((range.0, range.1)));
-            std::env::set_var("CLAURDVOYANT_HOME", &home);
+            std::env::set_var("CLUSTERVISION_HOME", &home);
             assert_eq!(seeked, full, "range {range:?} render must be byte-identical");
             assert!(seeked.contains("claude-test"), "header model expected in {range:?}");
         }
@@ -949,7 +949,7 @@ mod tests {
         let after = render(&r, Some((9, Some(12))));
         assert!(after.contains("follow-up 7") && after.contains("appended"));
 
-        std::env::remove_var("CLAURDVOYANT_HOME");
+        std::env::remove_var("CLUSTERVISION_HOME");
         std::fs::remove_dir_all(&home).ok();
     }
 
@@ -959,7 +959,7 @@ mod tests {
     fn codex_windowed_render_is_byte_identical_via_seek_and_full_stream() {
         let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let home = temp_home("codex");
-        std::env::set_var("CLAURDVOYANT_HOME", &home);
+        std::env::set_var("CLUSTERVISION_HOME", &home);
 
         let path = home.join("rollout-r.jsonl");
         let big = "giant output\n".repeat(500);
@@ -992,14 +992,14 @@ mod tests {
 
         for range in [(2usize, Some(4usize)), (1, None), (3, Some(5))] {
             let seeked = render(&r, Some((range.0, range.1)));
-            std::env::set_var("CLAURDVOYANT_HOME", temp_home("codex-empty"));
+            std::env::set_var("CLUSTERVISION_HOME", temp_home("codex-empty"));
             let full = render(&r, Some((range.0, range.1)));
-            std::env::set_var("CLAURDVOYANT_HOME", &home);
+            std::env::set_var("CLUSTERVISION_HOME", &home);
             assert_eq!(seeked, full, "range {range:?} render must be byte-identical");
             assert!(seeked.contains("gpt-test"), "header model expected in {range:?}");
         }
 
-        std::env::remove_var("CLAURDVOYANT_HOME");
+        std::env::remove_var("CLUSTERVISION_HOME");
         std::fs::remove_dir_all(&home).ok();
     }
 }

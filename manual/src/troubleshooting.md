@@ -8,7 +8,7 @@ the plain browser build, which is zip-drop only), and that nothing else is occup
 
 ### "Showing 0 sessions" / nothing found
 
-claurdvoyant only sees harnesses installed in their standard locations (see
+clustervision only sees harnesses installed in their standard locations (see
 [Harnesses](harnesses.md)). Run `cv ls` in a terminal — if that's empty too, no supported harness
 data was found under `$HOME`.
 
@@ -27,7 +27,7 @@ text. That's a format limitation, not a bug. See [Cross-harness conversion](conv
 
 ### Sub-agents
 
-Claude Code's Task tool spawns sub-agents whose transcripts are normally invisible. claurdvoyant
+Claude Code's Task tool spawns sub-agents whose transcripts are normally invisible. clustervision
 finds them and nests them under the parent session in the app's transcript view (lazy-loaded,
 labeled by task prompt). There can be thousands, so they're never dumped into the main list. See
 [The app](app.md).
@@ -35,9 +35,9 @@ labeled by task prompt). There can be thousands, so they're never dumped into th
 ### The MCP server isn't responding
 
 `cv-mcp` speaks JSON-RPC over **stdio**, and **stdout is the protocol channel** — all diagnostics go
-to stderr. Register it with `claude mcp add claurdvoyant -- /abs/path/to/cv-mcp`. See [MCP](mcp.md).
+to stderr. Register it with `claude mcp add clustervision -- /abs/path/to/cv-mcp`. See [MCP](mcp.md).
 
 ### Still stuck?
 
-Open an issue: <https://github.com/emberian/claurdvoyant/issues>. Weird old transcripts especially
+Open an issue: <https://github.com/emberian/clustervision/issues>. Weird old transcripts especially
 welcome. 🔮

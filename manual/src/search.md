@@ -1,6 +1,6 @@
 # Search (full-text & semantic)
 
-claurdvoyant indexes every session you've ever run — across every harness — so you
+clustervision indexes every session you've ever run — across every harness — so you
 can find that one conversation again. There are two ways to look: **full-text**
 search (you remember a word that was said) and **semantic** search (you only
 remember what it was *about*). 🔮
@@ -27,9 +27,9 @@ cv index --semantic   # also build semantic embeddings
 
 ```text
 ✦ building full-text index…
-indexed 412 session(s) → /Users/you/.claurdvoyant/tantivy
+indexed 412 session(s) → /Users/you/.clustervision/tantivy
 ✦ embedding sessions (downloads a small model on first use)…
-embedded 412 session(s) → /Users/you/.claurdvoyant/embeddings.json
+embedded 412 session(s) → /Users/you/.clustervision/embeddings.json
 ```
 
 `cv index` discovers and parses every session from every supported harness, then
@@ -56,14 +56,14 @@ fragments are searchable), the `title`, and created/updated timestamps.
 
 ### Where the index lives
 
-Both indexes live under `$CLAURDVOYANT_HOME` (default `~/.claurdvoyant`):
+Both indexes live under `$CLUSTERVISION_HOME` (default `~/.clustervision`):
 
 | Index            | Path                                  |
 | ---------------- | ------------------------------------- |
-| Full-text        | `~/.claurdvoyant/tantivy/`            |
-| Semantic vectors | `~/.claurdvoyant/embeddings.json`     |
+| Full-text        | `~/.clustervision/tantivy/`            |
+| Semantic vectors | `~/.clustervision/embeddings.json`     |
 
-Set `CLAURDVOYANT_HOME` to relocate them.
+Set `CLUSTERVISION_HOME` to relocate them.
 
 ## Full-text search
 
@@ -107,7 +107,7 @@ instant search)`, build the index.
 
 > Older releases also kept a SQLite full-text index as a middle tier; it's
 > retired (tantivy is canonical). If a stale `index.sqlite` lingers in your
-> claurdvoyant home, `cv search` prints a note that it's safe to delete.
+> clustervision home, `cv search` prints a note that it's safe to delete.
 
 ## Semantic / meaning search
 
@@ -188,7 +188,7 @@ Semantic search uses [model2vec] *static* embeddings (model
 `minishlab/potion-base-8M`, ~30 MB, 256-dim). "Static" means there's no
 transformer forward pass and no ONNX runtime: text is tokenized, per-token
 vectors are looked up in a distilled table and mean-pooled. It's tiny and
-CPU-fast, so claurdvoyant just embeds every session up front and does a
+CPU-fast, so clustervision just embeds every session up front and does a
 brute-force in-memory cosine scan at query time — no approximate-nearest-neighbor
 index needed at the ~1k-session scale.
 

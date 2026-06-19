@@ -1,4 +1,4 @@
-"""claurdvoyant archive plugin for Hermes.
+"""clustervision archive plugin for Hermes.
 
 Hermes loads directory plugins from ``~/.hermes/plugins/<name>/`` (and project
 ``./.hermes/plugins/<name>/``). Each plugin has a ``plugin.yaml`` manifest plus an
@@ -8,8 +8,8 @@ Hermes loads directory plugins from ``~/.hermes/plugins/<name>/`` (and project
 ``disk-cleanup`` plugin in the Hermes source for the canonical pattern).
 
 On session end this plugin:
-  1. runs ``cvd sync`` to archive every harness's sessions into ~/.claurdvoyant, and
-  2. posts ``"hermes finished (<session_id>)"`` to the claurdvoyant ``fleet`` board.
+  1. runs ``cvd sync`` to archive every harness's sessions into ~/.clustervision, and
+  2. posts ``"hermes finished (<session_id>)"`` to the clustervision ``fleet`` board.
 
 Set CV_BIN / CVD_BIN env vars if ``cv`` / ``cvd`` are not on PATH.
 """

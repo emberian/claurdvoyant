@@ -1,7 +1,7 @@
-description = "Recall prior cross-harness work relevant to the current task (via claurdvoyant)"
+description = "Recall prior cross-harness work relevant to the current task (via clustervision)"
 
 prompt = """
-Use the claurdvoyant MCP server to find prior work — across every harness and every
+Use the clustervision MCP server to find prior work — across every harness and every
 past session — relevant to: {{args}}
 
 1. Call the `recall` tool with the query above (k=5). It semantically searches the whole

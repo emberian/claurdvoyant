@@ -2,7 +2,7 @@
 //! an isolated catalog, then `offsets::stream_range` must deliver byte-identical windows to a
 //! full stream — and fall back (`Ok(false)`, sink untouched) on anything stale or unsupported.
 //!
-//! Lives in its own integration-test process because `CLAURDVOYANT_HOME` is process-global state
+//! Lives in its own integration-test process because `CLUSTERVISION_HOME` is process-global state
 //! (the in-crate unit tests that touch it serialize among themselves; we don't share their lock).
 
 #![cfg(all(feature = "sqlite", feature = "mmap"))]
@@ -104,7 +104,7 @@ fn full_stream(r: &SessionRef, opts: &ParseOptions) -> Vec<Message> {
 #[test]
 fn record_then_seek_windows_match_full_stream_and_guard_staleness() {
     let home = temp_home("e2e");
-    std::env::set_var("CLAURDVOYANT_HOME", &home);
+    std::env::set_var("CLUSTERVISION_HOME", &home);
 
     // ---------- claude ----------
     let cpath = home.join("seek-claude.jsonl");
@@ -250,6 +250,6 @@ fn record_then_seek_windows_match_full_stream_and_guard_staleness() {
     let mut probe = Probe::default();
     assert!(!offsets::stream_range(&other, 2, Some(4), &opts, &mut probe).unwrap());
 
-    std::env::remove_var("CLAURDVOYANT_HOME");
+    std::env::remove_var("CLUSTERVISION_HOME");
     std::fs::remove_dir_all(&home).ok();
 }

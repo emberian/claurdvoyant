@@ -1,4 +1,4 @@
-//! cvd — the claurdvoyant daemon.
+//! cvd — the clustervision daemon.
 //!
 //! Watches every harness's on-disk storage and archives agent sessions into a central store, so a
 //! user can centralize cloud-fleet / multi-machine agent logs for search and safekeeping. Built on
@@ -18,11 +18,11 @@ use std::time::Duration;
 #[derive(Parser)]
 #[command(
     name = "cvd",
-    about = "claurdvoyant daemon — archive agent sessions into a central store",
+    about = "clustervision daemon — archive agent sessions into a central store",
     version
 )]
 struct Cli {
-    /// Archive home (default: $CLAURDVOYANT_HOME or ~/.claurdvoyant).
+    /// Archive home (default: $CLUSTERVISION_HOME or ~/.clustervision).
     #[arg(long, global = true, value_name = "DIR")]
     home: Option<PathBuf>,
 

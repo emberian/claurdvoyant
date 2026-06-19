@@ -1,6 +1,6 @@
 [package]
 name = "cv-llm"
-description = "LLM-backed features over claurdvoyant sessions (distillation) via OpenRouter / Anthropic."
+description = "LLM-backed features over clustervision sessions (distillation) via OpenRouter / Anthropic."
 version.workspace = true
 edition.workspace = true
 license.workspace = true

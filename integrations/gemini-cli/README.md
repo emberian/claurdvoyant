@@ -1,8 +1,8 @@
-# claurdvoyant × Gemini CLI
+# clustervision × Gemini CLI
 
 Gemini CLI is cleanly extensible via **extensions** that bundle an MCP server, a context
 file, custom commands, and lifecycle hooks. This directory is a ready-to-install
-extension: [`cv-claurdvoyant/`](./cv-claurdvoyant/).
+extension: [`cv-clustervision/`](./cv-clustervision/).
 
 ## Mechanism (where this is confirmed, in `/Users/ember/pug/gemini-cli`)
 
@@ -25,7 +25,7 @@ extension: [`cv-claurdvoyant/`](./cv-claurdvoyant/).
 
 ## What the extension does
 
-- **MCP** (`claurdvoyant`): exposes `recall`, `search_sessions`, `project_sessions`,
+- **MCP** (`clustervision`): exposes `recall`, `search_sessions`, `project_sessions`,
   `read_session`, `list_sessions`, `await_omen`, `board_*` to a running Gemini agent.
 - **SessionStart hook** (`hooks/session-start.sh`): emits `cv ls --cwd <cwd>` +
   `cv board read fleet` as `additionalContext`, so prior project sessions and fleet
@@ -33,7 +33,7 @@ extension: [`cv-claurdvoyant/`](./cv-claurdvoyant/).
 - **SessionEnd hook** (`hooks/session-end.sh`): runs `cvd sync` to archive everything and
   posts `"gemini finished in <cwd>"` to the fleet board.
 - **`/recall <task>`** command: drives the MCP `recall` flow.
-- **`GEMINI.md`**: tells the model claurdvoyant is available and how to use it.
+- **`GEMINI.md`**: tells the model clustervision is available and how to use it.
 
 ## Install
 
@@ -42,16 +42,16 @@ extension: [`cv-claurdvoyant/`](./cv-claurdvoyant/).
 cargo build --release
 
 # Install the extension (copies it into ~/.gemini/extensions/):
-gemini extensions install /Users/ember/pug/claurdvoyant/integrations/gemini-cli/cv-claurdvoyant
+gemini extensions install /Users/ember/pug/clustervision/integrations/gemini-cli/cv-clustervision
 ```
 
-Then edit the installed `gemini-extension.json` so `mcpServers.claurdvoyant.command`
+Then edit the installed `gemini-extension.json` so `mcpServers.clustervision.command`
 points at your absolute `cv-mcp` path (use `${extensionPath}` only for files shipped
 inside the extension; the binary lives in your build tree). Restart Gemini CLI for the
 extension to take effect.
 
 > The hook scripts reference
-> `$GEMINI_PROJECT_DIR/.gemini/extensions/cv-claurdvoyant/hooks/...`. If your install
+> `$GEMINI_PROJECT_DIR/.gemini/extensions/cv-clustervision/hooks/...`. If your install
 > path differs, adjust the `command` paths in `hooks/hooks.json` accordingly, or make
 > `cv`/`cvd` available on `PATH` and set `CV_BIN`/`CVD_BIN`.
 

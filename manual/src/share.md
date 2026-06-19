@@ -21,7 +21,7 @@ The page itself:
 - **code blocks** with a tiny built-in syntax highlighter (no JS dependencies — it's ~40 lines of inline script operating on text only);
 - **keyboard nav**: `j`/`k` move between messages, `x` toggles the focused message's folds, and the header button expands/collapses everything;
 - **dark theme by default** (the 🔮 violet), light theme automatically via `prefers-color-scheme`;
-- **a footer** crediting the `claurdvoyant` version that produced the file.
+- **a footer** crediting the `clustervision` version that produced the file.
 
 Every session-derived string is HTML-escaped on the way in — a transcript containing `<script>` renders as text, never as markup.
 

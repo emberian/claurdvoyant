@@ -1,5 +1,5 @@
 {
-  "//": "claurdvoyant <-> Claude Code hooks. Merge the `hooks` block below into your ~/.claude/settings.json (user scope) or <project>/.claude/settings.json (project scope). Replace /path/to/... with absolute paths to your built binaries (cargo build --release puts them in target/release/). Hooks receive a JSON object on stdin with keys including session_id, transcript_path, cwd, and hook_event_name.",
+  "//": "clustervision <-> Claude Code hooks. Merge the `hooks` block below into your ~/.claude/settings.json (user scope) or <project>/.claude/settings.json (project scope). Replace /path/to/... with absolute paths to your built binaries (cargo build --release puts them in target/release/). Hooks receive a JSON object on stdin with keys including session_id, transcript_path, cwd, and hook_event_name.",
   "hooks": {
     "SessionStart": [
       {
@@ -7,7 +7,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "/path/to/cv ls --cwd \"$CLAUDE_PROJECT_DIR\" --limit 8 2>/dev/null; /path/to/cv board read \"fleet\" --limit 5 2>/dev/null; echo '(claurdvoyant: prior sessions + fleet board above; use the MCP recall/project_sessions tools for deeper context)'"
+            "command": "/path/to/cv ls --cwd \"$CLAUDE_PROJECT_DIR\" --limit 8 2>/dev/null; /path/to/cv board read \"fleet\" --limit 5 2>/dev/null; echo '(clustervision: prior sessions + fleet board above; use the MCP recall/project_sessions tools for deeper context)'"
           }
         ]
       }

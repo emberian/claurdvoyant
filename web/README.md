@@ -1,4 +1,4 @@
-# claurdvoyant — web viewer
+# clustervision — web viewer
 
 A static, **client-side** web app for browsing, comparing, and **splicing** agent
 sessions. Drop one or more `.zip`s of a harness directory (a `.claude/projects/…`
@@ -221,7 +221,7 @@ The same `web/` runs unchanged in a plain browser **and** inside the Tauri deskt
 shell (the `app/` wrapper). All of `tauri.js` degrades to no-ops when
 `window.__TAURI__` is absent, so the browser path is never affected.
 
-When running under Tauri, claurdvoyant:
+When running under Tauri, clustervision:
 
 - **routes generation through native commands.** The loom's **⚡ generate** calls
   `window.__TAURI__.core.invoke('generate', { messages, model })` instead of the

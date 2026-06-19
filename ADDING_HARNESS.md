@@ -1,4 +1,4 @@
-# 💛 Adding a harness to claurdvoyant
+# 💛 Adding a harness to clustervision
 
 So you run a coding agent we don't support yet — or you have **old logs in a format we've never seen**.
 Adding a parser is one file. This guide walks you through it, and (just as important) how we handle the
@@ -50,7 +50,7 @@ Harnesses are living software. **Their on-disk format drifts**, and a real archi
 overlapping variants. Codex alone has at least three shapes we handle (a `session_meta`-wrapped first line, a
 bare `{id,timestamp}` header, and a 2025 single-JSON `{session, items[]}` file). OpenCode has a pre-`parts`
 generation that stored an inline `summary` and a newer one with separate part files. **A core goal of
-claurdvoyant is to parse ALL historical variations accurately** — your five-year-old logs should open.
+clustervision is to parse ALL historical variations accurately** — your five-year-old logs should open.
 
 How we do that, and what we ask of you:
 

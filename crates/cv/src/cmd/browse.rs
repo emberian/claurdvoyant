@@ -191,7 +191,7 @@ pub(crate) fn cmd_stats(query: Option<String>) -> Result<()> {
         }
     }
 
-    println!("✦ claurdvoyant fleet stats\n");
+    println!("✦ clustervision fleet stats\n");
     println!("{total} session(s) · {total_messages} message(s)\n");
 
     println!("by harness:");

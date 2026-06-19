@@ -2,10 +2,10 @@
 
 After reverse-engineering seventeen different transcript formats, one thing was obvious: they're all
 *almost the same thing* underneath. **OpenSession** is the format they should have agreed on — a
-small, honest, harness-neutral interchange format. claurdvoyant's internal IR is its reference
+small, honest, harness-neutral interchange format. clustervision's internal IR is its reference
 implementation, and `.opensession.json` is a first-class import/export format in the app and CLI.
 
-The full spec lives at **[docs/OPENSESSION.md](https://github.com/emberian/claurdvoyant/blob/main/docs/OPENSESSION.md)**. The essentials:
+The full spec lives at **[docs/OPENSESSION.md](https://github.com/emberian/clustervision/blob/main/docs/OPENSESSION.md)**. The essentials:
 
 ## The shape
 

@@ -1,9 +1,9 @@
-# claurdvoyant × OpenCode
+# clustervision × OpenCode
 
 Two integration surfaces, both confirmed against the OpenCode source in
 `/Users/ember/pug/opencode`:
 
-## 1. Plugin (active feed) — [`claurdvoyant.ts`](./claurdvoyant.ts)
+## 1. Plugin (active feed) — [`clustervision.ts`](./clustervision.ts)
 
 OpenCode has a first-class TypeScript plugin API:
 
@@ -16,7 +16,7 @@ OpenCode has a first-class TypeScript plugin API:
   `type: "session.idle"`, `properties.sessionID`).
 
 On `session.idle` the plugin runs `cvd sync` (archives every harness's sessions) and
-posts `"opencode idle in <directory>"` to the claurdvoyant `fleet` board channel via
+posts `"opencode idle in <directory>"` to the clustervision `fleet` board channel via
 `cv board post`. All shell calls use `.nothrow()` so they never disrupt OpenCode.
 
 **Install.** OpenCode auto-discovers local plugin files under a `.opencode/plugin(s)/`
@@ -24,8 +24,8 @@ directory — no `opencode.json` entry needed. Confirmed in
 `packages/opencode/src/config/config.ts` (`// Auto-discovered plugins under
 .opencode/plugin(s)`). Place the file at:
 
-- `~/.config/opencode/plugin/claurdvoyant.ts` — global, or
-- `<project>/.opencode/plugin/claurdvoyant.ts` — per project.
+- `~/.config/opencode/plugin/clustervision.ts` — global, or
+- `<project>/.opencode/plugin/clustervision.ts` — per project.
 
 Set `CV_BIN` / `CVD_BIN` env vars to absolute binary paths, or rely on `cv`/`cvd`
 being on `PATH`. The plugin imports types from `@opencode-ai/plugin` (the published

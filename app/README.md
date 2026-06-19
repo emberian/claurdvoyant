@@ -1,6 +1,6 @@
-# claurdvoyant — desktop app (Tauri v2)
+# clustervision — desktop app (Tauri v2)
 
-A single clickable cross-platform desktop application that wraps claurdvoyant:
+A single clickable cross-platform desktop application that wraps clustervision:
 the existing **static web UI** (session viewer, timeline, compare, stats, OpenSession,
 splice/loom composer, fleet dashboard) plus **native Rust backend power** (distill,
 redact, generative loom, **native zip ingest**), a **native application menu**,
@@ -14,7 +14,7 @@ app/
 └── src-tauri/           ← the Tauri v2 Rust app (its OWN cargo workspace)
     ├── Cargo.toml       ← declares `[workspace]` so it's EXCLUDED from the repo-root workspace
     ├── build.rs         ← tauri-build codegen
-    ├── tauri.conf.json  ← v2 config; identifier `town.lunar.claurdvoyant`
+    ├── tauri.conf.json  ← v2 config; identifier `town.lunar.clustervision`
     ├── capabilities/
     │   └── default.json ← grants core + shell:allow-open + dialog:default to the main window
     ├── icons/           ← app icon set (crystal-ball theme)
@@ -25,7 +25,7 @@ app/
 
 ### Why its own workspace
 `src-tauri/Cargo.toml` has a top-level `[workspace]` table. That makes it a **standalone
-cargo workspace**, so it is *excluded* from the main claurdvoyant workspace at the repo
+cargo workspace**, so it is *excluded* from the main clustervision workspace at the repo
 root. Building or CI-testing the main crates never compiles the app (which pulls in the
 heavy WebKit/Tauri stack), and vice-versa. The app still depends on the real crates by
 relative path: `cv-core`, `cv-llm`, `cv-search` at `../../crates/...`.
@@ -70,7 +70,7 @@ The app installs a native [`Menu`](https://docs.rs/tauri/2/tauri/menu/) in `setu
 - **View → Reload** (`Cmd/Ctrl+R`) reloads the webview, **Toggle DevTools** (`Cmd/Ctrl+Alt+I`;
   the `tauri` `devtools` feature is enabled so this works in release bundles too),
   **Toggle Fullscreen**, and **Toggle cvd serve** (start/stop the sidecar at runtime).
-- **Help → About claurdvoyant** (predefined, with name/version/description) and
+- **Help → About clustervision** (predefined, with name/version/description) and
   **Open the web demo** (opens the public demo in the default browser via `shell:allow-open`).
 
 The native dialog is driven from **Rust** (`app.dialog().file()…`), so no JS-side permission is
@@ -156,9 +156,9 @@ Requirements:
 - `cargo build` **and** `cargo build --release` in `app/src-tauri` **compile cleanly** — Tauri v2
   (with the `devtools` feature) + system WebKit on macOS; the dialog, window-state, and shell
   plugins; the `zip` crate; and cv-core / cv-llm / cv-search via relative paths. No warnings from
-  `claurdvoyant-app` itself.
+  `clustervision-app` itself.
 - The app is **excluded from the main repo workspace** (`cargo metadata` at the repo root does
-  not list `claurdvoyant-app`).
+  not list `clustervision-app`).
 
 A full `cargo tauri dev` / `cargo tauri build` bundle (.app/.dmg) needs a display and (for
 distribution) codesigning, so it was not produced here — run it on your machine with `tauri-cli`

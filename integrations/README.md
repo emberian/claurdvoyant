@@ -1,16 +1,16 @@
-# claurdvoyant integrations — the cross-harness memory + coordination layer
+# clustervision integrations — the cross-harness memory + coordination layer
 
-> Wire your agent harnesses *into* claurdvoyant so they feed it and use it automatically.
+> Wire your agent harnesses *into* clustervision so they feed it and use it automatically.
 
-claurdvoyant already parses, searches, ports, and streams sessions from every harness.
+clustervision already parses, searches, ports, and streams sessions from every harness.
 These integrations close the loop: instead of running `cv`/`cvd` by hand, each harness's
-own extension points (**hooks**, **plugins**, **MCP**) drive claurdvoyant **live** —
+own extension points (**hooks**, **plugins**, **MCP**) drive clustervision **live** —
 turning it into a hub every agent plugs into.
 
 Three things happen, automatically, in whatever harness you're in:
 
 1. **Feed** — when a session ends/idles, the harness runs `cvd sync` to archive every
-   harness's sessions into `~/.claurdvoyant`, so nothing rots in scattered folders.
+   harness's sessions into `~/.clustervision`, so nothing rots in scattered folders.
 2. **Surface** — when a session starts, the harness pulls prior context for the current
    project (`cv ls --cwd`, `cv board read fleet`) and injects it; deeper, semantic recall
    is one tool/command away.
@@ -43,7 +43,7 @@ to `cv-mcp` when registering the MCP server. Every config below uses the placeho
 | **[Kimi CLI](./kimi/)** | `kimi mcp add` / `~/.kimi/mcp.json` | passive¹ | ✅ | `docs/en/customization/mcp.md`, `docs/en/configuration/data-locations.md` |
 
 ¹ Kimi exposes MCP but has **no documented lifecycle-hooks system**, so it can't actively
-call `cvd sync`. It feeds claurdvoyant passively: run `cvd watch` and it archives Kimi's
+call `cvd sync`. It feeds clustervision passively: run `cvd watch` and it archives Kimi's
 on-disk sessions like any other harness.
 
 ## What turned out *not* cleanly extensible

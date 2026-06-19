@@ -6,7 +6,7 @@ members = ["crates/cv-core", "crates/cv", "crates/cv-mcp", "crates/cvd", "crates
 version = "0.9.15"
 edition = "2021"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/emberian/claurdvoyant"
+repository = "https://github.com/emberian/clustervision"
 authors = ["ember"]
 
 [workspace.dependencies]
@@ -26,7 +26,7 @@ ruzstd = "0.8"
 dirs = "5"
 clap = { version = "4", features = ["derive"] }
 uuid = { version = "1", features = ["v4", "v7"] }
-# Human-editable config (`~/.config/claurdvoyant/config.toml`). Pure Rust.
+# Human-editable config (`~/.config/clustervision/config.toml`). Pure Rust.
 toml = "0.8"
 # BurntSushi's regex engine — powers the query calculus's `~` (regex-match) operator. Linear-time
 # (no catastrophic backtracking) and already in the tree transitively (tantivy), so it's near-free.

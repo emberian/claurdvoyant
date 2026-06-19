@@ -29,7 +29,7 @@ async function loadWasm() {
     wasmStatus = "ready";
   } catch (err) {
     // Expected on the static fallback deploy (no pkg/ built). Demo via sample.js.
-    console.info("[claurdvoyant] wasm module unavailable, using sample fallback:", err?.message ?? err);
+    console.info("[clustervision] wasm module unavailable, using sample fallback:", err?.message ?? err);
     wasmStatus = "missing";
   }
 }

@@ -40,7 +40,7 @@ impl World {
             .args(args)
             .current_dir(&self.base)
             .env("HOME", &self.home)
-            .env("CLAURDVOYANT_HOME", &self.cv_home)
+            .env("CLUSTERVISION_HOME", &self.cv_home)
             .env("XDG_CACHE_HOME", self.home.join(".cache"))
             .env("XDG_CONFIG_HOME", self.home.join(".config"))
             .env("XDG_DATA_HOME", self.home.join(".local/share"))
@@ -165,7 +165,7 @@ fn share_redacts_by_default() {
     // session content is escaped, never raw markup
     assert!(html.contains("&lt;tables&gt;"), "content not escaped");
     // footer credits the emitting version
-    assert!(html.contains(&format!("claurdvoyant</strong> v{}", env!("CARGO_PKG_VERSION"))));
+    assert!(html.contains(&format!("clustervision</strong> v{}", env!("CARGO_PKG_VERSION"))));
 }
 
 #[test]

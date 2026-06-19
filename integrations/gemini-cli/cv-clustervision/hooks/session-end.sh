@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# claurdvoyant SessionEnd hook for Gemini CLI.
+# clustervision SessionEnd hook for Gemini CLI.
 #
 # Advisory event: archive every harness's sessions and ping the fleet board.
 # SessionEnd output is advisory, but we still keep stdout JSON-clean per Gemini's rule.
