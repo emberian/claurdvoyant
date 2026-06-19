@@ -15,7 +15,7 @@ pub(crate) use util::short_id;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use cmd::live::BoardCmd;
-use cmd::{browse, compose, config, convert, live, pack, provenance, query, search, share, view, workflow};
+use cmd::{browse, compose, config, convert, doctor, live, pack, provenance, query, search, share, view, workflow};
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -421,6 +421,21 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// Diagnose why a session's context window keeps filling and compacting: attribute context
+    /// pressure by source (tool results split MCP/builtin, thinking, messages), size the fixed
+    /// system+tools overhead from token usage, and pair it with compaction frequency. With no
+    /// <id>, analyzes the most recent session(s) for the current directory.
+    Doctor {
+        /// Session id (prefix ok). Omit to analyze recent sessions in the current project.
+        id: Option<String>,
+        #[arg(long)]
+        harness: Option<String>,
+        /// With no <id>: how many recent sessions (for this cwd) to aggregate.
+        #[arg(long, default_value_t = 1)]
+        recent: usize,
+        #[arg(long)]
+        json: bool,
+    },
     /// Post to / read from the agent coordination board.
     Board {
         #[command(subcommand)]
@@ -679,6 +694,12 @@ fn main() -> Result<()> {
             summaries,
             json,
         } => workflow::cmd_compaction(&id, harness, summaries, json),
+        Cmd::Doctor {
+            id,
+            harness,
+            recent,
+            json,
+        } => doctor::cmd_doctor(id, harness, recent, json),
         Cmd::Board { action } => live::cmd_board(action),
         Cmd::Timeline {
             harness,

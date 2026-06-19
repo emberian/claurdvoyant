@@ -4,6 +4,7 @@ pub(crate) mod browse;
 pub(crate) mod compose;
 pub(crate) mod config;
 pub(crate) mod convert;
+pub(crate) mod doctor;
 pub(crate) mod live;
 pub(crate) mod pack;
 pub(crate) mod provenance;
