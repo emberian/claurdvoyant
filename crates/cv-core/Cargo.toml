@@ -7,6 +7,13 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 
+# Keep the Rust crate name `cv_core` even though the crates.io package is
+# `clustervision-core` (renamed off the taken `cv-core`). Dependents already
+# alias it via `package = "clustervision-core"`, and this keeps the crate's own
+# `tests/` (which `use cv_core::…`) compiling.
+[lib]
+name = "cv_core"
+
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true
