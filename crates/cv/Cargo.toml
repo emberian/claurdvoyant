@@ -1,5 +1,5 @@
 [package]
-name = "cv"
+name = "clustervision"
 description = "clustervision CLI — search, read, and port AI coding-agent sessions across harnesses."
 version.workspace = true
 edition.workspace = true
@@ -12,9 +12,9 @@ name = "cv"
 path = "src/main.rs"
 
 [dependencies]
-cv-core = { path = "../cv-core" }
-cv-search = { path = "../cv-search" }
-cv-llm = { path = "../cv-llm" }
+cv-core = { path = "../cv-core", version = "0.9.16", package = "clustervision-core" }
+cv-search = { path = "../cv-search", version = "0.9.16" }
+cv-llm = { path = "../cv-llm", version = "0.9.16" }
 clap.workspace = true
 anyhow.workspace = true
 serde_json.workspace = true

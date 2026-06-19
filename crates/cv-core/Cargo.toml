@@ -1,5 +1,5 @@
 [package]
-name = "cv-core"
+name = "clustervision-core"
 description = "Unified parser and intermediate representation for AI coding-agent session transcripts across harnesses (Claude Code, Codex, Grok, OpenCode, Gemini)."
 version.workspace = true
 edition.workspace = true

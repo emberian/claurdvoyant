@@ -325,6 +325,40 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 
 [[package]]
+name = "clustervision"
+version = "0.9.16"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "clap",
+ "clustervision-core",
+ "cv-llm",
+ "cv-search",
+ "serde_json",
+]
+
+[[package]]
+name = "clustervision-core"
+version = "0.9.16"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "dirs 5.0.1",
+ "memmap2",
+ "percent-encoding",
+ "rayon",
+ "regex",
+ "rusqlite",
+ "ruzstd",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "toml",
+ "uuid",
+ "walkdir",
+]
+
+[[package]]
 name = "colorchoice"
 version = "1.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -453,45 +487,11 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "460fbee9c2c2f33933d720630a6a0bac33ba7053db5344fac858d4b8952d77d5"
 
 [[package]]
-name = "cv"
-version = "0.9.16"
-dependencies = [
- "anyhow",
- "chrono",
- "clap",
- "cv-core",
- "cv-llm",
- "cv-search",
- "serde_json",
-]
-
-[[package]]
-name = "cv-core"
-version = "0.9.16"
-dependencies = [
- "anyhow",
- "chrono",
- "dirs 5.0.1",
- "memmap2",
- "percent-encoding",
- "rayon",
- "regex",
- "rusqlite",
- "ruzstd",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "toml",
- "uuid",
- "walkdir",
-]
-
-[[package]]
 name = "cv-llm"
 version = "0.9.16"
 dependencies = [
  "anyhow",
- "cv-core",
+ "clustervision-core",
  "reqwest",
  "serde",
  "serde_json",
@@ -503,7 +503,7 @@ version = "0.9.16"
 dependencies = [
  "anyhow",
  "chrono",
- "cv-core",
+ "clustervision-core",
  "cv-search",
  "regex",
  "serde",
@@ -518,7 +518,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "clap",
- "cv-core",
+ "clustervision-core",
  "dirs 5.0.1",
  "model2vec-rs",
  "serde",
@@ -533,8 +533,8 @@ version = "0.9.16"
 dependencies = [
  "anyhow",
  "chrono",
+ "clustervision-core",
  "crossterm",
- "cv-core",
  "cv-search",
  "dirs 5.0.1",
  "ratatui",
@@ -545,7 +545,7 @@ dependencies = [
 name = "cv-web"
 version = "0.9.16"
 dependencies = [
- "cv-core",
+ "clustervision-core",
  "serde_json",
  "uuid",
  "wasm-bindgen",
@@ -559,7 +559,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "clap",
- "cv-core",
+ "clustervision-core",
  "dirs 5.0.1",
  "serde",
  "serde_json",

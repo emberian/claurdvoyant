@@ -12,8 +12,8 @@ name = "cv-tui"
 path = "src/main.rs"
 
 [dependencies]
-cv-core = { path = "../cv-core" }
-cv-search = { path = "../cv-search" }
+cv-core = { path = "../cv-core", version = "0.9.16", package = "clustervision-core" }
+cv-search = { path = "../cv-search", version = "0.9.16" }
 anyhow.workspace = true
 chrono.workspace = true
 dirs.workspace = true
