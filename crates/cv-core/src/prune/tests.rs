@@ -45,6 +45,7 @@ fn prunes_old_payloads_into_new_session_keeping_recent() {
         copy_resources: false,
         revive: false,
         dry_run: false,
+        ..Default::default()
     };
     let r = prune_session(&src, &opts).unwrap();
 
@@ -106,6 +107,7 @@ fn drop_mode_writes_no_sidecar() {
         copy_resources: false,
         revive: false,
         dry_run: false,
+        ..Default::default()
     };
     let r = prune_session(&src, &opts).unwrap();
     assert_eq!(r.new_id, "aaaa");

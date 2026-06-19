@@ -58,6 +58,13 @@ pub struct PruneOptions {
     /// window and corrects the stale number, so the gate lets you back in. Off by default — it edits
     /// recorded metadata, not just content. The source is still never touched (new id only).
     pub revive: bool,
+    /// Sliding window: keep only the NEWEST conversational turns whose content sums to ≤ this many
+    /// tokens, dropping older turns entirely (lossy — but the source session is never touched, so it
+    /// stays the full backup). The kept tail is re-rooted into a standalone resumable session.
+    pub window: Option<u64>,
+    /// Explicit message subrange `[start, end)` (turn indices) to keep, dropping everything outside
+    /// it. `end = None` ⇒ through the last turn. Like `window` but selected by index, not budget.
+    pub keep_range: Option<(usize, Option<usize>)>,
     /// Compute and report without writing anything.
     pub dry_run: bool,
 }
@@ -72,6 +79,8 @@ impl Default for PruneOptions {
             new_id: None,
             copy_resources: false,
             revive: false,
+            window: None,
+            keep_range: None,
             dry_run: false,
         }
     }
@@ -92,6 +101,9 @@ pub struct PruneResult {
     pub est_context_tokens_saved: u64,
     /// `--revive`: how many `message.usage` records were corrected.
     pub usage_rewritten: usize,
+    /// `--window`/`--range`: conversational turns dropped from the head/tail by the selection (0 if
+    /// neither was used). The kept turns form the new session; the source keeps everything.
+    pub dropped_turns: usize,
     /// `--revive`: the honest post-prune context-token figure written (None if revive off / nothing to do).
     pub revive_tokens: Option<u64>,
     /// `--revive`: the stale figure it replaced — the largest pre-revive usage total in the loaded window.
@@ -116,6 +128,51 @@ struct SidecarEntry {
     size: usize,
     line_count: usize,
     kind: String, // "text" | "image" | "mixed"
+}
+
+/// Resolve which conversational turns (`[start, end)` indices) a `--window`/`--range` prune keeps.
+/// `--range` is explicit; `--window` keeps the newest turns whose content sums to ≤ budget, snapped
+/// back to a user turn so the tail opens on a prompt. Neither set ⇒ the whole session.
+fn select_kept_turns(lines: &[&str], opts: &PruneOptions, total_turns: usize) -> (usize, usize) {
+    if let Some((s, e)) = opts.keep_range {
+        let end = e.unwrap_or(total_turns).min(total_turns);
+        return (s.min(end), end);
+    }
+    let Some(budget) = opts.window else {
+        return (0, total_turns);
+    };
+    // Per-turn content tokens + whether each turn is a user turn.
+    let mut per_turn: Vec<u64> = Vec::with_capacity(total_turns);
+    let mut is_user: Vec<bool> = Vec::with_capacity(total_turns);
+    for line in lines {
+        let Ok(v) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if let Some(t @ ("user" | "assistant")) = v.get("type").and_then(Value::as_str) {
+            let toks = v
+                .get("message")
+                .and_then(|m| m.get("content"))
+                .map(est_tokens)
+                .unwrap_or(0);
+            per_turn.push(toks);
+            is_user.push(t == "user");
+        }
+    }
+    // Accumulate from the newest turn backward until the budget is met.
+    let mut acc = 0u64;
+    let mut start = per_turn.len();
+    for i in (0..per_turn.len()).rev() {
+        acc += per_turn[i];
+        start = i;
+        if acc >= budget {
+            break;
+        }
+    }
+    // Snap back to a user turn so the kept tail opens on a prompt, not a bare assistant reply.
+    while start > 0 && !is_user.get(start).copied().unwrap_or(true) {
+        start -= 1;
+    }
+    (start, total_turns)
 }
 
 /// Prune `src_path` (a Claude `<id>.jsonl`) into a new session. Returns what happened.
@@ -165,6 +222,12 @@ pub fn prune_session(src_path: &Path, opts: &PruneOptions) -> Result<PruneResult
         .count();
     let keep_from = total_turns.saturating_sub(opts.keep_last);
 
+    // `--window`/`--range`: select which conversational turns survive; the rest are dropped and the
+    // first survivor is re-rooted after the loop. Defaults to the whole session (no-op).
+    let (keep_start, keep_end) = select_kept_turns(&lines, opts, total_turns);
+    let windowing = keep_start > 0 || keep_end < total_turns;
+    let mut dropped_turns = 0usize;
+
     let mut out_lines: Vec<String> = Vec::with_capacity(lines.len());
     let mut sidecar: Vec<SidecarEntry> = Vec::new();
     let mut pruned_count = 0usize;
@@ -190,6 +253,14 @@ pub fn prune_session(src_path: &Path, opts: &PruneOptions) -> Result<PruneResult
             turn += 1;
         }
         let is_old = is_turn && this_turn < keep_from;
+
+        // `--window`/`--range`: drop turns (and the records between them) outside the kept range.
+        if windowing && (this_turn < keep_start || this_turn >= keep_end) {
+            if is_turn {
+                dropped_turns += 1;
+            }
+            continue;
+        }
 
         // Only old user messages carry snippable tool results.
         if is_old && ty == "user" {
@@ -238,6 +309,24 @@ pub fn prune_session(src_path: &Path, opts: &PruneOptions) -> Result<PruneResult
         out_lines.push(reserialize_with_id(line, &new_id));
     }
 
+    // Re-root the first surviving turn: its parentUuid points at a now-dropped message, which would
+    // break the resume chain. Null it so the kept tail is a valid standalone conversation.
+    if windowing {
+        for l in out_lines.iter_mut() {
+            let Ok(mut v) = serde_json::from_str::<Value>(l) else {
+                continue;
+            };
+            let ty = v.get("type").and_then(Value::as_str).unwrap_or("");
+            if ty == "user" || ty == "assistant" {
+                if v.get("parentUuid").is_some_and(|p| !p.is_null()) {
+                    v["parentUuid"] = Value::Null;
+                    *l = v.to_string();
+                }
+                break;
+            }
+        }
+    }
+
     // `--revive`: correct the stale recorded context size so the resume gate reads the honest
     // post-prune figure. Runs on the already-flattened lines, so the number reflects what's left.
     let (usage_rewritten, revive_tokens, revive_old_tokens) =
@@ -277,6 +366,7 @@ pub fn prune_session(src_path: &Path, opts: &PruneOptions) -> Result<PruneResult
         new_size,
         est_context_tokens_saved: est_tokens_saved,
         usage_rewritten,
+        dropped_turns,
         revive_tokens,
         revive_old_tokens,
         dry_run: opts.dry_run,

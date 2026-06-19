@@ -404,6 +404,7 @@ fn tool_list() -> Value {
                     "thinking": { "type": "boolean", "description": "Also flatten the oldest assistant reasoning (thinking blocks); recent thinking (within keep_last) stays. Big lever for shrinking loaded context." },
                     "copy_resources": { "type": "boolean", "description": "Also copy the session's subagents/workflows dir under the new id (off by default; can be large)." },
                     "revive": { "type": "boolean", "description": "Correct the recorded context size so a maxed-out session will resume. Claude Code's resume gate reads the last turn's stored usage (input+cache) as the current size before re-sending anything, so a session at the wall refuses to resume even after pruning. This rewrites that stale number to the honest post-prune figure. ON BY DEFAULT (a no-op when already honest); set false to preserve the original usage records." },
+                    "window": { "type": "number", "description": "Sliding window: keep only the NEWEST turns whose content sums to ≤ this many tokens, dropping older turns entirely (lossy — the source session keeps the full history). Re-roots the kept tail into a standalone resumable session. Use to get a maxed-out session back under a context budget while keeping recent work." },
                     "dry_run": { "type": "boolean", "description": "Report what would happen without writing." }
                 },
                 "required": ["id"]
@@ -521,6 +522,8 @@ fn prune_session(args: &Value) -> anyhow::Result<String> {
         new_id: arg_str(args, "to").map(String::from),
         copy_resources: args.get("copy_resources").and_then(Value::as_bool).unwrap_or(false),
         revive: args.get("revive").and_then(Value::as_bool).unwrap_or(true),
+        window: args.get("window").and_then(Value::as_u64),
+        keep_range: None,
         dry_run: args.get("dry_run").and_then(Value::as_bool).unwrap_or(false),
     };
     let r = cv_core::prune::prune_session(&sref.path, &opts)?;

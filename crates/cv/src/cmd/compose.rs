@@ -24,6 +24,8 @@ pub(crate) fn cmd_prune(
     thinking: bool,
     copy_resources: bool,
     revive: bool,
+    window: Option<u64>,
+    keep_range: Option<(usize, Option<usize>)>,
     dry_run: bool,
 ) -> Result<()> {
     let want = parse_harness(&harness)?;
@@ -65,6 +67,8 @@ pub(crate) fn cmd_prune(
         new_id: to,
         copy_resources,
         revive,
+        window,
+        keep_range,
         dry_run,
     };
     let res = cv_core::prune::prune_session(&r.path, &opts)?;
@@ -85,6 +89,12 @@ pub(crate) fn cmd_prune(
         pct,
         res.est_context_tokens_saved,
     );
+    if res.dropped_turns > 0 {
+        eprintln!(
+            "  sliding window: dropped {} older turn(s) — the source keeps the full history",
+            res.dropped_turns
+        );
+    }
     if revive {
         match (res.revive_tokens, res.revive_old_tokens) {
             (Some(honest), Some(stale)) => eprintln!(

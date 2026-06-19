@@ -18,6 +18,17 @@ use cmd::live::BoardCmd;
 use cmd::{browse, compose, config, convert, doctor, live, pack, provenance, query, search, share, view, workflow};
 use std::path::PathBuf;
 
+/// Parse a `cv prune --range` spec: `START-END` turn indices, either end optional
+/// (`650-`, `650-900`, `-900`). Returns `(start, end_exclusive_or_none)`.
+fn parse_keep_range(s: &str) -> Result<(usize, Option<usize>)> {
+    let (a, b) = s
+        .split_once('-')
+        .ok_or_else(|| anyhow::anyhow!("range must be START-END (e.g. 650-, 650-900, -900)"))?;
+    let start = if a.trim().is_empty() { 0 } else { a.trim().parse()? };
+    let end = if b.trim().is_empty() { None } else { Some(b.trim().parse()?) };
+    Ok((start, end))
+}
+
 #[derive(Parser)]
 #[command(
     name = "cv",
@@ -331,6 +342,16 @@ enum Cmd {
         /// figure — a no-op when the recorded size is already honest. (Source untouched.)
         #[arg(long)]
         no_revive: bool,
+        /// Sliding window: keep only the NEWEST turns whose content sums to ≤ this many tokens,
+        /// dropping older turns (lossy — but the source keeps the full history). Re-roots the kept
+        /// tail into a standalone resumable session. The cv-doctor estimate is accurate here (no
+        /// multi-compaction window to confuse it), so the budget lands true.
+        #[arg(long, value_name = "TOKENS")]
+        window: Option<u64>,
+        /// Keep an explicit message subrange instead: `START-END` turn indices (END optional —
+        /// `650-`, `650-900`, or `-900`), dropping everything outside it. Like --window but by index.
+        #[arg(long, value_name = "RANGE")]
+        range: Option<String>,
         /// Report what would be pruned without writing anything.
         #[arg(long)]
         dry_run: bool,
@@ -655,6 +676,8 @@ fn main() -> Result<()> {
             thinking,
             copy_resources,
             no_revive,
+            window,
+            range,
             dry_run,
         } => compose::cmd_prune(
             &id,
@@ -667,6 +690,8 @@ fn main() -> Result<()> {
             thinking,
             copy_resources,
             !no_revive,
+            window,
+            range.map(|s| parse_keep_range(&s)).transpose()?,
             dry_run,
         ),
         Cmd::Config { add_export, rm_export } => config::cmd_config(add_export, rm_export),
