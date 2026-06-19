@@ -12,8 +12,8 @@ name = "cv-mcp"
 path = "src/main.rs"
 
 [dependencies]
-cv-core = { path = "../cv-core", version = "0.9.17", package = "clustervision-core" }
-cv-search = { path = "../cv-search", version = "0.9.17" }
+cv-core = { path = "../cv-core", version = "0.9.18", package = "clustervision-core" }
+cv-search = { path = "../cv-search", version = "0.9.18" }
 serde.workspace = true
 serde_json.workspace = true
 anyhow.workspace = true
