@@ -403,7 +403,7 @@ fn tool_list() -> Value {
                     "drop": { "type": "boolean", "description": "Hard-drop payloads (no sidecar, irreversible) instead of stashing them." },
                     "thinking": { "type": "boolean", "description": "Also flatten the oldest assistant reasoning (thinking blocks); recent thinking (within keep_last) stays. Big lever for shrinking loaded context." },
                     "copy_resources": { "type": "boolean", "description": "Also copy the session's subagents/workflows dir under the new id (off by default; can be large)." },
-                    "revive": { "type": "boolean", "description": "Correct the recorded context size so a maxed-out session will resume. Claude Code's resume gate reads the last turn's stored usage (input+cache) as the current size before re-sending anything, so a session at the wall refuses to resume even after pruning. This rewrites that stale number to the honest post-prune figure." },
+                    "revive": { "type": "boolean", "description": "Correct the recorded context size so a maxed-out session will resume. Claude Code's resume gate reads the last turn's stored usage (input+cache) as the current size before re-sending anything, so a session at the wall refuses to resume even after pruning. This rewrites that stale number to the honest post-prune figure. ON BY DEFAULT (a no-op when already honest); set false to preserve the original usage records." },
                     "dry_run": { "type": "boolean", "description": "Report what would happen without writing." }
                 },
                 "required": ["id"]
@@ -419,6 +419,17 @@ fn tool_list() -> Value {
                     "tool_use_id": { "type": "string", "description": "The id from the [PRUNED id=…] marker (e.g. toolu_… or …#tur)." }
                 },
                 "required": ["session", "tool_use_id"]
+            }
+        },
+        {
+            "name": "doctor",
+            "description": "Diagnose why a Claude Code session's context window keeps filling and compacting. Attributes context pressure by SOURCE — tool results (ranked per tool, MCP vs builtin), thinking, messages, images — sizes the fixed system+tools overhead from token usage, and reports compaction frequency/triggers. Returns JSON. Point an agent at its OWN session id to self-diagnose what's eating its window.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string", "description": "Session id (or unique prefix) to diagnose." }
+                },
+                "required": ["id"]
             }
         }
     ])
@@ -473,8 +484,21 @@ fn call_tool(name: &str, args: &Value) -> anyhow::Result<String> {
         "board_ack" => board_ack(args),
         "prune_session" => prune_session(args),
         "prune_retrieve" => prune_retrieve(args),
+        "doctor" => doctor(args),
         other => anyhow::bail!("unknown tool: {other}"),
     }
+}
+
+/// Diagnose a session's context-window pressure by source (see `cv_core::doctor`).
+fn doctor(args: &Value) -> anyhow::Result<String> {
+    let id = arg_str(args, "id").ok_or_else(|| anyhow::anyhow!("missing required argument: id"))?;
+    let harness = parse_harness(args)?;
+    let (sref, adapter) =
+        cv_core::find(id, harness)?.ok_or_else(|| anyhow::anyhow!("no session found for id {id:?}"))?;
+    let session = adapter.parse(&sref)?;
+    let mut rep = cv_core::doctor::Report::default();
+    rep.observe(&session);
+    Ok(serde_json::to_string_pretty(&rep.to_json())?)
 }
 
 /// Compact a Claude session into a new resumable one (see `cv_core::prune`).
@@ -496,7 +520,7 @@ fn prune_session(args: &Value) -> anyhow::Result<String> {
         thinking: args.get("thinking").and_then(Value::as_bool).unwrap_or(false),
         new_id: arg_str(args, "to").map(String::from),
         copy_resources: args.get("copy_resources").and_then(Value::as_bool).unwrap_or(false),
-        revive: args.get("revive").and_then(Value::as_bool).unwrap_or(false),
+        revive: args.get("revive").and_then(Value::as_bool).unwrap_or(true),
         dry_run: args.get("dry_run").and_then(Value::as_bool).unwrap_or(false),
     };
     let r = cv_core::prune::prune_session(&sref.path, &opts)?;

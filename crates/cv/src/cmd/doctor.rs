@@ -1,146 +1,14 @@
 //! `cv doctor` — diagnose why a session's context window keeps filling (and compacting).
 //!
-//! Attributes context pressure to its SOURCES, measured from the transcript's typed blocks:
-//! tool results (split MCP vs builtin, ranked per tool), thinking, assistant/user text, images.
-//! The *fixed* system+tools overhead (base prompt, CLAUDE.md/rules, skills, MCP tool schemas) is
-//! NOT carried in the transcript — Claude Code records the conversation, not the system block — so
-//! it can't be itemized; instead it's *sized* indirectly from token `usage` (the context every
-//! turn pays before any conversation) and reported as one bucket. Paired with compaction
-//! frequency/triggers, this answers David's "why is my Claude compacting so much?".
-//!
-//! With no <id>, analyzes the most recent session(s) for the current directory.
+//! The analysis engine lives in [`cv_core::doctor`] (shared with the `doctor` MCP tool); this module
+//! resolves the target session(s) and renders the report. Attributes context pressure to its
+//! sources — tool results (split MCP vs builtin, ranked per tool), thinking, messages, images — and
+//! sizes the fixed system+tools overhead from token usage. With no <id>, analyzes the most recent
+//! session(s) for the current directory.
 
 use anyhow::{Context, Result};
-use cv_core::{Block, Role, Session, SessionRef};
-use std::collections::{BTreeMap, HashMap};
-
-/// Claude tokenizer ≈ 3.3–3.7 bytes/token; matches cv_core::prune's text estimate.
-const BYTES_PER_TOKEN: f64 = 3.5;
-/// One image tile ≈ this many tokens (we never inline image bytes, so estimate per block).
-const IMAGE_TOKENS: u64 = 1500;
-
-fn toks(byte_len: usize) -> u64 {
-    (byte_len as f64 / BYTES_PER_TOKEN).ceil() as u64
-}
-
-#[derive(Default)]
-struct ToolStat {
-    calls: u64,
-    result_tokens: u64,
-    is_mcp: bool,
-}
-
-#[derive(Default)]
-struct Report {
-    sessions: u64,
-    messages: u64,
-    // measured conversational content, by source
-    user_text: u64,
-    assistant_text: u64,
-    thinking: u64,
-    tool_call_args: u64,
-    tool_results: u64,
-    images: u64,
-    system_text: u64,
-    by_tool: BTreeMap<String, ToolStat>,
-    // compaction
-    compactions: u64,
-    auto_compactions: u64,
-    pre_tokens: Vec<u64>,
-    // usage-derived context sizing
-    startup_ctx: u64, // worst per-session first-turn total context (≈ fixed overhead)
-    peak_ctx: u64,    // largest total context observed across turns
-}
-
-impl Report {
-    fn conv_total(&self) -> u64 {
-        self.user_text
-            + self.assistant_text
-            + self.thinking
-            + self.tool_call_args
-            + self.tool_results
-            + self.images
-            + self.system_text
-    }
-}
-
-fn attribute(rep: &mut Report, session: &Session) {
-    rep.sessions += 1;
-    rep.messages += session.messages.len() as u64;
-
-    // Claude Code's ToolResult blocks usually omit the tool name but carry `tool_use_id`; the
-    // matching ToolUse block has {id, name}. Map id→name first so results attribute to real tools
-    // (and MCP names) instead of all collapsing into "(unknown tool)".
-    let mut id_to_name: HashMap<&str, &str> = HashMap::new();
-    for m in &session.messages {
-        for b in &m.content {
-            if let Block::ToolUse { id, name, .. } = b {
-                id_to_name.insert(id.as_str(), name.as_str());
-            }
-        }
-    }
-
-    let mut session_startup: Option<u64> = None;
-    for m in &session.messages {
-        if let Some(u) = &m.usage {
-            let total = u.input_tokens.unwrap_or(0)
-                + u.cache_read_tokens.unwrap_or(0)
-                + u.cache_creation_tokens.unwrap_or(0);
-            if total > 0 {
-                rep.peak_ctx = rep.peak_ctx.max(total);
-                if session_startup.is_none() {
-                    session_startup = Some(total); // first turn ≈ system+tools+rules+first msg
-                }
-            }
-        }
-        for b in &m.content {
-            match b {
-                Block::Text { text } => {
-                    let t = toks(text.len());
-                    match m.role {
-                        Role::Assistant => rep.assistant_text += t,
-                        Role::System => rep.system_text += t,
-                        _ => rep.user_text += t,
-                    }
-                }
-                Block::Thinking { text, signature, encrypted, .. } => {
-                    // Thinking costs context as its plaintext PLUS the signature/encrypted blob that
-                    // rides with it — both are re-sent to the API. Claude Code frequently records
-                    // signature-only thinking (plaintext stripped), so counting just `text` reported
-                    // a misleading zero.
-                    rep.thinking += toks(text.len())
-                        + toks(signature.as_deref().map_or(0, str::len))
-                        + toks(encrypted.as_deref().map_or(0, str::len));
-                }
-                Block::ToolUse { name, input, .. } => {
-                    rep.tool_call_args += toks(input.to_string().len());
-                    let e = rep.by_tool.entry(name.clone()).or_default();
-                    e.calls += 1;
-                    if name.starts_with("mcp__") {
-                        e.is_mcp = true;
-                    }
-                }
-                Block::ToolResult { content, tool_name, tool_use_id, .. } => {
-                    let t = toks(content.len());
-                    rep.tool_results += t;
-                    let name = tool_name
-                        .clone()
-                        .or_else(|| id_to_name.get(tool_use_id.as_str()).map(|s| s.to_string()))
-                        .unwrap_or_else(|| "(unknown tool)".to_string());
-                    let mcp = name.starts_with("mcp__");
-                    let e = rep.by_tool.entry(name).or_default();
-                    e.result_tokens += t;
-                    if mcp {
-                        e.is_mcp = true;
-                    }
-                }
-                Block::Image { .. } => rep.images += IMAGE_TOKENS,
-                _ => {}
-            }
-        }
-    }
-    rep.startup_ctx = rep.startup_ctx.max(session_startup.unwrap_or(0));
-}
+use cv_core::doctor::Report;
+use cv_core::SessionRef;
 
 fn fmt_tok(n: u64) -> String {
     if n >= 1000 {
@@ -197,20 +65,12 @@ pub(crate) fn cmd_doctor(
         if label.is_empty() {
             label = crate::short_id(&rr.id);
         }
-        attribute(&mut rep, &session);
-        for c in cv_core::compaction::detect_in_session(&session, false) {
-            rep.compactions += 1;
-            if c.trigger.as_deref() == Some("auto") {
-                rep.auto_compactions += 1;
-            }
-            if let Some(p) = c.pre_tokens {
-                rep.pre_tokens.push(p);
-            }
-        }
+        rep.observe(&session);
     }
 
     if json {
-        return print_json(&rep);
+        println!("{}", serde_json::to_string_pretty(&rep.to_json())?);
+        return Ok(());
     }
     print_report(&rep, &label, targets.len());
     Ok(())
@@ -226,7 +86,10 @@ fn print_report(rep: &Report, label: &str, n_targets: usize) {
 
     // Compaction summary.
     if rep.compactions == 0 {
-        println!("Compaction:  never compacted across {} message(s) — healthy ✅", rep.messages);
+        println!(
+            "Compaction:  never compacted across {} message(s) — healthy ✅",
+            rep.messages
+        );
     } else {
         let avg = rep.pre_tokens.iter().sum::<u64>() / rep.pre_tokens.len().max(1) as u64;
         let worst = rep.pre_tokens.iter().copied().max().unwrap_or(0);
@@ -254,7 +117,10 @@ fn print_report(rep: &Report, label: &str, n_targets: usize) {
 
     // Where the conversational growth goes (measured).
     let total = rep.conv_total().max(1);
-    println!("\nConversational context by source ({} measured):", fmt_tok(rep.conv_total()));
+    println!(
+        "\nConversational context by source ({} measured):",
+        fmt_tok(rep.conv_total())
+    );
     let mut rows: Vec<(&str, u64)> = vec![
         ("tool results", rep.tool_results),
         ("thinking", rep.thinking),
@@ -274,7 +140,7 @@ fn print_report(rep: &Report, label: &str, n_targets: usize) {
     }
 
     // Top tools by result tokens (the usual variable bloat).
-    let mut tools: Vec<(&String, &ToolStat)> = rep.by_tool.iter().collect();
+    let mut tools: Vec<(&String, &cv_core::doctor::ToolStat)> = rep.by_tool.iter().collect();
     tools.sort_by(|a, b| b.1.result_tokens.cmp(&a.1.result_tokens));
     let shown: Vec<_> = tools.iter().filter(|(_, s)| s.result_tokens > 0).take(8).collect();
     if !shown.is_empty() {
@@ -290,7 +156,7 @@ fn print_report(rep: &Report, label: &str, n_targets: usize) {
                 if s.calls == 1 { "" } else { "s" }
             );
         }
-        let mcp: u64 = rep.by_tool.values().filter(|s| s.is_mcp).map(|s| s.result_tokens).sum();
+        let mcp = rep.mcp_tool_results();
         let builtin = rep.tool_results.saturating_sub(mcp);
         if mcp > 0 {
             let share = 100.0 * mcp as f64 / rep.tool_results.max(1) as f64;
@@ -311,7 +177,7 @@ fn print_report(rep: &Report, label: &str, n_targets: usize) {
 
 fn verdict(rep: &Report) -> String {
     let total = rep.conv_total().max(1);
-    let mcp: u64 = rep.by_tool.values().filter(|s| s.is_mcp).map(|s| s.result_tokens).sum();
+    let mcp = rep.mcp_tool_results();
     let mut parts: Vec<String> = Vec::new();
 
     // Tool output is the lever to pull when it's the single largest source (even below 50%) or
@@ -356,42 +222,4 @@ fn verdict(rep: &Report) -> String {
         return "context use is fairly balanced; compaction is driven by overall conversation length more than any one source.".into();
     }
     parts.join("; ")
-}
-
-fn print_json(rep: &Report) -> Result<()> {
-    let tools: Vec<_> = rep
-        .by_tool
-        .iter()
-        .map(|(name, s)| {
-            serde_json::json!({
-                "tool": name, "mcp": s.is_mcp,
-                "calls": s.calls, "result_tokens": s.result_tokens
-            })
-        })
-        .collect();
-    let mcp: u64 = rep.by_tool.values().filter(|s| s.is_mcp).map(|s| s.result_tokens).sum();
-    let out = serde_json::json!({
-        "sessions": rep.sessions,
-        "messages": rep.messages,
-        "compactions": rep.compactions,
-        "auto_compactions": rep.auto_compactions,
-        "pre_tokens": rep.pre_tokens,
-        "fixed_overhead_est": rep.startup_ctx,
-        "peak_context": rep.peak_ctx,
-        "conversational": {
-            "total": rep.conv_total(),
-            "tool_results": rep.tool_results,
-            "thinking": rep.thinking,
-            "assistant_text": rep.assistant_text,
-            "user_text": rep.user_text,
-            "tool_call_args": rep.tool_call_args,
-            "images": rep.images,
-            "system_msgs": rep.system_text,
-        },
-        "tool_results_mcp": mcp,
-        "tool_results_builtin": rep.tool_results.saturating_sub(mcp),
-        "by_tool": tools,
-    });
-    println!("{}", serde_json::to_string_pretty(&out)?);
-    Ok(())
 }

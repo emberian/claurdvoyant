@@ -11,6 +11,7 @@ pub mod catalog;
 pub mod compaction;
 pub mod config;
 pub mod dataset;
+pub mod doctor;
 pub mod discover_cache;
 pub mod emit;
 pub mod events;
