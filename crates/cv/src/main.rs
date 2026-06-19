@@ -314,6 +314,11 @@ enum Cmd {
         /// Hard-drop payloads (no sidecar, irreversible) instead of stashing them for retrieval.
         #[arg(long)]
         drop: bool,
+        /// Also flatten the OLDEST assistant reasoning (thinking blocks) — recent thinking (within
+        /// --keep-last) stays verbatim. On a long session the chain-of-thought dominates the loaded
+        /// context; flattening the old reasoning is the biggest lever for shrinking it. Lossless.
+        #[arg(long)]
+        thinking: bool,
         /// Also copy the session's subagents/workflows dir under the new id (off by default; can be
         /// hundreds of MB for big sessions). Resume doesn't need it — only cv's forest features do.
         #[arg(long)]
@@ -624,6 +629,7 @@ fn main() -> Result<()> {
             keep_last,
             to,
             drop,
+            thinking,
             copy_resources,
             dry_run,
         } => compose::cmd_prune(
@@ -634,6 +640,7 @@ fn main() -> Result<()> {
             keep_last,
             to,
             drop,
+            thinking,
             copy_resources,
             dry_run,
         ),

@@ -401,6 +401,7 @@ fn tool_list() -> Value {
                     "keep_last": { "type": "number", "description": "Keep the last N conversational turns' payloads verbatim (default 25)." },
                     "to": { "type": "string", "description": "New session id (default: a fresh UUID)." },
                     "drop": { "type": "boolean", "description": "Hard-drop payloads (no sidecar, irreversible) instead of stashing them." },
+                    "thinking": { "type": "boolean", "description": "Also flatten the oldest assistant reasoning (thinking blocks); recent thinking (within keep_last) stays. Big lever for shrinking loaded context." },
                     "copy_resources": { "type": "boolean", "description": "Also copy the session's subagents/workflows dir under the new id (off by default; can be large)." },
                     "dry_run": { "type": "boolean", "description": "Report what would happen without writing." }
                 },
@@ -491,6 +492,7 @@ fn prune_session(args: &Value) -> anyhow::Result<String> {
         min_size: arg_usize(args, "min_size", 2048),
         keep_last: arg_usize(args, "keep_last", 25),
         drop: args.get("drop").and_then(Value::as_bool).unwrap_or(false),
+        thinking: args.get("thinking").and_then(Value::as_bool).unwrap_or(false),
         new_id: arg_str(args, "to").map(String::from),
         copy_resources: args.get("copy_resources").and_then(Value::as_bool).unwrap_or(false),
         dry_run: args.get("dry_run").and_then(Value::as_bool).unwrap_or(false),

@@ -40,6 +40,7 @@ fn prunes_old_payloads_into_new_session_keeping_recent() {
         min_size: 2048,
         keep_last: 2,
         drop: false,
+        thinking: false,
         new_id: None,
         copy_resources: false,
         dry_run: false,
@@ -99,6 +100,7 @@ fn drop_mode_writes_no_sidecar() {
         min_size: 2048,
         keep_last: 0,
         drop: true,
+        thinking: false,
         new_id: Some("aaaa".into()),
         copy_resources: false,
         dry_run: false,
@@ -110,6 +112,61 @@ fn drop_mode_writes_no_sidecar() {
     let out = std::fs::read_to_string(&r.new_path).unwrap();
     assert!(out.contains("[PRUNED id=toolu_1"));
     assert!(!out.contains(&big)); // dropped entirely (nothing retained, no sidecar)
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn thinking_flatten_targets_old_reasoning_only() {
+    let dir = tmpdir();
+    let big = "R".repeat(5000);
+    let sid = "22222222-2222-4222-8222-222222222222";
+    // old assistant turn with big thinking; then enough turns that it's outside keep_last; a recent
+    // assistant turn with big thinking that must be preserved.
+    let line = |uuid: &str, parent: &str, role: &str, content: serde_json::Value| {
+        serde_json::json!({"type":role,"sessionId":sid,"uuid":uuid,"parentUuid":parent,
+            "timestamp":"2026-06-18T00:00:00Z","message":{"role":role,"content":content}})
+    };
+    let think = |t: &str| serde_json::json!([{"type":"thinking","thinking":t,"signature":"sig"}]);
+    let lines = [
+        line("u0", "", "user", serde_json::json!("start")),
+        line("a0", "u0", "assistant", think(&big)), // OLD thinking → flatten
+        line("u1", "a0", "user", serde_json::json!("more")),
+        line("a1", "u1", "assistant", serde_json::json!("ok")),
+        line("u2", "a1", "user", serde_json::json!("again")),
+        line("a2", "u2", "assistant", think(&big)), // RECENT thinking → keep (within keep_last)
+    ];
+    let path = dir.join(format!("{sid}.jsonl"));
+    std::fs::write(&path, lines.iter().map(|l| l.to_string() + "\n").collect::<String>()).unwrap();
+
+    let opts = PruneOptions {
+        min_size: 1024,
+        keep_last: 2,
+        thinking: true,
+        ..Default::default()
+    };
+    let r = prune_session(&path, &opts).unwrap();
+    let out = std::fs::read_to_string(&r.new_path).unwrap();
+
+    // old thinking (a0) flattened to a text marker; its big payload gone, original in sidecar
+    let a0 = out.lines().find(|l| l.contains("\"uuid\":\"a0\"")).unwrap();
+    assert!(
+        a0.contains("[PRUNED id=a0#think0"),
+        "old thinking flattened (id = message uuid)"
+    );
+    assert!(!a0.contains(&big));
+    assert!(
+        !a0.contains("\"thinking\""),
+        "thinking block became a text marker (no signature mismatch)"
+    );
+    // recent thinking (a2, within keep_last=2) preserved verbatim
+    let a2 = out.lines().find(|l| l.contains("\"uuid\":\"a2\"")).unwrap();
+    assert!(
+        a2.contains(&big) && a2.contains("\"thinking\""),
+        "recent thinking kept verbatim"
+    );
+    // retrievable
+    let restored = retrieve(r.sidecar_path.as_ref().unwrap(), "a0#think0").unwrap();
+    assert_eq!(restored.get("thinking").and_then(|v| v.as_str()), Some(big.as_str()));
     std::fs::remove_dir_all(&dir).ok();
 }
 

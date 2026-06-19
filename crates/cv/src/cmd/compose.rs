@@ -21,6 +21,7 @@ pub(crate) fn cmd_prune(
     keep_last: usize,
     to: Option<String>,
     drop: bool,
+    thinking: bool,
     copy_resources: bool,
     dry_run: bool,
 ) -> Result<()> {
@@ -59,6 +60,7 @@ pub(crate) fn cmd_prune(
         min_size,
         keep_last,
         drop,
+        thinking,
         new_id: to,
         copy_resources,
         dry_run,

@@ -292,6 +292,7 @@ cv prune <new-id> --retrieve toolu_abc123          # fetch a stashed original ba
 - `--min-size <bytes>` — only snip a tool payload larger than this (default 2048).
 - `--keep-last <N>` — keep the last N conversational turns' payloads verbatim (default 25).
 - `--to <id>` — the new session id (default: a fresh UUID).
+- `--thinking` — also flatten the **oldest** assistant reasoning (thinking blocks); recent thinking (within `--keep-last`) stays verbatim. On a long Claude session the chain-of-thought *signatures* dominate the loaded context (Claude keeps a ~600-byte signature per thinking turn even when the reasoning text is omitted), so this is the biggest lever for shrinking what a resume loads. Lossless (stashed in the sidecar). Real example: it took a 976k-token session from ~98% to ~36% of a 1M window.
 - `--drop` — discard payloads entirely instead of stashing them (smallest output, irreversible; the source session is never touched regardless).
 - `--copy-resources` — also copy the session's `subagents/`/`workflows/` dir under the new id (off by default; can be hundreds of MB for big sessions). `claude --resume` doesn't need it — only cv's forest features (`cv workflow`/`cv tools`) on the pruned session do.
 - `--dry-run` — compute and report without writing.

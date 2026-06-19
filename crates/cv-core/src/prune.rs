@@ -40,6 +40,11 @@ pub struct PruneOptions {
     pub keep_last: usize,
     /// Hard-drop payloads (no sidecar, irreversible) instead of stashing them for retrieval.
     pub drop: bool,
+    /// Also flatten assistant **thinking** blocks (extended reasoning). On a long session the
+    /// chain-of-thought often dominates the loaded context, and on resume you rarely need the
+    /// verbatim old reasoning — the conclusions are in the assistant's text. Lossless (stashed in the
+    /// sidecar like any other payload). Off by default — it changes more than tool output.
+    pub thinking: bool,
     /// Explicit new session id; otherwise a fresh UUIDv4.
     pub new_id: Option<String>,
     /// Also copy the session's `subagents/`/`workflows/` resource dir under the new id. Off by
@@ -56,6 +61,7 @@ impl Default for PruneOptions {
             min_size: 2048,
             keep_last: 25,
             drop: false,
+            thinking: false,
             new_id: None,
             copy_resources: false,
             dry_run: false,
@@ -182,6 +188,27 @@ pub fn prune_session(src_path: &Path, opts: &PruneOptions) -> Result<PruneResult
                 &mut sidecar,
                 &mut pruned_count,
                 &mut image_blocks,
+                &mut est_tokens_saved,
+                &mut modified,
+            );
+            out_lines.push(if modified {
+                v.to_string()
+            } else {
+                reserialize_with_id(line, &new_id)
+            });
+            continue;
+        }
+
+        // `--thinking`: flatten the OLDEST assistant reasoning (recent thinking, within keep-last,
+        // stays verbatim so the resumed agent keeps its live train of thought).
+        if is_old && ty == "assistant" && opts.thinking {
+            let mut modified = false;
+            prune_assistant_thinking(
+                &mut v,
+                opts,
+                &new_id,
+                &mut sidecar,
+                &mut pruned_count,
                 &mut est_tokens_saved,
                 &mut modified,
             );
@@ -342,6 +369,63 @@ fn prune_user_line(
             });
         }
         v["toolUseResult"] = Value::String(marker);
+        *modified = true;
+        *count += 1;
+    }
+}
+
+/// Flatten large `thinking` blocks on one (old) assistant line. Each is replaced by a small **text**
+/// block carrying the marker (not a thinking block — keeping the original `signature` against altered
+/// text would fail Claude's validation on resume), with the original block stashed verbatim in the
+/// sidecar under `<uuid>#think<i>`.
+#[allow(clippy::too_many_arguments)]
+fn prune_assistant_thinking(
+    v: &mut Value,
+    opts: &PruneOptions,
+    new_id: &str,
+    sidecar: &mut Vec<SidecarEntry>,
+    count: &mut usize,
+    tokens_saved: &mut u64,
+    modified: &mut bool,
+) {
+    let uuid = v.get("uuid").and_then(Value::as_str).unwrap_or("line").to_string();
+    let Some(blocks) = v.pointer_mut("/message/content").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for (i, block) in blocks.iter_mut().enumerate() {
+        if block.get("type").and_then(Value::as_str) != Some("thinking") {
+            continue;
+        }
+        // Gate on the WHOLE block size, not the thinking text: Claude usually omits the reasoning
+        // text in the transcript but keeps a ~600-byte cryptographic `signature` — that signature
+        // (×thousands of turns) is what actually bloats the resumed context, so that's what we lift
+        // out. Commit by cloning the block out (lossless), releasing the borrow before overwriting.
+        let size = value_byte_size(block);
+        if size <= opts.min_size {
+            continue;
+        }
+        let line_count = block
+            .get("thinking")
+            .and_then(Value::as_str)
+            .map(|t| t.lines().count().max(1))
+            .unwrap_or(1);
+        let original = block.clone();
+        let id = format!("{uuid}#think{i}");
+        let marker = build_marker(&id, "thinking", &Value::Null, "text", size, line_count, new_id);
+        *tokens_saved += str_tokens(&original.to_string()).saturating_sub(str_tokens(&marker));
+        if !opts.drop {
+            sidecar.push(SidecarEntry {
+                id,
+                slot: "thinking".into(),
+                name: "thinking".into(),
+                input: Value::Null,
+                content: original,
+                size,
+                line_count,
+                kind: "text".into(),
+            });
+        }
+        *block = serde_json::json!({ "type": "text", "text": marker });
         *modified = true;
         *count += 1;
     }
