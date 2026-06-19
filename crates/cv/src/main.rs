@@ -323,12 +323,14 @@ enum Cmd {
         /// hundreds of MB for big sessions). Resume doesn't need it — only cv's forest features do.
         #[arg(long)]
         copy_resources: bool,
-        /// Correct the recorded context size so a maxed-out session will resume. Claude Code's resume
-        /// gate reads the last turn's stored `usage` (input+cache) as the current size *before* it
-        /// re-sends anything — so a session at the wall refuses to resume even after pruning shrinks
-        /// it. This rewrites that stale number to the honest post-prune figure. (Source untouched.)
+        /// Preserve the original `usage` records byte-for-byte (opt out of revive). By default,
+        /// prune corrects the recorded context size so a maxed-out session will resume: Claude
+        /// Code's resume gate reads the last turn's stored `usage` (input+cache) as the current
+        /// size *before* it re-sends anything, so a session at the wall refuses to resume even
+        /// after pruning shrinks it. Revive rewrites that stale number to the honest post-prune
+        /// figure — a no-op when the recorded size is already honest. (Source untouched.)
         #[arg(long)]
-        revive: bool,
+        no_revive: bool,
         /// Report what would be pruned without writing anything.
         #[arg(long)]
         dry_run: bool,
@@ -652,7 +654,7 @@ fn main() -> Result<()> {
             drop,
             thinking,
             copy_resources,
-            revive,
+            no_revive,
             dry_run,
         } => compose::cmd_prune(
             &id,
@@ -664,7 +666,7 @@ fn main() -> Result<()> {
             drop,
             thinking,
             copy_resources,
-            revive,
+            !no_revive,
             dry_run,
         ),
         Cmd::Config { add_export, rm_export } => config::cmd_config(add_export, rm_export),
