@@ -11,7 +11,7 @@ This chapter is the field guide: for each harness, *where* it keeps sessions on 
 [conversion](conversion.md) target).
 
 The ground-truth catalog these adapters are built from lives in
-[`docs/FORMATS.md`](https://github.com/emberian/clustervision/blob/main/docs/FORMATS.md), reverse-engineered
+[`docs/FORMATS.md`](https://github.com/emberian/cv/blob/main/docs/FORMATS.md), reverse-engineered
 from a real machine. The table below is the centerpiece; per-harness notes follow.
 
 ## The master table

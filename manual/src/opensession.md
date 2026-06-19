@@ -5,7 +5,7 @@ After reverse-engineering seventeen different transcript formats, one thing was 
 small, honest, harness-neutral interchange format. clustervision's internal IR is its reference
 implementation, and `.opensession.json` is a first-class import/export format in the app and CLI.
 
-The full spec lives at **[docs/OPENSESSION.md](https://github.com/emberian/clustervision/blob/main/docs/OPENSESSION.md)**. The essentials:
+The full spec lives at **[docs/OPENSESSION.md](https://github.com/emberian/cv/blob/main/docs/OPENSESSION.md)**. The essentials:
 
 ## The shape
 

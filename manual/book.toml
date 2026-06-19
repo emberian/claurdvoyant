@@ -8,8 +8,8 @@ language = "en"
 [output.html]
 default-theme = "navy"
 preferred-dark-theme = "navy"
-git-repository-url = "https://github.com/emberian/clustervision"
-edit-url-template = "https://github.com/emberian/clustervision/edit/main/manual/{path}"
+git-repository-url = "https://github.com/emberian/cv"
+edit-url-template = "https://github.com/emberian/cv/edit/main/manual/{path}"
 additional-css = ["theme/cv.css"]
 
 [output.html.fold]

@@ -212,7 +212,7 @@ fn call_model(provider: &Provider, model: &str, prompt: &str) -> Result<String> 
             let resp = client
                 .post("https://openrouter.ai/api/v1/chat/completions")
                 .bearer_auth(key)
-                .header("HTTP-Referer", "https://github.com/emberian/clustervision")
+                .header("HTTP-Referer", "https://github.com/emberian/cv")
                 .header("X-Title", "clustervision")
                 .json(&body)
                 .send()
@@ -403,7 +403,7 @@ fn call_chat(
         if let Some(b) = bearer {
             req = req
                 .bearer_auth(b)
-                .header("HTTP-Referer", "https://github.com/emberian/clustervision")
+                .header("HTTP-Referer", "https://github.com/emberian/cv")
                 .header("X-Title", "clustervision");
         }
         let resp = req.send().with_context(|| format!("POST to {url}"))?;

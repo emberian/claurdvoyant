@@ -103,10 +103,10 @@ Full docs — every CLI command, the MCP tools, the daemon's HTTP API, the app, 
 
 ## 🛠️ Install
 
-**Prebuilt binaries** for macOS / Linux / Windows (arm64 · x64 · x86) ship on every release — grab the latest from **[Releases](https://github.com/emberian/clustervision/releases/latest)** (`cv` · `cv-mcp` · `cvd` · `cv-tui` · `cv-search`), or one-line it:
+**Prebuilt binaries** for macOS / Linux / Windows (arm64 · x64 · x86) ship on every release — grab the latest from **[Releases](https://github.com/emberian/cv/releases/latest)** (`cv` · `cv-mcp` · `cvd` · `cv-tui` · `cv-search`), or one-line it:
 
 ```sh
-curl --proto '=https' --tlsv1.2 -LsSf https://github.com/emberian/clustervision/releases/latest/download/cv-installer.sh | sh
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/emberian/cv/releases/latest/download/cv-installer.sh | sh
 ```
 
 Or from source:

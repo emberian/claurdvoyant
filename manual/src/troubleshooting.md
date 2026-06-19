@@ -39,5 +39,5 @@ to stderr. Register it with `claude mcp add clustervision -- /abs/path/to/cv-mcp
 
 ### Still stuck?
 
-Open an issue: <https://github.com/emberian/clustervision/issues>. Weird old transcripts especially
+Open an issue: <https://github.com/emberian/cv/issues>. Weird old transcripts especially
 welcome. 🔮

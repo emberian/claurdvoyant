@@ -272,7 +272,7 @@ class CvApp extends HTMLElement {
           <button type="button" class="icon-btn help-btn" title="Keyboard shortcuts (?)" aria-label="Keyboard shortcuts">?</button>
           <button type="button" class="icon-btn theme-toggle" title="Toggle theme — dark / light / auto (t)" aria-label="Toggle theme">◐</button>
           <a class="repo-link" href="https://emberian.github.io/clustervision/manual/" target="_blank" rel="noopener" title="User manual">manual</a>
-          <a class="repo-link" href="https://github.com/emberian/clustervision" target="_blank" rel="noopener" title="Project repository">source</a>
+          <a class="repo-link" href="https://github.com/emberian/cv" target="_blank" rel="noopener" title="Project repository">source</a>
         </div>
       </header>
 
