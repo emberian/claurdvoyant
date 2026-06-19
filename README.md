@@ -6,11 +6,13 @@
 
 ### Your AI coding sessions are gold. Stop letting them rot in scattered folders.
 
-**One tool to find, read, search, port, and stream every agent session you've ever run — across every harness.**
+**Find, search, convert, prune, and even *resurrect* every AI coding-agent session you've ever run — across 20 harnesses, through one unified format.**
 
 `claude` · `codex` · `grok` · `opencode` · `gemini` · `hermes` · `openclaw` · `cursor` · …
 
-*parse anything · search by meaning · resume anywhere · let your agents read each other's minds*
+*search by meaning · read behind every compaction · port across harnesses · resurrect a maxed-out session · pack a new task from your whole history*
+
+No database, no import, no telemetry: clustervision reads your **real local session storage** and turns the scattered pile of `.jsonl` into one searchable, lossless corpus. Full-text **and** semantic search across everything you've ever run; the verbatim detail **behind every compaction boundary**; one-command porting between harnesses; and a custom compaction that pulls a maxed-out session back from the context wall.
 
 <br>
 
@@ -37,7 +39,7 @@ Restarting from scratch is the most expensive thing you do all day. **clustervis
 ```sh
 # 🔎 find that session from last week by what it was ABOUT, not where it lived
 cv search "the flux inference refactor"        # full-text, instant
-cv-search semantic "formalizing proofs"        # by meaning — no keyword overlap needed
+cv search --semantic "formalizing proofs"      # by meaning — no keyword overlap needed
 
 # 🚀 take a Claude session and continue it in Codex. for real.
 cv convert da9174f4 --to codex
@@ -47,14 +49,17 @@ cv convert da9174f4 --to codex
 # 🧳 break a session out of its directory jail (brings CLAUDE.md / MEMORY.md along)
 cv port da9174f4 --to-dir ~/new/home
 
+# 🪦 a session hit the context wall and won't reopen? prune the bulk and revive it
+cv prune da9174f4 --thinking --revive
+#   ✦ recorded context 976k → 149k · resume with: claude --resume <new-id>
+
 # 👁️ watch every agent on your machine work, live, in one feed
 cv scry
 ```
 
 …and a couple that didn't exist before:
 
-- 🧠 **An MCP server** so a *running* agent can read **other** agents' sessions — "what happened in this project before?", "what's my sibling agent doing right now?" — and even **`await_omen`**: block until another session prints something matching a regex.
-- 📣 **A coordination board** (`cv board` + MCP): agents post status and hand off work to each other. With the daemon mirroring activity, it's a live feed across your whole **cloud fleet**.
+- 🧠 **An MCP server** so a *running* agent can read **other** agents' sessions — "what happened in this project before?", "what's my sibling agent doing right now?", "have I solved this before?" — mid-task, without leaving its harness.
 - 🌐 **A zero-install web viewer**: drag a zip of any harness folder into your browser and explore it. Nothing uploaded, all WASM.
 
 ## 🪐 20 harnesses, one IR
@@ -86,16 +91,15 @@ cv scry
 - **🔒 Redact** — `cv redact <id>` scrubs secrets/PII so a transcript is safe to share.
 - **🎁 Share** — `cv share <id>` → one self-contained, redacted-by-default HTML artifact: dark crystal-ball theme, collapsible thinking/tool folds, opens offline in any browser, uploads nothing (CSP-pinned so it *can't*).
 - **📦 Pack** — `cv pack "<task>"` compiles a context bundle from your whole corpus: relevant past spans + what files those sessions actually touched (event catalog), as a CLAUDE.md digest, a system prompt, or a synthetic *resumable session* in any harness. Never explain your codebase to an agent twice.
-- **📣 Coordination board** — agents post status, hand off work, and grab tasks with a **distributed lock** (`board_claim`) so a fleet never duplicates effort. `await_omen` blocks until a session matches a regex.
 - **🖥️ Desktop app + 🌐 web viewer** — the Tauri app reads **all your local sessions natively** (zero setup) and lays the corpus out beautifully:
   - a **Projects** lens — every repo, every agent that touched it, over time;
   - a GitHub-style **activity heatmap** timeline (a constellation of your working days);
-  - side-by-side **Compare**, a **Stats** dashboard, a visual **loom composer** (OpenRouter *or* free local LM Studio generation), and a live **fleet dashboard**;
+  - side-by-side **Compare**, a **Stats** dashboard, and a visual **loom composer** (OpenRouter *or* free local LM Studio generation);
   - **sub-agent trees** — a Claude Task session's children, nested and lazy-loaded inline, each labeled with its task prompt;
   - a **Structure** explorer (`<cv-forest>`) — Overview / Forest / Workflows / Tools / Compaction tabs that turn a run's anatomy into something you can drill through.
 
   The browser build is zero-install — drop a harness zip, nothing uploaded (all WASM).
-- **🔌 Harness integrations** — plug clustervision into the agents' own hooks/MCP/plugins ([`integrations/`](integrations/)): SessionEnd → archive + distill, SessionStart → recall, events → the board.
+- **🔌 Harness integrations** — plug clustervision into the agents' own hooks/MCP/plugins ([`integrations/`](integrations/)): SessionEnd → archive + distill, SessionStart → recall.
 
 ## 📖 Manual
 
@@ -121,7 +125,7 @@ cargo build --release          # → target/release/{cv, cv-mcp, cvd, cv-tui, cv
 claude mcp add clustervision -- /path/to/target/release/cv-mcp
 ```
 
-18 tools, incl: `list_sessions` · `search_sessions` · `read_session` · `project_sessions` · **`recall`** (semantic "where was this solved before") · **`await_omen`** (block until a session matches a regex) · `board_post/read/await` + `board_claim/release/who` (coordination + distributed locks).
+Tools incl: `list_sessions` · `search_sessions` · `read_session` · `project_sessions` · **`recall`** (semantic "where was this solved before") · `prune_session`/`prune_retrieve` (custom compaction, in-place). …and a few more your agents can discover for themselves. 😉
 
 ## 📡 Archive your whole fleet (`cvd`)
 
@@ -136,10 +140,10 @@ After staring into seven different transcript formats, we wrote down the one the
 
 ## 🏗️ Under the hood
 
-One IR (`Session → Message → Block{Text|Thinking|ToolUse|ToolResult|File|Image}`), one `Adapter` per harness (`discover` + `parse` + `emit`), plus `loom` / `redact` / `board` / `watch` / `ingest` modules — and small crates on top: **`cv`** (CLI) · **`cv-mcp`** (MCP) · **`cvd`** (daemon + `serve`) · **`cv-search`** (tantivy + `model2vec`) · **`cv-llm`** (distill/generate) · **`cv-web`** (WASM) · **`app/`** (Tauri desktop).
+One IR (`Session → Message → Block{Text|Thinking|ToolUse|ToolResult|File|Image}`), one `Adapter` per harness (`discover` + `parse` + `emit`), plus `loom` / `redact` / `prune` / `watch` / `ingest` modules — and small crates on top: **`cv`** (CLI) · **`cv-mcp`** (MCP) · **`cvd`** (daemon + `serve`) · **`cv-search`** (tantivy + `model2vec`) · **`cv-llm`** (distill/generate) · **`cv-web`** (WASM) · **`app/`** (Tauri desktop).
 
 ```
-parse(any harness) → 🔮 unified IR → search · convert · port · loom · distill · archive · coordinate · view
+parse(any harness) → 🔮 unified IR → search · convert · port · prune · loom · distill · archive · view
 ```
 
 ## 🧪 Status
