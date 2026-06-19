@@ -23,6 +23,7 @@ pub(crate) fn cmd_prune(
     drop: bool,
     thinking: bool,
     copy_resources: bool,
+    revive: bool,
     dry_run: bool,
 ) -> Result<()> {
     let want = parse_harness(&harness)?;
@@ -63,6 +64,7 @@ pub(crate) fn cmd_prune(
         thinking,
         new_id: to,
         copy_resources,
+        revive,
         dry_run,
     };
     let res = cv_core::prune::prune_session(&r.path, &opts)?;
@@ -83,6 +85,17 @@ pub(crate) fn cmd_prune(
         pct,
         res.est_context_tokens_saved,
     );
+    if revive {
+        match (res.revive_tokens, res.revive_old_tokens) {
+            (Some(honest), Some(stale)) => eprintln!(
+                "  revived: recorded context {}k → {}k across {} usage record(s) — resume gate will let you back in",
+                stale / 1000,
+                honest / 1000,
+                res.usage_rewritten,
+            ),
+            _ => eprintln!("  revive: recorded usage already honest (≤ loaded content) — nothing to rewrite"),
+        }
+    }
     if !dry_run {
         eprintln!("  new session: {}", res.new_path.display());
         if let Some(sc) = &res.sidecar_path {

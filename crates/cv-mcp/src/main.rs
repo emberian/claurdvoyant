@@ -1,4 +1,4 @@
-//! # cv-mcp — claurdvoyant as an MCP server
+//! # cv-mcp — clustervision as an MCP server
 //!
 //! A stdio [Model Context Protocol](https://modelcontextprotocol.io) server that lets a *running*
 //! coding agent (Claude Code, Codex, Gemini, …) search and read the sessions of **other** agents —
@@ -10,7 +10,7 @@
 //! Build it (`cargo build -p cv-mcp --release`) and point your agent at the binary. For Claude Code:
 //!
 //! ```text
-//! claude mcp add claurdvoyant -- /absolute/path/to/cv-mcp
+//! claude mcp add clustervision -- /absolute/path/to/cv-mcp
 //! ```
 //!
 //! It speaks line-delimited JSON-RPC 2.0 over stdin/stdout. **stdout is the protocol channel**, so
@@ -42,7 +42,7 @@ const PROTOCOL_VERSION: &str = "2025-06-18";
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> anyhow::Result<()> {
-    eprintln!("cv-mcp: claurdvoyant MCP server starting (stdio JSON-RPC)");
+    eprintln!("cv-mcp: clustervision MCP server starting (stdio JSON-RPC)");
 
     let stdin = tokio::io::stdin();
     let mut reader = BufReader::new(stdin);
@@ -138,10 +138,10 @@ fn initialize_result() -> Value {
         "protocolVersion": PROTOCOL_VERSION,
         "capabilities": { "tools": {} },
         "serverInfo": {
-            "name": "claurdvoyant",
+            "name": "clustervision",
             "version": env!("CARGO_PKG_VERSION"),
         },
-        "instructions": "claurdvoyant lets you read OTHER agents' sessions across harnesses and time. \
+        "instructions": "clustervision lets you read OTHER agents' sessions across harnesses and time. \
     Use project_sessions(cwd) to see what happened (or is happening) in the current project, \
     search_sessions(query) to find a past conversation by content, and read_session(id) to read a full transcript. \
     Use recall(query) — the 'find where this was solved before' tool — to semantically search the whole \
@@ -403,6 +403,7 @@ fn tool_list() -> Value {
                     "drop": { "type": "boolean", "description": "Hard-drop payloads (no sidecar, irreversible) instead of stashing them." },
                     "thinking": { "type": "boolean", "description": "Also flatten the oldest assistant reasoning (thinking blocks); recent thinking (within keep_last) stays. Big lever for shrinking loaded context." },
                     "copy_resources": { "type": "boolean", "description": "Also copy the session's subagents/workflows dir under the new id (off by default; can be large)." },
+                    "revive": { "type": "boolean", "description": "Correct the recorded context size so a maxed-out session will resume. Claude Code's resume gate reads the last turn's stored usage (input+cache) as the current size before re-sending anything, so a session at the wall refuses to resume even after pruning. This rewrites that stale number to the honest post-prune figure." },
                     "dry_run": { "type": "boolean", "description": "Report what would happen without writing." }
                 },
                 "required": ["id"]
@@ -495,6 +496,7 @@ fn prune_session(args: &Value) -> anyhow::Result<String> {
         thinking: args.get("thinking").and_then(Value::as_bool).unwrap_or(false),
         new_id: arg_str(args, "to").map(String::from),
         copy_resources: args.get("copy_resources").and_then(Value::as_bool).unwrap_or(false),
+        revive: args.get("revive").and_then(Value::as_bool).unwrap_or(false),
         dry_run: args.get("dry_run").and_then(Value::as_bool).unwrap_or(false),
     };
     let r = cv_core::prune::prune_session(&sref.path, &opts)?;
@@ -510,6 +512,9 @@ fn prune_session(args: &Value) -> anyhow::Result<String> {
         "new_size": r.new_size,
         "bytes_saved": r.bytes_saved(),
         "est_context_tokens_saved": r.est_context_tokens_saved,
+        "usage_rewritten": r.usage_rewritten,
+        "revive_tokens": r.revive_tokens,
+        "revive_old_tokens": r.revive_old_tokens,
         "dry_run": r.dry_run,
         "resume": format!("claude --resume {}", r.new_id),
     }))?)

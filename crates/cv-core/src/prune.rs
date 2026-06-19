@@ -51,6 +51,13 @@ pub struct PruneOptions {
     /// default — `claude --resume` doesn't need it, and for big sessions it can be hundreds of MB /
     /// thousands of files. Turn on if you want cv's forest features to work on the pruned session.
     pub copy_resources: bool,
+    /// After pruning, rewrite the trailing `message.usage` records to an **honest** post-prune token
+    /// count. Claude Code's resume gate reads the last turn's recorded `usage` (input + cache) as the
+    /// session's current size *before it re-sends anything* — so an already-maxed session refuses to
+    /// resume even when the (now pruned) content would fit. This recomputes the real size of the loaded
+    /// window and corrects the stale number, so the gate lets you back in. Off by default — it edits
+    /// recorded metadata, not just content. The source is still never touched (new id only).
+    pub revive: bool,
     /// Compute and report without writing anything.
     pub dry_run: bool,
 }
@@ -64,6 +71,7 @@ impl Default for PruneOptions {
             thinking: false,
             new_id: None,
             copy_resources: false,
+            revive: false,
             dry_run: false,
         }
     }
@@ -82,6 +90,12 @@ pub struct PruneResult {
     pub original_size: u64,
     pub new_size: u64,
     pub est_context_tokens_saved: u64,
+    /// `--revive`: how many `message.usage` records were corrected.
+    pub usage_rewritten: usize,
+    /// `--revive`: the honest post-prune context-token figure written (None if revive off / nothing to do).
+    pub revive_tokens: Option<u64>,
+    /// `--revive`: the stale figure it replaced — the largest pre-revive usage total in the loaded window.
+    pub revive_old_tokens: Option<u64>,
     pub dry_run: bool,
 }
 
@@ -224,6 +238,11 @@ pub fn prune_session(src_path: &Path, opts: &PruneOptions) -> Result<PruneResult
         out_lines.push(reserialize_with_id(line, &new_id));
     }
 
+    // `--revive`: correct the stale recorded context size so the resume gate reads the honest
+    // post-prune figure. Runs on the already-flattened lines, so the number reflects what's left.
+    let (usage_rewritten, revive_tokens, revive_old_tokens) =
+        if opts.revive { revive_usage(&mut out_lines) } else { (0, None, None) };
+
     let new_content = out_lines.join("\n") + "\n";
     let new_size = new_content.len() as u64;
 
@@ -257,8 +276,86 @@ pub fn prune_session(src_path: &Path, opts: &PruneOptions) -> Result<PruneResult
         original_size,
         new_size,
         est_context_tokens_saved: est_tokens_saved,
+        usage_rewritten,
+        revive_tokens,
+        revive_old_tokens,
         dry_run: opts.dry_run,
     })
+}
+
+/// Rewrite the trailing `message.usage` token counts to an honest post-prune figure (`--revive`).
+///
+/// Claude Code's resume gate reads the **last turn's recorded `usage`** (input + cache tokens) as the
+/// session's current context size — and it does so *before* re-sending anything to the API. After a
+/// prune the real content is small, but that recorded number is still the pre-prune total, so the gate
+/// refuses to resume a session that would actually fit (the "979.7k / context limit reached" wall).
+///
+/// We recompute the honest size of the **loaded window** — everything after the last compaction
+/// boundary, which is what Claude actually re-sends on resume — and rewrite every usage record in that
+/// window that still over-reports, pinning it to the honest figure with the cache counters zeroed (a
+/// fresh resume has no live cache anyway). Returns `(records rewritten, honest tokens, stale max)`.
+fn revive_usage(out_lines: &mut [String]) -> (usize, Option<u64>, Option<u64>) {
+    let parsed: Vec<Option<Value>> = out_lines.iter().map(|l| serde_json::from_str::<Value>(l).ok()).collect();
+
+    // Claude re-sends only what follows the last compaction boundary; before the first, the whole file.
+    let window = parsed
+        .iter()
+        .rposition(|p| {
+            p.as_ref().is_some_and(|v| {
+                v.get("type").and_then(Value::as_str) == Some("system")
+                    && v.get("subtype").and_then(Value::as_str) == Some("compact_boundary")
+            })
+        })
+        .map(|i| i + 1)
+        .unwrap_or(0);
+
+    // Honest size of the loaded window: the tokens Claude will actually re-send (message.content).
+    let honest: u64 = parsed[window..]
+        .iter()
+        .flatten()
+        .filter_map(|v| v.get("message").and_then(|m| m.get("content")))
+        .map(est_tokens)
+        .sum();
+
+    let mut rewritten = 0usize;
+    let mut stale_max = 0u64;
+    for i in window..out_lines.len() {
+        let Some(v) = &parsed[i] else { continue };
+        let Some(usage) = v.pointer("/message/usage").and_then(Value::as_object) else {
+            continue;
+        };
+        let total = usage_total(usage);
+        if total <= honest {
+            continue; // already honest (or smaller) — leave it
+        }
+        stale_max = stale_max.max(total);
+        let mut v = v.clone();
+        if let Some(u) = v.pointer_mut("/message/usage").and_then(Value::as_object_mut) {
+            u.insert("input_tokens".into(), Value::from(honest));
+            u.insert("cache_read_input_tokens".into(), Value::from(0u64));
+            u.insert("cache_creation_input_tokens".into(), Value::from(0u64));
+            if let Some(cc) = u.get_mut("cache_creation").and_then(Value::as_object_mut) {
+                cc.insert("ephemeral_1h_input_tokens".into(), Value::from(0u64));
+                cc.insert("ephemeral_5m_input_tokens".into(), Value::from(0u64));
+            }
+        }
+        out_lines[i] = v.to_string();
+        rewritten += 1;
+    }
+
+    if rewritten == 0 {
+        (0, None, None)
+    } else {
+        (rewritten, Some(honest), Some(stale_max))
+    }
+}
+
+/// Sum the context-bearing token counts of a Claude `usage` object (input + both cache buckets).
+fn usage_total(usage: &serde_json::Map<String, Value>) -> u64 {
+    ["input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"]
+        .iter()
+        .map(|k| usage.get(*k).and_then(Value::as_u64).unwrap_or(0))
+        .sum()
 }
 
 /// Snip the eligible payloads on one (old) user line, in place.

@@ -1,4 +1,4 @@
-//! `cv` — the claurdvoyant CLI.
+//! `cv` — the clustervision CLI.
 //!
 //! This file holds only the clap surface (`Cli`/`Cmd`) and the dispatch into the per-command
 //! modules under `cmd/`; shared helpers live in `util.rs` and `cv blame` in `blame.rs`.
@@ -22,7 +22,7 @@ use std::path::PathBuf;
 #[command(
     name = "cv",
     version,
-    about = "claurdvoyant — search, read, and port AI agent sessions across harnesses"
+    about = "clustervision — search, read, and port AI agent sessions across harnesses"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -323,11 +323,17 @@ enum Cmd {
         /// hundreds of MB for big sessions). Resume doesn't need it — only cv's forest features do.
         #[arg(long)]
         copy_resources: bool,
+        /// Correct the recorded context size so a maxed-out session will resume. Claude Code's resume
+        /// gate reads the last turn's stored `usage` (input+cache) as the current size *before* it
+        /// re-sends anything — so a session at the wall refuses to resume even after pruning shrinks
+        /// it. This rewrites that stale number to the honest post-prune figure. (Source untouched.)
+        #[arg(long)]
+        revive: bool,
         /// Report what would be pruned without writing anything.
         #[arg(long)]
         dry_run: bool,
     },
-    /// View the user config (`~/.config/claurdvoyant/config.toml`) and manage the export-source index.
+    /// View the user config (`~/.config/clustervision/config.toml`) and manage the export-source index.
     /// With no flag, prints the config path + registered export sources. Account data exports
     /// (ChatGPT/Claude.ai `conversations.json`) have no fixed home, so register the dirs/files you want
     /// the `chatgpt-export`/`claude-export` harnesses to discover.
@@ -631,6 +637,7 @@ fn main() -> Result<()> {
             drop,
             thinking,
             copy_resources,
+            revive,
             dry_run,
         } => compose::cmd_prune(
             &id,
@@ -642,6 +649,7 @@ fn main() -> Result<()> {
             drop,
             thinking,
             copy_resources,
+            revive,
             dry_run,
         ),
         Cmd::Config { add_export, rm_export } => config::cmd_config(add_export, rm_export),

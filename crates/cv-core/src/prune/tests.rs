@@ -43,6 +43,7 @@ fn prunes_old_payloads_into_new_session_keeping_recent() {
         thinking: false,
         new_id: None,
         copy_resources: false,
+        revive: false,
         dry_run: false,
     };
     let r = prune_session(&src, &opts).unwrap();
@@ -103,6 +104,7 @@ fn drop_mode_writes_no_sidecar() {
         thinking: false,
         new_id: Some("aaaa".into()),
         copy_resources: false,
+        revive: false,
         dry_run: false,
     };
     let r = prune_session(&src, &opts).unwrap();
@@ -167,6 +169,55 @@ fn thinking_flatten_targets_old_reasoning_only() {
     // retrievable
     let restored = retrieve(r.sidecar_path.as_ref().unwrap(), "a0#think0").unwrap();
     assert_eq!(restored.get("thinking").and_then(|v| v.as_str()), Some(big.as_str()));
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn revive_rewrites_stale_usage_below_loaded_content() {
+    let dir = tmpdir();
+    let sid = "33333333-3333-4333-8333-333333333333";
+    // A compaction boundary, then a small post-boundary window whose last assistant turn still
+    // carries a giant *recorded* usage (the stale wall) even though the content is tiny.
+    let line = |uuid: &str, role: &str, content: serde_json::Value, usage: Option<serde_json::Value>| {
+        let mut m = serde_json::json!({"role":role,"content":content});
+        if let Some(u) = usage {
+            m["usage"] = u;
+        }
+        serde_json::json!({"type":role,"sessionId":sid,"uuid":uuid,"timestamp":"2026-06-19T00:00:00Z","message":m})
+    };
+    let stale = serde_json::json!({"input_tokens":2,"output_tokens":10,
+        "cache_read_input_tokens":975_000,"cache_creation_input_tokens":296,
+        "cache_creation":{"ephemeral_1h_input_tokens":0,"ephemeral_5m_input_tokens":296}});
+    let lines = [
+        line("u0", "user", serde_json::json!("old turn"), None),
+        serde_json::json!({"type":"system","subtype":"compact_boundary","sessionId":sid,"uuid":"b0",
+            "timestamp":"2026-06-19T00:00:01Z"}),
+        line("u1", "user", serde_json::json!("hi again"), None),
+        line("a1", "assistant", serde_json::json!([{"type":"text","text":"small reply"}]), Some(stale)),
+    ];
+    let path = dir.join(format!("{sid}.jsonl"));
+    std::fs::write(&path, lines.iter().map(|l| l.to_string() + "\n").collect::<String>()).unwrap();
+
+    let opts = PruneOptions {
+        revive: true,
+        keep_last: 100, // don't snip anything — isolate the revive behavior
+        ..Default::default()
+    };
+    let r = prune_session(&path, &opts).unwrap();
+
+    assert_eq!(r.usage_rewritten, 1, "the one inflated post-boundary usage record corrected");
+    assert_eq!(r.revive_old_tokens, Some(975_298), "reports the stale total it replaced");
+    let honest = r.revive_tokens.expect("honest figure written");
+    assert!(honest < 1000, "tiny post-boundary content → tiny honest figure (got {honest})");
+
+    // the written file carries the corrected usage, caches zeroed
+    let out = std::fs::read_to_string(&r.new_path).unwrap();
+    let a1 = out.lines().find(|l| l.contains("\"uuid\":\"a1\"")).unwrap();
+    let v: serde_json::Value = serde_json::from_str(a1).unwrap();
+    let u = v.pointer("/message/usage").unwrap();
+    assert_eq!(u["cache_read_input_tokens"], 0);
+    assert_eq!(u["cache_creation_input_tokens"], 0);
+    assert_eq!(u["input_tokens"].as_u64().unwrap(), honest);
     std::fs::remove_dir_all(&dir).ok();
 }
 
