@@ -12,9 +12,9 @@ name = "cv"
 path = "src/main.rs"
 
 [dependencies]
-cv-core = { path = "../cv-core", version = "0.9.16", package = "clustervision-core" }
-cv-search = { path = "../cv-search", version = "0.9.16" }
-cv-llm = { path = "../cv-llm", version = "0.9.16" }
+cv-core = { path = "../cv-core", version = "0.9.17", package = "clustervision-core" }
+cv-search = { path = "../cv-search", version = "0.9.17" }
+cv-llm = { path = "../cv-llm", version = "0.9.17" }
 clap.workspace = true
 anyhow.workspace = true
 serde_json.workspace = true
