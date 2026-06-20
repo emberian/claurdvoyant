@@ -29,6 +29,11 @@
 //!   Semantic search over the whole corpus (via `cv-search`) that returns the most relevant
 //!   message *spans*, not just metadata. Needs `cv index --semantic`; degrades to keyword search
 //!   otherwise.
+//! - `observe_stream(cwd_contains?, harness?, since_cursor?, max_messages=50, char_cap?)` — the
+//!   non-blocking sibling of `await_omen`: drains the *newly-appended* messages since an opaque
+//!   cursor and returns immediately with a fresh cursor, so a senior agent can poll a junior's
+//!   activity on its own cadence (await_omen blocks until one regex matches; observe_stream tails
+//!   the incremental stream). Bounded + read-only (no board write).
 
 use anyhow::Context as _;
 use cv_core::watch::{Filter, Watcher};
@@ -230,6 +235,20 @@ fn tool_list() -> Value {
                     "interval_secs": { "type": "number", "description": "Poll interval (default 2)." }
                 },
                 "required": ["regex"]
+            }
+        },
+        {
+            "name": "observe_stream",
+            "description": "The NON-BLOCKING sibling of await_omen: drain the newly-appended messages from another agent's session(s) since an opaque cursor and return IMMEDIATELY with a fresh cursor — so a senior orchestrator can poll a junior agent's live activity on its own cadence (await_omen blocks until ONE regex matches; observe_stream tails the incremental stream of everything). The first call (no cursor) records a baseline and returns no backlog — pass the returned cursor to the next call to get only what was appended since. Read-only (never writes the board); bounded by max_messages + char_cap. Scope it with cwd_contains and/or harness, e.g. observe_stream(cwd_contains='/junior-proj').",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "cwd_contains": { "type": "string", "description": "Only observe sessions whose recorded cwd contains this substring." },
+                    "harness": { "type": "string", "description": "Only observe this harness: claude, codex, grok, opencode, gemini." },
+                    "since_cursor": { "type": "string", "description": "Opaque cursor from a previous observe_stream call. Omit on the first call to start from the current tail (baseline; returns no messages)." },
+                    "max_messages": { "type": "number", "description": "Max messages to return this call (default 50). Remaining unread messages are reported as more_pending; poll again with the returned cursor to drain them." },
+                    "char_cap": { "type": "number", "description": "Optional cap on total characters of message text returned; the last message is truncated to fit (default 16000)." }
+                }
             }
         },
         {
@@ -471,6 +490,7 @@ fn call_tool(name: &str, args: &Value) -> anyhow::Result<String> {
         "project_sessions" => project_sessions(args),
         "recall" => recall(args),
         "await_omen" => await_omen(args),
+        "observe_stream" => observe_stream(args),
         "board_post" => board_post(args),
         "board_read" => board_read(args),
         "board_await" => board_await(args),
@@ -809,6 +829,173 @@ fn await_omen(args: &Value) -> anyhow::Result<String> {
         }
         std::thread::sleep(interval);
     }
+}
+
+// ---------------------------------------------------------------------------
+// observe_stream — the non-blocking tail of await_omen
+// ---------------------------------------------------------------------------
+
+/// One session's position in the stream: the cheap discovery trigger we last saw (to skip an
+/// unchanged session without re-parsing) and how many parsed IR messages we've already reported.
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy)]
+struct StreamPos {
+    /// `(message_count, updated_at_millis)` — the same cheap change-signal `watch::Watcher` uses.
+    t: (usize, Option<i64>),
+    /// Parsed IR messages already reported for this session.
+    n: usize,
+}
+
+/// The opaque `since_cursor`: a per-session offset map. Serialized to a compact JSON string and
+/// handed back to the caller, who replays it on the next call. This externalizes the in-memory
+/// state `watch::Watcher` keeps in its `seen` map, so the stateless MCP server can resume a tail
+/// across independent `tools/call` invocations.
+#[derive(serde::Serialize, serde::Deserialize, Default)]
+struct StreamCursor {
+    /// Schema version, so an older cursor from a future build degrades to a fresh baseline.
+    v: u32,
+    /// `"<harness>:<id>"` -> position.
+    o: std::collections::HashMap<String, StreamPos>,
+}
+
+const STREAM_CURSOR_VERSION: u32 = 1;
+
+fn session_key(r: &SessionRef) -> String {
+    format!("{}:{}", r.harness.as_str(), r.id)
+}
+
+fn discover_trigger(r: &SessionRef) -> (usize, Option<i64>) {
+    (r.message_count, r.updated_at.map(|t| t.timestamp_millis()))
+}
+
+/// Non-blocking incremental tail: returns the messages appended to matching sessions since
+/// `since_cursor` plus a fresh cursor, then returns immediately. Read-only — it parses sessions
+/// and emits their tail; it never touches the board. The first call (no cursor) records a baseline
+/// and returns no messages, so a caller starts following from "now" rather than dumping history.
+fn observe_stream(args: &Value) -> anyhow::Result<String> {
+    let filter = Filter {
+        harness: parse_harness(args)?,
+        cwd_contains: arg_str(args, "cwd_contains").map(str::to_string),
+    };
+    let max_messages = arg_usize(args, "max_messages", 50).max(1);
+    let char_cap = arg_usize(args, "char_cap", 16_000).max(1);
+
+    // Decode the prior cursor (a fresh baseline if absent / unparseable / from an older schema).
+    let baseline = arg_str(args, "since_cursor").is_none();
+    let prev: StreamCursor = arg_str(args, "since_cursor")
+        .and_then(|c| serde_json::from_str::<StreamCursor>(c).ok())
+        .filter(|c| c.v == STREAM_CURSOR_VERSION)
+        .unwrap_or_default();
+
+    let mut refs: Vec<SessionRef> = cv_core::discover_all()
+        .into_iter()
+        .filter(|r| filter.matches(r))
+        .collect();
+    // Drain oldest-touched first so a bounded call yields a coherent chronological slice.
+    refs.sort_by(|a, b| {
+        let ka = a.updated_at.or(a.created_at);
+        let kb = b.updated_at.or(b.created_at);
+        ka.cmp(&kb)
+    });
+
+    let mut next = StreamCursor { v: STREAM_CURSOR_VERSION, o: std::collections::HashMap::new() };
+    let mut out_msgs: Vec<Value> = Vec::new();
+    let mut chars_used = 0usize;
+    let mut budget_hit = false;
+    let mut more_pending = false;
+
+    for r in &refs {
+        let key = session_key(r);
+        let trigger = discover_trigger(r);
+        let prior = prev.o.get(&key).copied();
+
+        // Unchanged since last time (same cheap trigger): carry the position forward, no re-parse.
+        if let Some(p) = prior {
+            if p.t == trigger {
+                next.o.insert(key, p);
+                continue;
+            }
+        }
+
+        // Establish the true parsed offset. The cheap discover `message_count` is NOT the parsed IR
+        // length for several harnesses (codex/claude add reasoning/tool/system turns), so we parse —
+        // exactly as `watch::Watcher` does — to avoid re-emitting or skipping messages.
+        let Some(session) = cv_core::find(&r.id, Some(r.harness))
+            .ok()
+            .flatten()
+            .and_then(|(sref, adapter)| adapter.parse(&sref).ok())
+        else {
+            // Parse failed: keep the prior position (or none) so a transient failure isn't a skip.
+            if let Some(p) = prior {
+                next.o.insert(key, p);
+            }
+            continue;
+        };
+        let total = session.messages.len();
+
+        // On a baseline call (no incoming cursor at all) we record positions but emit nothing, so
+        // the caller starts following from "now" (mirrors await_omen's emit_existing=false).
+        let already = match prior {
+            Some(p) => p.n.min(total),
+            None if baseline => total,
+            None => 0,
+        };
+
+        if budget_hit {
+            // We've filled this call's budget; record where we are and flag the rest as pending.
+            next.o.insert(key, StreamPos { t: trigger, n: already });
+            if total > already {
+                more_pending = true;
+            }
+            continue;
+        }
+
+        let mut emitted = already;
+        for m in &session.messages[already..] {
+            if out_msgs.len() >= max_messages {
+                budget_hit = true;
+                break;
+            }
+            let text = message_text(m);
+            let text = if chars_used + text.len() > char_cap {
+                let room = char_cap.saturating_sub(chars_used);
+                if room == 0 {
+                    budget_hit = true;
+                    break;
+                }
+                let end = floor_char_boundary(&text, room);
+                format!("{}…", &text[..end])
+            } else {
+                text
+            };
+            chars_used += text.len();
+            out_msgs.push(json!({
+                "harness": r.harness.as_str(),
+                "session_id": r.id,
+                "cwd": r.cwd.as_ref().map(|p| p.to_string_lossy().to_string()),
+                "role": cv_core::render::role_label(m.role),
+                "timestamp": m.timestamp.map(|t| t.to_rfc3339()),
+                "text": text,
+            }));
+            emitted += 1;
+            if chars_used >= char_cap {
+                budget_hit = true;
+                break;
+            }
+        }
+        if total > emitted {
+            more_pending = true;
+        }
+        next.o.insert(key, StreamPos { t: trigger, n: emitted });
+    }
+
+    let cursor = serde_json::to_string(&next)?;
+    Ok(serde_json::to_string_pretty(&json!({
+        "baseline": baseline,
+        "messages": out_msgs,
+        "count": out_msgs.len(),
+        "more_pending": more_pending,
+        "cursor": cursor,
+    }))?)
 }
 
 /// All matchable text in a message: text + thinking + tool-result content.

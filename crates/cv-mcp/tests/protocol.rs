@@ -195,6 +195,7 @@ fn handshake_and_tool_schemas() {
         "read_session",
         "project_sessions",
         "recall",
+        "observe_stream",
     ] {
         assert!(names.contains(expected), "missing core tool {expected}");
     }
@@ -343,4 +344,118 @@ fn protocol_error_handling() {
     // Still alive and well after all of that.
     let resp = s.request(5, "tools/list", json!({}));
     assert!(resp["result"]["tools"].is_array(), "{resp}");
+}
+
+
+/// `observe_stream` is the non-blocking tail of `await_omen`: bounded, read-only, cursor-driven.
+/// Covers the spec's required cases — an absent/empty corpus yields a bounded EMPTY result, the
+/// baseline call emits no backlog, the cursor drains only newly-appended messages, max_messages
+/// bounds the batch (more_pending), and NO board side-effect is produced.
+#[test]
+fn observe_stream_bounded_read_only_tail() {
+    let mut s = Server::spawn("observe");
+    s.request(1, "initialize", json!({}));
+
+    // 1) Empty corpus (a filter that matches NO session) → a bounded, empty, baseline result.
+    //    No crash, no error, an empty `messages`, and a usable cursor.
+    let (text, is_err) = s.call_tool(2, "observe_stream", json!({"cwd_contains": "/no/such/dir"}));
+    assert!(!is_err, "{text}");
+    let v: Value = serde_json::from_str(&text).expect("observe_stream returns JSON");
+    assert_eq!(v["baseline"], true, "first call is a baseline: {text}");
+    assert_eq!(v["count"], 0, "absent corpus → zero messages: {text}");
+    assert_eq!(v["messages"].as_array().unwrap().len(), 0, "{text}");
+    assert_eq!(v["more_pending"], false, "{text}");
+    assert!(v["cursor"].as_str().unwrap().contains("\"v\":1"), "cursor is versioned: {text}");
+
+    // 2) Baseline over the REAL fixture corpus emits no backlog (only future activity is tailed),
+    //    and hands back a cursor recording the current tail.
+    let (text, is_err) = s.call_tool(3, "observe_stream", json!({"cwd_contains": "/work/proj"}));
+    assert!(!is_err, "{text}");
+    let v: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(v["baseline"], true, "{text}");
+    assert_eq!(v["count"], 0, "baseline emits no history: {text}");
+    let cursor = v["cursor"].as_str().unwrap().to_string();
+
+    // 3) Replaying that cursor with no new activity drains nothing (and is no longer a baseline).
+    let (text, is_err) = s.call_tool(
+        4,
+        "observe_stream",
+        json!({"cwd_contains": "/work/proj", "since_cursor": cursor}),
+    );
+    assert!(!is_err, "{text}");
+    let v: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(v["baseline"], false, "a cursor call is not a baseline: {text}");
+    assert_eq!(v["count"], 0, "no new activity → nothing drained: {text}");
+
+    // 4) Append a NEW message to the alpha session on disk; the next cursor call drains exactly it.
+    let proj = s.base.join("home/.claude/projects/-work-proj");
+    let extra = json!({"type": "assistant", "uuid": "a2",
+                       "timestamp": "2026-06-19T12:00:00Z",
+                       "message": {"role": "assistant", "content": [
+                           {"type": "text", "text": "ZEBRA_TAIL_MARKER appended later"}]}});
+    let mut body = fs::read_to_string(proj.join("alphasess.jsonl")).unwrap();
+    body.push_str(&format!("{extra}\n"));
+    fs::write(proj.join("alphasess.jsonl"), body).unwrap();
+
+    let (text, is_err) = s.call_tool(
+        5,
+        "observe_stream",
+        json!({"cwd_contains": "/work/proj", "since_cursor": cursor}),
+    );
+    assert!(!is_err, "{text}");
+    let v: Value = serde_json::from_str(&text).unwrap();
+    let msgs = v["messages"].as_array().unwrap();
+    assert!(
+        msgs.iter().any(|m| m["text"].as_str().unwrap_or("").contains("ZEBRA_TAIL_MARKER")),
+        "the appended message must be drained: {text}"
+    );
+    assert!(
+        msgs.iter().all(|m| m["text"].as_str().unwrap_or("").contains("ZEBRA_TAIL_MARKER")
+            || !m["text"].as_str().unwrap_or("").contains("zebrafish")),
+        "previously-seen messages must NOT re-emit: {text}"
+    );
+
+    // 5) max_messages bounds the batch. Append several messages, baseline-reset, then drain with a
+    //    cap of 1 and assert more_pending is flagged.
+    let mut body = fs::read_to_string(proj.join("alphasess.jsonl")).unwrap();
+    for i in 0..3 {
+        let m = json!({"type": "assistant", "uuid": format!("burst{i}"),
+                       "timestamp": "2026-06-19T13:00:00Z",
+                       "message": {"role": "assistant", "content": [
+                           {"type": "text", "text": format!("burst message {i}")}]}});
+        body.push_str(&format!("{m}\n"));
+    }
+    fs::write(proj.join("alphasess.jsonl"), &body).unwrap();
+    // Fresh baseline so we know exactly what's pending, then append AFTER baselining.
+    let (text, _) = s.call_tool(6, "observe_stream", json!({"cwd_contains": "/work/proj"}));
+    let base2 = serde_json::from_str::<Value>(&text).unwrap()["cursor"].as_str().unwrap().to_string();
+    let mut body = fs::read_to_string(proj.join("alphasess.jsonl")).unwrap();
+    for i in 0..3 {
+        let m = json!({"type": "assistant", "uuid": format!("after{i}"),
+                       "timestamp": "2026-06-19T14:00:00Z",
+                       "message": {"role": "assistant", "content": [
+                           {"type": "text", "text": format!("after message {i}")}]}});
+        body.push_str(&format!("{m}\n"));
+    }
+    fs::write(proj.join("alphasess.jsonl"), body).unwrap();
+    let (text, is_err) = s.call_tool(
+        7,
+        "observe_stream",
+        json!({"cwd_contains": "/work/proj", "since_cursor": base2, "max_messages": 1}),
+    );
+    assert!(!is_err, "{text}");
+    let v: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(v["count"], 1, "max_messages=1 bounds the batch: {text}");
+    assert_eq!(v["more_pending"], true, "the rest must be flagged pending: {text}");
+
+    // 6) READ-ONLY: observe_stream must NEVER write the board. Reading the channel observe_stream
+    //    was scoped to ("/work/proj"/"fleet") returns nothing it could have posted. Assert the
+    //    board has no observe_stream-authored traffic on a fresh channel.
+    let (text, _) = s.call_tool(8, "board_read", json!({"channel": "fleet"}));
+    let msgs: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(
+        msgs.as_array().unwrap().len(),
+        0,
+        "observe_stream must not write the board (fleet channel must be empty): {text}"
+    );
 }
