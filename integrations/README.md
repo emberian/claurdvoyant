@@ -46,6 +46,15 @@ to `cv-mcp` when registering the MCP server. Every config below uses the placeho
 call `cvd sync`. It feeds clustervision passively: run `cvd watch` and it archives Kimi's
 on-disk sessions like any other harness.
 
+## Coordination patterns (not harness-specific)
+
+Some recipes aren't a *harness* adapter — they're a **way to use** clustervision's coordination
+tools across whatever harnesses your agents run in:
+
+| Pattern | What it does | Built from |
+|---|---|---|
+| **[mentor-observe](./mentor-observe/)** | A senior/orchestrator agent **polls a junior agent's live activity on its own cadence** (non-blocking), drains the junior's newly-appended messages since a cursor, and steers via the board. The mentor-loop sibling of the blocking `await_omen`. | `cvd watch` + the `observe_stream` MCP tool |
+
 ## What turned out *not* cleanly extensible
 
 - **Kimi CLI** — MCP only; no hooks/plugin lifecycle to actively run `cvd`. Covered via
@@ -61,7 +70,8 @@ These recipes use only commands that **exist in this build**:
   `cv index --semantic`, `cv stats`, `cv resume`, `cv show`, `cv timeline`.
 - Daemon: `cvd sync`, `cvd watch`, `cvd ls`, `cvd path`.
 - MCP (`cv-mcp`): `recall`, `search_sessions`, `project_sessions`, `read_session`,
-  `list_sessions`, `await_omen`, `board_*`.
+  `list_sessions`, `await_omen`, `observe_stream` (the non-blocking tail of `await_omen`),
+  `board_*`.
 
 There is **no `cv distill` or `cv recall` CLI subcommand** in this build — distillation
 exists only as the `cv-llm::distill` library, and `recall` exists only as an MCP tool.

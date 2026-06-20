@@ -35,7 +35,10 @@ pub struct Filter {
 }
 
 impl Filter {
-    fn matches(&self, r: &SessionRef) -> bool {
+    /// Whether a session passes this filter (harness + cwd-substring). Public so non-`Watcher`
+    /// consumers (e.g. the MCP `observe_stream` tool) can reuse the exact same filtering semantics
+    /// rather than re-deriving them and drifting.
+    pub fn matches(&self, r: &SessionRef) -> bool {
         if let Some(h) = self.harness {
             if r.harness != h {
                 return false;

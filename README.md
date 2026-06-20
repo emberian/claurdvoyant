@@ -125,7 +125,7 @@ cargo build --release          # → target/release/{cv, cv-mcp, cvd, cv-tui, cv
 claude mcp add clustervision -- /path/to/target/release/cv-mcp
 ```
 
-Tools incl: `list_sessions` · `search_sessions` · `read_session` · `project_sessions` · **`recall`** (semantic "where was this solved before") · `prune_session`/`prune_retrieve` (custom compaction, in-place). …and a few more your agents can discover for themselves. 😉
+Tools incl: `list_sessions` · `search_sessions` · `read_session` · `project_sessions` · **`recall`** (semantic "where was this solved before") · `await_omen` (block until a sibling's message matches a regex) · **`observe_stream`** (its non-blocking sibling — poll a junior agent's live message tail on your own cadence) · `prune_session`/`prune_retrieve` (custom compaction, in-place). …and a few more your agents can discover for themselves. 😉
 
 ## 📡 Archive your whole fleet (`cvd`)
 
