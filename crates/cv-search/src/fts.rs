@@ -12,9 +12,12 @@
 //!   the session's **first** chunk doc only (~240 bytes/session): the snippet fallback when the
 //!   source file has moved/changed
 //! - `created_at`/`updated_at` i64 INDEXED | STORED — returned on hits + future sort/filter
-//! - `mtime`      i64 STORED       — incremental-index key: unchanged `(id, mtime)` is skipped
+//! - `mtime`      i64 STORED       — file mtime, still used for non-append transcript stores
+//! - `size`       i64 STORED       — file size: the primary incremental-index key for append-only
+//!   session logs, which can skip on unchanged size even when mtime was spuriously bumped (touch,
+//!   rsync, restore); non-append stores require both size and mtime to match.
 //!
-//! Indexing is **incremental** by default: only sessions whose file mtime changed (plus new ones)
+//! Indexing is **incremental** by default: only sessions whose file signature changed (plus new ones)
 //! are (re)written, and sessions whose files vanished are deleted. A full rebuild is `rebuild=true`.
 //! Snippets are generated **live** from the top hits (re-reading the session, capped) rather than
 //! from a stored copy of every body — which is what keeps the on-disk index small.
@@ -39,6 +42,7 @@ struct Fields {
     created_at: Field,
     updated_at: Field,
     mtime: Field,
+    size: Field,
     /// Sub-agent provenance, written only on folded-in sub-agent docs (`cv index --subagents`):
     /// `parent_id` is fielded (`parent_id:<top-level id>` filters to one parent's whole forest),
     /// `agent_id`/`workflow` are stored-only attribution carried onto the hit. NULL/absent on
@@ -60,6 +64,7 @@ fn build_schema() -> Schema {
     b.add_i64_field("created_at", INDEXED | STORED);
     b.add_i64_field("updated_at", INDEXED | STORED);
     b.add_i64_field("mtime", STORED);
+    b.add_i64_field("size", STORED); // primary incremental key for append-only logs
     b.add_text_field("parent_id", STRING | STORED); // fielded: `parent_id:<id>` scopes to a forest
     b.add_text_field("agent_id", STRING | STORED); // stored attribution
     b.add_text_field("workflow", STRING | STORED); // stored attribution
@@ -79,6 +84,7 @@ fn fields_of(schema: &Schema) -> Result<Fields> {
         created_at: get("created_at")?,
         updated_at: get("updated_at")?,
         mtime: get("mtime")?,
+        size: get("size")?,
         parent_id: get("parent_id")?,
         agent_id: get("agent_id")?,
         workflow: get("workflow")?,
@@ -100,7 +106,12 @@ fn open_or_create(dir: &Path) -> Result<(Index, Fields)> {
                 // exactly like the earlier path/mtime/preview upgrade did.
                 && idx.schema().get_field("parent_id").is_ok()
                 && idx.schema().get_field("agent_id").is_ok()
-                && idx.schema().get_field("workflow").is_ok() =>
+                && idx.schema().get_field("workflow").is_ok()
+                // Pre-`size` indexes only stored mtime → rebuild fresh so every doc is re-indexed
+                // once and backfilled with its file size. One-time on upgrade; thereafter
+                // append-only logs can skip on unchanged size while rewriteable stores still check
+                // mtime.
+                && idx.schema().get_field("size").is_ok() =>
         {
             idx
         }
@@ -126,10 +137,11 @@ const CHUNK_BYTES: usize = 4 * 1024 * 1024;
 
 /// Discover + parse every session and bring the index at `dir` up to date.
 ///
-/// Incremental by default: a session whose `(id, file-mtime)` already matches the index is **skipped**
-/// (no re-parse cost beyond the metadata scan, no rewrite); changed sessions are replaced; new ones
-/// added; and sessions whose source files no longer exist are deleted. Pass `rebuild = true` to clear
-/// and rebuild from scratch. Returns the number of sessions discovered (not just the changed ones).
+/// Incremental by default: a session whose freshness signature already matches the index is
+/// **skipped** (no re-parse cost beyond the metadata scan, no rewrite); changed sessions are
+/// replaced; new ones added; and sessions whose source files no longer exist are deleted. Pass
+/// `rebuild = true` to clear and rebuild from scratch. Returns the number of sessions discovered
+/// (not just the changed ones).
 ///
 /// **Chunked ingestion:** each session streams message-by-message into a bounded body buffer that
 /// flushes a tantivy document every [`CHUNK_BYTES`], so a large session is indexed as several small
@@ -159,10 +171,13 @@ pub fn index_all(dir: &Path, rebuild: bool, subagents: bool) -> Result<usize> {
         writer.commit().context("commit after clear")?;
     }
 
-    let existing: HashMap<String, i64> = if rebuild {
+    // id → (mtime, size) for every live doc — the incremental skip-set. Append-only transcript
+    // logs use size as the primary freshness signal; non-append stores still use mtime to catch
+    // same-size rewrites.
+    let existing: HashMap<String, (i64, i64)> = if rebuild {
         HashMap::new()
     } else {
-        read_indexed_mtimes(&index, &f).unwrap_or_default()
+        read_indexed_sigs(&index, &f).unwrap_or_default()
     };
 
     let mut seen: HashSet<String> = HashSet::new();
@@ -179,7 +194,7 @@ pub fn index_all(dir: &Path, rebuild: bool, subagents: bool) -> Result<usize> {
         total += 1;
         seen.insert(r.id.clone());
         let (mtime, size) = cv_core::offsets::file_sig(&r.path);
-        let fts_fresh = existing.get(&r.id).is_some_and(|&mt| mt == mtime && mtime != 0);
+        let fts_fresh = fts_is_fresh(&r, existing.get(&r.id), mtime, size);
         let events_stale = event_sync.needs_ingest(&r, mtime);
         // Message byte offsets (seekable `cv show --range` — see [`cv_core::offsets`]) ride the
         // same pass, for the harnesses whose adapters can stamp them.
@@ -237,6 +252,7 @@ pub fn index_all(dir: &Path, rebuild: bool, subagents: bool) -> Result<usize> {
             adapter.as_ref(),
             &r,
             mtime,
+            size,
             events.as_mut(),
             offsets.as_mut(),
             cv_core::events::Provenance::default(),
@@ -323,6 +339,7 @@ fn index_session(
     adapter: &dyn cv_core::Adapter,
     r: &cv_core::SessionRef,
     mtime: i64,
+    size: i64,
     events: Option<&mut cv_core::events::EventSink>,
     offsets: Option<&mut cv_core::offsets::OffsetSink>,
     prov: cv_core::events::Provenance,
@@ -333,7 +350,7 @@ fn index_session(
     } else {
         ParseOptions::lazy()
     };
-    let mut sink = ChunkSink::new(writer, f, r, mtime, prov);
+    let mut sink = ChunkSink::new(writer, f, r, mtime, size, prov);
     match (events, offsets) {
         (Some(es), Some(os)) => {
             let mut tee = cv_core::TeeSink::new(&mut sink, es);
@@ -369,13 +386,13 @@ fn index_one_subagent(
     f: &Fields,
     parent: &cv_core::SessionRef,
     sub: &cv_core::SubagentInfo,
-    existing: &HashMap<String, i64>,
+    existing: &HashMap<String, (i64, i64)>,
     event_sync: &cv_core::events::SyncTable,
     offset_sync: &cv_core::offsets::SyncTable,
 ) -> Result<usize> {
     let sr = &sub.session;
     let (mtime, size) = cv_core::offsets::file_sig(&sr.path);
-    let fts_fresh = existing.get(&sr.id).is_some_and(|&mt| mt == mtime && mtime != 0);
+    let fts_fresh = fts_is_fresh(sr, existing.get(&sr.id), mtime, size);
     let events_stale = event_sync.needs_ingest(sr, mtime);
     let offsets_stale = cv_core::offsets::supported(sr.harness) && offset_sync.needs_record(sr, mtime, size);
     if fts_fresh && !events_stale && !offsets_stale {
@@ -430,6 +447,7 @@ fn index_one_subagent(
         adapter.as_ref(),
         sr,
         mtime,
+        size,
         events.as_mut(),
         offsets.as_mut(),
         prov.clone(),
@@ -455,6 +473,7 @@ struct ChunkSink<'w> {
     created_at: Option<i64>,
     updated_at: Option<i64>,
     mtime: i64,
+    size: i64,
     disc_title: Option<String>,
     meta_title: Option<String>,
     meta_received: bool,
@@ -480,6 +499,7 @@ impl<'w> ChunkSink<'w> {
         f: &'w Fields,
         r: &cv_core::SessionRef,
         mtime: i64,
+        size: i64,
         prov: cv_core::events::Provenance,
     ) -> Self {
         ChunkSink {
@@ -492,6 +512,7 @@ impl<'w> ChunkSink<'w> {
             created_at: r.created_at.map(|t| t.timestamp()),
             updated_at: r.updated_at.map(|t| t.timestamp()),
             mtime,
+            size,
             disc_title: r.title.clone(),
             meta_title: None,
             meta_received: false,
@@ -542,6 +563,8 @@ impl<'w> ChunkSink<'w> {
             doc.add_i64(self.f.updated_at, t);
         }
         doc.add_i64(self.f.mtime, self.mtime);
+        // `size` is the primary incremental freshness key for append-only transcript logs.
+        doc.add_i64(self.f.size, self.size);
         // Provenance rides every doc of a folded-in sub-agent; top-level docs add nothing here, so
         // they stay byte-for-byte as before.
         if let Some(p) = &self.prov.parent_id {
@@ -687,9 +710,45 @@ impl cv_core::MessageSink for ChunkSink<'_> {
     }
 }
 
-/// Read `id → mtime` for every live document in the index — the incremental skip-set. Stored fields
-/// are tiny now (no body is stored), so scanning them all is cheap.
-fn read_indexed_mtimes(index: &Index, f: &Fields) -> Result<HashMap<String, i64>> {
+/// Whether this session source can use file size as its primary FTS freshness key. These are the
+/// append-only JSONL transcript logs where a mtime-only check caused the live spiral: a pure mtime
+/// bump does not mean new content, while a real append grows the file. Other stores (SQLite DBs,
+/// JSON arrays/objects, and metadata files) can rewrite in place at the same byte length, so they
+/// must keep mtime in the freshness predicate.
+fn size_primary_freshness(r: &cv_core::SessionRef) -> bool {
+    let is_jsonl = r
+        .path
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("jsonl"));
+    is_jsonl
+        && matches!(
+            r.harness,
+            cv_core::Harness::Claude
+                | cv_core::Harness::Codex
+                | cv_core::Harness::Gemini
+                | cv_core::Harness::Qwen
+                | cv_core::Harness::Kimi
+                | cv_core::Harness::OpenClaw
+        )
+}
+
+/// Whether an indexed session is FTS-fresh given its stored `(mtime, size)` and the current file
+/// signature. For append-only transcript logs, size is primary: unchanged size means no new content
+/// even if mtime was spuriously bumped (touch / rsync / restore). For non-append stores, a same-size
+/// rewrite is possible, so mtime must also match. A `size` of 0 (unreadable file) is never fresh,
+/// mirroring [`cv_core::offsets`]'s `(0, 0)` semantics. An entry is present only when a doc carried a
+/// size; a pre-`size` index never reaches here (it's rebuilt by [`open_or_create`]), so an unknown
+/// size is correctly treated as not-fresh rather than skipped.
+fn fts_is_fresh(r: &cv_core::SessionRef, stored: Option<&(i64, i64)>, mtime: i64, size: i64) -> bool {
+    stored.is_some_and(|&(stored_mtime, stored_size)| {
+        stored_size == size && size != 0 && (size_primary_freshness(r) || (stored_mtime == mtime && mtime != 0))
+    })
+}
+
+/// Read `id → (mtime, size)` for every live document in the index — the incremental skip-set.
+/// Stored fields are tiny now (no body is stored), so scanning them all is cheap.
+fn read_indexed_sigs(index: &Index, f: &Fields) -> Result<HashMap<String, (i64, i64)>> {
     let reader = index.reader().context("opening index reader")?;
     let searcher = reader.searcher();
     let mut out = HashMap::new();
@@ -702,8 +761,9 @@ fn read_indexed_mtimes(index: &Index, f: &Fields) -> Result<HashMap<String, i64>
             };
             let id = doc.get_first(f.id).and_then(|v| v.as_str()).map(str::to_string);
             let mt = doc.get_first(f.mtime).and_then(|v| v.as_i64());
-            if let (Some(id), Some(mt)) = (id, mt) {
-                out.insert(id, mt);
+            let sz = doc.get_first(f.size).and_then(|v| v.as_i64());
+            if let (Some(id), Some(mt), Some(sz)) = (id, mt, sz) {
+                out.insert(id, (mt, sz));
             }
         }
     }
@@ -735,6 +795,7 @@ pub(crate) fn index_refs(dir: &Path, refs: &[cv_core::SessionRef], catalog: bool
             adapter.as_ref(),
             r,
             mtime,
+            size,
             es.as_mut(),
             os.as_mut(),
             cv_core::events::Provenance::default(),
@@ -751,6 +812,48 @@ pub(crate) fn index_refs(dir: &Path, refs: &[cv_core::SessionRef], catalog: bool
     Ok(refs.len())
 }
 
+/// Index an explicit set of sessions through the real **incremental** path — mirroring `index_all`'s
+/// per-session freshness skip ([`fts_is_fresh`] over the [`read_indexed_sigs`] skip-set) exactly,
+/// minus only the global `discover_all()` scan (which can't be pointed at a temp dir). Unlike
+/// [`index_refs`] it does **not** clear first, so a second call with unchanged files exercises the
+/// skip. Returns the number of sessions actually (re)indexed — the count the regression test asserts
+/// goes to 0 on a pure mtime bump and to 1 on a real append. `catalog` left off here (FTS-only).
+#[cfg(test)]
+pub(crate) fn index_refs_incremental(dir: &Path, refs: &[cv_core::SessionRef]) -> Result<usize> {
+    let (index, f) = open_or_create(dir)?;
+    let mut writer: IndexWriter = index.writer(50_000_000).context("creating tantivy index writer")?;
+    let existing = read_indexed_sigs(&index, &f).unwrap_or_default();
+    let mut changed = 0usize;
+    for r in refs {
+        let Some(adapter) = cv_core::harness::for_harness(r.harness) else {
+            continue;
+        };
+        let (mtime, size) = cv_core::offsets::file_sig(&r.path);
+        // The exact production freshness gate.
+        if fts_is_fresh(r, existing.get(&r.id), mtime, size) {
+            continue;
+        }
+        if existing.contains_key(&r.id) {
+            writer.delete_term(Term::from_field_text(f.id, &r.id));
+        }
+        index_session(
+            &mut writer,
+            &f,
+            adapter.as_ref(),
+            r,
+            mtime,
+            size,
+            None,
+            None,
+            cv_core::events::Provenance::default(),
+        )
+        .with_context(|| format!("indexing {}", r.id))?;
+        changed += 1;
+    }
+    writer.commit().context("committing index")?;
+    Ok(changed)
+}
+
 /// Index `refs` (top-level) **and** their sub-agent forests, exercising the exact production forest
 /// path [`index_one_subagent`] that `index_all(.., subagents=true)` drives — minus only the global
 /// `discover_all()` scan (which can't be pointed at a temp dir in a unit test). `catalog = true` tees
@@ -762,7 +865,7 @@ pub(crate) fn index_refs_with_subagents(dir: &Path, refs: &[cv_core::SessionRef]
     index_refs(dir, refs, catalog)?;
     let (index, f) = open_or_create(dir)?;
     let mut writer: IndexWriter = index.writer(50_000_000).context("creating tantivy index writer")?;
-    let existing = read_indexed_mtimes(&index, &f).unwrap_or_default();
+    let existing = read_indexed_sigs(&index, &f).unwrap_or_default();
     let event_sync = cv_core::events::SyncTable::load();
     let offset_sync = cv_core::offsets::SyncTable::load();
     let mut folded = 0usize;
@@ -1201,6 +1304,116 @@ mod tests {
 
         std::fs::remove_dir_all(&dir).ok();
         std::fs::remove_dir_all(&sdir).ok();
+    }
+
+    /// Rewrite a file with its own byte-identical content — bumping mtime (the OS stamps "now" on
+    /// write) while leaving size unchanged: the precise "mtime mass-bump, no real change" condition
+    /// from the live incident. No new dep needed; the freshness check ignores the mtime value anyway,
+    /// so an unchanged size is all that decides the skip.
+    fn bump_mtime(path: &str) {
+        let content = std::fs::read(path).unwrap();
+        let before = std::fs::metadata(path).unwrap().len();
+        std::fs::write(path, &content).unwrap();
+        assert_eq!(
+            std::fs::metadata(path).unwrap().len(),
+            before,
+            "bump_mtime must not change size"
+        );
+    }
+
+    /// Append a line to a session transcript (size grows) — a real content change.
+    fn append(path: &str, extra: &str) {
+        use std::io::Write as _;
+        let line = serde_json::json!({
+            "type": "user",
+            "uuid": "append",
+            "message": { "role": "user", "content": extra }
+        });
+        let before = std::fs::metadata(path).unwrap().len();
+        let mut f = std::fs::OpenOptions::new().append(true).open(path).unwrap();
+        writeln!(f, "{line}").unwrap();
+        assert!(
+            std::fs::metadata(path).unwrap().len() > before,
+            "append must grow the file"
+        );
+    }
+
+    /// Regression for bug-class `fts-incremental-lossy-mtime`: incremental freshness for append-only
+    /// transcripts keys on file **size**, not mtime. A pure mtime bump (touch / rsync / restore) with
+    /// byte-identical content must **skip** — the pre-fix mtime-only check
+    /// re-indexed the whole corpus here, which is what blew past the caller timeout and spiralled.
+    /// A real append (size grows) must re-index exactly that one session.
+    #[test]
+    fn incremental_keys_on_size_not_mtime() {
+        let _home = IsolatedHome::new();
+        let dir = tmpdir();
+        let sdir = tmpdir();
+        let p1 = write_claude(&sdir, "s1", "alpha session one body");
+        let p2 = write_claude(&sdir, "s2", "beta session two body");
+        let refs = || vec![sref("s1", "one", p1.clone()), sref("s2", "two", p2.clone())];
+
+        // Initial index: both sessions are new → both indexed.
+        assert_eq!(
+            index_refs_incremental(&dir, &refs()).unwrap(),
+            2,
+            "first pass indexes both new sessions"
+        );
+
+        // Bump BOTH files' mtime forward while keeping content (and therefore size) identical — the
+        // exact "mtimes mass-bumped" condition from the live incident. Size unchanged ⇒ must skip.
+        bump_mtime(&p1);
+        bump_mtime(&p2);
+        let reindexed = index_refs_incremental(&dir, &refs()).unwrap();
+        assert_eq!(
+            reindexed, 0,
+            "pure mtime bump (size unchanged) must re-index NOTHING — got {reindexed} (the lossy-mtime bug)"
+        );
+
+        // Append to exactly one session (size grows) → that one re-indexes, the other still skips.
+        append(&p2, "gamma appended tail");
+        let reindexed = index_refs_incremental(&dir, &refs()).unwrap();
+        assert_eq!(
+            reindexed, 1,
+            "a real append (size grew) must re-index exactly the appended session — got {reindexed}"
+        );
+        // And the appended content is now searchable.
+        let hits = text_search(&dir, "gamma", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id, "s2");
+
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&sdir).ok();
+    }
+
+    /// Unit guard on the freshness predicate itself: append-only logs use size as the primary signal,
+    /// while rewriteable stores still require mtime. An unknown size (no entry) or a 0 size (unreadable
+    /// file) is never fresh.
+    #[test]
+    fn fts_is_fresh_uses_size_primary_only_for_append_only_sources() {
+        let append_only = sref("append", "append", "/tmp/append.jsonl".into());
+        let non_append = cv_core::SessionRef {
+            id: "cline-task".into(),
+            harness: cv_core::Harness::Cline,
+            path: "/tmp/task/api_conversation_history.json".into(),
+            cwd: Some("/home/u/proj".into()),
+            title: Some("task".into()),
+            created_at: None,
+            updated_at: None,
+            message_count: 1,
+        };
+
+        assert!(size_primary_freshness(&append_only));
+        assert!(!size_primary_freshness(&non_append));
+
+        // Same size, different mtime is fresh only for append-only logs.
+        assert!(fts_is_fresh(&append_only, Some(&(111, 4096)), 222, 4096));
+        assert!(!fts_is_fresh(&append_only, Some(&(111, 4096)), 111, 8192));
+        assert!(!fts_is_fresh(&append_only, Some(&(111, 0)), 111, 0));
+        assert!(!fts_is_fresh(&append_only, None, 111, 4096));
+
+        assert!(fts_is_fresh(&non_append, Some(&(111, 4096)), 111, 4096));
+        assert!(!fts_is_fresh(&non_append, Some(&(111, 4096)), 222, 4096));
+        assert!(!fts_is_fresh(&non_append, Some(&(111, 4096)), 111, 8192));
     }
 
     /// The core invariant of `ChunkSink`: a body larger than [`CHUNK_BYTES`] is flushed into several
