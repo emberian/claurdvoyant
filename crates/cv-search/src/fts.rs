@@ -12,12 +12,12 @@
 //!   the session's **first** chunk doc only (~240 bytes/session): the snippet fallback when the
 //!   source file has moved/changed
 //! - `created_at`/`updated_at` i64 INDEXED | STORED — returned on hits + future sort/filter
-//! - `mtime`      i64 STORED       — file mtime, kept as a cheap secondary freshness hint
-//! - `size`       i64 STORED       — file size: the **authoritative** incremental-index key. Session
-//!   transcripts are append-only, so an unchanged size means no new content even when mtime was
-//!   spuriously bumped (touch, rsync, restore) — `(id, size)` matching is what skips a re-index.
+//! - `mtime`      i64 STORED       — file mtime, still used for non-append transcript stores
+//! - `size`       i64 STORED       — file size: the primary incremental-index key for append-only
+//!   session logs, which can skip on unchanged size even when mtime was spuriously bumped (touch,
+//!   rsync, restore); non-append stores require both size and mtime to match.
 //!
-//! Indexing is **incremental** by default: only sessions whose file *size* changed (plus new ones)
+//! Indexing is **incremental** by default: only sessions whose file signature changed (plus new ones)
 //! are (re)written, and sessions whose files vanished are deleted. A full rebuild is `rebuild=true`.
 //! Snippets are generated **live** from the top hits (re-reading the session, capped) rather than
 //! from a stored copy of every body — which is what keeps the on-disk index small.
@@ -64,7 +64,7 @@ fn build_schema() -> Schema {
     b.add_i64_field("created_at", INDEXED | STORED);
     b.add_i64_field("updated_at", INDEXED | STORED);
     b.add_i64_field("mtime", STORED);
-    b.add_i64_field("size", STORED); // authoritative incremental key (append-only ⇒ size = real change)
+    b.add_i64_field("size", STORED); // primary incremental key for append-only logs
     b.add_text_field("parent_id", STRING | STORED); // fielded: `parent_id:<id>` scopes to a forest
     b.add_text_field("agent_id", STRING | STORED); // stored attribution
     b.add_text_field("workflow", STRING | STORED); // stored attribution
@@ -108,8 +108,9 @@ fn open_or_create(dir: &Path) -> Result<(Index, Fields)> {
                 && idx.schema().get_field("agent_id").is_ok()
                 && idx.schema().get_field("workflow").is_ok()
                 // Pre-`size` indexes only stored mtime → rebuild fresh so every doc is re-indexed
-                // once and backfilled with its file size (the new authoritative freshness key).
-                // One-time on upgrade; thereafter incremental skips on size as designed.
+                // once and backfilled with its file size. One-time on upgrade; thereafter
+                // append-only logs can skip on unchanged size while rewriteable stores still check
+                // mtime.
                 && idx.schema().get_field("size").is_ok() =>
         {
             idx
@@ -136,10 +137,11 @@ const CHUNK_BYTES: usize = 4 * 1024 * 1024;
 
 /// Discover + parse every session and bring the index at `dir` up to date.
 ///
-/// Incremental by default: a session whose `(id, file-mtime)` already matches the index is **skipped**
-/// (no re-parse cost beyond the metadata scan, no rewrite); changed sessions are replaced; new ones
-/// added; and sessions whose source files no longer exist are deleted. Pass `rebuild = true` to clear
-/// and rebuild from scratch. Returns the number of sessions discovered (not just the changed ones).
+/// Incremental by default: a session whose freshness signature already matches the index is
+/// **skipped** (no re-parse cost beyond the metadata scan, no rewrite); changed sessions are
+/// replaced; new ones added; and sessions whose source files no longer exist are deleted. Pass
+/// `rebuild = true` to clear and rebuild from scratch. Returns the number of sessions discovered
+/// (not just the changed ones).
 ///
 /// **Chunked ingestion:** each session streams message-by-message into a bounded body buffer that
 /// flushes a tantivy document every [`CHUNK_BYTES`], so a large session is indexed as several small
@@ -169,8 +171,9 @@ pub fn index_all(dir: &Path, rebuild: bool, subagents: bool) -> Result<usize> {
         writer.commit().context("commit after clear")?;
     }
 
-    // id → (mtime, size) for every live doc — the incremental skip-set. Size is authoritative
-    // (append-only transcripts), mtime kept as a cheap secondary hint.
+    // id → (mtime, size) for every live doc — the incremental skip-set. Append-only transcript
+    // logs use size as the primary freshness signal; non-append stores still use mtime to catch
+    // same-size rewrites.
     let existing: HashMap<String, (i64, i64)> = if rebuild {
         HashMap::new()
     } else {
@@ -191,7 +194,7 @@ pub fn index_all(dir: &Path, rebuild: bool, subagents: bool) -> Result<usize> {
         total += 1;
         seen.insert(r.id.clone());
         let (mtime, size) = cv_core::offsets::file_sig(&r.path);
-        let fts_fresh = fts_is_fresh(existing.get(&r.id), size);
+        let fts_fresh = fts_is_fresh(&r, existing.get(&r.id), mtime, size);
         let events_stale = event_sync.needs_ingest(&r, mtime);
         // Message byte offsets (seekable `cv show --range` — see [`cv_core::offsets`]) ride the
         // same pass, for the harnesses whose adapters can stamp them.
@@ -389,7 +392,7 @@ fn index_one_subagent(
 ) -> Result<usize> {
     let sr = &sub.session;
     let (mtime, size) = cv_core::offsets::file_sig(&sr.path);
-    let fts_fresh = fts_is_fresh(existing.get(&sr.id), size);
+    let fts_fresh = fts_is_fresh(sr, existing.get(&sr.id), mtime, size);
     let events_stale = event_sync.needs_ingest(sr, mtime);
     let offsets_stale = cv_core::offsets::supported(sr.harness) && offset_sync.needs_record(sr, mtime, size);
     if fts_fresh && !events_stale && !offsets_stale {
@@ -560,7 +563,7 @@ impl<'w> ChunkSink<'w> {
             doc.add_i64(self.f.updated_at, t);
         }
         doc.add_i64(self.f.mtime, self.mtime);
-        // `size` is the authoritative incremental freshness key (append-only ⇒ size = real change).
+        // `size` is the primary incremental freshness key for append-only transcript logs.
         doc.add_i64(self.f.size, self.size);
         // Provenance rides every doc of a folded-in sub-agent; top-level docs add nothing here, so
         // they stay byte-for-byte as before.
@@ -707,20 +710,44 @@ impl cv_core::MessageSink for ChunkSink<'_> {
     }
 }
 
-/// Whether an indexed session is FTS-fresh given its stored `(mtime, size)` and the current file
-/// `size`. **Size is authoritative**: session transcripts are append-only, so an unchanged size
-/// means no new content even if the mtime was spuriously bumped (touch / rsync / restore) — which is
-/// exactly what a mtime-only check got wrong (a mass mtime-bump forced a full re-index). A `size` of
-/// 0 (unreadable file) is never fresh, mirroring [`cv_core::offsets`]'s `(0, 0)` semantics. An entry
-/// is present only when a doc carried a size; a pre-`size` index never reaches here (it's rebuilt by
-/// [`open_or_create`]), so an unknown size is correctly treated as not-fresh rather than skipped.
-fn fts_is_fresh(stored: Option<&(i64, i64)>, size: i64) -> bool {
-    stored.is_some_and(|&(_mtime, stored_size)| stored_size == size && size != 0)
+/// Whether this session source can use file size as its primary FTS freshness key. These are the
+/// append-only JSONL transcript logs where a mtime-only check caused the live spiral: a pure mtime
+/// bump does not mean new content, while a real append grows the file. Other stores (SQLite DBs,
+/// JSON arrays/objects, and metadata files) can rewrite in place at the same byte length, so they
+/// must keep mtime in the freshness predicate.
+fn size_primary_freshness(r: &cv_core::SessionRef) -> bool {
+    let is_jsonl = r
+        .path
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("jsonl"));
+    is_jsonl
+        && matches!(
+            r.harness,
+            cv_core::Harness::Claude
+                | cv_core::Harness::Codex
+                | cv_core::Harness::Gemini
+                | cv_core::Harness::Qwen
+                | cv_core::Harness::Kimi
+                | cv_core::Harness::OpenClaw
+        )
 }
 
-/// Read `id → (mtime, size)` for every live document in the index — the incremental skip-set. Size
-/// is the authoritative freshness key (see [`fts_is_fresh`]); mtime is read back too as a cheap
-/// secondary hint. Stored fields are tiny now (no body is stored), so scanning them all is cheap.
+/// Whether an indexed session is FTS-fresh given its stored `(mtime, size)` and the current file
+/// signature. For append-only transcript logs, size is primary: unchanged size means no new content
+/// even if mtime was spuriously bumped (touch / rsync / restore). For non-append stores, a same-size
+/// rewrite is possible, so mtime must also match. A `size` of 0 (unreadable file) is never fresh,
+/// mirroring [`cv_core::offsets`]'s `(0, 0)` semantics. An entry is present only when a doc carried a
+/// size; a pre-`size` index never reaches here (it's rebuilt by [`open_or_create`]), so an unknown
+/// size is correctly treated as not-fresh rather than skipped.
+fn fts_is_fresh(r: &cv_core::SessionRef, stored: Option<&(i64, i64)>, mtime: i64, size: i64) -> bool {
+    stored.is_some_and(|&(stored_mtime, stored_size)| {
+        stored_size == size && size != 0 && (size_primary_freshness(r) || (stored_mtime == mtime && mtime != 0))
+    })
+}
+
+/// Read `id → (mtime, size)` for every live document in the index — the incremental skip-set.
+/// Stored fields are tiny now (no body is stored), so scanning them all is cheap.
 fn read_indexed_sigs(index: &Index, f: &Fields) -> Result<HashMap<String, (i64, i64)>> {
     let reader = index.reader().context("opening index reader")?;
     let searcher = reader.searcher();
@@ -803,7 +830,7 @@ pub(crate) fn index_refs_incremental(dir: &Path, refs: &[cv_core::SessionRef]) -
         };
         let (mtime, size) = cv_core::offsets::file_sig(&r.path);
         // The exact production freshness gate.
-        if fts_is_fresh(existing.get(&r.id), size) {
+        if fts_is_fresh(r, existing.get(&r.id), mtime, size) {
             continue;
         }
         if existing.contains_key(&r.id) {
@@ -1311,9 +1338,9 @@ mod tests {
         );
     }
 
-    /// Regression for bug-class `fts-incremental-lossy-mtime`: incremental freshness keyed on file
-    /// **size** (authoritative for append-only transcripts), not mtime. A pure mtime bump (touch /
-    /// rsync / restore) with byte-identical content must **skip** — the pre-fix mtime-only check
+    /// Regression for bug-class `fts-incremental-lossy-mtime`: incremental freshness for append-only
+    /// transcripts keys on file **size**, not mtime. A pure mtime bump (touch / rsync / restore) with
+    /// byte-identical content must **skip** — the pre-fix mtime-only check
     /// re-indexed the whole corpus here, which is what blew past the caller timeout and spiralled.
     /// A real append (size grows) must re-index exactly that one session.
     #[test]
@@ -1358,18 +1385,35 @@ mod tests {
         std::fs::remove_dir_all(&sdir).ok();
     }
 
-    /// Unit guard on the freshness predicate itself: size is authoritative, mtime is ignored, and an
-    /// unknown size (no entry) or a 0 size (unreadable file) is never fresh.
+    /// Unit guard on the freshness predicate itself: append-only logs use size as the primary signal,
+    /// while rewriteable stores still require mtime. An unknown size (no entry) or a 0 size (unreadable
+    /// file) is never fresh.
     #[test]
-    fn fts_is_fresh_is_size_primary() {
-        // Same size, DIFFERENT mtime → fresh (the whole point — a mtime bump must not bust the skip).
-        assert!(fts_is_fresh(Some(&(111, 4096)), 4096));
-        // Different size → stale even if mtime happened to match.
-        assert!(!fts_is_fresh(Some(&(111, 4096)), 8192));
-        // Size 0 (unreadable) → never fresh.
-        assert!(!fts_is_fresh(Some(&(111, 0)), 0));
-        // No stored entry (new or pre-`size` index) → never fresh.
-        assert!(!fts_is_fresh(None, 4096));
+    fn fts_is_fresh_uses_size_primary_only_for_append_only_sources() {
+        let append_only = sref("append", "append", "/tmp/append.jsonl".into());
+        let non_append = cv_core::SessionRef {
+            id: "cline-task".into(),
+            harness: cv_core::Harness::Cline,
+            path: "/tmp/task/api_conversation_history.json".into(),
+            cwd: Some("/home/u/proj".into()),
+            title: Some("task".into()),
+            created_at: None,
+            updated_at: None,
+            message_count: 1,
+        };
+
+        assert!(size_primary_freshness(&append_only));
+        assert!(!size_primary_freshness(&non_append));
+
+        // Same size, different mtime is fresh only for append-only logs.
+        assert!(fts_is_fresh(&append_only, Some(&(111, 4096)), 222, 4096));
+        assert!(!fts_is_fresh(&append_only, Some(&(111, 4096)), 111, 8192));
+        assert!(!fts_is_fresh(&append_only, Some(&(111, 0)), 111, 0));
+        assert!(!fts_is_fresh(&append_only, None, 111, 4096));
+
+        assert!(fts_is_fresh(&non_append, Some(&(111, 4096)), 111, 4096));
+        assert!(!fts_is_fresh(&non_append, Some(&(111, 4096)), 222, 4096));
+        assert!(!fts_is_fresh(&non_append, Some(&(111, 4096)), 111, 8192));
     }
 
     /// The core invariant of `ChunkSink`: a body larger than [`CHUNK_BYTES`] is flushed into several
