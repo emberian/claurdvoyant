@@ -29,11 +29,25 @@ fn parse_keep_range(s: &str) -> Result<(usize, Option<usize>)> {
     Ok((start, end))
 }
 
+/// Footer for `cv --help`. The auto `Commands:` list above stays tight (the common path); every
+/// other command is still here, grouped, and still invokable via `cv <command>` / `cv <command>
+/// --help`. `recall` is intentionally absent from the visible list — see its steer below.
+const MORE_COMMANDS: &str = "\
+The list above is the common path. Everything below still works — run `cv <command> --help`.
+
+  Read a session     export · tree · tools · workflow · compaction · doctor · diff
+  Find across fleet  timeline · stats
+  Build context      distill   (for context, prefer `pack`; `recall` is deprecated for agents)
+  Reshape & branch   convert · port · resume · prune · splice · loom · dataset · redact · share
+  Live               scry · board
+  System             config · query";
+
 #[derive(Parser)]
 #[command(
     name = "cv",
     version,
-    about = "clustervision — search, read, and port AI agent sessions across harnesses"
+    about = "clustervision — search, read, and port AI agent sessions across harnesses",
+    after_help = MORE_COMMANDS
 )]
 struct Cli {
     #[command(subcommand)]
@@ -111,6 +125,7 @@ enum Cmd {
         pre_compaction: Option<usize>,
     },
     /// Export a session to markdown, JSON, or self-contained HTML (stdout).
+    #[command(hide = true)]
     Export {
         id: String,
         /// Output format: `md` (default), `json`, or `html`.
@@ -121,6 +136,7 @@ enum Cmd {
     },
     /// Export the corpus as a fine-tuning dataset (JSONL, one session per line).
     /// `chatml`/`sharegpt` import directly into Unsloth Studio / TRL / HF — no adapter.
+    #[command(hide = true)]
     Dataset {
         /// `chatml` (default) → {"messages":[…]}, or `sharegpt` → {"conversations":[…]}.
         #[arg(long, default_value = "chatml")]
@@ -156,6 +172,7 @@ enum Cmd {
         out: Option<PathBuf>,
     },
     /// Convert a session into another harness's native format (cross-harness port).
+    #[command(hide = true)]
     Convert {
         id: String,
         /// Target harness (claude, codex, grok, …).
@@ -172,6 +189,7 @@ enum Cmd {
         cwd: Option<PathBuf>,
     },
     /// Rehome a session to a different working directory (and optionally another harness).
+    #[command(hide = true)]
     Port {
         id: String,
         /// Target harness (defaults to the source harness).
@@ -190,6 +208,7 @@ enum Cmd {
         no_context: bool,
     },
     /// Follow live agent activity across harnesses (tail -f for sessions).
+    #[command(hide = true)]
     Scry {
         #[arg(long)]
         harness: Option<String>,
@@ -252,6 +271,7 @@ enum Cmd {
         edits_only: bool,
     },
     /// Redact a session and emit a single self-contained HTML artifact anyone can open.
+    #[command(hide = true)]
     Share {
         id: String,
         #[arg(long)]
@@ -296,6 +316,7 @@ enum Cmd {
         show: bool,
     },
     /// Fleet analytics over all discovered sessions.
+    #[command(hide = true)]
     Stats {
         /// Restrict the analytics to sessions matching this query (see `cv query`).
         #[arg(long, short = 'q')]
@@ -305,6 +326,7 @@ enum Cmd {
     /// tool payloads (large reads/logs/screenshots) into a sidecar, leaving a small `[PRUNED]` marker
     /// — your prompts and flow stay verbatim, the recent turns stay sharp. Resume with
     /// `claude --resume <new-id>`. Use `--retrieve <tool_use_id>` to fetch a stashed original back.
+    #[command(hide = true)]
     Prune {
         /// Source session id (or, with `--retrieve`, the *pruned* session to read from).
         id: String,
@@ -361,6 +383,7 @@ enum Cmd {
     /// With no flag, prints the config path + registered export sources. Account data exports
     /// (ChatGPT/Claude.ai `conversations.json`) have no fixed home, so register the dirs/files you want
     /// the `chatgpt-export`/`claude-export` harnesses to discover.
+    #[command(hide = true)]
     Config {
         /// Register an export source (a dir to scan, or a `conversations.json` file).
         #[arg(long, value_name = "PATH")]
@@ -371,6 +394,7 @@ enum Cmd {
     },
     /// The query-calculus reference: every field, operator, and example. `--json` emits the machine
     /// schema. The `-q` flag on ls/dataset/timeline/stats speaks this language.
+    #[command(hide = true)]
     Query {
         /// Emit the machine-readable schema (fields, types, operators) as JSON instead of the
         /// human reference.
@@ -378,6 +402,7 @@ enum Cmd {
         json: bool,
     },
     /// Print (or with --launch, run) the resume incantation for a session in its native harness.
+    #[command(hide = true)]
     Resume {
         id: String,
         #[arg(long)]
@@ -387,6 +412,7 @@ enum Cmd {
         launch: bool,
     },
     /// Render a session's message threading (DAG if parent_ids exist, else a numbered list).
+    #[command(hide = true)]
     Tree {
         id: String,
         #[arg(long)]
@@ -394,6 +420,7 @@ enum Cmd {
     },
     /// A `Workflow`-tool run, first-class: its phase tree, the agents under each phase with their
     /// outcomes, run totals, and the driving script. Without `<run_id>`, lists the session's runs.
+    #[command(hide = true)]
     Workflow {
         /// The session that launched the workflow.
         id: String,
@@ -410,6 +437,7 @@ enum Cmd {
     },
     /// Cross-agent tool analytics: per-agent histograms, which-agent-used-what, aggregate usage,
     /// and a tool-call timeline — across the orchestrator and its whole sub-agent forest.
+    #[command(hide = true)]
     Tools {
         id: String,
         #[arg(long)]
@@ -435,6 +463,7 @@ enum Cmd {
     /// Compaction boundaries in a session: every `/compact` (or auto-compaction), its trigger,
     /// pre-compaction context size, and the summary that seeded the next window. `--summaries`
     /// prints each full summary; `cv show <id> --pre-compaction` reads the lost pre-span.
+    #[command(hide = true)]
     Compaction {
         id: String,
         #[arg(long)]
@@ -449,6 +478,7 @@ enum Cmd {
     /// pressure by source (tool results split MCP/builtin, thinking, messages), size the fixed
     /// system+tools overhead from token usage, and pair it with compaction frequency. With no
     /// <id>, analyzes the most recent session(s) for the current directory.
+    #[command(hide = true)]
     Doctor {
         /// Session id (prefix ok). Omit to analyze recent sessions in the current project.
         id: Option<String>,
@@ -461,11 +491,13 @@ enum Cmd {
         json: bool,
     },
     /// Post to / read from the agent coordination board.
+    #[command(hide = true)]
     Board {
         #[command(subcommand)]
         action: BoardCmd,
     },
     /// Unified chronological feed across all harnesses (oldest → newest).
+    #[command(hide = true)]
     Timeline {
         #[arg(long)]
         harness: Option<String>,
@@ -479,6 +511,7 @@ enum Cmd {
         limit: usize,
     },
     /// Compare two sessions message-by-message (great for loom branches).
+    #[command(hide = true)]
     Diff {
         a: String,
         b: String,
@@ -486,6 +519,7 @@ enum Cmd {
         harness: Option<String>,
     },
     /// Compose a new session from spans of existing ones (`<id>:<start>-<end>`).
+    #[command(hide = true)]
     Splice {
         /// One or more specs: `<id>:<start>-<end>`, `<id>:<start>-`, or `<id>` (whole session).
         #[arg(required = true)]
@@ -511,6 +545,7 @@ enum Cmd {
         gen_model: Option<String>,
     },
     /// Distill a session into durable memory (decisions, gotchas, where things live) via an LLM.
+    #[command(hide = true)]
     Distill {
         id: String,
         #[arg(long)]
@@ -528,7 +563,10 @@ enum Cmd {
         #[arg(long)]
         append: bool,
     },
-    /// Semantic recall across the corpus: the most relevant past spans for a query (CLI recall).
+    /// DEPRECATED for agents: returns raw matching spans, not answers — agents reach for this
+    /// expecting a synthesized result it can't give. Use `cv search` to find content, or `cv pack`
+    /// to assemble task context. (Still functions: top-K semantic spans for a query.)
+    #[command(hide = true)]
     Recall {
         query: String,
         #[arg(short = 'k', default_value_t = 5)]
@@ -537,6 +575,7 @@ enum Cmd {
         harness: Option<String>,
     },
     /// Scrub secrets/PII from a session and export it (safe to share).
+    #[command(hide = true)]
     Redact {
         id: String,
         #[arg(long)]
@@ -548,6 +587,7 @@ enum Cmd {
         stats: bool,
     },
     /// Loom graft: take base[..N], then graft other[M..] into one new branched session.
+    #[command(hide = true)]
     Loom {
         base: String,
         #[arg(long)]
