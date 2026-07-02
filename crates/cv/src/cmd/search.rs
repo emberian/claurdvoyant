@@ -8,11 +8,13 @@ use std::path::{Path, PathBuf};
 pub(crate) fn cmd_search(query: &str, harness: Option<String>, limit: usize, semantic: bool) -> Result<()> {
     let want = parse_harness(&harness)?;
 
-    // Semantic search: embed the query and rank stored vectors. Requires `cv index --semantic`.
+    // Semantic search: embed the query and rank stored window vectors. Requires `cv index
+    // --semantic`. Located hits carry the matched window's message index, so the rendering can
+    // say WHERE in the session the match lives.
     if semantic {
-        let hits = cv_search::semantic_search(None, query, limit.saturating_mul(4))
+        let hits = cv_search::semantic_search_located(None, query, limit.saturating_mul(4))
             .context("semantic search failed (run `cv index --semantic` first?)")?;
-        render_search_hits(&hits, want, limit, query, "semantic");
+        render_semantic_hits(&hits, want, limit, query);
         return Ok(());
     }
 
@@ -50,6 +52,46 @@ fn legacy_sqlite_index_path() -> Option<PathBuf> {
         .map(PathBuf::from)
         .or_else(|| dirs_home().map(|h| h.join(".clustervision")))
         .map(|d| d.join("index.sqlite"))
+}
+
+/// Render semantic hits: the same harness/short-id/date/title/snippet rows as
+/// [`render_search_hits`], plus each hit's **location** — the message the best-matching window
+/// starts at, with a ready-to-paste `cv show --range` jump.
+fn render_semantic_hits(hits: &[cv_search::SemanticHit], want: Option<Harness>, limit: usize, query: &str) {
+    let rows: Vec<&cv_search::SemanticHit> = hits
+        .iter()
+        .filter(|h| want.is_none_or(|w| h.hit.harness == w.as_str()))
+        .take(limit)
+        .collect();
+    if rows.is_empty() {
+        println!("no matches for {query:?} (semantic; run `cv index --semantic` to (re)build embeddings)");
+        return;
+    }
+    for h in rows {
+        let date = h
+            .hit
+            .updated_at
+            .or(h.hit.created_at)
+            .and_then(|t| chrono::DateTime::from_timestamp(t, 0))
+            .map(|d| d.format("%Y-%m-%d").to_string())
+            .unwrap_or_else(|| "----------".into());
+        println!(
+            "{:8}  {:8}  {:10}  {}",
+            h.hit.harness,
+            short_id(&h.hit.id),
+            date,
+            h.hit.title.clone().unwrap_or_default(),
+        );
+        if !h.hit.snippet.trim().is_empty() {
+            println!("          … {}", truncate(&h.hit.snippet, 120));
+        }
+        println!(
+            "          ⌖ msg {} — cv show {} --range {}-",
+            h.first_msg,
+            short_id(&h.hit.id),
+            h.first_msg
+        );
+    }
 }
 
 /// Render a slice of cv-search [`cv_search::Hit`]s with harness/short-id/date/title/snippet,
@@ -277,8 +319,13 @@ pub(crate) fn cmd_index(semantic: bool, rebuild: bool, subagents: bool) -> Resul
         }
     );
     if semantic {
-        eprintln!("✦ embedding sessions (downloads a small model on first use)…");
-        let e = cv_search::embed_all(None)?;
+        eprintln!(
+            "✦ {} session embeddings (downloads a small model on first use)…",
+            if rebuild { "rebuilding" } else { "updating" }
+        );
+        // Incremental like the FTS pass: unchanged sessions keep their window vectors;
+        // `--rebuild` re-embeds everything.
+        let e = cv_search::embed_all_with(None, rebuild)?;
         println!(
             "embedded {e} session(s) → {}",
             cv_search::default_embeddings_path().display()

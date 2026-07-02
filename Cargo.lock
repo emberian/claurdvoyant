@@ -522,6 +522,7 @@ dependencies = [
  "clustervision-core",
  "dirs 5.0.1",
  "model2vec-rs",
+ "rayon",
  "serde",
  "serde_json",
  "tantivy",

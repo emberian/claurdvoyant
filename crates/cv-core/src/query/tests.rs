@@ -343,7 +343,13 @@ fn reference_and_schema_cover_every_field() {
 fn bare_url_and_unknown_keys_fall_back_to_needles() {
     // `http://…` is field-shaped ("http" + ':') but not a field — it must search, not error.
     let query = q("http://example.com/x");
-    assert!(query.prefilter(&refx("a", Harness::Claude, None, Some("see http://example.com/x please"), 1)));
+    assert!(query.prefilter(&refx(
+        "a",
+        Harness::Claude,
+        None,
+        Some("see http://example.com/x please"),
+        1
+    )));
     assert!(!query.prefilter(&refx("a", Harness::Claude, None, Some("no links here"), 1)));
     // An unknown key that's nowhere near a real field is a needle too.
     let query = q("bogus:1");
@@ -378,7 +384,12 @@ fn until_since_sugar_and_explicit_ops_on_sugar_error() {
     assert_eq!(q("before:2026-07-01").expr, q("until:2026-07-01").expr);
     assert_eq!(q("after:2026-01-01").expr, q("since:2026-01-01").expr);
     // An explicit comparison on sugar contradicts the implied one — it must teach, not override.
-    for s in ["before>=2026-01-01", "after<2026-01-01", "until=2026-01-01", "since>2026-01-01"] {
+    for s in [
+        "before>=2026-01-01",
+        "after<2026-01-01",
+        "until=2026-01-01",
+        "since>2026-01-01",
+    ] {
         assert!(SessionQuery::parse(s).unwrap_err().contains("sugar"), "{s}");
     }
 }

@@ -51,7 +51,9 @@ pub fn ingest_zip(bytes: &[u8]) -> Result<String, JsValue> {
             .read_to_end(&mut buf)
             .map_err(|e| JsValue::from_str(&format!("reading {name}: {e}")))?;
         if buf.len() as u64 > cap {
-            warn(&format!("cv-web: skipping {name}: decompressed past the extraction cap ({cap})"));
+            warn(&format!(
+                "cv-web: skipping {name}: decompressed past the extraction cap ({cap})"
+            ));
             continue;
         }
         total += buf.len() as u64;

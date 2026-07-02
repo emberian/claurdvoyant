@@ -140,8 +140,7 @@ fn open_or_create(dir: &Path) -> Result<(Index, Fields)> {
 /// failure during a search must not wipe an index that took an hour to build. A stale-schema index
 /// is an error pointing at `cv index` (whose path is the one allowed to rebuild).
 fn open_existing(dir: &Path) -> Result<(Index, Fields)> {
-    let index =
-        Index::open_in_dir(dir).with_context(|| format!("opening tantivy index at {}", dir.display()))?;
+    let index = Index::open_in_dir(dir).with_context(|| format!("opening tantivy index at {}", dir.display()))?;
     if !schema_current(&index.schema()) {
         anyhow::bail!(
             "full-text index at {} was built by an older cv — run `cv index` to rebuild it",
@@ -153,6 +152,13 @@ fn open_existing(dir: &Path) -> Result<(Index, Fields)> {
 }
 
 const COMMIT_EVERY: usize = 256;
+
+/// Sessions handed to the rayon pool per wave of the parallel sweep. Between waves the
+/// coordinating thread — the only place allowed to commit — checks the doc counter against
+/// [`COMMIT_EVERY`]. `commit` takes `&mut self` while workers hold `&IndexWriter`, so the borrow
+/// checker itself enforces "never commit concurrently with adds"; the wave boundary is where the
+/// exclusive borrow becomes available.
+const INDEX_BATCH: usize = 128;
 
 /// Max searchable bytes per tantivy document. A session's body is flushed into **multiple** docs of
 /// at most this size (all sharing the session id), so the index never holds a whole large session's
@@ -186,10 +192,18 @@ const CHUNK_BYTES: usize = 4 * 1024 * 1024;
 /// hundreds of transcripts (~900 MB) — and folded-in sub-agent docs carry the provenance fields so
 /// a hit knows which agent of which workflow of which parent it came from.
 pub fn index_all(dir: &Path, rebuild: bool, subagents: bool) -> Result<usize> {
-    use cv_core::ParseOptions;
+    use rayon::prelude::*;
 
     let (index, f) = open_or_create(dir)?;
-    let mut writer: IndexWriter = index.writer(50_000_000).context("creating tantivy index writer")?;
+    // The parallel fan-out feeds docs from many parse workers at once, and the writer's add-queue
+    // is bounded — `Index::writer(50MB)` would size its own tokenizer pool at 50MB / 15MB-per-
+    // thread-minimum ≈ 3 threads, a stall point for the fan-out (measured: ~3-12% wall on a cold
+    // sweep, and less CPU burned on tiny-arena segment flushes). Match the pool to the machine
+    // (tantivy caps it at 8) with the 15MB minimum arena each — ≤ ~128MB, held only while indexing.
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get()).min(8);
+    let mut writer: IndexWriter = index
+        .writer_with_num_threads(threads, threads * 16_000_000)
+        .context("creating tantivy index writer")?;
 
     if rebuild {
         writer.delete_all_documents().context("clearing index")?;
@@ -216,6 +230,10 @@ pub fn index_all(dir: &Path, rebuild: bool, subagents: bool) -> Result<usize> {
     let event_sync = cv_core::events::SyncTable::load();
     let offset_sync = cv_core::offsets::SyncTable::load();
 
+    // Serial partition pass: pure metadata (a stat + skip-table lookups per session, no parsing),
+    // so it stays cheap and single-threaded. Everything that needs a re-parse — the dominant cost
+    // of a sweep — is collected into `work` and fanned out below.
+    let mut work: Vec<IndexWork> = Vec::new();
     for r in cv_core::discover_all() {
         total += 1;
         seen.insert(r.id.clone());
@@ -229,78 +247,56 @@ pub fn index_all(dir: &Path, rebuild: bool, subagents: bool) -> Result<usize> {
         if fts_fresh && !events_stale && !offsets_stale {
             continue;
         }
-        let Some(adapter) = cv_core::harness::for_harness(r.harness) else {
-            continue;
-        };
-        let mut events = events_stale.then(|| cv_core::events::EventSink::new(r.cwd.clone()));
-        let mut offsets = offsets_stale.then(cv_core::offsets::OffsetSink::new);
-        // The recording pass needs per-message offset stamps; otherwise plain lazy. Identical for
-        // every other consumer on the tee (the stamp is one small `extra` entry nobody reads).
-        let opts = if offsets.is_some() {
-            ParseOptions::lazy_offsets()
-        } else {
-            ParseOptions::lazy()
-        };
-
-        // FTS docs current but events/offsets missing/stale (e.g. first run after upgrading, or
-        // after a catalog wipe): a catalog-only pass that never touches tantivy.
-        if fts_fresh {
-            let res = match (events.as_mut(), offsets.as_mut()) {
-                (Some(es), Some(os)) => {
-                    let mut tee = cv_core::TeeSink::new(es, os);
-                    adapter.stream(&r, &opts, &mut tee)
-                }
-                (Some(es), None) => adapter.stream(&r, &opts, es),
-                (None, Some(os)) => adapter.stream(&r, &opts, os),
-                (None, None) => unreachable!("skip above covers fresh+fresh"),
-            };
-            match res {
-                Ok(_) => {
-                    if let Some(es) = &events {
-                        cv_core::events::record(&r, es.events(), mtime, size);
-                    }
-                    if let Some(os) = &offsets {
-                        cv_core::offsets::record(&r, os, mtime, size);
-                    }
-                }
-                Err(e) => eprintln!("cv-search: parse failed for {} ({}): {e:#}", r.id, r.harness),
-            }
-            continue;
-        }
-
-        if existing.contains_key(&r.id) {
-            // Changed: drop *all* of this session's docs (delete by the shared id term) before re-add.
-            writer.delete_term(Term::from_field_text(f.id, &r.id));
-        }
-        let docs = match index_session_clean(
-            &mut writer,
-            &f,
-            adapter.as_ref(),
-            &r,
+        work.push(IndexWork {
+            r,
             mtime,
             size,
-            events.as_mut(),
-            offsets.as_mut(),
-            cv_core::events::Provenance::default(),
-        ) {
-            Ok(docs) => docs,
-            Err(e) => {
-                // `index_session_clean` already deleted any partial chunk docs, so the session is
-                // simply absent from the index (and its skip-set entry) until a later run parses
-                // it whole — never frozen in as a truncated body stamped fresh.
-                eprintln!("cv-search: parse failed for {} ({}): {e:#}", r.id, r.harness);
-                continue;
+            fts_fresh,
+            events_stale,
+            offsets_stale,
+        });
+    }
+
+    // The single sqlite tee-writer: the event/offsets recorders are not safe for concurrent use
+    // (each `record` opens its own connection to the one catalog db), so every worker funnels its
+    // completed buffers here and one thread runs the sqlite transactions — the per-session
+    // DELETE+INSERT transactional shape unchanged. Persistence stays best-effort, as before.
+    let (tee_tx, tee_rx) = std::sync::mpsc::channel::<TeeRecord>();
+    let tee_writer = std::thread::spawn(move || {
+        for t in tee_rx {
+            if let Some(es) = &t.events {
+                cv_core::events::record(&t.r, es.events(), t.mtime, t.size);
             }
+            if let Some(os) = &t.offsets {
+                cv_core::offsets::record(&t.r, os, t.mtime, t.size);
+            }
+        }
+    });
+
+    // Largest files first: each wave ends at a barrier (the commit point), so a multi-GB session
+    // discovered late would serialize its whole wave behind it. Front-loading the giants lets them
+    // overlap each other and leaves the cheap tail waves barrier-friendly. Order is otherwise
+    // free — sessions are independent, and `seen`/reap were already computed above.
+    work.sort_by_key(|w| std::cmp::Reverse(w.size));
+
+    // Parallel parse fan-out, in waves so the coordinator can take the exclusive borrow back for
+    // periodic commits. `add_document`/`delete_term` take `&self` (tantivy's writer runs its own
+    // indexing threads behind an internal queue), so workers share `&writer` directly; B1 stays
+    // correct under concurrency because a worker's error-path `delete_term` targets only its own
+    // session's id, and within that worker the delete is stamped after its partial adds.
+    let pool = index_pool();
+    for batch in work.chunks(INDEX_BATCH) {
+        let run = || {
+            batch
+                .par_iter()
+                .map(|w| index_one_parallel(&writer, &f, w, &existing, &tee_tx))
+                .reduce(|| (0, 0), |a, b| (a.0 + b.0, a.1 + b.1))
         };
-        // Only stamp events/offsets after a *complete* pass — a parse error above leaves the sync
-        // rows untouched so the session is retried next run.
-        if let Some(es) = events {
-            cv_core::events::record(&r, es.events(), mtime, size);
-        }
-        if let Some(os) = offsets {
-            cv_core::offsets::record(&r, &os, mtime, size);
-        }
-        changed += 1;
+        let (docs, batch_changed) = match &pool {
+            Some(p) => p.install(run),
+            None => run(),
+        };
+        changed += batch_changed;
         since_commit += docs;
         if since_commit >= COMMIT_EVERY {
             writer.commit().context("interim commit")?;
@@ -308,15 +304,20 @@ pub fn index_all(dir: &Path, rebuild: bool, subagents: bool) -> Result<usize> {
         }
     }
 
+    // All workers are done: close the channel so the tee-writer drains and exits. The join waits
+    // at the end of the function — the sqlite drain overlaps the subagent/reap/commit work below.
+    drop(tee_tx);
+
     // Sub-agent forest fold (opt-in): after the top-level sweep, walk every claude session's
     // `subagent_tree_of` and index/ingest each agent transcript tagged with provenance. Done as a
     // second pass (a cheap metadata re-discovery) so the top-level loop's skip logic stays intact;
     // its `seen` set is extended here so a previously-folded agent still on disk isn't reaped.
+    // Serial (unlike the top-level fan-out): its per-agent sqlite records happen inline.
     if subagents {
         for r in cv_core::discover_all() {
             for sub in cv_core::subagent_tree_of(&r) {
                 seen.insert(sub.session.id.clone());
-                match index_one_subagent(&mut writer, &f, &r, &sub, &existing, &event_sync, &offset_sync) {
+                match index_one_subagent(&writer, &f, &r, &sub, &existing, &event_sync, &offset_sync) {
                     Ok(0) => {}
                     Ok(docs) => {
                         changed += 1;
@@ -340,10 +341,13 @@ pub fn index_all(dir: &Path, rebuild: bool, subagents: bool) -> Result<usize> {
     let removed = if rebuild {
         0
     } else {
-        reap_missing(&mut writer, &f, &existing, &seen, &folded, subagents)
+        reap_missing(&writer, &f, &existing, &seen, &folded, subagents)
     };
 
     writer.commit().context("committing index")?;
+    // Wait for the tee-writer to finish its sqlite transactions before reporting: a caller may
+    // query the catalog the moment `index_all` returns.
+    let _ = tee_writer.join();
     if !rebuild {
         eprintln!(
             "  ↳ index: {changed} changed/new, {removed} removed, {} unchanged",
@@ -353,14 +357,141 @@ pub fn index_all(dir: &Path, rebuild: bool, subagents: bool) -> Result<usize> {
     Ok(total)
 }
 
+/// One session the partition pass decided needs a re-parse, with the file signature captured at
+/// partition time (so a file appended mid-sweep reads as stale next run, never wrong) and which
+/// axes were stale — exactly the state the old serial loop carried across its skip checks.
+struct IndexWork {
+    r: cv_core::SessionRef,
+    mtime: i64,
+    size: i64,
+    fts_fresh: bool,
+    events_stale: bool,
+    offsets_stale: bool,
+}
+
+/// One parsed session's completed sqlite payload, shipped from a parallel worker to the single
+/// tee-writer thread. Sent only after a *complete* pass — a parse error sends nothing, leaving the
+/// sync rows untouched so the session is retried next run (same stamp-after-success rule as before).
+struct TeeRecord {
+    r: cv_core::SessionRef,
+    events: Option<cv_core::events::EventSink>,
+    offsets: Option<cv_core::offsets::OffsetSink>,
+    mtime: i64,
+    size: i64,
+}
+
+/// Worker-count override for the parallel sweep: `CV_INDEX_JOBS=N` builds a scoped rayon pool
+/// (`N=1` is effectively the old serial behavior); unset/invalid/0 falls through to rayon's global
+/// default of one worker per core — a fine fit for this IO+alloc-heavy parse load. A `--jobs` CLI
+/// flag would live in `crates/cv`, outside this crate, so the env var is the whole surface here.
+fn index_pool() -> Option<rayon::ThreadPool> {
+    let n: usize = std::env::var("CV_INDEX_JOBS").ok()?.parse().ok().filter(|&n| n > 0)?;
+    rayon::ThreadPoolBuilder::new().num_threads(n).build().ok()
+}
+
+/// Process one [`IndexWork`] item on a rayon worker: stream-parse the session, feed its chunk docs
+/// straight into the shared `&IndexWriter` (tantivy's `add_document`/`delete_term` take `&self`
+/// and queue onto its internal indexing threads), and ship the completed event/offset buffers to
+/// the tee-writer over `tee`. Returns `(docs_added, sessions_changed)` for the coordinator's
+/// commit cadence and summary line — the catalog-only path is `(0, 0)`, as it never counted as
+/// changed before either.
+fn index_one_parallel(
+    writer: &IndexWriter,
+    f: &Fields,
+    w: &IndexWork,
+    existing: &HashMap<String, (i64, i64)>,
+    tee: &std::sync::mpsc::Sender<TeeRecord>,
+) -> (usize, usize) {
+    use cv_core::ParseOptions;
+    let r = &w.r;
+    let Some(adapter) = cv_core::harness::for_harness(r.harness) else {
+        return (0, 0);
+    };
+    let mut events = w.events_stale.then(|| cv_core::events::EventSink::new(r.cwd.clone()));
+    let mut offsets = w.offsets_stale.then(cv_core::offsets::OffsetSink::new);
+    // The recording pass needs per-message offset stamps; otherwise plain lazy. Identical for
+    // every other consumer on the tee (the stamp is one small `extra` entry nobody reads).
+    let opts = if offsets.is_some() {
+        ParseOptions::lazy_offsets()
+    } else {
+        ParseOptions::lazy()
+    };
+
+    // FTS docs current but events/offsets missing/stale (e.g. first run after upgrading, or
+    // after a catalog wipe): a catalog-only pass that never touches tantivy.
+    if w.fts_fresh {
+        let res = match (events.as_mut(), offsets.as_mut()) {
+            (Some(es), Some(os)) => {
+                let mut tee = cv_core::TeeSink::new(es, os);
+                adapter.stream(r, &opts, &mut tee)
+            }
+            (Some(es), None) => adapter.stream(r, &opts, es),
+            (None, Some(os)) => adapter.stream(r, &opts, os),
+            (None, None) => unreachable!("the partition pass skips fresh+fresh"),
+        };
+        match res {
+            Ok(_) => {
+                let _ = tee.send(TeeRecord {
+                    r: r.clone(),
+                    events,
+                    offsets,
+                    mtime: w.mtime,
+                    size: w.size,
+                });
+            }
+            Err(e) => eprintln!("cv-search: parse failed for {} ({}): {e:#}", r.id, r.harness),
+        }
+        return (0, 0);
+    }
+
+    if existing.contains_key(&r.id) {
+        // Changed: drop *all* of this session's docs (delete by the shared id term) before re-add.
+        // Safe under concurrency: the term is this session's id, so it can't touch a neighbor's
+        // docs, and this worker's re-adds are stamped after it (opstamps are per-call, in order).
+        writer.delete_term(Term::from_field_text(f.id, &r.id));
+    }
+    let docs = match index_session_clean(
+        writer,
+        f,
+        adapter.as_ref(),
+        r,
+        w.mtime,
+        w.size,
+        events.as_mut(),
+        offsets.as_mut(),
+        cv_core::events::Provenance::default(),
+    ) {
+        Ok(docs) => docs,
+        Err(e) => {
+            // `index_session_clean` already deleted any partial chunk docs, so the session is
+            // simply absent from the index (and its skip-set entry) until a later run parses
+            // it whole — never frozen in as a truncated body stamped fresh.
+            eprintln!("cv-search: parse failed for {} ({}): {e:#}", r.id, r.harness);
+            return (0, 0);
+        }
+    };
+    // Only stamp events/offsets after a *complete* pass (the tee-writer runs the transactions).
+    let _ = tee.send(TeeRecord {
+        r: r.clone(),
+        events,
+        offsets,
+        mtime: w.mtime,
+        size: w.size,
+    });
+    (docs, 1)
+}
+
 /// Stream one session into bounded tantivy docs through [`ChunkSink`] — teeing the same pass into
 /// `events` and/or `offsets` when given, so the transcript is read once for all consumers.
 /// `lazy()` keeps large content as spans: the chunk sink chunk-resolves them and the other sinks
 /// never read them at all; with an offsets sink the pass runs under `lazy_offsets()` so the
 /// adapter stamps each message's byte offset for it to harvest. Returns the docs written.
+///
+/// Takes `&IndexWriter` (adds go through tantivy's own thread-safe queue), so parallel workers
+/// share the one writer; only `commit` needs the exclusive borrow, and only the coordinator has it.
 #[allow(clippy::too_many_arguments)]
 fn index_session(
-    writer: &mut IndexWriter,
+    writer: &IndexWriter,
     f: &Fields,
     adapter: &dyn cv_core::Adapter,
     r: &cv_core::SessionRef,
@@ -409,7 +540,7 @@ fn index_session(
 /// the id drops out of the skip-set entirely and is retried on the next run.
 #[allow(clippy::too_many_arguments)]
 fn index_session_clean(
-    writer: &mut IndexWriter,
+    writer: &IndexWriter,
     f: &Fields,
     adapter: &dyn cv_core::Adapter,
     r: &cv_core::SessionRef,
@@ -436,7 +567,7 @@ fn index_session_clean(
 /// walk the forest and extends `seen` with every live agent) may decide an agent is gone. Returns
 /// the number of sessions reaped.
 fn reap_missing(
-    writer: &mut IndexWriter,
+    writer: &IndexWriter,
     f: &Fields,
     existing: &HashMap<String, (i64, i64)>,
     seen: &HashSet<String>,
@@ -463,7 +594,7 @@ fn reap_missing(
 /// disk; only chunked docs and the small event rows touch memory.
 #[allow(clippy::too_many_arguments)]
 fn index_one_subagent(
-    writer: &mut IndexWriter,
+    writer: &IndexWriter,
     f: &Fields,
     parent: &cv_core::SessionRef,
     sub: &cv_core::SubagentInfo,
@@ -547,7 +678,7 @@ fn index_one_subagent(
 /// Streams one session's messages into bounded-size tantivy docs (all sharing the session id), so a
 /// large session never materializes its whole body in the index.
 struct ChunkSink<'w> {
-    writer: &'w mut IndexWriter,
+    writer: &'w IndexWriter,
     f: &'w Fields,
     id: String,
     harness: String,
@@ -578,7 +709,7 @@ const PREVIEW_CHARS: usize = 240;
 
 impl<'w> ChunkSink<'w> {
     fn new(
-        writer: &'w mut IndexWriter,
+        writer: &'w IndexWriter,
         f: &'w Fields,
         r: &cv_core::SessionRef,
         mtime: i64,
@@ -872,7 +1003,7 @@ pub(crate) fn index_refs(dir: &Path, refs: &[cv_core::SessionRef], catalog: bool
         let mut es = catalog.then(|| cv_core::events::EventSink::new(r.cwd.clone()));
         let mut os = (catalog && cv_core::offsets::supported(r.harness)).then(cv_core::offsets::OffsetSink::new);
         index_session(
-            &mut writer,
+            &writer,
             &f,
             adapter.as_ref(),
             r,
@@ -922,7 +1053,7 @@ pub(crate) fn index_refs_incremental(dir: &Path, refs: &[cv_core::SessionRef]) -
             writer.delete_term(Term::from_field_text(f.id, &r.id));
         }
         index_session_clean(
-            &mut writer,
+            &writer,
             &f,
             adapter.as_ref(),
             r,
@@ -937,7 +1068,7 @@ pub(crate) fn index_refs_incremental(dir: &Path, refs: &[cv_core::SessionRef]) -
     }
     // The exact production reap, as a plain (no --subagents) refresh: vanished top-level sessions
     // go, the folded sub-agent forest stays.
-    reap_missing(&mut writer, &f, &existing, &seen, &folded, false);
+    reap_missing(&writer, &f, &existing, &seen, &folded, false);
     writer.commit().context("committing index")?;
     Ok(changed)
 }
@@ -961,7 +1092,7 @@ pub(crate) fn index_refs_with_subagents(dir: &Path, refs: &[cv_core::SessionRef]
         for sub in cv_core::subagent_tree_of(r) {
             // In a no-catalog test the skip tables are empty, so every agent indexes; with a catalog
             // the freshness skip behaves exactly as `index_all` does.
-            let docs = index_one_subagent(&mut writer, &f, r, &sub, &existing, &event_sync, &offset_sync)?;
+            let docs = index_one_subagent(&writer, &f, r, &sub, &existing, &event_sync, &offset_sync)?;
             if docs > 0 {
                 folded += 1;
             }
@@ -1830,7 +1961,7 @@ mod tests {
         let mut writer: IndexWriter = index.writer(50_000_000).unwrap();
         let r = sref("victim", "doomed", "/nonexistent/victim.jsonl".into());
         let res = index_session_clean(
-            &mut writer,
+            &writer,
             &f,
             &FailsAfterAChunk,
             &r,
@@ -1892,7 +2023,7 @@ mod tests {
         let offset_sync = cv_core::offsets::SyncTable::load();
         let subs = cv_core::subagent_tree_of(&parent);
         assert_eq!(subs.len(), 1, "fixture must discover exactly one sub-agent");
-        let docs = index_one_subagent(&mut writer, &f, &parent, &subs[0], &existing, &event_sync, &offset_sync)
+        let docs = index_one_subagent(&writer, &f, &parent, &subs[0], &existing, &event_sync, &offset_sync)
             .expect("catalog-only pass");
         assert_eq!(docs, 0, "catalog-only pass must not rewrite tantivy docs");
         writer.commit().unwrap();

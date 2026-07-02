@@ -164,7 +164,6 @@ impl Adapter for Hermes {
         let conn = Self::open_path(&r.path)?;
         stream_conn(&conn, r, sink)
     }
-
 }
 
 /// Which optional columns exist on the `messages` table of this DB (for historical schemas).

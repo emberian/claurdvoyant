@@ -405,10 +405,7 @@ fn call_chat(
     messages: &[Value],
     max_tokens: u32,
 ) -> Result<String> {
-    let approx: usize = messages
-        .iter()
-        .map(|m| m["content"].as_str().map_or(0, str::len))
-        .sum();
+    let approx: usize = messages.iter().map(|m| m["content"].as_str().map_or(0, str::len)).sum();
     egress_notice(provider, model, approx);
     let client = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(180))

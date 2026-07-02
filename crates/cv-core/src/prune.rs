@@ -204,9 +204,7 @@ fn usage_window_cutoff(parsed: &[Option<Value>], budget: u64) -> Option<(usize, 
                 }
                 ti += 1;
             }
-            Some("system")
-                if v.get("subtype").and_then(Value::as_str) == Some("compact_boundary") =>
-            {
+            Some("system") if v.get("subtype").and_then(Value::as_str) == Some("compact_boundary") => {
                 boundary_pending = true;
             }
             _ => {}
@@ -298,7 +296,12 @@ fn select_kept_turns(
         .iter()
         .flatten()
         .filter(|v| is_main_turn(v))
-        .map(|v| v.get("message").and_then(|m| m.get("content")).map(est_tokens).unwrap_or(0))
+        .map(|v| {
+            v.get("message")
+                .and_then(|m| m.get("content"))
+                .map(est_tokens)
+                .unwrap_or(0)
+        })
         .collect();
     let mut acc = 0u64;
     let mut start = per_turn.len();
@@ -490,8 +493,11 @@ pub fn prune_session(src_path: &Path, opts: &PruneOptions) -> Result<PruneResult
 
     // `--revive`: correct the stale recorded context size so the resume gate reads the honest
     // post-prune figure. Runs on the already-flattened lines, so the number reflects what's left.
-    let (usage_rewritten, revive_tokens, revive_old_tokens) =
-        if opts.revive { revive_usage(&mut out_lines, windowing, window_real) } else { (0, None, None) };
+    let (usage_rewritten, revive_tokens, revive_old_tokens) = if opts.revive {
+        revive_usage(&mut out_lines, windowing, window_real)
+    } else {
+        (0, None, None)
+    };
 
     let new_content = out_lines.join("\n") + "\n";
     let new_size = new_content.len() as u64;
@@ -555,7 +561,10 @@ fn revive_usage(
     windowed: bool,
     real_override: Option<u64>,
 ) -> (usize, Option<u64>, Option<u64>) {
-    let parsed: Vec<Option<Value>> = out_lines.iter().map(|l| serde_json::from_str::<Value>(l).ok()).collect();
+    let parsed: Vec<Option<Value>> = out_lines
+        .iter()
+        .map(|l| serde_json::from_str::<Value>(l).ok())
+        .collect();
 
     // Claude re-sends only what follows the last compaction boundary; before the first, the whole file.
     // BUT a `--window`/`--range` tail IS the whole resumable session — and it can still contain OLDER
@@ -644,12 +653,7 @@ fn revive_usage(
 ///  * Lines after the last record (or when there are no records at all): byte estimate.
 ///
 /// Sidechain lines contribute neither usage nor bytes — they aren't re-sent on the main thread.
-fn honest_window_tokens(
-    parsed: &[Option<Value>],
-    out_lines: &[String],
-    window: usize,
-    first_trusted: bool,
-) -> u64 {
+fn honest_window_tokens(parsed: &[Option<Value>], out_lines: &[String], window: usize, first_trusted: bool) -> u64 {
     let span_est = |lo: usize, hi: usize| -> u64 {
         parsed[lo..hi]
             .iter()
@@ -857,7 +861,16 @@ fn prune_assistant_thinking(
             .unwrap_or(1);
         let original = block.clone();
         let id = format!("{line_key}#think{i}");
-        let marker = build_marker(&id, "thinking", &Value::Null, "text", size, line_count, new_id, opts.drop);
+        let marker = build_marker(
+            &id,
+            "thinking",
+            &Value::Null,
+            "text",
+            size,
+            line_count,
+            new_id,
+            opts.drop,
+        );
         *tokens_saved += str_tokens(&original.to_string()).saturating_sub(str_tokens(&marker));
         if !opts.drop {
             sidecar.push(SidecarEntry {

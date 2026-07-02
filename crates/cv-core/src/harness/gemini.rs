@@ -86,7 +86,6 @@ impl Adapter for Gemini {
     fn stream(&self, r: &SessionRef, opts: &ParseOptions, sink: &mut dyn MessageSink) -> Result<Session> {
         stream_for(Harness::Gemini, r, opts, sink)
     }
-
 }
 
 /// Discovery scan of one Gemini-format file into 0..n [`SessionRef`]s, tagged as `harness`.

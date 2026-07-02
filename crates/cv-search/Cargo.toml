@@ -16,6 +16,7 @@ dirs.workspace = true
 chrono.workspace = true
 clap.workspace = true
 uuid.workspace = true
+rayon.workspace = true
 
 # Full-text: pure-Rust Lucene-like engine. Always on.
 tantivy = "0.26"

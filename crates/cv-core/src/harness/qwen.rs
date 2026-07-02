@@ -83,7 +83,6 @@ impl Adapter for Qwen {
         // applies on the materializing path.
         crate::harness::gemini::stream_for(Harness::Qwen, r, opts, sink)
     }
-
 }
 
 /// Whether a file under `~/.qwen/tmp` is one of the shapes we parse: `logs.json`, a chat recording

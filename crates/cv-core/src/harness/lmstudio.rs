@@ -69,8 +69,6 @@ impl Adapter for LmStudio {
         Harness::LmStudio
     }
 
-
-
     fn storage_root(&self) -> Option<PathBuf> {
         // Detect the install even if no conversations dir exists yet.
         self.root

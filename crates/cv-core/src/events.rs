@@ -526,7 +526,8 @@ mod db {
             )
             .ok()?;
         if !has_size {
-            conn.execute_batch("ALTER TABLE event_sync ADD COLUMN size INTEGER;").ok()?;
+            conn.execute_batch("ALTER TABLE event_sync ADD COLUMN size INTEGER;")
+                .ok()?;
         }
         Some(conn)
     }

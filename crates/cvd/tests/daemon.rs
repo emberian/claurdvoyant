@@ -706,7 +706,10 @@ fn serve_cors_allowlist() {
     );
     let raw = raw_request(port, "OPTIONS", "/api/health", &[("Origin", "https://evil.example")]);
     assert_eq!(raw_status(&raw), 204, "{raw}");
-    assert!(!raw.to_ascii_lowercase().contains("access-control-allow-origin"), "{raw}");
+    assert!(
+        !raw.to_ascii_lowercase().contains("access-control-allow-origin"),
+        "{raw}"
+    );
 }
 
 /// The Host header must name this machine (DNS-rebinding guard): loopback names in any spelling

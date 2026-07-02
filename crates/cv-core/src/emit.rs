@@ -2444,14 +2444,18 @@ mod tests {
             "user text block survives"
         );
         assert!(
-            rich.content.iter().any(|b| matches!(b, Block::Image { media_type, data_ref }
+            rich.content
+                .iter()
+                .any(|b| matches!(b, Block::Image { media_type, data_ref }
                 if media_type.as_deref() == Some("image/png")
                     && data_ref.as_deref() == Some("https://example.com/x.png"))),
             "user image (media_type + data_ref) survives: {:?}",
             rich.content
         );
         assert!(
-            rich.content.iter().any(|b| matches!(b, Block::File { mime, path, source }
+            rich.content
+                .iter()
+                .any(|b| matches!(b, Block::File { mime, path, source }
                 if mime.as_deref() == Some("application/pdf")
                     && path.as_deref() == Some("spec.pdf")
                     && source.as_deref() == Some("file:file_123"))),
@@ -2627,11 +2631,7 @@ mod tests {
             results,
             vec![
                 ("call_1".to_string(), "file_a.txt\nfile_b.txt".to_string(), false),
-                (
-                    "call_2".to_string(),
-                    "command not found: frobnicate".to_string(),
-                    true
-                ),
+                ("call_2".to_string(), "command not found: frobnicate".to_string(), true),
             ],
             "is_error must survive a port into codex"
         );

@@ -153,7 +153,6 @@ impl Adapter for Codex {
             sink,
         ))
     }
-
 }
 
 /// Parse a Codex transcript from its text contents into a [`Session`].

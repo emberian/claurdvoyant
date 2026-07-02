@@ -418,7 +418,6 @@ fn malformed_numeric_args_are_invalid_params() {
     assert!(resp["result"].is_object(), "{resp}");
 }
 
-
 /// `observe_stream` is the non-blocking tail of `await_omen`: bounded, read-only, cursor-driven.
 /// Covers the spec's required cases — an absent/empty corpus yields a bounded EMPTY result, the
 /// baseline call emits no backlog, the cursor drains only newly-appended messages, max_messages
@@ -437,7 +436,10 @@ fn observe_stream_bounded_read_only_tail() {
     assert_eq!(v["count"], 0, "absent corpus → zero messages: {text}");
     assert_eq!(v["messages"].as_array().unwrap().len(), 0, "{text}");
     assert_eq!(v["more_pending"], false, "{text}");
-    assert!(v["cursor"].as_str().unwrap().contains("\"v\":1"), "cursor is versioned: {text}");
+    assert!(
+        v["cursor"].as_str().unwrap().contains("\"v\":1"),
+        "cursor is versioned: {text}"
+    );
 
     // 2) Baseline over the REAL fixture corpus emits no backlog (only future activity is tailed),
     //    and hands back a cursor recording the current tail.
@@ -478,12 +480,14 @@ fn observe_stream_bounded_read_only_tail() {
     let v: Value = serde_json::from_str(&text).unwrap();
     let msgs = v["messages"].as_array().unwrap();
     assert!(
-        msgs.iter().any(|m| m["text"].as_str().unwrap_or("").contains("ZEBRA_TAIL_MARKER")),
+        msgs.iter()
+            .any(|m| m["text"].as_str().unwrap_or("").contains("ZEBRA_TAIL_MARKER")),
         "the appended message must be drained: {text}"
     );
     assert!(
-        msgs.iter().all(|m| m["text"].as_str().unwrap_or("").contains("ZEBRA_TAIL_MARKER")
-            || !m["text"].as_str().unwrap_or("").contains("zebrafish")),
+        msgs.iter()
+            .all(|m| m["text"].as_str().unwrap_or("").contains("ZEBRA_TAIL_MARKER")
+                || !m["text"].as_str().unwrap_or("").contains("zebrafish")),
         "previously-seen messages must NOT re-emit: {text}"
     );
 
@@ -500,7 +504,10 @@ fn observe_stream_bounded_read_only_tail() {
     fs::write(proj.join("alphasess.jsonl"), &body).unwrap();
     // Fresh baseline so we know exactly what's pending, then append AFTER baselining.
     let (text, _) = s.call_tool(6, "observe_stream", json!({"cwd_contains": "/work/proj"}));
-    let base2 = serde_json::from_str::<Value>(&text).unwrap()["cursor"].as_str().unwrap().to_string();
+    let base2 = serde_json::from_str::<Value>(&text).unwrap()["cursor"]
+        .as_str()
+        .unwrap()
+        .to_string();
     let mut body = fs::read_to_string(proj.join("alphasess.jsonl")).unwrap();
     for i in 0..3 {
         let m = json!({"type": "assistant", "uuid": format!("after{i}"),

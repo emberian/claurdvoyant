@@ -119,7 +119,11 @@ fn handle(request: Request, ctx: &Ctx) {
 
     // Only GET (besides the OPTIONS handled above) is supported.
     if method != Method::Get {
-        let _ = request.respond(json_response(405, &json!({"error": "method not allowed"}), origin.as_deref()));
+        let _ = request.respond(json_response(
+            405,
+            &json!({"error": "method not allowed"}),
+            origin.as_deref(),
+        ));
         return;
     }
 

@@ -95,7 +95,12 @@ impl Report {
                             _ => self.user_text += t,
                         }
                     }
-                    Block::Thinking { text, signature, encrypted, .. } => {
+                    Block::Thinking {
+                        text,
+                        signature,
+                        encrypted,
+                        ..
+                    } => {
                         // Thinking costs context as plaintext PLUS the signature/encrypted blob that
                         // rides with it — both re-sent to the API. Claude Code frequently records
                         // signature-only thinking (plaintext stripped), so counting just `text`
@@ -112,7 +117,12 @@ impl Report {
                             e.is_mcp = true;
                         }
                     }
-                    Block::ToolResult { content, tool_name, tool_use_id, .. } => {
+                    Block::ToolResult {
+                        content,
+                        tool_name,
+                        tool_use_id,
+                        ..
+                    } => {
                         let t = toks(content.len());
                         self.tool_results += t;
                         let name = tool_name
@@ -170,9 +180,7 @@ impl Report {
         let tools: Vec<Value> = self
             .by_tool
             .iter()
-            .map(|(name, s)| {
-                json!({"tool": name, "mcp": s.is_mcp, "calls": s.calls, "result_tokens": s.result_tokens})
-            })
+            .map(|(name, s)| json!({"tool": name, "mcp": s.is_mcp, "calls": s.calls, "result_tokens": s.result_tokens}))
             .collect();
         let mcp = self.mcp_tool_results();
         json!({
