@@ -17,7 +17,7 @@ serde = { version = "1", features = ["derive"] }
 # fallback shuffled messages by UUID and Zed's `tool_results` map lost its insertion order.
 serde_json = { version = "1", features = ["raw_value", "preserve_order"] }
 chrono = { version = "0.4", features = ["serde"] }
-anyhow = "1"
+anyhow = ">=1.0.103, <2"
 thiserror = "2"
 walkdir = "2"
 rayon = "1"
