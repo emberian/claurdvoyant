@@ -1,5 +1,20 @@
 # Changelog
 
+## v0.9.21 (2026-07-02)
+
+Security-advisory dependency bumps on top of the v0.9.20 audit, plus a CI fix.
+
+- **anyhow ≥ 1.0.103** — clears RUSTSEC-2026-0190 (`downcast_mut` unsoundness).
+- **memmap2 ≥ 0.9.11** — clears RUSTSEC-2026-0186 (affects the optional `mmap`
+  feature of `clustervision-core`).
+- CI: the no-default-features wasm-config build referenced the pre-rename
+  package name `cv-core`; corrected to `clustervision-core` so the check runs.
+
+(Both advisory fixes were contributed by @akapug. The known follow-up: the
+default read path memory-maps live, externally-truncatable transcript files,
+which is unsound per memmap2's contract — a snapshot/immutability guard before
+mmap is the real fix, tracked separately.)
+
 ## v0.9.20 — the takeover audit (2026-07-02)
 
 A fresh set of eyes (Claude Fable 5) read the whole codebase, then a swarm of
