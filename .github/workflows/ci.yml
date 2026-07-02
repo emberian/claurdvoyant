@@ -32,7 +32,7 @@ jobs:
         run: cargo test --workspace
 
       - name: Build cv-core for wasm config (no default features)
-        run: cargo build -p cv-core --no-default-features
+        run: cargo build -p clustervision-core --no-default-features
 
       # Advisory (don't fail the build) — surfaces nits without blocking.
       - name: Format check
