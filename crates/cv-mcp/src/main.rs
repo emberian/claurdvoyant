@@ -51,15 +51,37 @@ async fn main() -> anyhow::Result<()> {
 
     let stdin = tokio::io::stdin();
     let mut reader = BufReader::new(stdin);
-    let mut stdout = tokio::io::stdout();
     let mut buf: Vec<u8> = Vec::new();
+
+    // Every response funnels through one writer task: requests are handled *concurrently* (a
+    // parked long-poll like await_omen/board_await must not head-of-line-block a list_sessions
+    // issued after it), but stdout is a shared byte stream, so a single consumer serializes the
+    // frames. Responses may therefore complete out of order — JSON-RPC ties a reply to its request
+    // by `id`, so that's fine.
+    let (resp_tx, mut resp_rx) = tokio::sync::mpsc::unbounded_channel::<Value>();
+    let writer = tokio::spawn(async move {
+        let mut stdout = tokio::io::stdout();
+        while let Some(msg) = resp_rx.recv().await {
+            if let Err(e) = write_message(&mut stdout, &msg).await {
+                eprintln!("cv-mcp: stdout write failed: {e:#}");
+                break;
+            }
+        }
+    });
 
     loop {
         buf.clear();
         // Read raw bytes, not into a String: a single non-UTF-8 byte on stdin would make `read_line`
-        // error out, and `?` would tear down the whole server. Lossy-decode instead so one bad frame
-        // is tolerated rather than fatal.
-        let n = reader.read_until(b'\n', &mut buf).await?;
+        // error out. Lossy-decode instead so one bad frame is tolerated rather than fatal, and keep
+        // transient read errors non-fatal too — only EOF (or a dead stdin) ends the server.
+        let n = match reader.read_until(b'\n', &mut buf).await {
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => {
+                eprintln!("cv-mcp: stdin read error, shutting down: {e:#}");
+                break;
+            }
+        };
         if n == 0 {
             break; // EOF
         }
@@ -73,24 +95,29 @@ async fn main() -> anyhow::Result<()> {
             Ok(v) => v,
             Err(e) => {
                 // Parse error: id unknown, reply with null id per JSON-RPC.
-                let resp = error_response(Value::Null, -32700, &format!("Parse error: {e}"));
-                write_message(&mut stdout, &resp).await?;
+                let _ = resp_tx.send(error_response(Value::Null, -32700, &format!("Parse error: {e}")));
                 continue;
             }
         };
 
         // A notification (no `id`) gets no response; just acknowledge by ignoring.
         let id = req.get("id").cloned();
-        let method = req.get("method").and_then(Value::as_str).unwrap_or("");
+        let method = req.get("method").and_then(Value::as_str).unwrap_or("").to_string();
+        let params = req.get("params").cloned();
 
-        // Handle in a blocking-friendly way; the cv_core calls are synchronous + filesystem-heavy,
-        // so run them on a blocking thread to keep the runtime responsive.
-        let response = handle(method, req.get("params").cloned(), id.clone()).await;
-
-        if let Some(resp) = response {
-            write_message(&mut stdout, &resp).await?;
-        }
+        // Dispatch each request on its own task so slow handlers never block the read loop.
+        let tx = resp_tx.clone();
+        tokio::spawn(async move {
+            if let Some(resp) = handle(&method, params, id).await {
+                let _ = tx.send(resp);
+            }
+        });
     }
+
+    // Flush responses already queued (or about to land) before exiting; don't hang around for the
+    // full length of an in-flight long-poll — the host that would read its answer is gone.
+    drop(resp_tx);
+    let _ = tokio::time::timeout(Duration::from_secs(2), writer).await;
 
     Ok(())
 }
@@ -117,6 +144,11 @@ async fn handle(method: &str, params: Option<Value>, id: Option<Value>) -> Optio
 
             match result {
                 Ok(Ok(text)) => Some(ok_response(id, tool_text_result(&text, false))),
+                // A malformed *argument* (wrong type, negative count, …) is the caller's protocol
+                // mistake: JSON-RPC -32602 Invalid params, not a tool-execution failure.
+                Ok(Err(e)) if e.downcast_ref::<InvalidParams>().is_some() => {
+                    Some(error_response(id, -32602, &format!("{e}")))
+                }
                 Ok(Err(e)) => {
                     // Tool execution errors are reported via the result's isError flag, not a
                     // protocol-level error, per the MCP spec.
@@ -535,8 +567,8 @@ fn prune_session(args: &Value) -> anyhow::Result<String> {
         );
     }
     let opts = cv_core::prune::PruneOptions {
-        min_size: arg_usize(args, "min_size", 2048),
-        keep_last: arg_usize(args, "keep_last", 25),
+        min_size: arg_usize(args, "min_size", 2048)?,
+        keep_last: arg_usize(args, "keep_last", 25)?,
         drop: args.get("drop").and_then(Value::as_bool).unwrap_or(false),
         thinking: args.get("thinking").and_then(Value::as_bool).unwrap_or(false),
         new_id: arg_str(args, "to").map(String::from),
@@ -563,6 +595,7 @@ fn prune_session(args: &Value) -> anyhow::Result<String> {
         "revive_tokens": r.revive_tokens,
         "revive_old_tokens": r.revive_old_tokens,
         "dry_run": r.dry_run,
+        "warnings": r.warnings,
         "resume": format!("claude --resume {}", r.new_id),
     }))?)
 }
@@ -604,7 +637,7 @@ fn board_post(args: &Value) -> anyhow::Result<String> {
 fn board_read(args: &Value) -> anyhow::Result<String> {
     let channel = arg_str(args, "channel").context("`channel` is required")?;
     let since = arg_str(args, "since");
-    let limit = arg_usize(args, "limit", 50);
+    let limit = arg_usize(args, "limit", 50)?;
     let msgs = cv_core::board::read(channel, since, limit)?;
     Ok(serde_json::to_string_pretty(&msgs)?)
 }
@@ -615,8 +648,8 @@ fn board_await(args: &Value) -> anyhow::Result<String> {
     let channel = arg_str(args, "channel").context("`channel` is required")?;
     let pattern = arg_str(args, "regex").context("`regex` is required")?;
     let re = regex::Regex::new(pattern).with_context(|| format!("invalid regex: {pattern:?}"))?;
-    let timeout = Duration::from_secs(arg_usize(args, "timeout_secs", 120) as u64);
-    let interval = Duration::from_secs(arg_usize(args, "interval_secs", 2).max(1) as u64);
+    let timeout = Duration::from_secs(arg_usize(args, "timeout_secs", 120)? as u64);
+    let interval = Duration::from_secs(arg_usize(args, "interval_secs", 2)?.max(1) as u64);
     // Start the cursor at the current tail so we only react to *new* posts (unless caller gives one).
     let mut cursor = arg_str(args, "since").map(String::from).or_else(|| {
         cv_core::board::read(channel, None, 0)
@@ -683,7 +716,7 @@ fn board_claim(args: &Value) -> anyhow::Result<String> {
     let channel = arg_str(args, "channel").context("`channel` is required")?;
     let from = arg_str(args, "from").unwrap_or("agent");
     let key = arg_str(args, "key").context("`key` is required")?;
-    let ttl = Duration::from_secs(arg_usize(args, "ttl_secs", 300).max(1) as u64);
+    let ttl = Duration::from_secs(arg_usize(args, "ttl_secs", 300)?.max(1) as u64);
     match cv_core::board::claim(channel, from, key, ttl)? {
         Some(lease) => Ok(serde_json::to_string_pretty(&json!({
             "granted": true,
@@ -755,7 +788,7 @@ fn board_claims(args: &Value) -> anyhow::Result<String> {
 /// List agents that heartbeat on a channel within the last `within_secs` (default 120).
 fn board_who(args: &Value) -> anyhow::Result<String> {
     let channel = arg_str(args, "channel").context("`channel` is required")?;
-    let within = Duration::from_secs(arg_usize(args, "within_secs", 120) as u64);
+    let within = Duration::from_secs(arg_usize(args, "within_secs", 120)? as u64);
     let who = cv_core::board::who(channel, within)?;
     Ok(serde_json::to_string_pretty(&json!(who))?)
 }
@@ -795,8 +828,8 @@ fn await_omen(args: &Value) -> anyhow::Result<String> {
         harness: parse_harness(args)?,
         cwd_contains: arg_str(args, "cwd_contains").map(str::to_string),
     };
-    let timeout = Duration::from_secs(arg_usize(args, "timeout_secs", 120) as u64);
-    let interval = Duration::from_secs(arg_usize(args, "interval_secs", 2).max(1) as u64);
+    let timeout = Duration::from_secs(arg_usize(args, "timeout_secs", 120)? as u64);
+    let interval = Duration::from_secs(arg_usize(args, "interval_secs", 2)?.max(1) as u64);
 
     // Only react to activity from now on (not the existing backlog).
     let mut watcher = Watcher::new(filter, false);
@@ -876,8 +909,8 @@ fn observe_stream(args: &Value) -> anyhow::Result<String> {
         harness: parse_harness(args)?,
         cwd_contains: arg_str(args, "cwd_contains").map(str::to_string),
     };
-    let max_messages = arg_usize(args, "max_messages", 50).max(1);
-    let char_cap = arg_usize(args, "char_cap", 16_000).max(1);
+    let max_messages = arg_usize(args, "max_messages", 50)?.max(1);
+    let char_cap = arg_usize(args, "char_cap", 16_000)?.max(1);
 
     // Decode the prior cursor (a fresh baseline if absent / unparseable / from an older schema).
     let baseline = arg_str(args, "since_cursor").is_none();
@@ -886,7 +919,13 @@ fn observe_stream(args: &Value) -> anyhow::Result<String> {
         .filter(|c| c.v == STREAM_CURSOR_VERSION)
         .unwrap_or_default();
 
-    let mut refs: Vec<SessionRef> = cv_core::discover_all()
+    // `sessions()` is the catalog fast path (~ms) vs `discover_all`'s stat-the-fleet scan
+    // (~seconds) — it matters here because observe_stream is *polled*. Freshness is carried by the
+    // catalog's staleness probe, which re-stats the top-50 most-recently-updated session files
+    // (nanosecond mtime + size), and an actively-tailed session is by definition recently updated.
+    // Blind spot: an in-place append to a session outside that window is seen only at the ~900s
+    // backstop.
+    let mut refs: Vec<SessionRef> = cv_core::sessions()
         .into_iter()
         .filter(|r| filter.matches(r))
         .collect();
@@ -1046,11 +1085,37 @@ fn arg_str<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
     args.get(key).and_then(Value::as_str).filter(|s| !s.is_empty())
 }
 
-fn arg_usize(args: &Value, key: &str, default: usize) -> usize {
-    args.get(key)
-        .and_then(Value::as_u64)
-        .map(|n| n as usize)
-        .unwrap_or(default)
+/// A malformed caller-supplied argument. Mapped to JSON-RPC `-32602 Invalid params` at the
+/// protocol layer (unlike tool *execution* failures, which surface as `isError` tool results).
+#[derive(Debug)]
+struct InvalidParams(String);
+
+impl std::fmt::Display for InvalidParams {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Invalid params: {}", self.0)
+    }
+}
+
+impl std::error::Error for InvalidParams {}
+
+/// Read an optional non-negative-integer argument. Absent (or JSON null) yields `default`; a
+/// present-but-malformed value (a string, a negative, a fractional float) is an [`InvalidParams`]
+/// error rather than a silent fallback to the default. Integral floats are tolerated — some
+/// clients serialize `20` as `20.0`.
+fn arg_usize(args: &Value, key: &str, default: usize) -> anyhow::Result<usize> {
+    let v = match args.get(key) {
+        None | Some(Value::Null) => return Ok(default),
+        Some(v) => v,
+    };
+    if let Some(n) = v.as_u64() {
+        return Ok(n as usize);
+    }
+    if let Some(f) = v.as_f64() {
+        if f >= 0.0 && f.fract() == 0.0 && f <= usize::MAX as f64 {
+            return Ok(f as usize);
+        }
+    }
+    Err(InvalidParams(format!("`{key}` must be a non-negative integer, got {v}")).into())
 }
 
 fn parse_harness(args: &Value) -> anyhow::Result<Option<Harness>> {
@@ -1094,9 +1159,11 @@ fn ref_to_json(r: &SessionRef) -> Value {
 fn list_sessions(args: &Value) -> anyhow::Result<String> {
     let harness = parse_harness(args)?;
     let cwd_needle = arg_str(args, "cwd_contains");
-    let limit = arg_usize(args, "limit", 40);
+    let limit = arg_usize(args, "limit", 40)?;
 
-    let mut refs: Vec<SessionRef> = cv_core::discover_all()
+    // Catalog fast path (staleness-probed, ≤ ~900s stale by design) — listing doesn't need a
+    // guaranteed-fresh fleet scan.
+    let mut refs: Vec<SessionRef> = cv_core::sessions()
         .into_iter()
         .filter(|r| harness.is_none_or(|h| r.harness == h))
         .filter(|r| cwd_needle.is_none_or(|n| cwd_contains(r, n)))
@@ -1132,10 +1199,10 @@ fn paths_related(a: &std::path::Path, b: &std::path::Path) -> bool {
 fn project_sessions(args: &Value) -> anyhow::Result<String> {
     let cwd = arg_str(args, "cwd").ok_or_else(|| anyhow::anyhow!("missing required argument: cwd"))?;
     let harness = parse_harness(args)?;
-    let limit = arg_usize(args, "limit", 20);
+    let limit = arg_usize(args, "limit", 20)?;
 
     let query = std::path::Path::new(cwd);
-    let mut refs: Vec<SessionRef> = cv_core::discover_all()
+    let mut refs: Vec<SessionRef> = cv_core::sessions()
         .into_iter()
         .filter(|r| harness.is_none_or(|h| r.harness == h))
         .filter(|r| r.cwd.as_deref().map(|p| paths_related(p, query)).unwrap_or(false))
@@ -1152,10 +1219,10 @@ fn search_sessions(args: &Value) -> anyhow::Result<String> {
     let query = arg_str(args, "query").ok_or_else(|| anyhow::anyhow!("missing required argument: query"))?;
     let harness = parse_harness(args)?;
     let cwd_needle = arg_str(args, "cwd_contains");
-    let limit = arg_usize(args, "limit", 20);
+    let limit = arg_usize(args, "limit", 20)?;
     let needle = query.to_lowercase();
 
-    let mut refs: Vec<SessionRef> = cv_core::discover_all()
+    let mut refs: Vec<SessionRef> = cv_core::sessions()
         .into_iter()
         .filter(|r| harness.is_none_or(|h| r.harness == h))
         .filter(|r| cwd_needle.is_none_or(|n| cwd_contains(r, n)))
@@ -1256,7 +1323,7 @@ fn read_session(args: &Value) -> anyhow::Result<String> {
 /// built) falls back to `cv_search::text_search`. Optionally filtered to one harness.
 fn recall(args: &Value) -> anyhow::Result<String> {
     let query = arg_str(args, "query").ok_or_else(|| anyhow::anyhow!("missing required argument: query"))?;
-    let k = arg_usize(args, "k", 5).max(1);
+    let k = arg_usize(args, "k", 5)?.max(1);
     let harness = parse_harness(args)?;
     let cwd_needle = arg_str(args, "cwd_contains");
 

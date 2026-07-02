@@ -597,16 +597,18 @@ class CvApp extends HTMLElement {
     throw new Error(`"${name}" isn't a .zip or .json file.`);
   }
 
-  // Merge new sessions into the pool, de-duplicating by id (last wins is fine;
-  // we keep the first occurrence to preserve source ordering, but give a fresh
-  // id to any collision so nothing is silently dropped).
+  // Merge new sessions into the pool, de-duplicating by id (we keep the first
+  // occurrence to preserve source ordering, but give a fresh id to any collision
+  // so nothing is silently dropped). Colliding sessions are cloned rather than
+  // mutated — the caller's objects keep their ids, so merging the same array
+  // twice can't double-suffix.
   _mergePool(pool, incoming) {
     const seen = new Set(pool.map((s) => s.id));
     const out = pool.slice();
     for (const s of incoming) {
-      if (s.id && seen.has(s.id)) s.id = `${s.id}~${randomId().slice(0, 4)}`;
-      seen.add(s.id);
-      out.push(s);
+      const add = s.id && seen.has(s.id) ? { ...s, id: `${s.id}~${randomId().slice(0, 4)}` } : s;
+      seen.add(add.id);
+      out.push(add);
     }
     return out;
   }

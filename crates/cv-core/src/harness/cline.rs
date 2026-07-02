@@ -95,13 +95,6 @@ impl Adapter for Cline {
         stream_task_dir(&r.path, &r.id, Harness::Cline, opts, sink)
     }
 
-    fn emit(&self, session: &Session, out_dir: &Path) -> Result<crate::harness::EmitResult> {
-        emit(session, out_dir, &crate::emit::EmitOptions::default())
-    }
-
-    fn can_emit(&self) -> bool {
-        true
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1117,7 +1110,7 @@ mod tests {
         let out_dir = std::env::temp_dir().join(format!("cv-cline-emit-{}-{}", std::process::id(), n));
 
         let cline = Cline::new();
-        let res = cline.emit(&session, &out_dir).expect("emit");
+        let res = emit(&session, &out_dir, &crate::emit::EmitOptions::default()).expect("emit");
         assert_eq!(res.path, out_dir.join("tasks").join(&res.new_id));
 
         // Re-parse via this adapter's parse path.

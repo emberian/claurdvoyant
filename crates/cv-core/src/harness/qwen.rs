@@ -84,9 +84,6 @@ impl Adapter for Qwen {
         crate::harness::gemini::stream_for(Harness::Qwen, r, opts, sink)
     }
 
-    fn can_emit(&self) -> bool {
-        false
-    }
 }
 
 /// Whether a file under `~/.qwen/tmp` is one of the shapes we parse: `logs.json`, a chat recording

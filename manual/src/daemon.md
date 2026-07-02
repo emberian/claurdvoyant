@@ -100,7 +100,8 @@ filterable.
 ```sh
 cvd serve                      # http://127.0.0.1:7777
 cvd serve --port 8080          # pick a port
-cvd serve --host 0.0.0.0       # bind a different interface
+cvd serve --token s3cret       # require `Authorization: Bearer s3cret` on /api/* ($CVD_TOKEN works too)
+cvd serve --host 0.0.0.0 --token s3cret   # expose beyond loopback (demands a token or --insecure-expose)
 ```
 
 `serve` is a tiny synchronous HTTP server (a small worker pool, no async stack) that exposes fleet
@@ -113,10 +114,22 @@ Two things worth noting up front:
   discovery/parse engine `cv` uses, so they reflect the current on-disk state of each harness in
   real time. (The archive is what `sync`/`watch` build for durability and search; `serve` is the
   live window.) The board endpoints read [the board](board.md) directly.
-- **Every response is JSON with permissive CORS** (`Access-Control-Allow-Origin: *`,
-  `Access-Control-Allow-Methods: GET, OPTIONS`), and `OPTIONS` preflight is answered with a `204`.
-  So a dashboard served from any origin can consume it. Only `GET` is supported; anything else is a
-  `405`.
+- **Every response is JSON, and the API is locked to local callers.** Your transcripts can contain
+  secrets, so `serve` treats them that way:
+  - **CORS is an allow-list, never `*`.** Only local origins (`http://localhost:*`,
+    `http://127.0.0.1:*`, `[::1]`, your configured `--host`) and the desktop app's Tauri origins get
+    an `Access-Control-Allow-Origin` echo; a random website you happen to have open gets nothing,
+    so its scripts can't read the corpus. `OPTIONS` preflight is answered with a `204`.
+  - **The `Host` header must name this machine** (`127.0.0.1`, `localhost`, `[::1]`, or your
+    `--host`) — anything else is a `403`. This defeats DNS rebinding, where a hostile page points
+    its own domain at `127.0.0.1` to sidestep CORS entirely.
+  - **Optional bearer token.** Set `--token <t>` (or `$CVD_TOKEN`) and every `/api/*` request must
+    carry `Authorization: Bearer <t>` or get a `401`.
+  - **Non-loopback binds demand an opt-in.** `--host 0.0.0.0` (or any non-loopback address) is
+    refused unless you set a token or pass `--insecure-expose`, and warns loudly either way —
+    anyone who can reach the port can read every transcript.
+
+  Only `GET` is supported; anything else is a `405`.
 
 ### Routes
 

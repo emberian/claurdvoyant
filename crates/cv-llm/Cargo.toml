@@ -8,7 +8,7 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
-cv-core = { path = "../cv-core", version = "0.9.18", package = "clustervision-core" }
+cv-core = { path = "../cv-core", version = "0.9.20", package = "clustervision-core" }
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true

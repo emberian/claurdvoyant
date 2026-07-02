@@ -236,73 +236,89 @@ fn fuse(ranked: Vec<(f32, Vec<cv_search::Hit>)>, limit: usize) -> Vec<cv_search:
     picked
 }
 
+/// Builds a capped searchable head (`hay`, at most [`LIVE_HAY_BYTES`]) as messages stream past
+/// (each dropped immediately), grabbing the first user text for the label fallback; stops the
+/// parse once the cap is hit and a first-user label candidate exists. Stream it under
+/// [`ParseOptions::lazy`] so large content arrives as spans resolved only up to the remaining
+/// budget — peak per session is O(cap), never O(session).
+///
+/// The no-index live path for both `cv pack` ([`live_scan`]) and `cv search`
+/// (`super::search::cmd_search_live`) — exactly the first-run surface where an unbounded
+/// haystack used to mean multi-GB RSS.
+pub(crate) struct CapSink {
+    pub(crate) hay: String,
+    pub(crate) first_user: Option<String>,
+    resolver: Resolver,
+}
+impl CapSink {
+    /// A fresh sink for one session at `path` (the resolver reads lazy spans back from it).
+    pub(crate) fn new(path: &Path) -> Self {
+        CapSink {
+            hay: String::new(),
+            first_user: None,
+            resolver: Resolver::new(Some(path.to_path_buf())),
+        }
+    }
+
+    fn push_text(&mut self, text: &cv_core::Text) {
+        let remaining = LIVE_HAY_BYTES.saturating_sub(self.hay.len());
+        if remaining == 0 {
+            return;
+        }
+        if let Some(sp) = text.as_span() {
+            self.hay.push_str(&self.resolver.resolve_prefix(sp, remaining as u64));
+        } else if let Some(t) = text.inline_str() {
+            self.hay.push_str(&t[..floor_char(t, remaining.min(t.len()))]);
+        }
+        self.hay.push('\n');
+    }
+}
+impl MessageSink for CapSink {
+    fn message(&mut self, m: Message) -> Flow {
+        if self.first_user.is_none() && m.role == Role::User {
+            for b in &m.content {
+                if let Block::Text { text } = b {
+                    if let Some(t) = text.inline_str().filter(|t| !t.trim().is_empty()) {
+                        self.first_user = Some(t.to_string());
+                        break;
+                    }
+                }
+            }
+        }
+        for b in &m.content {
+            match b {
+                Block::Text { text } | Block::Thinking { text, .. } => self.push_text(text),
+                Block::ToolUse { name, input, .. } => {
+                    if self.hay.len() < LIVE_HAY_BYTES {
+                        self.hay.push_str(name);
+                        self.hay.push(' ');
+                        let _ = write!(self.hay, "{input}");
+                        self.hay.push('\n');
+                    }
+                }
+                Block::ToolResult { content, .. } => self.push_text(content),
+                Block::File { path, source, .. } => {
+                    if let Some(p) = path.as_deref().or(source.as_deref()) {
+                        self.hay.push_str(p);
+                        self.hay.push('\n');
+                    }
+                }
+                Block::Image { .. } => {}
+            }
+        }
+        if self.hay.len() >= LIVE_HAY_BYTES && self.first_user.is_some() {
+            Flow::Stop
+        } else {
+            Flow::Continue
+        }
+    }
+}
+
 /// No-index fallback: discover and stream every session, scoring a head-capped searchable
 /// haystack against the task's words. Peak memory is O(`LIVE_HAY_BYTES`), never O(session).
 fn live_scan(task: &str, fetch: usize) -> Result<Vec<cv_search::Hit>> {
     let needle = task.to_lowercase();
     let words: Vec<&str> = needle.split_whitespace().filter(|w| w.len() > 2).collect();
-
-    /// Builds a capped searchable head as messages stream past (each dropped immediately);
-    /// stops the parse once the cap is hit and a first-user label candidate exists.
-    struct CapSink {
-        hay: String,
-        first_user: Option<String>,
-        resolver: Resolver,
-    }
-    impl CapSink {
-        fn push_text(&mut self, text: &cv_core::Text) {
-            let remaining = LIVE_HAY_BYTES.saturating_sub(self.hay.len());
-            if remaining == 0 {
-                return;
-            }
-            if let Some(sp) = text.as_span() {
-                self.hay.push_str(&self.resolver.resolve_prefix(sp, remaining as u64));
-            } else if let Some(t) = text.inline_str() {
-                self.hay.push_str(&t[..floor_char(t, remaining.min(t.len()))]);
-            }
-            self.hay.push('\n');
-        }
-    }
-    impl MessageSink for CapSink {
-        fn message(&mut self, m: Message) -> Flow {
-            if self.first_user.is_none() && m.role == Role::User {
-                for b in &m.content {
-                    if let Block::Text { text } = b {
-                        if let Some(t) = text.inline_str().filter(|t| !t.trim().is_empty()) {
-                            self.first_user = Some(t.to_string());
-                            break;
-                        }
-                    }
-                }
-            }
-            for b in &m.content {
-                match b {
-                    Block::Text { text } | Block::Thinking { text, .. } => self.push_text(text),
-                    Block::ToolUse { name, input, .. } => {
-                        if self.hay.len() < LIVE_HAY_BYTES {
-                            self.hay.push_str(name);
-                            self.hay.push(' ');
-                            let _ = write!(self.hay, "{input}");
-                            self.hay.push('\n');
-                        }
-                    }
-                    Block::ToolResult { content, .. } => self.push_text(content),
-                    Block::File { path, source, .. } => {
-                        if let Some(p) = path.as_deref().or(source.as_deref()) {
-                            self.hay.push_str(p);
-                            self.hay.push('\n');
-                        }
-                    }
-                    Block::Image { .. } => {}
-                }
-            }
-            if self.hay.len() >= LIVE_HAY_BYTES && self.first_user.is_some() {
-                Flow::Stop
-            } else {
-                Flow::Continue
-            }
-        }
-    }
 
     let mut scored: Vec<(i64, cv_search::Hit)> = Vec::new();
     for adapter in cv_core::harness::all() {
@@ -310,11 +326,7 @@ fn live_scan(task: &str, fetch: usize) -> Result<Vec<cv_search::Hit>> {
             continue;
         }
         for r in adapter.discover()? {
-            let mut sink = CapSink {
-                hay: String::new(),
-                first_user: None,
-                resolver: Resolver::new(Some(r.path.clone())),
-            };
+            let mut sink = CapSink::new(&r.path);
             let meta = match adapter.stream(&r, &ParseOptions::lazy(), &mut sink) {
                 Ok(m) => m,
                 Err(_) => continue,

@@ -91,38 +91,63 @@ fn fields_of(schema: &Schema) -> Result<Fields> {
     })
 }
 
-/// Open the index at `dir`, creating it if absent. If an existing index has a **stale schema**
-/// (missing the `path`/`mtime`/`preview` fields from before this layout — e.g. an index built by
-/// an older `cv`), it's transparently rebuilt fresh so the binary self-heals on upgrade; the next
-/// `cv index` repopulates it.
+/// Whether an on-disk index carries every field of the current schema. A miss means it was built
+/// by an older `cv` (pre-`path`/`mtime`/`preview`, pre-subagent-provenance, or pre-`size`) and
+/// must be rebuilt fresh — one-time on upgrade, from the indexing path only.
+fn schema_current(schema: &Schema) -> bool {
+    ["path", "mtime", "preview", "parent_id", "agent_id", "workflow", "size"]
+        .iter()
+        .all(|f| schema.get_field(f).is_ok())
+}
+
+/// Open the index at `dir` for **indexing**: created when absent, and an existing index with a
+/// stale schema (see [`schema_current`]) is transparently rebuilt fresh so the binary self-heals
+/// on upgrade — the caller's sweep repopulates it. Any *other* open failure (corruption, a
+/// transient IO/lock error) propagates: only a positively-identified schema mismatch may delete;
+/// read-only callers use [`open_existing`], which never deletes anything.
 fn open_or_create(dir: &Path) -> Result<(Index, Fields)> {
     std::fs::create_dir_all(dir).with_context(|| format!("creating tantivy dir {}", dir.display()))?;
-    let index = match Index::open_in_dir(dir) {
-        Ok(idx)
-            if idx.schema().get_field("path").is_ok()
-                && idx.schema().get_field("mtime").is_ok()
-                && idx.schema().get_field("preview").is_ok()
-                // Pre-subagent indexes lack the provenance fields → rebuild fresh (self-heal),
-                // exactly like the earlier path/mtime/preview upgrade did.
-                && idx.schema().get_field("parent_id").is_ok()
-                && idx.schema().get_field("agent_id").is_ok()
-                && idx.schema().get_field("workflow").is_ok()
-                // Pre-`size` indexes only stored mtime → rebuild fresh so every doc is re-indexed
-                // once and backfilled with its file size. One-time on upgrade; thereafter
-                // append-only logs can skip on unchanged size while rewriteable stores still check
-                // mtime.
-                && idx.schema().get_field("size").is_ok() =>
-        {
-            idx
-        }
-        // Either no index yet, or one with an incompatible older schema → (re)create fresh.
-        _ => {
-            let _ = std::fs::remove_dir_all(dir);
-            std::fs::create_dir_all(dir).with_context(|| format!("recreating tantivy dir {}", dir.display()))?;
-            Index::create_in_dir(dir, build_schema())
-                .with_context(|| format!("creating tantivy index in {}", dir.display()))?
-        }
-    };
+    // No `meta.json` → nothing here is an index (a fresh dir, or stray leftovers from a failed
+    // create): safe to start clean.
+    if !dir.join("meta.json").exists() {
+        let _ = std::fs::remove_dir_all(dir);
+        std::fs::create_dir_all(dir).with_context(|| format!("recreating tantivy dir {}", dir.display()))?;
+        let index = Index::create_in_dir(dir, build_schema())
+            .with_context(|| format!("creating tantivy index in {}", dir.display()))?;
+        let fields = fields_of(&index.schema())?;
+        return Ok((index, fields));
+    }
+    let index = Index::open_in_dir(dir).with_context(|| {
+        format!(
+            "opening tantivy index at {} (if it is corrupt, delete the directory and re-run `cv index`)",
+            dir.display()
+        )
+    })?;
+    if schema_current(&index.schema()) {
+        let fields = fields_of(&index.schema())?;
+        return Ok((index, fields));
+    }
+    // Positively identified as an older-schema index → rebuild fresh.
+    std::fs::remove_dir_all(dir).with_context(|| format!("clearing stale-schema index at {}", dir.display()))?;
+    std::fs::create_dir_all(dir).with_context(|| format!("recreating tantivy dir {}", dir.display()))?;
+    let index = Index::create_in_dir(dir, build_schema())
+        .with_context(|| format!("creating tantivy index in {}", dir.display()))?;
+    let fields = fields_of(&index.schema())?;
+    Ok((index, fields))
+}
+
+/// Open the index at `dir` for **querying**: never creates and never deletes — a transient open
+/// failure during a search must not wipe an index that took an hour to build. A stale-schema index
+/// is an error pointing at `cv index` (whose path is the one allowed to rebuild).
+fn open_existing(dir: &Path) -> Result<(Index, Fields)> {
+    let index =
+        Index::open_in_dir(dir).with_context(|| format!("opening tantivy index at {}", dir.display()))?;
+    if !schema_current(&index.schema()) {
+        anyhow::bail!(
+            "full-text index at {} was built by an older cv — run `cv index` to rebuild it",
+            dir.display()
+        );
+    }
     let fields = fields_of(&index.schema())?;
     Ok((index, fields))
 }
@@ -150,7 +175,7 @@ const CHUNK_BYTES: usize = 4 * 1024 * 1024;
 ///
 /// **Event ride-along:** the same single adapter pass also feeds the event catalog
 /// ([`cv_core::events`] — file edits/reads, commands, errors → `cv events` / `cv touched`) via a
-/// [`cv_core::TeeSink`]. Events keep their own mtime skip-table (`event_sync`), so an FTS-only
+/// [`cv_core::TeeSink`]. Events keep their own `(mtime, size)` skip-table (`event_sync`), so an FTS-only
 /// `--rebuild` doesn't force an event re-ingest and a tantivy-fresh session whose events are
 /// missing gets an events-only catch-up pass; when both are stale the session is read exactly once.
 /// Event persistence is best-effort (sqlite errors never fail indexing).
@@ -171,11 +196,12 @@ pub fn index_all(dir: &Path, rebuild: bool, subagents: bool) -> Result<usize> {
         writer.commit().context("commit after clear")?;
     }
 
-    // id → (mtime, size) for every live doc — the incremental skip-set. Append-only transcript
-    // logs use size as the primary freshness signal; non-append stores still use mtime to catch
-    // same-size rewrites.
-    let existing: HashMap<String, (i64, i64)> = if rebuild {
-        HashMap::new()
+    // id → (mtime, size) for every live doc — the incremental skip-set — plus the set of ids that
+    // are folded-in sub-agent docs (they carry `parent_id`), which the reap below must leave alone
+    // on a plain (no --subagents) refresh. Append-only transcript logs use size as the primary
+    // freshness signal; non-append stores still use mtime to catch same-size rewrites.
+    let (existing, folded): (HashMap<String, (i64, i64)>, HashSet<String>) = if rebuild {
+        Default::default()
     } else {
         read_indexed_sigs(&index, &f).unwrap_or_default()
     };
@@ -195,7 +221,7 @@ pub fn index_all(dir: &Path, rebuild: bool, subagents: bool) -> Result<usize> {
         seen.insert(r.id.clone());
         let (mtime, size) = cv_core::offsets::file_sig(&r.path);
         let fts_fresh = fts_is_fresh(&r, existing.get(&r.id), mtime, size);
-        let events_stale = event_sync.needs_ingest(&r, mtime);
+        let events_stale = event_sync.needs_ingest(&r, mtime, size);
         // Message byte offsets (seekable `cv show --range` — see [`cv_core::offsets`]) ride the
         // same pass, for the harnesses whose adapters can stamp them.
         let offsets_stale = cv_core::offsets::supported(r.harness) && offset_sync.needs_record(&r, mtime, size);
@@ -231,7 +257,7 @@ pub fn index_all(dir: &Path, rebuild: bool, subagents: bool) -> Result<usize> {
             match res {
                 Ok(_) => {
                     if let Some(es) = &events {
-                        cv_core::events::record(&r, es.events(), mtime);
+                        cv_core::events::record(&r, es.events(), mtime, size);
                     }
                     if let Some(os) = &offsets {
                         cv_core::offsets::record(&r, os, mtime, size);
@@ -246,7 +272,7 @@ pub fn index_all(dir: &Path, rebuild: bool, subagents: bool) -> Result<usize> {
             // Changed: drop *all* of this session's docs (delete by the shared id term) before re-add.
             writer.delete_term(Term::from_field_text(f.id, &r.id));
         }
-        let docs = match index_session(
+        let docs = match index_session_clean(
             &mut writer,
             &f,
             adapter.as_ref(),
@@ -259,6 +285,9 @@ pub fn index_all(dir: &Path, rebuild: bool, subagents: bool) -> Result<usize> {
         ) {
             Ok(docs) => docs,
             Err(e) => {
+                // `index_session_clean` already deleted any partial chunk docs, so the session is
+                // simply absent from the index (and its skip-set entry) until a later run parses
+                // it whole — never frozen in as a truncated body stamped fresh.
                 eprintln!("cv-search: parse failed for {} ({}): {e:#}", r.id, r.harness);
                 continue;
             }
@@ -266,7 +295,7 @@ pub fn index_all(dir: &Path, rebuild: bool, subagents: bool) -> Result<usize> {
         // Only stamp events/offsets after a *complete* pass — a parse error above leaves the sync
         // rows untouched so the session is retried next run.
         if let Some(es) = events {
-            cv_core::events::record(&r, es.events(), mtime);
+            cv_core::events::record(&r, es.events(), mtime, size);
         }
         if let Some(os) = offsets {
             cv_core::offsets::record(&r, &os, mtime, size);
@@ -306,16 +335,13 @@ pub fn index_all(dir: &Path, rebuild: bool, subagents: bool) -> Result<usize> {
         }
     }
 
-    // Reap sessions that disappeared from disk since the last index (incremental only).
-    let mut removed = 0usize;
-    if !rebuild {
-        for id in existing.keys() {
-            if !seen.contains(id) {
-                writer.delete_term(Term::from_field_text(f.id, id));
-                removed += 1;
-            }
-        }
-    }
+    // Reap sessions that disappeared from disk since the last index (incremental only). A plain
+    // refresh never reaps the folded sub-agent forest — see [`reap_missing`].
+    let removed = if rebuild {
+        0
+    } else {
+        reap_missing(&mut writer, &f, &existing, &seen, &folded, subagents)
+    };
 
     writer.commit().context("committing index")?;
     if !rebuild {
@@ -373,6 +399,61 @@ fn index_session(
     Ok(sink.docs)
 }
 
+/// [`index_session`], but guaranteeing the writer holds **no** docs for the session on error.
+///
+/// A large session flushes chunk docs into the writer *while* streaming, so a mid-stream parse
+/// error would otherwise leave a truncated head behind — and since every chunk doc is stamped with
+/// the full current `(mtime, size)`, [`fts_is_fresh`] would then skip the session forever, freezing
+/// the truncation in. Deleting by the shared id term on the error path removes those partial docs
+/// (tantivy applies operations in opstamp order, so this cannot touch docs added by a later pass);
+/// the id drops out of the skip-set entirely and is retried on the next run.
+#[allow(clippy::too_many_arguments)]
+fn index_session_clean(
+    writer: &mut IndexWriter,
+    f: &Fields,
+    adapter: &dyn cv_core::Adapter,
+    r: &cv_core::SessionRef,
+    mtime: i64,
+    size: i64,
+    events: Option<&mut cv_core::events::EventSink>,
+    offsets: Option<&mut cv_core::offsets::OffsetSink>,
+    prov: cv_core::events::Provenance,
+) -> Result<usize> {
+    match index_session(writer, f, adapter, r, mtime, size, events, offsets, prov) {
+        Ok(docs) => Ok(docs),
+        Err(e) => {
+            writer.delete_term(Term::from_field_text(f.id, &r.id));
+            Err(e)
+        }
+    }
+}
+
+/// Delete every previously-indexed id that this sweep did not see on disk — with one carve-out:
+/// when `subagents` is false, ids belonging to the **folded sub-agent forest** (`folded`, the docs
+/// tagged with a `parent_id`) are kept. A plain refresh never walks the forest, so an unseen agent
+/// transcript is merely *unvisited*, not vanished — reaping it would silently unfold a forest the
+/// user deliberately folded in with `cv index --subagents`. Only a `--subagents` sweep (which does
+/// walk the forest and extends `seen` with every live agent) may decide an agent is gone. Returns
+/// the number of sessions reaped.
+fn reap_missing(
+    writer: &mut IndexWriter,
+    f: &Fields,
+    existing: &HashMap<String, (i64, i64)>,
+    seen: &HashSet<String>,
+    folded: &HashSet<String>,
+    subagents: bool,
+) -> usize {
+    let mut removed = 0usize;
+    for id in existing.keys() {
+        if seen.contains(id) || (!subagents && folded.contains(id)) {
+            continue;
+        }
+        writer.delete_term(Term::from_field_text(f.id, id));
+        removed += 1;
+    }
+    removed
+}
+
 /// Index/ingest one sub-agent transcript `sub` (a child of top-level `parent`) into the forest fold,
 /// tagged with provenance (parent id / agent id / workflow). Mirrors the top-level loop's per-axis
 /// freshness skip: returns `Ok(0)` when this agent is unchanged on all axes (or has no adapter), so
@@ -393,7 +474,7 @@ fn index_one_subagent(
     let sr = &sub.session;
     let (mtime, size) = cv_core::offsets::file_sig(&sr.path);
     let fts_fresh = fts_is_fresh(sr, existing.get(&sr.id), mtime, size);
-    let events_stale = event_sync.needs_ingest(sr, mtime);
+    let events_stale = event_sync.needs_ingest(sr, mtime, size);
     let offsets_stale = cv_core::offsets::supported(sr.harness) && offset_sync.needs_record(sr, mtime, size);
     if fts_fresh && !events_stale && !offsets_stale {
         return Ok(0);
@@ -408,12 +489,10 @@ fn index_one_subagent(
     };
     let mut events = events_stale.then(|| cv_core::events::EventSink::new(sr.cwd.clone()));
     let mut offsets = offsets_stale.then(cv_core::offsets::OffsetSink::new);
-    if existing.contains_key(&sr.id) {
-        // Changed agent: drop its prior docs before re-adding (same delete-by-id as top-level).
-        writer.delete_term(Term::from_field_text(f.id, &sr.id));
-    }
     // FTS-fresh but catalog/offsets stale: a catalog-only pass that never touches tantivy (keeps the
-    // doc set byte-stable), mirroring the top-level loop's fast path.
+    // doc set byte-stable), mirroring the top-level loop's fast path. This runs BEFORE the
+    // delete-by-id below — mirroring the top-level loop's order — so a fresh agent's docs are never
+    // deleted with nothing re-added in their place.
     if fts_fresh {
         let opts = if offsets.is_some() {
             cv_core::ParseOptions::lazy_offsets()
@@ -434,14 +513,18 @@ fn index_one_subagent(
             (None, None) => return Ok(0),
         }
         if let Some(es) = &events {
-            cv_core::events::record_with(sr, es.events(), mtime, &prov);
+            cv_core::events::record_with(sr, es.events(), mtime, size, &prov);
         }
         if let Some(os) = &offsets {
             cv_core::offsets::record(sr, os, mtime, size);
         }
         return Ok(0);
     }
-    let docs = index_session(
+    if existing.contains_key(&sr.id) {
+        // Changed agent: drop its prior docs before re-adding (same delete-by-id as top-level).
+        writer.delete_term(Term::from_field_text(f.id, &sr.id));
+    }
+    let docs = index_session_clean(
         writer,
         f,
         adapter.as_ref(),
@@ -453,7 +536,7 @@ fn index_one_subagent(
         prov.clone(),
     )?;
     if let Some(es) = events {
-        cv_core::events::record_with(sr, es.events(), mtime, &prov);
+        cv_core::events::record_with(sr, es.events(), mtime, size, &prov);
     }
     if let Some(os) = offsets {
         cv_core::offsets::record(sr, &os, mtime, size);
@@ -710,28 +793,9 @@ impl cv_core::MessageSink for ChunkSink<'_> {
     }
 }
 
-/// Whether this session source can use file size as its primary FTS freshness key. These are the
-/// append-only JSONL transcript logs where a mtime-only check caused the live spiral: a pure mtime
-/// bump does not mean new content, while a real append grows the file. Other stores (SQLite DBs,
-/// JSON arrays/objects, and metadata files) can rewrite in place at the same byte length, so they
-/// must keep mtime in the freshness predicate.
-fn size_primary_freshness(r: &cv_core::SessionRef) -> bool {
-    let is_jsonl = r
-        .path
-        .extension()
-        .and_then(|e| e.to_str())
-        .is_some_and(|e| e.eq_ignore_ascii_case("jsonl"));
-    is_jsonl
-        && matches!(
-            r.harness,
-            cv_core::Harness::Claude
-                | cv_core::Harness::Codex
-                | cv_core::Harness::Gemini
-                | cv_core::Harness::Qwen
-                | cv_core::Harness::Kimi
-                | cv_core::Harness::OpenClaw
-        )
-}
+// The size-primary policy (append-only JSONL logs skip on unchanged size even when mtimes were
+// mass-bumped) is shared with the event catalog and lives in cv-core.
+use cv_core::events::size_primary_freshness;
 
 /// Whether an indexed session is FTS-fresh given its stored `(mtime, size)` and the current file
 /// signature. For append-only transcript logs, size is primary: unchanged size means no new content
@@ -746,12 +810,18 @@ fn fts_is_fresh(r: &cv_core::SessionRef, stored: Option<&(i64, i64)>, mtime: i64
     })
 }
 
-/// Read `id → (mtime, size)` for every live document in the index — the incremental skip-set.
-/// Stored fields are tiny now (no body is stored), so scanning them all is cheap.
-fn read_indexed_sigs(index: &Index, f: &Fields) -> Result<HashMap<String, (i64, i64)>> {
+/// `id → (mtime, size)` for every live doc (the incremental skip-set), plus the set of ids that
+/// are folded-in sub-agent docs (those tagged with a `parent_id`), which a plain refresh's reap
+/// must leave alone.
+type IndexedSigs = (HashMap<String, (i64, i64)>, HashSet<String>);
+
+/// Read the [`IndexedSigs`] off every live document in the index. Stored fields are tiny (no body
+/// is stored), so scanning them all is cheap.
+fn read_indexed_sigs(index: &Index, f: &Fields) -> Result<IndexedSigs> {
     let reader = index.reader().context("opening index reader")?;
     let searcher = reader.searcher();
     let mut out = HashMap::new();
+    let mut folded = HashSet::new();
     for seg in searcher.segment_readers() {
         let store = seg.get_store_reader(0).context("opening store reader")?;
         for doc_id in seg.doc_ids_alive() {
@@ -763,11 +833,23 @@ fn read_indexed_sigs(index: &Index, f: &Fields) -> Result<HashMap<String, (i64, 
             let mt = doc.get_first(f.mtime).and_then(|v| v.as_i64());
             let sz = doc.get_first(f.size).and_then(|v| v.as_i64());
             if let (Some(id), Some(mt), Some(sz)) = (id, mt, sz) {
+                if doc.get_first(f.parent_id).is_some() {
+                    folded.insert(id.clone());
+                }
                 out.insert(id, (mt, sz));
             }
         }
     }
-    Ok(out)
+    Ok((out, folded))
+}
+
+/// The newest file mtime (ns) stamped on any indexed doc — how far the index has caught up. `None`
+/// when the index can't be opened or is empty. One stored-field scan, the same cost incremental
+/// indexing pays for its skip-set.
+pub fn newest_indexed_mtime(dir: &Path) -> Option<i64> {
+    let (index, f) = open_existing(dir).ok()?;
+    let (sigs, _) = read_indexed_sigs(&index, &f).ok()?;
+    sigs.values().map(|&(mt, _)| mt).max()
 }
 
 /// Index an explicit set of sessions through the real production [`index_session`] path — the same
@@ -802,7 +884,7 @@ pub(crate) fn index_refs(dir: &Path, refs: &[cv_core::SessionRef], catalog: bool
         )
         .with_context(|| format!("indexing {}", r.id))?;
         if let Some(es) = es {
-            cv_core::events::record(r, es.events(), mtime);
+            cv_core::events::record(r, es.events(), mtime, size);
         }
         if let Some(os) = os {
             cv_core::offsets::record(r, &os, mtime, size);
@@ -813,18 +895,21 @@ pub(crate) fn index_refs(dir: &Path, refs: &[cv_core::SessionRef], catalog: bool
 }
 
 /// Index an explicit set of sessions through the real **incremental** path — mirroring `index_all`'s
-/// per-session freshness skip ([`fts_is_fresh`] over the [`read_indexed_sigs`] skip-set) exactly,
-/// minus only the global `discover_all()` scan (which can't be pointed at a temp dir). Unlike
-/// [`index_refs`] it does **not** clear first, so a second call with unchanged files exercises the
-/// skip. Returns the number of sessions actually (re)indexed — the count the regression test asserts
-/// goes to 0 on a pure mtime bump and to 1 on a real append. `catalog` left off here (FTS-only).
+/// per-session freshness skip ([`fts_is_fresh`] over the [`read_indexed_sigs`] skip-set) and its
+/// end-of-sweep [`reap_missing`] (as a plain, no-`--subagents` refresh) exactly, minus only the
+/// global `discover_all()` scan (which can't be pointed at a temp dir). Unlike [`index_refs`] it
+/// does **not** clear first, so a second call with unchanged files exercises the skip. Returns the
+/// number of sessions actually (re)indexed — the count the regression test asserts goes to 0 on a
+/// pure mtime bump and to 1 on a real append. `catalog` left off here (FTS-only).
 #[cfg(test)]
 pub(crate) fn index_refs_incremental(dir: &Path, refs: &[cv_core::SessionRef]) -> Result<usize> {
     let (index, f) = open_or_create(dir)?;
     let mut writer: IndexWriter = index.writer(50_000_000).context("creating tantivy index writer")?;
-    let existing = read_indexed_sigs(&index, &f).unwrap_or_default();
+    let (existing, folded) = read_indexed_sigs(&index, &f).unwrap_or_default();
+    let mut seen: HashSet<String> = HashSet::new();
     let mut changed = 0usize;
     for r in refs {
+        seen.insert(r.id.clone());
         let Some(adapter) = cv_core::harness::for_harness(r.harness) else {
             continue;
         };
@@ -836,7 +921,7 @@ pub(crate) fn index_refs_incremental(dir: &Path, refs: &[cv_core::SessionRef]) -
         if existing.contains_key(&r.id) {
             writer.delete_term(Term::from_field_text(f.id, &r.id));
         }
-        index_session(
+        index_session_clean(
             &mut writer,
             &f,
             adapter.as_ref(),
@@ -850,6 +935,9 @@ pub(crate) fn index_refs_incremental(dir: &Path, refs: &[cv_core::SessionRef]) -
         .with_context(|| format!("indexing {}", r.id))?;
         changed += 1;
     }
+    // The exact production reap, as a plain (no --subagents) refresh: vanished top-level sessions
+    // go, the folded sub-agent forest stays.
+    reap_missing(&mut writer, &f, &existing, &seen, &folded, false);
     writer.commit().context("committing index")?;
     Ok(changed)
 }
@@ -865,7 +953,7 @@ pub(crate) fn index_refs_with_subagents(dir: &Path, refs: &[cv_core::SessionRef]
     index_refs(dir, refs, catalog)?;
     let (index, f) = open_or_create(dir)?;
     let mut writer: IndexWriter = index.writer(50_000_000).context("creating tantivy index writer")?;
-    let existing = read_indexed_sigs(&index, &f).unwrap_or_default();
+    let (existing, _folded) = read_indexed_sigs(&index, &f).unwrap_or_default();
     let event_sync = cv_core::events::SyncTable::load();
     let offset_sync = cv_core::offsets::SyncTable::load();
     let mut folded = 0usize;
@@ -895,7 +983,8 @@ pub fn text_search(dir: &Path, query: &str, limit: usize) -> Result<Vec<Hit>> {
     if !dir.join("meta.json").exists() {
         anyhow::bail!("no full-text index at {} — run `index_all` first", dir.display());
     }
-    let (index, f) = open_or_create(dir)?;
+    // Read-only open: a transient failure here must surface as an error, never as a wiped index.
+    let (index, f) = open_existing(dir)?;
     let reader = index.reader().context("opening index reader")?;
     let searcher = reader.searcher();
 
@@ -1133,7 +1222,7 @@ fn ceil_char(s: &str, mut i: usize) -> usize {
 /// Remove a single session from the index by id (handy for incremental updates).
 #[allow(dead_code)]
 pub fn delete(dir: &Path, id: &str) -> Result<()> {
-    let (index, f) = open_or_create(dir)?;
+    let (index, f) = open_existing(dir)?;
     let mut writer: IndexWriter = index.writer(15_000_000)?;
     writer.delete_term(Term::from_field_text(f.id, id));
     writer.commit()?;
@@ -1690,6 +1779,159 @@ mod tests {
         let scoped = text_search(&dir, "parent_id:parent1 zqsubmarker", 10).unwrap();
         assert_eq!(scoped.len(), 1);
         assert_eq!(scoped[0].id, "agent-child9");
+
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&sdir).ok();
+    }
+
+    /// Regression for the truncated-fresh hole (B1): a parse error *after* chunk docs were already
+    /// flushed into the writer must not leave those docs behind — they carry the full current
+    /// `(mtime, size)` stamp, so a later `fts_is_fresh` would skip the session forever and freeze
+    /// the truncated head into the index. [`index_session_clean`] (the path both `index_all` and
+    /// the sub-agent fold drive) deletes the partial docs on error, dropping the id from the
+    /// skip-set so the session is retried next run.
+    #[test]
+    fn failed_parse_leaves_no_partial_docs_behind() {
+        let _home = IsolatedHome::new();
+        let dir = tmpdir();
+
+        /// Streams more than one chunk's worth of body into the sink (forcing ≥1 mid-stream doc
+        /// flush), then fails — the shape of a transcript whose tail is malformed after a healthy
+        /// multi-chunk head.
+        struct FailsAfterAChunk;
+        impl cv_core::Adapter for FailsAfterAChunk {
+            fn harness(&self) -> cv_core::Harness {
+                cv_core::Harness::Claude
+            }
+            fn storage_root(&self) -> Option<std::path::PathBuf> {
+                None
+            }
+            fn discover(&self) -> Result<Vec<cv_core::SessionRef>> {
+                Ok(Vec::new())
+            }
+            fn parse(&self, _r: &cv_core::SessionRef) -> Result<cv_core::Session> {
+                anyhow::bail!("unused: this test streams")
+            }
+            fn stream(
+                &self,
+                _r: &cv_core::SessionRef,
+                _opts: &cv_core::ParseOptions,
+                sink: &mut dyn cv_core::MessageSink,
+            ) -> Result<cv_core::Session> {
+                let mut m = cv_core::Message::new(cv_core::Role::User);
+                let body = "zqpartial ".repeat(CHUNK_BYTES / 8); // > CHUNK_BYTES → mid-stream flush
+                m.content.push(cv_core::Block::Text { text: body.into() });
+                let _ = sink.message(m);
+                anyhow::bail!("malformed line mid-transcript")
+            }
+        }
+
+        let (index, f) = open_or_create(&dir).unwrap();
+        let mut writer: IndexWriter = index.writer(50_000_000).unwrap();
+        let r = sref("victim", "doomed", "/nonexistent/victim.jsonl".into());
+        let res = index_session_clean(
+            &mut writer,
+            &f,
+            &FailsAfterAChunk,
+            &r,
+            111,
+            4096,
+            None,
+            None,
+            cv_core::events::Provenance::default(),
+        );
+        assert!(res.is_err(), "the fixture adapter must fail");
+        // index_all commits after the error (it continues the sweep); mirror that.
+        writer.commit().unwrap();
+
+        // No ghost docs: the flushed chunk must be gone…
+        assert!(
+            text_search(&dir, "zqpartial", 10).unwrap().is_empty(),
+            "partial chunk docs from a failed parse must not be committed (B1)"
+        );
+        // …and the id is absent from the skip-set, so the next incremental pass retries it
+        // instead of skipping a truncation stamped fresh.
+        let (sigs, _) = read_indexed_sigs(&index, &f).unwrap();
+        assert!(
+            !sigs.contains_key("victim"),
+            "a failed session must not enter the freshness skip-set (B1)"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Regression (B2): an FTS-fresh sub-agent whose *catalog* is stale (e.g. first run after an
+    /// event-schema upgrade, or a catalog wipe) takes the catalog-only pass — which must never
+    /// delete its tantivy docs. The pre-fix path issued the delete-by-id BEFORE the fresh check,
+    /// so the agent's docs were dropped and never re-added: a window of silently missing results.
+    #[test]
+    fn fts_fresh_events_stale_subagent_keeps_its_docs() {
+        let h = IsolatedHome::new();
+        let dir = tmpdir();
+        let sdir = tmpdir();
+        let pp = write_claude(&sdir, "parent2", "orchestrator planning the work");
+        write_subagent(&pp, "kid2", "zqkeepme lives only in the sub-agent");
+        let parent = sref("parent2", "parent session", pp);
+
+        // Fold the forest: sub-agent indexed AND its events stamped in the catalog.
+        let folded = index_refs_with_subagents(&dir, std::slice::from_ref(&parent), false).unwrap();
+        assert_eq!(folded, 1);
+        assert_eq!(text_search(&dir, "zqkeepme", 10).unwrap().len(), 1);
+
+        // Wipe the catalog (db + WAL sidecars): the agent is now FTS-fresh but events-stale — the
+        // exact combination that routes through the catalog-only pass.
+        std::fs::remove_file(h.home.join("catalog.db")).unwrap();
+        std::fs::remove_file(h.home.join("catalog.db-wal")).ok();
+        std::fs::remove_file(h.home.join("catalog.db-shm")).ok();
+
+        // Drive the production forest path directly (what index_all's --subagents sweep calls).
+        let (index, f) = open_or_create(&dir).unwrap();
+        let mut writer: IndexWriter = index.writer(50_000_000).unwrap();
+        let (existing, _) = read_indexed_sigs(&index, &f).unwrap();
+        let event_sync = cv_core::events::SyncTable::load();
+        let offset_sync = cv_core::offsets::SyncTable::load();
+        let subs = cv_core::subagent_tree_of(&parent);
+        assert_eq!(subs.len(), 1, "fixture must discover exactly one sub-agent");
+        let docs = index_one_subagent(&mut writer, &f, &parent, &subs[0], &existing, &event_sync, &offset_sync)
+            .expect("catalog-only pass");
+        assert_eq!(docs, 0, "catalog-only pass must not rewrite tantivy docs");
+        writer.commit().unwrap();
+
+        assert_eq!(
+            text_search(&dir, "zqkeepme", 10).unwrap().len(),
+            1,
+            "an FTS-fresh, events-stale sub-agent must keep its docs (B2)"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&sdir).ok();
+    }
+
+    /// Regression (B3): a plain (no `--subagents`) refresh after `cv index --subagents` must NOT
+    /// reap the folded forest. Only a --subagents sweep walks the forest, so only it can tell a
+    /// vanished agent transcript from a merely-unvisited one.
+    #[test]
+    fn plain_reindex_keeps_the_folded_subagent_forest() {
+        let _home = IsolatedHome::new();
+        let dir = tmpdir();
+        let sdir = tmpdir();
+        let pp = write_claude(&sdir, "parent3", "orchestrator text here");
+        write_subagent(&pp, "kid3", "zqforest lives only in the sub-agent");
+        let parent = sref("parent3", "parent session", pp);
+
+        index_refs_with_subagents(&dir, std::slice::from_ref(&parent), false).unwrap();
+        assert_eq!(text_search(&dir, "zqforest", 10).unwrap().len(), 1);
+
+        // A plain incremental refresh over the same top-level refs: the parent is fresh-skipped
+        // and the deliberately-folded forest must survive the reap.
+        let changed = index_refs_incremental(&dir, std::slice::from_ref(&parent)).unwrap();
+        assert_eq!(changed, 0, "unchanged parent must be skipped");
+        assert_eq!(
+            text_search(&dir, "zqforest", 10).unwrap().len(),
+            1,
+            "a plain refresh must not silently reap the folded sub-agent forest (B3)"
+        );
+        assert_eq!(text_search(&dir, "orchestrator", 10).unwrap().len(), 1);
 
         std::fs::remove_dir_all(&dir).ok();
         std::fs::remove_dir_all(&sdir).ok();

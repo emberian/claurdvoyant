@@ -45,7 +45,7 @@ pub(crate) fn cmd_doctor(
                     .is_none_or(|c| r.cwd.as_deref() == Some(c.as_path()))
             })
             .collect();
-        refs.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        refs.sort_by_key(|r| std::cmp::Reverse(r.updated_at));
         refs.truncate(recent.max(1));
         if refs.is_empty() {
             anyhow::bail!(
@@ -130,7 +130,7 @@ fn print_report(rep: &Report, label: &str, n_targets: usize) {
         ("images", rep.images),
         ("system msgs", rep.system_text),
     ];
-    rows.sort_by(|a, b| b.1.cmp(&a.1));
+    rows.sort_by_key(|r| std::cmp::Reverse(r.1));
     for (name, v) in rows {
         if v == 0 {
             continue;
@@ -141,7 +141,7 @@ fn print_report(rep: &Report, label: &str, n_targets: usize) {
 
     // Top tools by result tokens (the usual variable bloat).
     let mut tools: Vec<(&String, &cv_core::doctor::ToolStat)> = rep.by_tool.iter().collect();
-    tools.sort_by(|a, b| b.1.result_tokens.cmp(&a.1.result_tokens));
+    tools.sort_by_key(|t| std::cmp::Reverse(t.1.result_tokens));
     let shown: Vec<_> = tools.iter().filter(|(_, s)| s.result_tokens > 0).take(8).collect();
     if !shown.is_empty() {
         println!("\nTop context consumers (tool results):");
@@ -188,7 +188,7 @@ fn verdict(rep: &Report) -> String {
         && rep.tool_results >= rep.user_text;
     if rep.tool_results > 0 && (tool_results_is_top || tool_activity * 2 >= total) {
         let mut t: Vec<_> = rep.by_tool.iter().filter(|(_, s)| s.result_tokens > 0).collect();
-        t.sort_by(|a, b| b.1.result_tokens.cmp(&a.1.result_tokens));
+        t.sort_by_key(|e| std::cmp::Reverse(e.1.result_tokens));
         let top: Vec<String> = t.iter().take(2).map(|(n, _)| (*n).clone()).collect();
         parts.push(format!(
             "tool output is the biggest lever ({:.0}% of context, {:.0}% with tool-call args), led by {} — \

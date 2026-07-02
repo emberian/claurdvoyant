@@ -136,9 +136,6 @@ impl Adapter for Grok {
         Ok(s)
     }
 
-    fn can_emit(&self) -> bool {
-        false
-    }
 }
 
 fn grok_git(summary: &Value) -> Option<GitInfo> {

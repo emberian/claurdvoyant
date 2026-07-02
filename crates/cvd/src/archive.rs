@@ -71,6 +71,25 @@ impl Archive {
         self.home.join("catalog.jsonl")
     }
 
+    /// Serialize catalog writers across processes (parallel `cvd sync` / `watch` on one archive):
+    /// an exclusive advisory flock, released when the returned handle drops. It lives on a
+    /// dedicated lockfile rather than the catalog itself, because compaction rename-replaces the
+    /// catalog and a lock on the replaced inode would guard nothing.
+    fn lock_catalog(&self) -> Result<fs::File> {
+        let path = self.home.join("catalog.jsonl.lock");
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+        }
+        let f = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false) // the lockfile is a pure rendezvous point; contents are irrelevant
+            .write(true)
+            .open(&path)
+            .with_context(|| format!("opening {}", path.display()))?;
+        f.lock().with_context(|| format!("locking {}", path.display()))?;
+        Ok(f)
+    }
+
     /// Relative (to home) path where a session's JSON lives.
     fn rel_session_path(harness: Harness, id: &str) -> PathBuf {
         PathBuf::from("archive")
@@ -150,10 +169,10 @@ impl Archive {
     /// the newest `archived_at` winning, so superseded lines are harmless until we compact. When the
     /// raw line count grows well past the number of unique entries, rewrite once to reclaim space.
     fn upsert_catalog(&self, entry: CatalogEntry) -> Result<()> {
+        // Held across the append *and* the possible compaction: a compactor's read-rewrite-rename
+        // would otherwise silently drop a line another process appended in between.
+        let _lock = self.lock_catalog()?;
         let path = self.catalog_path();
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
-        }
         let line = serde_json::to_string(&entry)?;
         {
             let mut f = fs::OpenOptions::new()
@@ -170,6 +189,7 @@ impl Archive {
 
     /// Rewrite the catalog to one line per unique entry, but only when the on-disk line count has
     /// drifted far enough past the unique count to be worth the full rewrite (amortizes to O(1)).
+    /// Caller must hold the catalog lock (see [`Self::lock_catalog`]).
     fn maybe_compact_catalog(&self) -> Result<()> {
         let path = self.catalog_path();
         let raw = match fs::read_to_string(&path) {

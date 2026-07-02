@@ -17,6 +17,10 @@ function esc(s) { return String(s ?? "").replace(ESC_RE, (c) => ESC_MAP[c]); }
 function safeUrl(href) {
   const h = String(href ?? "").trim();
   if (/^(https?:|mailto:)/i.test(h)) return h;
+  // Protocol-relative (`//evil.com`, and `/\` / `\\` variants browsers
+  // normalize the same way) would navigate off-site — reject before the
+  // relative-path checks below, which they'd otherwise satisfy.
+  if (/^[/\\]{2}/.test(h)) return "";
   if (/^[^:]*$/.test(h) || h.startsWith("#") || h.startsWith("/") || h.startsWith("./") || h.startsWith("../")) return h;
   return "";
 }

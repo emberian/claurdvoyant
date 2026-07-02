@@ -77,13 +77,6 @@ impl Adapter for Roo {
         stream_task_dir(&r.path, &r.id, Harness::Roo, opts, sink)
     }
 
-    fn emit(&self, session: &Session, out_dir: &Path) -> Result<crate::harness::EmitResult> {
-        emit(session, out_dir, &crate::emit::EmitOptions::default())
-    }
-
-    fn can_emit(&self) -> bool {
-        true
-    }
 }
 
 // ---------------------------------------------------------------------------

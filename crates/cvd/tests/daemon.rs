@@ -69,6 +69,7 @@ impl World {
         let mut c = Command::new(env!("CARGO_BIN_EXE_cvd"));
         c.current_dir(&self.base)
             .env("HOME", &self.home)
+            .env_remove("CVD_TOKEN") // hermetic: a token in the ambient env must not gate tests
             .env("CLUSTERVISION_HOME", &self.cv_home)
             .env("XDG_CACHE_HOME", self.home.join(".cache"))
             .env("XDG_CONFIG_HOME", self.home.join(".config"))
@@ -300,6 +301,11 @@ fn spawn_serve(w: &World) -> (u16, Reaper) {
 
 /// Like [`spawn_serve`] but with extra `serve` args (e.g. `["--web", dir]`).
 fn spawn_serve_with(w: &World, extra: &[&str]) -> (u16, Reaper) {
+    spawn_serve_cfg(w, extra, &[])
+}
+
+/// Like [`spawn_serve_with`] but also with extra child env vars (e.g. `CVD_TOKEN`).
+fn spawn_serve_cfg(w: &World, extra: &[&str], envs: &[(&str, &str)]) -> (u16, Reaper) {
     // A free port: bind 0, note the assignment, release it for cvd (tiny race, fine for tests).
     let port = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
 
@@ -308,6 +314,7 @@ fn spawn_serve_with(w: &World, extra: &[&str]) -> (u16, Reaper) {
     let child = w
         .cvd_cmd()
         .args(&args)
+        .envs(envs.iter().copied())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -411,22 +418,14 @@ fn serve_endpoints() {
     let (status, body) = http(port, "OPTIONS", "/api/health");
     assert_eq!(status, 204);
     assert!(body.is_empty(), "{body}");
-    let (_, raw) = (status, {
-        // Re-fetch to check the CORS header is present on data responses too.
-        let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
-        write!(
-            stream,
-            "GET /api/health HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"
-        )
-        .unwrap();
-        let mut s = String::new();
-        stream.read_to_string(&mut s).unwrap();
-        s
-    });
+    // An allowed (local) Origin is echoed on data responses too — never a wildcard.
+    let raw = raw_request(port, "GET", "/api/health", &[("Origin", "http://localhost:5173")]);
     assert!(
-        raw.to_ascii_lowercase().contains("access-control-allow-origin: *"),
-        "CORS header missing:\n{raw}"
+        raw.to_ascii_lowercase()
+            .contains("access-control-allow-origin: http://localhost:5173"),
+        "CORS echo missing:\n{raw}"
     );
+    assert!(!raw.contains("Access-Control-Allow-Origin: *"), "{raw}");
 }
 
 /// The Wave-2 endpoints: windowed messages (full-stream fallback that stops at the window's
@@ -633,13 +632,14 @@ fn serve_static_web_hub() {
         "JS content-type missing:\n{raw}"
     );
 
-    // The JSON API still works under the same server, and *does* carry CORS.
+    // The JSON API still works under the same server, and *does* carry CORS for a local origin.
     let (status, v) = get_json(port, "/api/health");
     assert_eq!(status, 200);
     assert_eq!(v["ok"], true, "{v}");
-    let raw = raw_get(port, "/api/health");
+    let raw = raw_request(port, "GET", "/api/health", &[("Origin", "http://127.0.0.1:9999")]);
     assert!(
-        raw.to_ascii_lowercase().contains("access-control-allow-origin: *"),
+        raw.to_ascii_lowercase()
+            .contains("access-control-allow-origin: http://127.0.0.1:9999"),
         "API CORS missing:\n{raw}"
     );
 
@@ -660,16 +660,152 @@ fn serve_static_web_hub() {
     );
 }
 
+/// CORS is an allow-list, not a wildcard: local origins (and the Tauri app's) are echoed back
+/// verbatim; any other origin gets **no** `Access-Control-Allow-Origin` at all, so a hostile page
+/// the user happens to visit can't read the corpus cross-origin.
+#[test]
+fn serve_cors_allowlist() {
+    let w = World::new("cors");
+    let (port, _reaper) = spawn_serve(&w);
+
+    for origin in [
+        "http://localhost:5173",
+        "http://127.0.0.1:9999",
+        "tauri://localhost",
+        "http://tauri.localhost",
+    ] {
+        let raw = raw_request(port, "GET", "/api/health", &[("Origin", origin)]);
+        assert_eq!(raw_status(&raw), 200, "{raw}");
+        assert!(
+            raw.to_ascii_lowercase()
+                .contains(&format!("access-control-allow-origin: {origin}")),
+            "origin {origin} not echoed:\n{raw}"
+        );
+    }
+
+    // Foreign origins — including lookalikes — get no ACAO header (the browser withholds the body).
+    for origin in [
+        "https://evil.example",
+        "http://localhost.evil.example",
+        "http://127.0.0.1.evil.example:7777",
+    ] {
+        let raw = raw_request(port, "GET", "/api/health", &[("Origin", origin)]);
+        assert!(
+            !raw.to_ascii_lowercase().contains("access-control-allow-origin"),
+            "origin {origin} must get no ACAO:\n{raw}"
+        );
+    }
+
+    // Preflight mirrors the same allow-list.
+    let raw = raw_request(port, "OPTIONS", "/api/health", &[("Origin", "http://localhost:5173")]);
+    assert_eq!(raw_status(&raw), 204, "{raw}");
+    assert!(
+        raw.to_ascii_lowercase()
+            .contains("access-control-allow-origin: http://localhost:5173"),
+        "{raw}"
+    );
+    let raw = raw_request(port, "OPTIONS", "/api/health", &[("Origin", "https://evil.example")]);
+    assert_eq!(raw_status(&raw), 204, "{raw}");
+    assert!(!raw.to_ascii_lowercase().contains("access-control-allow-origin"), "{raw}");
+}
+
+/// The Host header must name this machine (DNS-rebinding guard): loopback names in any spelling
+/// pass, a rebound domain is a 403 before any route logic runs.
+#[test]
+fn serve_host_validation() {
+    let w = World::new("host");
+    let (port, _reaper) = spawn_serve(&w);
+
+    for host in [
+        format!("127.0.0.1:{port}"),
+        "127.0.0.1".to_string(),
+        "localhost".to_string(),
+        format!("localhost:{port}"),
+        format!("[::1]:{port}"),
+    ] {
+        let raw = raw_request(port, "GET", "/api/health", &[("Host", &host)]);
+        assert_eq!(raw_status(&raw), 200, "host {host}:\n{raw}");
+    }
+
+    for host in ["evil.example", "evil.example:7777", "127.0.0.1.evil.example"] {
+        let raw = raw_request(port, "GET", "/api/health", &[("Host", host)]);
+        assert_eq!(raw_status(&raw), 403, "host {host} must be rejected:\n{raw}");
+        assert!(!raw.contains("\"ok\""), "{raw}");
+    }
+}
+
+/// Bearer-token auth on `/api/*`: 401 without (or with the wrong) token, 200 with it, and the
+/// credential-less OPTIONS preflight stays exempt. Both `--token` and `$CVD_TOKEN` wire it up.
+#[test]
+fn serve_token_auth() {
+    let w = World::new("token");
+    let (port, _reaper) = spawn_serve_with(&w, &["--token", "opensesame"]);
+
+    let raw = raw_request(port, "GET", "/api/sessions", &[]);
+    assert_eq!(raw_status(&raw), 401, "{raw}");
+    assert!(!raw.contains("alphasess"), "401 must not leak data:\n{raw}");
+    let raw = raw_request(port, "GET", "/api/sessions", &[("Authorization", "Bearer wrong")]);
+    assert_eq!(raw_status(&raw), 401, "{raw}");
+
+    let raw = raw_request(port, "GET", "/api/sessions", &[("Authorization", "Bearer opensesame")]);
+    assert_eq!(raw_status(&raw), 200, "{raw}");
+    assert!(raw.contains("alphasess"), "{raw}");
+
+    let raw = raw_request(port, "OPTIONS", "/api/sessions", &[]);
+    assert_eq!(raw_status(&raw), 204, "preflight is exempt:\n{raw}");
+
+    // Same gate via the environment variable.
+    let (port, _reaper2) = spawn_serve_cfg(&w, &[], &[("CVD_TOKEN", "hunter2")]);
+    let raw = raw_request(port, "GET", "/api/health", &[]);
+    assert_eq!(raw_status(&raw), 401, "{raw}");
+    let raw = raw_request(port, "GET", "/api/health", &[("Authorization", "Bearer hunter2")]);
+    assert_eq!(raw_status(&raw), 200, "{raw}");
+}
+
+/// A non-loopback bind without auth is refused outright: the corpus can contain secrets, so
+/// exposure demands a token or an explicit `--insecure-expose`.
+#[test]
+fn serve_refuses_bare_public_bind() {
+    let w = World::new("expose");
+    let out = w
+        .cvd_cmd()
+        .args(["serve", "--host", "0.0.0.0", "--port", "0"])
+        .output()
+        .expect("cvd should run");
+    assert!(!out.status.success(), "bare 0.0.0.0 bind must be refused");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("refusing"), "{stderr}");
+    assert!(stderr.contains("--insecure-expose"), "{stderr}");
+}
+
 /// Raw GET returning the full response text (headers + body) — for content-type / CORS assertions.
 fn raw_get(port: u16, path: &str) -> String {
+    raw_request(port, "GET", path, &[])
+}
+
+/// A raw request with custom headers, returning the full response text (headers + body).
+/// A default local `Host` is supplied unless the caller passes their own.
+fn raw_request(port: u16, method: &str, path: &str, headers: &[(&str, &str)]) -> String {
     let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
     stream.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
-    write!(
-        stream,
-        "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
-    )
-    .unwrap();
+    let mut req = format!("{method} {path} HTTP/1.1\r\n");
+    if !headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("host")) {
+        req.push_str(&format!("Host: 127.0.0.1:{port}\r\n"));
+    }
+    for (k, v) in headers {
+        req.push_str(&format!("{k}: {v}\r\n"));
+    }
+    req.push_str("Connection: close\r\n\r\n");
+    stream.write_all(req.as_bytes()).unwrap();
     let mut s = String::new();
     stream.read_to_string(&mut s).unwrap();
     s
+}
+
+/// The status code from a raw response's status line.
+fn raw_status(raw: &str) -> u16 {
+    raw.split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| panic!("bad status line in: {raw}"))
 }

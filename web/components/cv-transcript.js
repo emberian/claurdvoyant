@@ -10,7 +10,7 @@ import {
   toOpenSession, toMarkdown, downloadFile, slug, ROLE_LABELS, HARNESS_LABELS,
 } from "./util.js";
 import { renderMarkdown, renderCodeBlock } from "../markdown.js";
-import { getSubagents, getSubagent, getEvents } from "./hydrate.js";
+import { getSubagents, getSubagent, getEvents, PAGE } from "./hydrate.js";
 
 class CvTranscript extends HTMLElement {
   constructor() {
@@ -48,12 +48,14 @@ class CvTranscript extends HTMLElement {
     // Building the HTML is the only O(n) cost left (markdown per block), so for huge sessions (20k+
     // messages exist) we render the first screenful synchronously, then append the rest in
     // rAF-scheduled chunks — instant open, no freeze, and scrolling works as chunks fill in.
-    // `_pump` renders from `_cursor` to the current end of `s.messages`, so paged loads
-    // (cvd's windowed endpoint via cv-app) just push and re-pump.
+    // `_pump` renders from `_cursor` up to `_limit` (a window over `s.messages`), so both paged
+    // loads (cvd's windowed endpoint via cv-app) and big in-memory sessions (dropped .zip/.json)
+    // go through the same "load more" footer instead of rendering 30k messages up front.
     this.innerHTML = `${this._headerHtml(s)}<div class="turns"></div>`;
     this._wireHeader(s);
     this._turns = this.querySelector(".turns");
     this._cursor = 0;
+    this._limit = PAGE;
     this._pumping = false;
     this._moreInFlight = false;
     this._io?.disconnect();
@@ -64,7 +66,7 @@ class CvTranscript extends HTMLElement {
     this._mountEvents(s);
   }
 
-  /** Render any not-yet-rendered messages in rAF-scheduled chunks (first chunk synchronously). */
+  /** Render messages from `_cursor` up to `_limit` in rAF-scheduled chunks (first chunk synchronously). */
   _pump() {
     const s = this._session;
     if (!s || this._pumping) return;
@@ -73,27 +75,40 @@ class CvTranscript extends HTMLElement {
     const step = () => {
       if (this._session !== s) { this._pumping = false; return; } // session changed — abandon
       const messages = s.messages || [];
-      const end = Math.min(messages.length, this._cursor + CHUNK);
+      const target = Math.min(messages.length, this._limit);
+      const end = Math.min(target, this._cursor + CHUNK);
       let html = "";
       for (; this._cursor < end; this._cursor++) html += this._messageHtml(messages[this._cursor], this._cursor);
-      if (html) this._turns.insertAdjacentHTML("beforeend", html);
-      this._wireBlocks(this._turns);
-      if (this._cursor < messages.length) requestAnimationFrame(step);
+      if (html) {
+        // Wire only the freshly-inserted turns — re-scanning the whole subtree
+        // every chunk made rendering O(n²) in message count.
+        const frag = document.createRange().createContextualFragment(html);
+        this._wireBlocks(frag);
+        this._turns.appendChild(frag);
+      }
+      if (this._cursor < Math.min((s.messages || []).length, this._limit)) requestAnimationFrame(step);
       else { this._pumping = false; this._renderPager(); }
     };
     step();
   }
 
   // ---- paged loading ("load more") ----------------------------------------
-  // When the session came from cvd's windowed `/messages` endpoint, `session._paged` marks that
-  // more messages exist server-side. We show a "load more" footer and also fire when it scrolls
-  // into view; the host (cv-app) listens for "load-more", fetches the next window, pushes onto
-  // `session.messages`, and calls `notifyAppended()`.
+  // Two sources of "more messages": (a) the session came from cvd's windowed `/messages`
+  // endpoint and `session._paged` marks that more exist server-side; (b) the session is fully
+  // in memory (dropped .zip/.json) but longer than the rendered window `_limit`. Either way we
+  // show a "load more" footer that also fires when it scrolls into view. For (a) the host
+  // (cv-app) listens for "load-more", fetches the next window, pushes onto `session.messages`,
+  // and calls `notifyAppended()`; for (b) we just widen the window and re-pump locally.
+
+  /** Messages already in `session.messages` but beyond the rendered window. */
+  _pendingLocal() {
+    return (this._session?.messages || []).length - this._cursor;
+  }
 
   _renderPager() {
     const s = this._session;
     let pager = this.querySelector(".load-more");
-    if (!s || !s._paged) {
+    if (!s || (!s._paged && this._pendingLocal() <= 0)) {
       pager?.remove();
       this._io?.disconnect();
       this._io = null;
@@ -114,14 +129,23 @@ class CvTranscript extends HTMLElement {
         this._io.observe(pager);
       }
     }
+    const shown = this._cursor;
     const loaded = (s.messages || []).length;
-    const total = s.message_count && s.message_count > loaded ? s.message_count : null;
+    const total = s.message_count && s.message_count > shown ? s.message_count
+      : loaded > shown ? loaded : null;
     pager.querySelector(".load-more-note").textContent =
-      `showing ${loaded}${total ? ` of ${total}` : ""} messages`;
+      `showing ${shown}${total ? ` of ${total}` : ""} messages`;
   }
 
   _requestMore() {
-    if (this._moreInFlight || !this._session?._paged) return;
+    if (this._moreInFlight || !this._session) return;
+    if (this._pendingLocal() > 0) {
+      // More already in memory — widen the window and render it; no fetch needed.
+      this._limit = Math.max(this._limit, this._cursor + PAGE);
+      this._pump(); // calls _renderPager() when the window is filled
+      return;
+    }
+    if (!this._session._paged) return;
     this._moreInFlight = true;
     const btn = this.querySelector(".load-more-btn");
     if (btn) { btn.disabled = true; btn.textContent = "Loading…"; }
@@ -135,6 +159,7 @@ class CvTranscript extends HTMLElement {
     this._moreInFlight = false;
     const btn = this.querySelector(".load-more-btn");
     if (btn) { btn.disabled = false; btn.textContent = "Load more messages"; }
+    this._limit = Math.max(this._limit, this._cursor + PAGE);
     this._pump();
     this._renderPager();
   }
@@ -306,7 +331,10 @@ class CvTranscript extends HTMLElement {
     });
     root.querySelectorAll("[data-copy]:not([data-wired])").forEach((btn) => {
       btn.setAttribute("data-wired", "1");
-      btn.addEventListener("click", async () => {
+      btn.addEventListener("click", async (e) => {
+        // Some copy buttons live inside a <summary> — don't toggle the <details>.
+        e.preventDefault();
+        e.stopPropagation();
         const pre = btn.closest(".block")?.querySelector("pre");
         const text = pre ? pre.textContent : "";
         try {
@@ -410,7 +438,7 @@ class CvTranscript extends HTMLElement {
             <button type="button" class="copy-btn" data-copy aria-label="Copy input">copy</button>
           </div>`;
         return big
-          ? `<details class="block tool-use"><summary class="tool-summary">⚙ <span class="tool-name">${esc(b.name || "?")}</span> <span class="muted">tool_use · ${input.length} chars</span></summary>${pre}</details>`
+          ? `<details class="block tool-use"><summary class="tool-summary">⚙ <span class="tool-name">${esc(b.name || "?")}</span> <span class="muted">tool_use · ${input.length} chars</span><button type="button" class="copy-btn" data-copy aria-label="Copy input">copy</button></summary>${pre}</details>`
           : `<div class="block tool-use">${label}${pre}</div>`;
       }
 
@@ -431,7 +459,7 @@ class CvTranscript extends HTMLElement {
             <button type="button" class="copy-btn" data-copy aria-label="Copy result">copy</button>
           </div>`;
         return big
-          ? `<details class="block tool-result${err}"><summary class="tool-summary">${b.is_error ? "✖" : "↳"} <span class="muted">tool_result${b.is_error ? " (error)" : ""} · ${content.length} chars</span> ${status}</summary>${pre}${details}</details>`
+          ? `<details class="block tool-result${err}"><summary class="tool-summary">${b.is_error ? "✖" : "↳"} <span class="muted">tool_result${b.is_error ? " (error)" : ""} · ${content.length} chars</span> ${status}<button type="button" class="copy-btn" data-copy aria-label="Copy result">copy</button></summary>${pre}${details}</details>`
           : `<div class="block tool-result${err}">${label}${pre}${details}</div>`;
       }
 

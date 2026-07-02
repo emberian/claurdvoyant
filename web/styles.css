@@ -586,6 +586,7 @@ pre code { background: none; padding: 0; }
   background: var(--bg-sunk); border-radius: 8px;
 }
 .tool-summary::before { content: "▸ "; }
+.tool-summary .copy-btn { float: right; }
 details[open] > .tool-summary::before { content: "▾ "; }
 details.tool-use > .tool-summary, details.tool-result > .tool-summary { border: 1px solid var(--border); }
 details.tool-use[open], details.tool-result[open] { display: flex; flex-direction: column; gap: 8px; }

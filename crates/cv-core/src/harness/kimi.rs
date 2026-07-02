@@ -236,13 +236,7 @@ impl Adapter for Kimi {
         Ok(s)
     }
 
-    fn can_emit(&self) -> bool {
-        true
-    }
 
-    fn emit(&self, session: &Session, out_dir: &Path) -> Result<crate::harness::EmitResult> {
-        emit(session, out_dir, &crate::emit::EmitOptions::default())
-    }
 }
 
 // ---------------------------------------------------------------------------

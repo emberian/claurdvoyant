@@ -100,6 +100,15 @@ Rehoming rewrites the working directory baked into the target format (Claude's e
 project-dir name, Grok's percent-encoded path, Cline/Roo's `<environment_details>` cwd
 line, …) so the ported session resolves to the new location.
 
+**Same-harness fidelity.** When the source and target harness are the same (a pure rehome,
+or an A→A convert), the session is parsed **format-complete** (`ParseOptions::complete()`):
+every record — including the non-conversational meta lines the lean passes skip (Claude's
+`mode`/`queue-operation`/`ai-title`/compact-boundary records, exhaustive per-record
+`extra` fields) — is carried through the IR and replayed verbatim into the output, with only
+the session-identity fields (`sessionId`, `cwd`) rewritten to the new home. Cross-harness
+conversion uses the ordinary full-fidelity parse, since one harness's raw records can't be
+replayed into another's format.
+
 **It also brings the project's memory along.** Unless you pass `--no-context`, `port`
 copies the source cwd's context files into the new directory so the ported session lands
 with its instructions/memory intact. The carried set (`CONTEXT_FILES` in `main.rs`) is:
@@ -121,11 +130,12 @@ clustervision tells you when that happens instead of pretending otherwise.
 
 ### Verified emits
 
-`emit_verified()` does the honest thing: after writing the output, it **re-parses that
-output with the target's own adapter** and diffs it against the source IR. Any content that
-didn't make it back is reported as a human-readable warning (`diff_lossy()`), e.g.
-`dropped 3 tool calls` or `2 reasoning blocks preserved as encrypted/summary only`. This is
-purely a read-back check — it never changes what `emit()` wrote.
+Every `cv convert` and `cv port` runs `emit_verified()`, which does the honest thing: after
+writing the output, it **re-parses that output with the target's own adapter** and diffs it
+against the source IR. Any content that didn't make it back is printed as a human-readable
+warning (`diff_lossy()`), e.g. `⚠ lossy: dropped 3 tool calls` or `⚠ lossy: 2 reasoning
+blocks preserved as encrypted/summary only`. This is purely a read-back check — it never
+changes what `emit()` wrote.
 
 It compares counts of the things most likely to be lost: tool calls, tool results, images,
 reasoning (thinking) text, and standalone system turns. An empty warning list means a clean
@@ -144,7 +154,7 @@ emitter does the most faithful thing the destination format allows:
 | **Continue** | thinking flattens into a plain text part | Continue's `ChatMessage` has no thinking/reasoning part, so reasoning is preserved as searchable text |
 | **Cline** / **Roo** | the cwd and task title are **embedded into the first user message text** (`<task>…</task>` + `<environment_details># Current Working Directory (/abs/path) Files`) | that's how Cline/Roo natively carry cwd/title — the parser reads them right back out of the transcript, plus a `task_metadata.json` cwd-hint sidecar |
 | **Grok** | per-message content collapses to plain text (thinking rides in a separate `reasoning` field, tools in `tool_calls[]`) | Grok's `chat_history` carries text only |
-| any target without a standalone system turn (e.g. Claude) | a `Role::System` turn may be dropped | the format has no place for a standalone system message; dropping it avoids polluting user text |
+| any target without a standalone system turn (e.g. Claude) | a `Role::System` turn may be dropped | the format has no place for a standalone system message; dropping it avoids polluting user text (Claude's emitter re-links `parentUuid` threading over the dropped record, and a same-harness port replays the original record verbatim instead of dropping it) |
 | reasoning that was only ever an encrypted blob | comes back as encrypted/summary only | the raw chain-of-thought text was never stored to begin with |
 
 When any of these reduce the content on the way out, `emit_verified` surfaces it as a

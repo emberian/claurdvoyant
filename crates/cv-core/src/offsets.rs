@@ -310,6 +310,12 @@ pub fn stream_range(
             let Ok(mut f) = std::fs::File::open(&r.path) else {
                 return Ok(false);
             };
+            // Post-open size recheck (mirrors the codex arm below): the file may have changed
+            // between the stat that keyed `seek_row` and this open — stale offsets, fall back.
+            match f.metadata() {
+                Ok(m) if m.len() as i64 == size && target < m.len() => {}
+                _ => return Ok(false), // raced a file change since the stat — stale, fall back
+            }
             if f.seek(std::io::SeekFrom::Start(target)).is_err() {
                 return Ok(false);
             }

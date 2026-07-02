@@ -69,13 +69,7 @@ impl Adapter for LmStudio {
         Harness::LmStudio
     }
 
-    fn can_emit(&self) -> bool {
-        true
-    }
 
-    fn emit(&self, session: &Session, out_dir: &Path) -> Result<EmitResult> {
-        emit(session, out_dir, &crate::emit::EmitOptions::default())
-    }
 
     fn storage_root(&self) -> Option<PathBuf> {
         // Detect the install even if no conversations dir exists yet.

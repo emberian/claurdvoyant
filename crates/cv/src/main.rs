@@ -18,15 +18,10 @@ use cmd::live::BoardCmd;
 use cmd::{browse, compose, config, convert, doctor, live, pack, provenance, query, search, share, view, workflow};
 use std::path::PathBuf;
 
-/// Parse a `cv prune --range` spec: `START-END` turn indices, either end optional
-/// (`650-`, `650-900`, `-900`). Returns `(start, end_exclusive_or_none)`.
+/// Parse a `cv prune --range` spec. Same grammar as `cv show --range` (`650-`, `650-900`,
+/// `-900`, bare `650` = that single turn) so range syntax is uniform across the CLI.
 fn parse_keep_range(s: &str) -> Result<(usize, Option<usize>)> {
-    let (a, b) = s
-        .split_once('-')
-        .ok_or_else(|| anyhow::anyhow!("range must be START-END (e.g. 650-, 650-900, -900)"))?;
-    let start = if a.trim().is_empty() { 0 } else { a.trim().parse()? };
-    let end = if b.trim().is_empty() { None } else { Some(b.trim().parse()?) };
-    Ok((start, end))
+    util::parse_msg_range(s)
 }
 
 /// Footer for `cv --help`. The auto `Commands:` list above stays tight (the common path); every
@@ -58,7 +53,8 @@ struct Cli {
 enum Cmd {
     /// List discovered sessions across all harnesses.
     Ls {
-        /// Only this harness (claude, codex, grok, opencode, gemini).
+        /// Only this harness (claude, codex, grok, opencode, gemini, cursor, kimi, qwen,
+        /// cline, roo, continue, lmstudio, hermes, goose, zed, openclaw, …).
         #[arg(long)]
         harness: Option<String>,
         /// Only sessions whose cwd contains this substring.

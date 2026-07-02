@@ -186,13 +186,7 @@ impl Adapter for Continue {
         Ok(s)
     }
 
-    fn can_emit(&self) -> bool {
-        true
-    }
 
-    fn emit(&self, session: &Session, out_dir: &Path) -> Result<super::EmitResult> {
-        emit(session, out_dir, &crate::emit::EmitOptions::default())
-    }
 }
 
 // ---------------------------------------------------------------------------

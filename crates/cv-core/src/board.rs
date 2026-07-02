@@ -14,9 +14,12 @@
 //! The board is designed to be safe under many simultaneous writers across *processes* (parallel
 //! Claude Codes, Codex, a cloud fleet), not just threads. Each [`post`] does two things:
 //!
-//! 1. Acquires a per-channel advisory lock by `create_new`-ing a `<channel>.lock` file and spinning
-//!    with a short backoff until it succeeds (the lock is removed when the [`ChannelLock`] guard
-//!    drops, including on panic). This serializes writers to a given channel.
+//! 1. Acquires a per-channel advisory lock: an OS `flock`-style **exclusive lock** on a sibling
+//!    `<channel>.lock` file, blocking until the current holder releases. The kernel ties the lock
+//!    to the holding process, so a crashed/killed holder's lock evaporates automatically — no
+//!    stale-lock timeouts, no steal heuristics, and never two simultaneous holders. This
+//!    serializes writers to a given channel. (The lockfile itself is left in place between uses;
+//!    only the kernel lock state comes and goes.)
 //! 2. Opens the channel file in append mode and writes the serialized message **plus its trailing
 //!    newline in a single `write_all`**. A single `write` of less than `PIPE_BUF` bytes to a file
 //!    opened `O_APPEND` is atomic on POSIX, so even without the lock individual lines never tear or
@@ -33,6 +36,8 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
+#[cfg(not(target_family = "wasm"))]
+use fs4::fs_std::FileExt;
 use serde::{Deserialize, Serialize};
 
 /// Root dir for board channels: `$CLUSTERVISION_HOME/board` (or `~/.clustervision/board`).
@@ -97,46 +102,30 @@ fn lock_path(dir: &Path, channel: &str) -> PathBuf {
     dir.join(format!("{}.lock", slug(channel)))
 }
 
-/// RAII guard for a per-channel advisory lockfile. Removes the lockfile on drop.
+/// RAII guard for the per-channel advisory lock: an OS `flock`-style exclusive lock on the
+/// `<channel>.lock` file. Closing the file (drop) releases the lock, and the kernel releases it on
+/// process death too — so a crashed holder can never wedge the channel, and there is no stale-lock
+/// steal path (the old `remove_file` + re-create dance could crown two winners and cascade-steal a
+/// *live* holder's lock). The lockfile itself is never removed: unlinking it would let the next
+/// locker open a fresh inode and lock *that*, silently breaking mutual exclusion.
 struct ChannelLock {
-    path: PathBuf,
+    _file: File,
 }
 
 impl ChannelLock {
-    /// Acquire the lock by `create_new`-ing the lockfile, spinning with backoff if it's held.
+    /// Acquire the lock, blocking until the current holder (if any) releases it.
     fn acquire(path: PathBuf) -> Result<ChannelLock> {
-        // Spin for a bounded number of attempts so a crashed holder's stale lock can't wedge us
-        // forever. Total wait is ~ sum of backoffs below (~ a few seconds) before we steal it.
-        let mut backoff = Duration::from_millis(1);
-        let max_backoff = Duration::from_millis(50);
-        for _ in 0..400 {
-            match OpenOptions::new().write(true).create_new(true).open(&path) {
-                Ok(_f) => return Ok(ChannelLock { path }),
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                    std::thread::sleep(backoff);
-                    backoff = (backoff * 2).min(max_backoff);
-                }
-                Err(e) => {
-                    return Err(e).with_context(|| format!("creating board lockfile {}", path.display()));
-                }
-            }
-        }
-        // Presume the holder died and left a stale lock; steal it so the board never deadlocks.
-        // (A racing thief just re-creates it; the append itself is still O_APPEND-atomic.)
-        let _ = fs::remove_file(&path);
-        OpenOptions::new()
+        let file = OpenOptions::new()
             .write(true)
             .create(true)
-            .truncate(true)
+            .truncate(false)
             .open(&path)
-            .with_context(|| format!("stealing stale board lockfile {}", path.display()))?;
-        Ok(ChannelLock { path })
-    }
-}
-
-impl Drop for ChannelLock {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
+            .with_context(|| format!("creating board lockfile {}", path.display()))?;
+        // wasm32 has no file locking (and no cross-process concurrency): the open alone suffices.
+        #[cfg(not(target_family = "wasm"))]
+        file.lock_exclusive()
+            .with_context(|| format!("locking board lockfile {}", path.display()))?;
+        Ok(ChannelLock { _file: file })
     }
 }
 
@@ -756,8 +745,48 @@ mod tests {
         ids.sort();
         ids.dedup();
         assert_eq!(ids.len(), n_threads * per_thread);
-        // Lock should be released; lockfile gone.
-        assert!(!lock_path(&dir, "race").exists());
+        // The lock must be free again: an immediate re-acquire succeeds. (The lockfile itself
+        // stays on disk by design — only the kernel lock state is released.)
+        drop(ChannelLock::acquire(lock_path(&dir, "race")).unwrap());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn abandoned_lockfile_is_harmless_and_single_winner() {
+        let dir = tmp_board();
+        fs::create_dir_all(&dir).unwrap();
+        // A crashed holder left the lockfile behind. With a real advisory lock the file alone
+        // holds nothing (the kernel dropped the dead process's lock), so claimers must neither
+        // stall on it nor let more than one of them win.
+        fs::write(lock_path(&dir, "ch"), b"stale").unwrap();
+
+        let started = std::time::Instant::now();
+        let n = 8;
+        let winners = std::sync::atomic::AtomicUsize::new(0);
+        std::thread::scope(|s| {
+            for t in 0..n {
+                let dir = dir.clone();
+                let winners = &winners;
+                s.spawn(move || {
+                    if claim_in_dir(&dir, "ch", &format!("agent-{t}"), "the-key", Duration::from_secs(60))
+                        .unwrap()
+                        .is_some()
+                    {
+                        winners.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    }
+                });
+            }
+        });
+        assert_eq!(winners.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let active = active_claims_in_dir(&dir, "ch").unwrap();
+        assert_eq!(active.len(), 1);
+        // The old steal path waited ~20s of backoff before (multiply) stealing; a real lock
+        // sails straight through the leftover file.
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "claimers stalled on an abandoned lockfile: {:?}",
+            started.elapsed()
+        );
         fs::remove_dir_all(&dir).ok();
     }
 

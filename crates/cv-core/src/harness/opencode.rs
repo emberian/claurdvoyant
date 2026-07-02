@@ -46,6 +46,13 @@ impl OpenCode {
         OpenCode { root }
     }
 
+    /// An adapter rooted at an explicit storage dir (`…/opencode/storage`) instead of `$HOME` —
+    /// lets emit-verification and tests re-parse a just-written session without mutating the
+    /// process environment (env writes race other threads' `getenv`).
+    pub fn with_root(root: PathBuf) -> Self {
+        OpenCode { root: Some(root) }
+    }
+
     fn message_dir(&self, sid: &str) -> Option<PathBuf> {
         self.root.as_ref().map(|r| r.join("message").join(sid))
     }
@@ -183,9 +190,6 @@ impl Adapter for OpenCode {
         Ok(s)
     }
 
-    fn can_emit(&self) -> bool {
-        false
-    }
 }
 
 /// Count a session's conversational turns: message records whose `role` is `user`/`assistant`.

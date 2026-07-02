@@ -29,33 +29,67 @@ pub struct EmitOptions {
     pub new_id: Option<String>,
 }
 
+/// An emitter: writes one IR session into one harness's native on-disk format.
+type EmitFn = fn(&Session, &Path, &EmitOptions) -> Result<EmitResult>;
+
+/// The ONE emit registry: which harnesses can be written, and by what. [`emit`] dispatches through
+/// it and [`supported_targets`] is derived from it, so the dispatcher and the CLI's `--to` list can
+/// never drift apart. Adding a target = adding an arm here (nothing else to keep in sync).
+fn emitter_for(target: Harness) -> Option<EmitFn> {
+    Some(match target {
+        Harness::Claude => emit_claude,
+        Harness::Codex => emit_codex,
+        Harness::Grok => emit_grok,
+        Harness::OpenCode => emit_opencode,
+        Harness::OpenClaw => emit_openclaw,
+        Harness::Gemini => emit_gemini,
+        #[cfg(feature = "sqlite")]
+        Harness::Hermes => emit_hermes,
+        // Emitters living in their own adapter modules.
+        Harness::Kimi => crate::harness::kimi::emit,
+        Harness::LmStudio => crate::harness::lmstudio::emit,
+        Harness::Cline => crate::harness::cline::emit,
+        Harness::Roo => crate::harness::roo::emit,
+        Harness::Continue => crate::harness::continuedev::emit,
+        // Qwen Code stores the same ConversationRecord shape Gemini does, so it reuses that emitter.
+        Harness::Qwen => emit_gemini,
+        // Parse-only harnesses (Cursor, Goose, desktop apps, …) aren't conversion targets.
+        _ => return None,
+    })
+}
+
 /// Emit `session` into `target`'s native format under `out_dir` (the target harness's storage root,
 /// or any directory for a dry run). Returns where it was written + how to resume it.
 pub fn emit(session: &Session, target: Harness, out_dir: &Path, opts: &EmitOptions) -> Result<EmitResult> {
-    match target {
-        Harness::Claude => emit_claude(session, out_dir, opts),
-        Harness::Codex => emit_codex(session, out_dir, opts),
-        Harness::Grok => emit_grok(session, out_dir, opts),
-        Harness::OpenCode => emit_opencode(session, out_dir, opts),
-        Harness::OpenClaw => emit_openclaw(session, out_dir, opts),
-        Harness::Gemini => emit_gemini(session, out_dir, opts),
-        #[cfg(feature = "sqlite")]
-        Harness::Hermes => emit_hermes(session, out_dir, opts),
-        #[cfg(not(feature = "sqlite"))]
-        Harness::Hermes => {
-            anyhow::bail!("emit to hermes requires the `sqlite` feature")
-        }
-        // Emitters living in their own adapter modules.
-        Harness::Kimi => crate::harness::kimi::emit(session, out_dir, opts),
-        Harness::LmStudio => crate::harness::lmstudio::emit(session, out_dir, opts),
-        Harness::Cline => crate::harness::cline::emit(session, out_dir, opts),
-        Harness::Roo => crate::harness::roo::emit(session, out_dir, opts),
-        Harness::Continue => crate::harness::continuedev::emit(session, out_dir, opts),
-        // Qwen Code stores the same ConversationRecord shape Gemini does, so it reuses that emitter.
-        Harness::Qwen => emit_gemini(session, out_dir, opts),
-        // Parse-only harnesses (Cursor, Goose, desktop apps, …) aren't conversion targets.
-        other => anyhow::bail!("emit to {other} is not supported yet"),
+    #[cfg(not(feature = "sqlite"))]
+    if target == Harness::Hermes {
+        anyhow::bail!("emit to hermes requires the `sqlite` feature");
     }
+    let Some(f) = emitter_for(target) else {
+        anyhow::bail!("emit to {target} is not supported yet");
+    };
+    // Guard: emitters read content via `msg.text()`/`Deref`, which PANICS on an unresolved lazy
+    // [`Span`](crate::lazy::Span) — and a span that reached `serde_json::to_value` would serialize
+    // as its `{source,off,len}` struct, shipping garbage into the target file. A lazily-parsed
+    // session must be resolved before it hits an emitter; do it here (on a clone, since `emit`
+    // takes `&Session`) so no caller can forget.
+    if has_unresolved_spans(session) {
+        let mut owned = session.clone();
+        owned.materialize();
+        return f(&owned, out_dir, opts);
+    }
+    f(session, out_dir, opts)
+}
+
+/// Whether any message content field is still a lazy [`Span`](crate::lazy::Span) (see [`emit`]).
+fn has_unresolved_spans(session: &Session) -> bool {
+    session.messages.iter().any(|m| {
+        m.content.iter().any(|b| match b {
+            Block::Text { text } | Block::Thinking { text, .. } => text.is_span(),
+            Block::ToolResult { content, .. } => content.is_span(),
+            _ => false,
+        })
+    })
 }
 
 /// Emit `session` into `target`, then re-parse the written output with `target`'s own adapter and
@@ -124,74 +158,44 @@ fn reparse_emitted(target: Harness, result: &EmitResult) -> Result<Session> {
     }
 }
 
-/// OpenCode resolves message/part dirs relative to `$HOME/.local/share/opencode/storage`; the emit
-/// target dir is that storage root. Point HOME at its grandparent-of-grandparent so `discover()`
-/// finds the session. Serialized against other HOME mutators in this crate's tests.
+/// OpenCode resolves message/part dirs relative to a storage root (normally
+/// `$HOME/.local/share/opencode/storage`); the emit target dir IS that root, so re-parse with an
+/// adapter rooted there explicitly. (No `HOME` mutation: `set_var` is process-global and races any
+/// concurrent `getenv` — e.g. rayon discovery threads.)
 fn reparse_opencode(result: &EmitResult) -> Result<Session> {
     use crate::harness::Adapter;
-    let _guard = HOME_ENV_LOCK.lock().unwrap();
-    // result.path is .../storage/session/<projectID>/<id>.json — walk up to the synthetic HOME.
+    // result.path is .../storage/session/<projectID>/<id>.json — walk up to the storage root.
     let storage = result
         .path
         .ancestors()
         .find(|p| p.file_name().map(|n| n == "storage").unwrap_or(false))
         .context("locating opencode storage root for re-parse")?;
-    let home = storage
-        .parent()
-        .and_then(|p| p.parent())
-        .and_then(|p| p.parent())
-        .context("locating opencode synthetic HOME for re-parse")?
-        .to_path_buf();
-    let prev = std::env::var_os("HOME");
-    unsafe {
-        std::env::set_var("HOME", &home);
-    }
-    let oc = crate::harness::opencode::OpenCode::new();
-    let parsed = oc.discover().ok().and_then(|refs| {
-        refs.into_iter()
-            .find(|r| r.id == result.new_id)
-            .and_then(|r| oc.parse(&r).ok())
-    });
-    unsafe {
-        match prev {
-            Some(h) => std::env::set_var("HOME", h),
-            None => std::env::remove_var("HOME"),
-        }
-    }
-    parsed.context("re-discovering emitted opencode session")
+    let oc = crate::harness::opencode::OpenCode::with_root(storage.to_path_buf());
+    oc.discover()
+        .ok()
+        .and_then(|refs| {
+            refs.into_iter()
+                .find(|r| r.id == result.new_id)
+                .and_then(|r| oc.parse(&r).ok())
+        })
+        .context("re-discovering emitted opencode session")
 }
 
-/// Hermes parses from `$HERMES_HOME/state.db`; point it at the emitted db's directory.
+/// Hermes re-parses straight from the emitted `state.db` (no `HERMES_HOME` mutation — see
+/// [`reparse_opencode`] for why env writes are off-limits here).
 #[cfg(feature = "sqlite")]
 fn reparse_hermes(result: &EmitResult) -> Result<Session> {
     use crate::harness::Adapter;
-    let _guard = HOME_ENV_LOCK.lock().unwrap();
-    let home = result
-        .path
-        .parent()
-        .context("locating hermes state.db dir for re-parse")?
-        .to_path_buf();
-    let prev = std::env::var_os("HERMES_HOME");
-    unsafe {
-        std::env::set_var("HERMES_HOME", &home);
-    }
-    let h = crate::harness::hermes::Hermes::new();
-    let parsed = h.discover().ok().and_then(|refs| {
-        refs.into_iter()
-            .find(|r| r.id == result.new_id)
-            .and_then(|r| h.parse(&r).ok())
-    });
-    unsafe {
-        match prev {
-            Some(p) => std::env::set_var("HERMES_HOME", p),
-            None => std::env::remove_var("HERMES_HOME"),
-        }
-    }
-    parsed.context("re-discovering emitted hermes session")
+    let h = crate::harness::hermes::Hermes::with_db(result.path.clone());
+    h.discover()
+        .ok()
+        .and_then(|refs| {
+            refs.into_iter()
+                .find(|r| r.id == result.new_id)
+                .and_then(|r| h.parse(&r).ok())
+        })
+        .context("re-discovering emitted hermes session")
 }
-
-/// Serializes HOME / HERMES_HOME env mutation during verification re-parse (process-global state).
-static HOME_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Count notable content features of a session, for before/after lossiness comparison.
 struct ContentStats {
@@ -215,7 +219,11 @@ fn content_stats(session: &Session) -> ContentStats {
         system_turns: 0,
     };
     for m in &session.messages {
-        if m.role == Role::System {
+        // Only content-bearing system turns count: a format-complete *carrier* (an empty-content
+        // System message holding a verbatim meta record) is replayed byte-for-byte by the emitter
+        // but re-parses (under the lean full() pass) into either nothing or a rendered system turn
+        // — counting carriers would flag that as loss when nothing was lost.
+        if m.role == Role::System && !m.content.is_empty() {
             s.system_turns += 1;
         }
         for b in &m.content {
@@ -285,24 +293,17 @@ fn diff_lossy(input: &Session, reparsed: &Session) -> Vec<String> {
     warnings
 }
 
-/// Which targets [`emit`] can currently write.
+/// Which targets [`emit`] can currently write — derived from [`emitter_for`] (the one registry),
+/// so this list is correct by construction.
 pub fn supported_targets() -> &'static [Harness] {
-    &[
-        Harness::Claude,
-        Harness::Codex,
-        Harness::Grok,
-        Harness::OpenCode,
-        Harness::OpenClaw,
-        Harness::Gemini,
-        #[cfg(feature = "sqlite")]
-        Harness::Hermes,
-        Harness::Kimi,
-        Harness::LmStudio,
-        Harness::Cline,
-        Harness::Roo,
-        Harness::Continue,
-        Harness::Qwen,
-    ]
+    static TARGETS: std::sync::OnceLock<Vec<Harness>> = std::sync::OnceLock::new();
+    TARGETS.get_or_init(|| {
+        Harness::ALL
+            .iter()
+            .copied()
+            .filter(|&h| emitter_for(h).is_some())
+            .collect()
+    })
 }
 
 /// Effective cwd after applying any rehome override.
@@ -395,23 +396,63 @@ fn emit_claude(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<
 
     // Thread the conversation by uuid / parentUuid.
     let mut parent: Option<String> = None;
+    // Non-carrier System turns can't be replayed (see below) and are dropped — record each dropped
+    // record's uuid → its own (surviving) parent, so a child that pointed at a dropped uuid is
+    // re-linked over the gap instead of left with a dangling parentUuid. `resolve_parent` follows
+    // chains of consecutively-dropped ancestors (bounded; parent links form a DAG).
+    let mut dropped: std::collections::HashMap<String, Option<String>> = std::collections::HashMap::new();
+    fn resolve_parent(dropped: &std::collections::HashMap<String, Option<String>>, pid: String) -> Option<String> {
+        let mut p = Some(pid);
+        for _ in 0..=dropped.len() {
+            match p.as_ref().and_then(|id| dropped.get(id)) {
+                Some(next) => p = next.clone(),
+                None => break,
+            }
+        }
+        p
+    }
     for msg in &session.messages {
         // Format-complete carrier (a meta/system record carried verbatim under
         // `ParseOptions::complete`): replay it byte-for-byte and skip envelope reconstruction. These
-        // are non-conversational, so they don't participate in uuid/parentUuid threading.
+        // are non-conversational, so they don't participate in uuid/parentUuid threading. The one
+        // exception to "verbatim": a record's `sessionId`/`cwd` are the session's *identity* — a
+        // ported session must carry the NEW ones (Claude keys resume off them), so rewrite them to
+        // match the envelope. On a pure round-trip (same id, same cwd) this is byte-identical.
         if let Some(record) = carrier_record_of(msg) {
-            lines.push(record.clone());
+            let mut record = record.clone();
+            if let Some(obj) = record.as_object_mut() {
+                if obj.contains_key("sessionId") {
+                    obj.insert("sessionId".into(), json!(new_id));
+                }
+                if obj.contains_key("cwd") {
+                    obj.insert("cwd".into(), json!(cwd_str));
+                }
+            }
+            lines.push(record);
             continue;
         }
         // Claude transcripts have no standalone system turn; skip to avoid polluting user text. (A
-        // *carrier* System message was already handled above; this is a synthetic/rendered one.)
+        // *carrier* System message was already handled above; this is a synthetic/rendered one —
+        // under `ParseOptions::full`, `system` records parse into these.) Its uuid leaves the file,
+        // so remember where its children should re-link to.
         if msg.role == Role::System {
+            if let Some(id) = &msg.id {
+                let p = match msg.parent_id.clone() {
+                    Some(pid) => resolve_parent(&dropped, pid),
+                    None => parent.clone(),
+                };
+                dropped.insert(id.clone(), p);
+            }
             continue;
         }
         // Preserve the source uuid/parentUuid/timestamp when the message carries them (a
         // format-complete round-trip), else generate fresh threading (cross-harness convert/port).
+        // A source parentUuid pointing at a dropped system record re-links to its survivor.
         let uuid = msg.id.clone().unwrap_or_else(|| Uuid::new_v4().to_string());
-        let parent_uuid = msg.parent_id.clone().or_else(|| parent.clone());
+        let parent_uuid = match msg.parent_id.clone() {
+            Some(pid) => resolve_parent(&dropped, pid),
+            None => parent.clone(),
+        };
         let ts = msg
             .timestamp
             .map(|t| t.to_rfc3339_opts(SecondsFormat::Millis, true))
@@ -430,10 +471,16 @@ fn emit_claude(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<
 
         match msg.role {
             Role::User => {
-                // Simple user text → string content.
-                let text = msg.text().unwrap_or_default();
                 line.insert("type".into(), json!("user"));
-                line.insert("message".into(), json!({ "role": "user", "content": text }));
+                // Text-only user turn → Claude's native bare-string content. Anything richer
+                // (images, document/File attachments, mixed content) → the array-of-blocks form
+                // Claude also writes; flattening to `msg.text()` dropped every non-text block.
+                let content = if msg.content.iter().all(|b| matches!(b, Block::Text { .. })) {
+                    json!(msg.text().unwrap_or_default())
+                } else {
+                    Value::Array(claude_user_blocks(&msg.content))
+                };
+                line.insert("message".into(), json!({ "role": "user", "content": content }));
             }
             Role::Assistant => {
                 line.insert("type".into(), json!("assistant"));
@@ -512,14 +559,19 @@ fn is_internal_extra_key(k: &str) -> bool {
 /// Fold a message's captured `extra` back onto an emitted Claude record (format-complete replay): a
 /// `message.<k>` key is routed inside the `message` object; any other key is a top-level field. The
 /// captured value is the source-of-truth for that key (it IS the original record's value), so it
-/// overrides the envelope reconstruction — e.g. the original `sessionId`/`cwd`/`gitBranch`/`version`
-/// win over the emit-time params. The IR-first-classed keys (uuid/parentUuid/timestamp/type and
-/// `message.content`) are never present in `extra` (the parser excludes them), so they're untouched
-/// and the [`Message`]'s own fields remain authoritative.
+/// overrides the envelope reconstruction — e.g. the original `gitBranch`/`version` win over the
+/// emit-time params. Two exceptions: `sessionId` and `cwd` are the session's *identity*, and the
+/// envelope (which carries the possibly-rehomed values from `EmitOptions::new_id`/`new_cwd`) must
+/// stay authoritative — replaying the captured ones would stamp a ported session with its OLD
+/// id/cwd, breaking `--new-cwd` porting and `claude --resume` (which keys off both). On a pure
+/// round-trip the envelope equals the captured values anyway, so nothing changes there. The
+/// IR-first-classed keys (uuid/parentUuid/timestamp/type and `message.content`) are never present
+/// in `extra` (the parser excludes them), so they're untouched and the [`Message`]'s own fields
+/// remain authoritative.
 fn apply_claude_extra(line: &mut Map<String, Value>, extra: &Map<String, Value>) {
     use crate::harness::claude::MESSAGE_EXTRA_PREFIX;
     for (k, val) in extra {
-        if is_internal_extra_key(k) {
+        if is_internal_extra_key(k) || k == "sessionId" || k == "cwd" {
             continue;
         }
         if let Some(sub) = k.strip_prefix(MESSAGE_EXTRA_PREFIX) {
@@ -584,35 +636,91 @@ fn claude_assistant_blocks(content: &[Block]) -> Vec<Value> {
                 let label = path.as_deref().or(source.as_deref()).unwrap_or("?");
                 out.push(json!({ "type": "text", "text": format!("[file: {label}]") }));
             }
-            Block::Image { media_type, data_ref } => {
-                // Reconstruct the Anthropic `source` from our `data_ref` so the reference survives a
-                // round-trip (the parser keeps a ref, not the bytes — but dropping it here lost even
-                // the `file:`/url pointer). Mirror the three shapes claude.rs parses.
-                let mut source = serde_json::Map::new();
-                if let Some(mt) = media_type {
-                    source.insert("media_type".into(), json!(mt));
-                }
-                match data_ref.as_deref() {
-                    Some(r) if r.starts_with("file:") => {
-                        source.insert("type".into(), json!("file"));
-                        source.insert("file_id".into(), json!(&r["file:".len()..]));
-                    }
-                    Some("base64:inline") => {
-                        // Bytes were intentionally not retained in the IR; mark the kind.
-                        source.insert("type".into(), json!("base64"));
-                    }
-                    Some(r) => {
-                        source.insert("type".into(), json!("url"));
-                        source.insert("url".into(), json!(r));
-                    }
-                    None => {}
-                }
-                out.push(json!({ "type": "image", "source": Value::Object(source) }));
-            }
+            Block::Image { media_type, data_ref } => out.push(claude_image_block(media_type, data_ref)),
         }
     }
     if out.is_empty() {
         out.push(json!({ "type": "text", "text": "" }));
+    }
+    out
+}
+
+/// Reconstruct an Anthropic `image` block's `source` from our `data_ref` so the reference survives
+/// a round-trip (the parser keeps a ref, not the bytes — dropping it would lose even the
+/// `file:`/url pointer). Mirrors the three shapes claude.rs parses.
+fn claude_image_block(media_type: &Option<String>, data_ref: &Option<String>) -> Value {
+    let mut source = serde_json::Map::new();
+    if let Some(mt) = media_type {
+        source.insert("media_type".into(), json!(mt));
+    }
+    match data_ref.as_deref() {
+        Some(r) if r.starts_with("file:") => {
+            source.insert("type".into(), json!("file"));
+            source.insert("file_id".into(), json!(&r["file:".len()..]));
+        }
+        Some("base64:inline") => {
+            // Bytes were intentionally not retained in the IR; mark the kind.
+            source.insert("type".into(), json!("base64"));
+        }
+        Some(r) => {
+            source.insert("type".into(), json!("url"));
+            source.insert("url".into(), json!(r));
+        }
+        None => {}
+    }
+    json!({ "type": "image", "source": Value::Object(source) })
+}
+
+/// Map user-turn IR blocks → Claude's array-of-blocks user content. Text/Image round-trip
+/// natively; a [`Block::File`] becomes the `document` attachment shape the parser reads back into
+/// a File; a stray ToolResult (mixed user content) is kept as a `tool_result` block. Thinking/
+/// ToolUse don't occur on user turns, but map to their native shapes rather than being dropped.
+fn claude_user_blocks(content: &[Block]) -> Vec<Value> {
+    let mut out = Vec::new();
+    for b in content {
+        match b {
+            Block::Text { text } => out.push(json!({ "type": "text", "text": text })),
+            Block::Image { media_type, data_ref } => out.push(claude_image_block(media_type, data_ref)),
+            Block::File { mime, path, source } => {
+                // Inverse of claude.rs's `document` parsing: title ← path, source ← url/file_id.
+                let mut src = serde_json::Map::new();
+                if let Some(mt) = mime {
+                    src.insert("media_type".into(), json!(mt));
+                }
+                match source.as_deref() {
+                    Some(r) if r.starts_with("file:") => {
+                        src.insert("type".into(), json!("file"));
+                        src.insert("file_id".into(), json!(&r["file:".len()..]));
+                    }
+                    Some(r) => {
+                        src.insert("type".into(), json!("url"));
+                        src.insert("url".into(), json!(r));
+                    }
+                    None => {}
+                }
+                let mut doc = Map::new();
+                doc.insert("type".into(), json!("document"));
+                if let Some(p) = path {
+                    doc.insert("title".into(), json!(p));
+                }
+                doc.insert("source".into(), Value::Object(src));
+                out.push(Value::Object(doc));
+            }
+            Block::ToolResult {
+                tool_use_id,
+                content,
+                is_error,
+                ..
+            } => out.push(json!({
+                "type": "tool_result",
+                "tool_use_id": tool_use_id,
+                "content": content,
+                "is_error": is_error,
+            })),
+            Block::Thinking { .. } | Block::ToolUse { .. } => {
+                out.extend(claude_assistant_blocks(std::slice::from_ref(b)));
+            }
+        }
     }
     out
 }
@@ -671,9 +779,6 @@ fn emit_codex(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<E
     meta.insert("source".into(), json!("cli"));
     meta.insert("originator".into(), json!("clustervision"));
     meta.insert("cli_version".into(), json!(env!("CARGO_PKG_VERSION")));
-    if let Some(model) = &session.model {
-        meta.insert("model_provider".into(), json!(model));
-    }
     if let Some(g) = &session.git {
         meta.insert("git".into(), codex_git(g));
     }
@@ -682,6 +787,23 @@ fn emit_codex(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<E
         "timestamp": ts_str,
         "payload": Value::Object(meta),
     }));
+
+    // The model rides in a `turn_context` record (per-turn config: model/cwd/approval/sandbox) —
+    // that's the ONLY place Codex's own parser (and ours, `apply_turn_context`) reads a model id
+    // from. (`session_meta.model_provider` is the *provider* name, not a model id; stuffing the
+    // model there was silently dropped on re-parse.)
+    if let Some(model) = &session.model {
+        let mut tc = Map::new();
+        if let Some(c) = &cwd {
+            tc.insert("cwd".into(), json!(c.to_string_lossy()));
+        }
+        tc.insert("model".into(), json!(model));
+        lines.push(json!({
+            "type": "turn_context",
+            "timestamp": ts_str,
+            "payload": Value::Object(tc),
+        }));
+    }
 
     for msg in &session.messages {
         let ts = msg
@@ -786,15 +908,26 @@ fn emit_codex(session: &Session, out_dir: &Path, opts: &EmitOptions) -> Result<E
             Role::Tool => {
                 for b in &msg.content {
                     if let Block::ToolResult {
-                        tool_use_id, content, ..
+                        tool_use_id,
+                        content,
+                        is_error,
+                        ..
                     } = b
                     {
+                        // A plain-string `output` always re-parses as success (`output_is_error`
+                        // only fires on objects), so a failed result must use Codex's object form
+                        // `{content, success:false}` or the error is silently laundered.
+                        let output = if *is_error {
+                            json!({ "content": content, "success": false })
+                        } else {
+                            json!(content)
+                        };
                         lines.push(codex_response_item(
                             &ts,
                             json!({
                                 "type": "function_call_output",
                                 "call_id": tool_use_id,
-                                "output": content,
+                                "output": output,
                             }),
                         ));
                     }
@@ -2264,6 +2397,141 @@ mod tests {
         assert_ne!(proj_dir, claude_encode_cwd(&link).as_str());
     }
 
+    /// User turns with non-text blocks must emit Claude's array-of-blocks content — the old
+    /// `msg.text()` flattening dropped user images and document/File attachments entirely.
+    #[test]
+    fn claude_round_trip_preserves_user_images_and_files() {
+        let mut s = sample_session(Harness::Claude);
+        let mut user = Message::new(Role::User);
+        user.content.push(Block::Text {
+            text: "look at this".into(),
+        });
+        user.content.push(Block::Image {
+            media_type: Some("image/png".into()),
+            data_ref: Some("https://example.com/x.png".into()),
+        });
+        user.content.push(Block::File {
+            mime: Some("application/pdf".into()),
+            path: Some("spec.pdf".into()),
+            source: Some("file:file_123".into()),
+        });
+        s.messages.push(user);
+
+        let out = temp_dir();
+        let res = emit(&s, Harness::Claude, &out, &EmitOptions::default()).unwrap();
+        let r = SessionRef {
+            id: res.new_id.clone(),
+            harness: Harness::Claude,
+            path: res.path.clone(),
+            cwd: None,
+            title: None,
+            created_at: None,
+            updated_at: None,
+            message_count: 0,
+        };
+        let parsed = Claude::new().parse(&r).unwrap();
+
+        let rich = parsed
+            .messages
+            .iter()
+            .filter(|m| m.role == Role::User)
+            .find(|m| m.content.len() > 1)
+            .expect("mixed-content user turn survives as multiple blocks");
+        assert!(
+            rich.content
+                .iter()
+                .any(|b| matches!(b, Block::Text { text } if text == "look at this")),
+            "user text block survives"
+        );
+        assert!(
+            rich.content.iter().any(|b| matches!(b, Block::Image { media_type, data_ref }
+                if media_type.as_deref() == Some("image/png")
+                    && data_ref.as_deref() == Some("https://example.com/x.png"))),
+            "user image (media_type + data_ref) survives: {:?}",
+            rich.content
+        );
+        assert!(
+            rich.content.iter().any(|b| matches!(b, Block::File { mime, path, source }
+                if mime.as_deref() == Some("application/pdf")
+                    && path.as_deref() == Some("spec.pdf")
+                    && source.as_deref() == Some("file:file_123"))),
+            "user document/File attachment survives: {:?}",
+            rich.content
+        );
+    }
+
+    /// Non-carrier System turns (a `full()`-parse of `system` records) are dropped on emit; their
+    /// children must be re-linked to the nearest surviving ancestor, never left pointing at a uuid
+    /// that isn't in the file. Covers a dropped root, a dropped mid-chain node, and a dropped
+    /// *chain* (two consecutive system records).
+    #[test]
+    fn claude_emit_relinks_parents_over_dropped_system_records() {
+        use crate::harness::claude::parse_str;
+
+        let sid = "22222222-2222-4222-8222-222222222222";
+        let src_lines = [
+            json!({"type":"system","uuid":"s0","parentUuid":null,"sessionId":sid,"subtype":"info",
+                "content":"session started","level":"info","timestamp":"2026-06-16T00:00:00.000Z"}),
+            json!({"type":"user","uuid":"u1","parentUuid":"s0","sessionId":sid,"cwd":"/work/proj",
+                "timestamp":"2026-06-16T00:00:01.000Z","message":{"role":"user","content":"hello"}}),
+            json!({"type":"system","uuid":"s2","parentUuid":"u1","sessionId":sid,"subtype":"local_command",
+                "content":"<command-name>/foo</command-name>","timestamp":"2026-06-16T00:00:02.000Z"}),
+            json!({"type":"system","uuid":"s3","parentUuid":"s2","sessionId":sid,"subtype":"info",
+                "content":"notice two","timestamp":"2026-06-16T00:00:03.000Z"}),
+            json!({"type":"assistant","uuid":"a4","parentUuid":"s3","sessionId":sid,
+                "timestamp":"2026-06-16T00:00:04.000Z",
+                "message":{"role":"assistant","content":[{"type":"text","text":"hi"}]}}),
+        ];
+        let text = src_lines
+            .iter()
+            .map(|v| serde_json::to_string(v).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let session = parse_str(sid, &text, None);
+        // Sanity: the lean full() parse surfaced the system records as content-bearing System turns.
+        assert_eq!(
+            session.messages.iter().filter(|m| m.role == Role::System).count(),
+            3,
+            "full() should parse all three system records into System messages"
+        );
+
+        let out = temp_dir();
+        let res = emit(&session, Harness::Claude, &out, &EmitOptions::default()).unwrap();
+        let emitted: Vec<Value> = fs::read_to_string(&res.path)
+            .unwrap()
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+
+        // No parentUuid may dangle: every non-null parent must be a uuid present in the file.
+        let uuids: std::collections::HashSet<&str> = emitted
+            .iter()
+            .filter_map(|v| v.get("uuid").and_then(Value::as_str))
+            .collect();
+        for v in &emitted {
+            if let Some(p) = v.get("parentUuid").and_then(Value::as_str) {
+                assert!(uuids.contains(p), "dangling parentUuid {p} in emitted transcript");
+            }
+        }
+        // And the re-links went to the *nearest surviving ancestor*:
+        let parent_of = |uuid: &str| -> Option<String> {
+            emitted
+                .iter()
+                .find(|v| v.get("uuid").and_then(Value::as_str) == Some(uuid))
+                .and_then(|v| v.get("parentUuid").and_then(Value::as_str))
+                .map(str::to_string)
+        };
+        // u1 pointed at the dropped root s0 → re-linked to null (no surviving ancestor).
+        assert_eq!(parent_of("u1"), None, "child of a dropped root gets a null parent");
+        // a4 pointed at s3 → s2 → u1: the dropped chain collapses to u1.
+        assert_eq!(
+            parent_of("a4").as_deref(),
+            Some("u1"),
+            "child of a dropped system chain re-links to the surviving ancestor"
+        );
+    }
+
     #[test]
     fn codex_round_trip() {
         let s = sample_session(Harness::Codex);
@@ -2285,15 +2553,19 @@ mod tests {
 
         assert_eq!(parsed.id, res.new_id);
         assert_eq!(parsed.cwd, Some(PathBuf::from("/Users/test/project")));
+        // The model must survive: it's carried by a `turn_context` record (the only place the
+        // codex parser reads a model id from; `session_meta.model_provider` is not a model).
+        assert_eq!(parsed.model.as_deref(), Some("test-model"));
         // event_msg user/assistant text survives.
         assert_eq!(texts(&parsed, Role::User), vec!["list the files please"]);
         assert_eq!(texts(&parsed, Role::Assistant), vec!["Sure, listing now."]);
         assert_eq!(tool_names(&parsed), vec!["run_shell"]);
-        // function_call_output round-trips as a Tool message.
+        // function_call_output round-trips as a Tool message (a success: is_error false).
         let tool_results: Vec<_> = parsed.messages.iter().filter(|m| m.role == Role::Tool).collect();
         assert_eq!(tool_results.len(), 1);
-        if let Block::ToolResult { content, .. } = &tool_results[0].content[0] {
+        if let Block::ToolResult { content, is_error, .. } = &tool_results[0].content[0] {
             assert_eq!(content, "file_a.txt\nfile_b.txt");
+            assert!(!is_error);
         } else {
             panic!("expected tool result");
         }
@@ -2306,6 +2578,63 @@ mod tests {
         assert_eq!(parsed.git.and_then(|g| g.branch), Some("main".to_string()));
         // System turn (developer) survives.
         assert!(parsed.messages.iter().any(|m| m.role == Role::System));
+    }
+
+    #[test]
+    fn codex_round_trip_preserves_tool_failure() {
+        // A plain-string `output` re-parses as success; a failed result must be emitted in the
+        // object form ({content, success:false}) so `output_is_error` recovers it.
+        let mut s = sample_session(Harness::Codex);
+        let mut failed = Message::new(Role::Tool);
+        failed.content.push(Block::ToolResult {
+            tool_use_id: "call_2".into(),
+            content: "command not found: frobnicate".into(),
+            is_error: true,
+            tool_name: None,
+            status: None,
+            details: None,
+        });
+        s.messages.push(failed);
+
+        let out = temp_dir();
+        let res = emit(&s, Harness::Codex, &out, &EmitOptions::default()).unwrap();
+        let r = SessionRef {
+            id: String::new(),
+            harness: Harness::Codex,
+            path: res.path.clone(),
+            cwd: None,
+            title: None,
+            created_at: None,
+            updated_at: None,
+            message_count: 0,
+        };
+        let parsed = Codex::new().parse(&r).unwrap();
+        let mut results: Vec<(String, String, bool)> = Vec::new();
+        for m in parsed.messages.iter().filter(|m| m.role == Role::Tool) {
+            for b in &m.content {
+                if let Block::ToolResult {
+                    tool_use_id,
+                    content,
+                    is_error,
+                    ..
+                } = b
+                {
+                    results.push((tool_use_id.clone(), content.to_string(), *is_error));
+                }
+            }
+        }
+        assert_eq!(
+            results,
+            vec![
+                ("call_1".to_string(), "file_a.txt\nfile_b.txt".to_string(), false),
+                (
+                    "call_2".to_string(),
+                    "command not found: frobnicate".to_string(),
+                    true
+                ),
+            ],
+            "is_error must survive a port into codex"
+        );
     }
 
     #[test]
@@ -2442,36 +2771,18 @@ mod tests {
 
     #[test]
     fn opencode_round_trip() {
-        // OpenCode::new() reads $HOME/.local/share/opencode/storage and its parse() resolves
-        // message/part dirs relative to that root. Redirect HOME at a temp home and emit there.
-        // Serialize HOME mutation across this binary's threads.
-        use std::sync::Mutex;
-        static HOME_LOCK: Mutex<()> = Mutex::new(());
-        let _guard = HOME_LOCK.lock().unwrap();
-
-        let home = temp_dir();
-        let storage = home.join(".local/share/opencode/storage");
+        // OpenCode's parse() resolves message/part dirs relative to a storage root; point an
+        // adapter at the emitted storage dir explicitly (no HOME mutation).
+        let storage = temp_dir().join(".local/share/opencode/storage");
         fs::create_dir_all(&storage).unwrap();
 
         let s = sample_session(Harness::OpenCode);
         let res = emit(&s, Harness::OpenCode, &storage, &EmitOptions::default()).unwrap();
         assert!(res.path.exists());
 
-        let prev_home = std::env::var_os("HOME");
-        // SAFETY: guarded by HOME_LOCK; restored before releasing the lock.
-        unsafe {
-            std::env::set_var("HOME", &home);
-        }
-        let oc = OpenCode::new();
+        let oc = OpenCode::with_root(storage);
         let refs = oc.discover().unwrap();
         let parsed = refs.iter().find(|r| r.id == res.new_id).map(|r| oc.parse(r).unwrap());
-        unsafe {
-            match prev_home {
-                Some(h) => std::env::set_var("HOME", h),
-                None => std::env::remove_var("HOME"),
-            }
-        }
-        drop(_guard);
 
         let parsed = parsed.expect("emitted opencode session should be discoverable");
         assert_eq!(parsed.cwd, Some(PathBuf::from("/Users/test/project")));
@@ -2580,24 +2891,10 @@ mod tests {
         assert!(res.path.exists());
         assert_eq!(res.path.file_name().unwrap(), "state.db");
 
-        // Point Hermes at the emitted DB via HERMES_HOME (its new() honours it).
-        use std::sync::Mutex;
-        static HERMES_LOCK: Mutex<()> = Mutex::new(());
-        let _guard = HERMES_LOCK.lock().unwrap();
-        let prev = std::env::var_os("HERMES_HOME");
-        unsafe {
-            std::env::set_var("HERMES_HOME", &out);
-        }
-        let h = Hermes::new();
+        // Point an adapter straight at the emitted DB (no HERMES_HOME mutation).
+        let h = Hermes::with_db(res.path.clone());
         let refs = h.discover().unwrap();
         let parsed = refs.iter().find(|r| r.id == res.new_id).map(|r| h.parse(r).unwrap());
-        unsafe {
-            match prev {
-                Some(p) => std::env::set_var("HERMES_HOME", p),
-                None => std::env::remove_var("HERMES_HOME"),
-            }
-        }
-        drop(_guard);
 
         let parsed = parsed.expect("emitted hermes session should be discoverable");
         assert_eq!(parsed.id, res.new_id);
@@ -2845,11 +3142,6 @@ mod tests {
         use crate::harness::hermes::Hermes;
         use crate::harness::Adapter;
         use rusqlite::Connection;
-        use std::sync::Mutex;
-
-        // Serialize HERMES_HOME mutation against the other env-touching hermes tests.
-        static HERMES_LOCK: Mutex<()> = Mutex::new(());
-        let _guard = HERMES_LOCK.lock().unwrap();
 
         // --- 1. Build a source state.db exercising the full column set. ---
         let src_home = temp_dir();
@@ -2921,12 +3213,8 @@ mod tests {
         let src_rows = dump_hermes_messages(&src_db, "src");
         let src_session = dump_hermes_session(&src_db, "src");
 
-        // --- 2. Parse the source db. ---
-        let prev = std::env::var_os("HERMES_HOME");
-        unsafe {
-            std::env::set_var("HERMES_HOME", &src_home);
-        }
-        let h = Hermes::new();
+        // --- 2. Parse the source db (adapter pointed straight at it; no HERMES_HOME mutation). ---
+        let h = Hermes::with_db(src_db.clone());
         let sref = h
             .discover()
             .unwrap()
@@ -2942,19 +3230,12 @@ mod tests {
             ..Default::default()
         };
         let res = emit(&parsed, Harness::Hermes, &dst_home, &opts).unwrap();
-        unsafe {
-            match prev {
-                Some(p) => std::env::set_var("HERMES_HOME", p),
-                None => std::env::remove_var("HERMES_HOME"),
-            }
-        }
-        drop(_guard);
 
         // --- 4. Compare the source db rows against the re-emitted db rows, column by column. ---
         // JSON-bearing columns (tool_calls / reasoning_details / codex_*) are compared by *parsed
-        // value*, not raw string: our IR stash → re-serialize path canonicalizes JSON key order
-        // (serde_json sorts object keys), which the losslessness bar explicitly permits ("key ORDER
-        // may differ"). Plain-text columns are compared verbatim.
+        // value*, not raw string: the IR stash → re-serialize path canonicalizes JSON whitespace
+        // (and, before `preserve_order`, used to re-sort keys), which the losslessness bar
+        // explicitly permits ("key ORDER may differ"). Plain-text columns are compared verbatim.
         let dst_rows = dump_hermes_messages(&res.path, "src");
         let norm = |rows: Vec<HermesMsgRow>| -> Vec<HermesMsgRow> {
             rows.into_iter()

@@ -128,15 +128,41 @@ fn sniff(name: &str, text: &str) -> Sniff {
         }
     }
 
-    // --- Claude: JSONL lines with parentUuid/sessionId and type user|assistant.
-    for line in text.lines().map(str::trim).filter(|l| !l.is_empty()).take(8) {
+    // --- Claude: JSONL lines with parentUuid/sessionId and type user|assistant. Real transcripts
+    // can open with a long run of meta records (`summary` compaction pointers,
+    // `file-history-snapshot`, queue/UI bookkeeping — the same set claude.rs treats as
+    // non-conversational), so those don't consume the 8-line sniff window; a hard line cap keeps
+    // the scan bounded on meta-only or foreign files.
+    let mut inspected = 0;
+    for line in text.lines().map(str::trim).filter(|l| !l.is_empty()).take(64) {
+        if inspected >= 8 {
+            break;
+        }
         if let Ok(v) = serde_json::from_str::<Value>(line) {
-            let has_thread = v.get("parentUuid").is_some() || v.get("sessionId").is_some();
             let ty = v.get("type").and_then(Value::as_str).unwrap_or("");
+            if matches!(
+                ty,
+                "summary"
+                    | "file-history-snapshot"
+                    | "ai-title"
+                    | "mode"
+                    | "permission-mode"
+                    | "last-prompt"
+                    | "attachment"
+                    | "progress"
+                    | "started"
+                    | "result"
+                    | "queue-operation"
+                    | "x-quota"
+            ) {
+                continue; // known Claude meta record — doesn't count against the window
+            }
+            let has_thread = v.get("parentUuid").is_some() || v.get("sessionId").is_some();
             if has_thread && matches!(ty, "user" | "assistant") {
                 return Sniff::Claude;
             }
         }
+        inspected += 1;
     }
 
     Sniff::Unknown
@@ -224,6 +250,23 @@ mod tests {
             .expect("codex session");
         assert_eq!(codex.id, "sess-123");
         assert_eq!(codex.messages.len(), 2);
+    }
+
+    #[test]
+    fn claude_with_many_leading_meta_records_still_sniffs() {
+        // Real transcripts can open with >8 summary / file-history-snapshot records; they must not
+        // exhaust the sniff window and drop the upload as Unknown.
+        let mut lines: Vec<String> = (0..9)
+            .map(|i| format!(r#"{{"type":"summary","summary":"topic {i}","leafUuid":"l{i}"}}"#))
+            .collect();
+        lines.push(r#"{"type":"file-history-snapshot","messageId":"m0","snapshot":{"trackedFileBackups":{}}}"#.into());
+        lines.push(CLAUDE_SAMPLE.to_string());
+        let text = lines.join("\n");
+
+        let sessions = ingest_files(vec![("abc.jsonl".to_string(), text.into_bytes())]);
+        assert_eq!(sessions.len(), 1, "meta-heavy claude transcript should ingest");
+        assert_eq!(sessions[0].harness, Harness::Claude);
+        assert_eq!(sessions[0].messages.len(), 2);
     }
 
     #[test]

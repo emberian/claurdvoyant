@@ -12,11 +12,11 @@ name = "cv-mcp"
 path = "src/main.rs"
 
 [dependencies]
-cv-core = { path = "../cv-core", version = "0.9.18", package = "clustervision-core" }
-cv-search = { path = "../cv-search", version = "0.9.18" }
+cv-core = { path = "../cv-core", version = "0.9.20", package = "clustervision-core" }
+cv-search = { path = "../cv-search", version = "0.9.20" }
 serde.workspace = true
 serde_json.workspace = true
 anyhow.workspace = true
 chrono.workspace = true
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std", "io-util"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std", "io-util", "sync", "time"] }
 regex = "1"

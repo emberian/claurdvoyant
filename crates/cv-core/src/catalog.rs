@@ -402,9 +402,12 @@ mod imp {
     /// harness. Order: exact-id matches first. Empty on any error or a cold catalog.
     pub fn lookup(id: &str, harness: Option<Harness>) -> Vec<SessionRef> {
         let Some(conn) = open() else { return Vec::new() };
-        let like = format!("{id}%");
+        // Escape LIKE metacharacters so ids containing `%`/`_` match literally (same treatment as
+        // `events::sessions_touching`) — `_` is common in real session ids.
+        let escaped = id.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
+        let like = format!("{escaped}%");
         let Ok(mut stmt) = conn.prepare(&format!(
-            "SELECT {REF_COLUMNS} FROM sessions WHERE id=?1 OR id LIKE ?2
+            "SELECT {REF_COLUMNS} FROM sessions WHERE id=?1 OR id LIKE ?2 ESCAPE '\\'
              ORDER BY (id=?1) DESC",
         )) else {
             return Vec::new();

@@ -125,8 +125,8 @@ pub const FIELDS: &[FieldDef] = &[
         desc: "User+assistant message count.", example: "msgs>=50" },
     FieldDef { id: FieldId::Created, name: "created", aliases: &[], kind: Kind::Date, cost: Cost::Catalog,
         desc: "Creation time (date or RFC3339).", example: "created>2026-01-01" },
-    FieldDef { id: FieldId::Updated, name: "updated", aliases: &["before", "after"], kind: Kind::Date, cost: Cost::Catalog,
-        desc: "Last-updated time. (`before:`/`after:` are sugar for `updated<`/`updated>=`.)", example: "updated:2026-01-01..2026-04-01" },
+    FieldDef { id: FieldId::Updated, name: "updated", aliases: &["before", "after", "until", "since"], kind: Kind::Date, cost: Cost::Catalog,
+        desc: "Last-updated time. (`before:`/`until:` are sugar for `updated<`; `after:`/`since:` for `updated>=`.)", example: "updated:2026-01-01..2026-04-01" },
     FieldDef { id: FieldId::Git, name: "git", aliases: &["branch"], kind: Kind::Str, cost: Cost::Parse,
         desc: "Git branch or repo (substring). Parse-required.", example: "git:main" },
     FieldDef { id: FieldId::Thread, name: "thread", aliases: &["path"], kind: Kind::Str, cost: Cost::Parse,
@@ -710,7 +710,13 @@ fn session_as_ref(s: &Session) -> SessionRef {
         title: s.title.clone(),
         created_at: s.created_at,
         updated_at: s.updated_at,
-        message_count: s.messages.len(),
+        // `SessionRef.message_count` is contractually user+assistant turns only (see ir.rs), so
+        // `msgs:` must count the same way here as the catalog prefilter does.
+        message_count: s
+            .messages
+            .iter()
+            .filter(|m| matches!(m.role, crate::ir::Role::User | crate::ir::Role::Assistant))
+            .count(),
     }
 }
 
@@ -720,12 +726,22 @@ fn session_as_ref(s: &Session) -> SessionRef {
 
 #[derive(Debug, Clone, PartialEq)]
 enum Tok {
-    Word(String), // a bare/quoted chunk (may contain a field:op:value)
+    Word(Word), // a bare/quoted chunk (may contain a field:op:value)
     And,
     Or,
     Not,
     LParen,
     RParen,
+}
+
+/// A lexed word plus where its quoting started, so the parser can tell `title:"a, b"` (a quoted
+/// value: commas are literal, not an OR-list) and `"http://x"` (a fully-quoted needle: never a
+/// field term) apart from bare text. Quoting info would otherwise be lost before value parsing.
+#[derive(Debug, Clone, PartialEq)]
+struct Word {
+    text: String,
+    /// Byte offset in `text` where the first quoted character landed, if any part was quoted.
+    quoted_from: Option<usize>,
 }
 
 /// Tokenize: split on whitespace honoring quotes; recognize `(`/`)` and the keywords AND/OR/NOT and
@@ -761,12 +777,17 @@ fn lex(input: &str) -> Result<Vec<Tok>, String> {
             i += 1;
             continue;
         }
-        // Read a word, honoring quotes and stopping at whitespace/parens.
+        // Read a word, honoring quotes and stopping at whitespace/parens. Remember where quoting
+        // began so the parser can treat quoted content literally (see [`Word`]).
         let mut w = String::new();
+        let mut quoted_from: Option<usize> = None;
         let mut in_quote = false;
         while i < chars.len() {
             let c = chars[i];
             if c == '"' {
+                if !in_quote && quoted_from.is_none() {
+                    quoted_from = Some(w.len());
+                }
                 in_quote = !in_quote;
                 i += 1;
                 continue;
@@ -780,11 +801,12 @@ fn lex(input: &str) -> Result<Vec<Tok>, String> {
         if in_quote {
             return Err("unterminated quote — see `cv query`".to_string());
         }
-        match w.as_str() {
-            "AND" | "and" => out.push(Tok::And),
-            "OR" | "or" => out.push(Tok::Or),
-            "NOT" | "not" => out.push(Tok::Not),
-            _ => out.push(Tok::Word(w)),
+        // Keywords only when unquoted: `"and"` is a needle, AND is an operator.
+        match (w.as_str(), quoted_from) {
+            ("AND" | "and", None) => out.push(Tok::And),
+            ("OR" | "or", None) => out.push(Tok::Or),
+            ("NOT" | "not", None) => out.push(Tok::Not),
+            _ => out.push(Tok::Word(Word { text: w, quoted_from })),
         }
     }
     Ok(out)
@@ -872,10 +894,18 @@ impl Parser {
 
 /// Parse one word into an [`Expr`]: a `field<op>value` term, or a bare needle that matches
 /// title/cwd/id (an OR over the three).
-fn parse_term(w: &str) -> Result<Expr, String> {
-    if let Some((field, op, value)) = split_op(w) {
-        // A known field → a real term. An unknown but field-shaped key (`foo:bar`) is an error
-        // (typo guard). Anything else (e.g. a bare `http://…` with a colon) falls back to a needle.
+fn parse_term(w: &Word) -> Result<Expr, String> {
+    // A word that *starts* quoted is a phrase, never a field term: `"http://x"`, `"key: value"`.
+    if w.quoted_from == Some(0) {
+        return Ok(bare(&w.text));
+    }
+    if let Some((field, op, value)) = split_op(&w.text) {
+        // Was (any of) the value quoted? Quoted values are literal: exempt from comma-OR-splitting.
+        let vstart = w.text.len() - value.len();
+        let value_quoted = w.quoted_from.is_some_and(|q| q >= vstart);
+        // A known field → a real term. An unknown key that's one typo away from a known field is
+        // an error (typo guard). Anything else (a bare `http://…`, `key:value` prose) falls back
+        // to a plain needle.
         if let Some(def) = field_for(field) {
             // `thread:` parses its value with the message-path sub-grammar, not as a plain string.
             if def.id == FieldId::Thread {
@@ -913,20 +943,76 @@ fn parse_term(w: &str) -> Result<Expr, String> {
                     def.name
                 ));
             }
-            let val = parse_value(def, op, value)?;
-            // Sugar: before:/after: map onto updated< / updated>=.
-            let op = match field {
-                "before" | "until" => Op::Lt,
-                "after" | "since" => Op::Ge,
+            // Sugar: before:/until: and after:/since: map onto updated< / updated>=. They only
+            // take `:` — an explicit comparison on sugar (`before>=x`) is contradictory, so it
+            // teaches instead of being silently overridden.
+            let op = match field.to_ascii_lowercase().as_str() {
+                f @ ("before" | "until" | "after" | "since") => {
+                    let sugar = if matches!(f, "before" | "until") { Op::Lt } else { Op::Ge };
+                    if op != Op::Contains {
+                        return Err(format!(
+                            "{f}: is sugar for `updated{}` and only takes `:` — write `updated{}` for an explicit comparison — see `cv query`",
+                            sugar.as_str(),
+                            op.as_str()
+                        ));
+                    }
+                    sugar
+                }
                 _ => op,
             };
+            let val = parse_value(def, op, value, value_quoted)?;
             return Ok(Expr::Term(Term { field: def.id, op, val }));
         }
-        if field.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') && op == Op::Contains {
-            return Err(format!("unknown field {field:?} — see `cv query` for the field list"));
+        if let Some(name) = close_field(field) {
+            return Err(format!(
+                "unknown field {field:?} (did you mean `{name}`?) — see `cv query` for the field list"
+            ));
         }
+        // Not a known field and not a near-miss: fall through to a plain needle, so bare URLs
+        // (`http://…`) and `key:value`-shaped prose still search title/cwd/id.
     }
-    Ok(bare(w))
+    Ok(bare(&w.text))
+}
+
+/// The typo guard: a known field name/alias within one edit of `key`, so `harnes:claude` errors
+/// with a suggestion instead of silently becoming a needle. Short keys (< 3 chars) never fuzzy-
+/// match — one edit on a 1–2 char key reaches half the alphabet of aliases.
+fn close_field(key: &str) -> Option<&'static str> {
+    let k = key.to_ascii_lowercase();
+    if k.len() < 3 {
+        return None;
+    }
+    FIELDS
+        .iter()
+        .flat_map(|f| std::iter::once(f.name).chain(f.aliases.iter().copied()))
+        .find(|cand| cand.len() >= 3 && within_one_edit(&k, cand))
+}
+
+/// Whether `a` and `b` are within one edit (insert / delete / substitute / adjacent transpose) —
+/// exact for distance ≤ 1, which is all [`close_field`] wants.
+fn within_one_edit(a: &str, b: &str) -> bool {
+    if a == b {
+        return true;
+    }
+    let (a, b): (Vec<char>, Vec<char>) = (a.chars().collect(), b.chars().collect());
+    match a.len().abs_diff(b.len()) {
+        0 => {
+            let diffs: Vec<usize> = (0..a.len()).filter(|&i| a[i] != b[i]).collect();
+            match diffs.as_slice() {
+                [_] => true,                                                   // one substitution
+                [i, j] => *j == *i + 1 && a[*i] == b[*j] && a[*j] == b[*i],    // one transposition
+                _ => false,
+            }
+        }
+        1 => {
+            // One insertion/deletion: after the common prefix, the shorter's tail matches the
+            // longer's tail shifted by one.
+            let (s, l) = if a.len() < b.len() { (&a, &b) } else { (&b, &a) };
+            let i = s.iter().zip(l.iter()).take_while(|(x, y)| x == y).count();
+            s[i..] == l[i + 1..]
+        }
+        _ => false,
+    }
 }
 
 /// Parse a `thread:` value — `step > step > …` — into a path of [`ThreadStep`]s. Each `>`-separated
@@ -1001,7 +1087,18 @@ fn bare(w: &str) -> Expr {
 // Value parsing.
 // ---------------------------------------------------------------------------
 
-fn parse_value(def: &FieldDef, _op: Op, raw: &str) -> Result<Val, String> {
+/// `quoted`: the value was quoted in the source — it's one literal needle, exempt from
+/// comma-OR-splitting (`title:"a, b"` is the phrase "a, b", not `a OR b`).
+fn parse_value(def: &FieldDef, op: Op, raw: &str, quoted: bool) -> Result<Val, String> {
+    /// Split an unquoted value into its comma-OR-list; keep a quoted value whole.
+    fn or_list(raw: &str, quoted: bool, lower: bool) -> Vec<String> {
+        let norm = |s: &str| if lower { s.to_lowercase() } else { s.to_string() };
+        if quoted {
+            std::iter::once(norm(raw)).filter(|s| !s.is_empty()).collect()
+        } else {
+            raw.split(',').map(|s| norm(s.trim())).filter(|s| !s.is_empty()).collect()
+        }
+    }
     match def.kind {
         Kind::Num => {
             if let Some((lo, hi)) = raw.split_once("..") {
@@ -1013,16 +1110,20 @@ fn parse_value(def: &FieldDef, _op: Op, raw: &str) -> Result<Val, String> {
         Kind::Date => {
             if let Some((lo, hi)) = raw.split_once("..") {
                 Ok(Val::DateRange(parse_date(lo)?, parse_date(hi)?))
+            } else if op == Op::Contains {
+                // A plain `field:DATE` means "any time that day", not "exactly midnight".
+                if let Ok(d) = NaiveDate::parse_from_str(raw.trim(), "%Y-%m-%d") {
+                    let lo = d.and_hms_opt(0, 0, 0).expect("midnight").and_utc();
+                    let hi = lo + chrono::Duration::days(1) - chrono::Duration::nanoseconds(1);
+                    return Ok(Val::DateRange(lo, hi));
+                }
+                Ok(Val::Date(parse_date(raw)?)) // an RFC3339 instant stays exact
             } else {
                 Ok(Val::Date(parse_date(raw)?))
             }
         }
         Kind::HarnessEnum => {
-            let names: Vec<String> = raw
-                .split(',')
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect();
+            let names = or_list(raw, quoted, false);
             for n in &names {
                 if Harness::parse(n).is_none() {
                     return Err(format!("unknown harness {n:?} — see `cv query`"));
@@ -1031,11 +1132,7 @@ fn parse_value(def: &FieldDef, _op: Op, raw: &str) -> Result<Val, String> {
             Ok(Val::Strs(names))
         }
         Kind::Flag => {
-            let flags: Vec<String> = raw
-                .split(',')
-                .map(|s| s.trim().to_lowercase())
-                .filter(|s| !s.is_empty())
-                .collect();
+            let flags = or_list(raw, quoted, true);
             for fl in &flags {
                 if !HAS_FLAGS.iter().any(|(n, _)| n == fl) {
                     return Err(format!(
@@ -1047,11 +1144,7 @@ fn parse_value(def: &FieldDef, _op: Op, raw: &str) -> Result<Val, String> {
             Ok(Val::Strs(flags))
         }
         Kind::Str | Kind::Path => {
-            let strs: Vec<String> = raw
-                .split(',')
-                .map(|s| s.trim().to_lowercase())
-                .filter(|s| !s.is_empty())
-                .collect();
+            let strs = or_list(raw, quoted, true);
             if strs.is_empty() {
                 return Err(format!("empty value for {} — see `cv query`", def.name));
             }
@@ -1117,9 +1210,13 @@ pub fn reference() -> String {
     s.push_str("GRAMMAR\n");
     s.push_str("  terms combine with implicit AND; also: OR (or |), NOT (or a leading -), and ( ) grouping.\n");
     s.push_str("  a term is  field<op>value  — or a bare word, which matches title/cwd/id.\n");
+    s.push_str("  (an unknown `key:value` word is a bare needle too — so URLs just work; a near-miss\n");
+    s.push_str("   of a real field like `harnes:` errors with a suggestion.)\n");
     s.push_str("  ops: ':' (contains) '=' (exact) '~' (case-insensitive regex, on string fields)\n");
     s.push_str("       and for numbers/dates: > >= < <=\n");
-    s.push_str("  values: word | \"quoted phrase\" | a,b,c (OR-list) | lo..hi (range, numbers & dates)\n\n");
+    s.push_str("  values: word | \"quoted phrase\" | a,b,c (OR-list) | lo..hi (range, numbers & dates)\n");
+    s.push_str("  quoting is literal: commas inside quotes are text, not an OR-list, and a fully-quoted\n");
+    s.push_str("  word is always a needle. `field:YYYY-MM-DD` on a date field means that whole day.\n\n");
     s.push_str("FIELDS\n");
     let w = FIELDS.iter().map(|f| f.name.len()).max().unwrap_or(7);
     for f in FIELDS {

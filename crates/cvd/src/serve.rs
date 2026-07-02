@@ -6,8 +6,11 @@
 //! deliberately use a lightweight *synchronous* server ([`tiny_http`]) with a small worker-thread
 //! pool rather than an async stack — the workload is a handful of pollers, and simplicity wins.
 //!
-//! All `/api/*` responses are JSON with permissive CORS (`Access-Control-Allow-Origin: *`) so a
-//! dashboard on any origin can consume them; `OPTIONS` preflight is answered with a 204.
+//! The transcript corpus is sensitive (it can contain secrets), so the API is locked to local
+//! callers: the `Host` header must name this machine (defeats DNS rebinding), and CORS is echoed
+//! only for an allow-list of local origins (the served dashboard, `localhost`/`127.0.0.1` dev
+//! servers, and the Tauri app) — never `*`. An optional bearer token (`--token` / `$CVD_TOKEN`)
+//! additionally gates every `/api/*` request; `OPTIONS` preflight is answered with a 204.
 
 use anyhow::Result;
 use cv_core::{Flow, Harness, Message, MessageSink, ParseOptions, Session};
@@ -17,12 +20,21 @@ use std::sync::Arc;
 use std::time::Duration;
 use tiny_http::{Header, Method, Request, Response, Server};
 
+/// What one request handler needs to know beyond the request itself.
+struct Ctx {
+    /// The configured bind host, accepted in `Host`/`Origin` checks alongside the loopback names.
+    bind_host: String,
+    web_root: Option<PathBuf>,
+    /// When set, every `/api/*` request must carry `Authorization: Bearer <token>`.
+    token: Option<String>,
+}
+
 /// Run the HTTP server until the process is killed. Never returns under normal operation.
 ///
 /// When `web_root` is `Some(dir)`, any request that doesn't match an `/api/*` route is served as a
 /// static file from `dir` (with `index.html` for `/`), so the same process hosts both the JSON API
 /// and the browser dashboard.
-pub fn run(host: &str, port: u16, web_root: Option<PathBuf>) -> Result<()> {
+pub fn run(host: &str, port: u16, web_root: Option<PathBuf>, token: Option<String>) -> Result<()> {
     let server = Server::http((host, port)).map_err(|e| anyhow::anyhow!("failed to bind {host}:{port}: {e}"))?;
     // Canonicalize the web root once so per-request path-traversal checks are cheap and robust.
     let web_root = web_root.and_then(|d| match d.canonicalize() {
@@ -41,15 +53,23 @@ pub fn run(host: &str, port: u16, web_root: Option<PathBuf>) -> Result<()> {
     }
 
     let server = Arc::new(server);
-    let web_root = Arc::new(web_root);
+    let ctx = Arc::new(Ctx {
+        bind_host: host.to_string(),
+        web_root,
+        token,
+    });
     let mut workers = Vec::new();
     // A handful of workers is plenty for dashboard polling; they share the listener.
     for _ in 0..4 {
         let server = Arc::clone(&server);
-        let web_root = Arc::clone(&web_root);
+        let ctx = Arc::clone(&ctx);
         workers.push(std::thread::spawn(move || {
             for request in server.incoming_requests() {
-                handle(request, &web_root);
+                // A panicking handler must cost one response, not a worker for the process's life.
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handle(request, &ctx)));
+                if outcome.is_err() {
+                    eprintln!("cvd serve: request handler panicked; worker continuing");
+                }
             }
         }));
     }
@@ -60,14 +80,24 @@ pub fn run(host: &str, port: u16, web_root: Option<PathBuf>) -> Result<()> {
     Ok(())
 }
 
-/// Handle one request, never panicking: any error becomes a JSON error response.
-fn handle(request: Request, web_root: &Option<PathBuf>) {
+/// Handle one request: any error becomes a JSON error response.
+fn handle(request: Request, ctx: &Ctx) {
+    // DNS-rebinding guard: a hostile page can point its own domain at 127.0.0.1 and fetch us
+    // same-origin, but it can't forge the Host header — reject anything that isn't our own name.
+    if !host_allowed(header_value(&request, "Host").as_deref(), &ctx.bind_host) {
+        let _ = request.respond(json_response(403, &json!({"error": "forbidden host"}), None));
+        return;
+    }
+    // Echoed on API responses only when the Origin is on the local allow-list; never `*`.
+    let origin = allowed_origin(header_value(&request, "Origin").as_deref(), &ctx.bind_host);
+
     let method = request.method().clone();
     let raw_url = request.url().to_string();
 
-    // CORS preflight: answer every OPTIONS with a permissive 204.
+    // CORS preflight: a 204, CORS-tagged only for allowed origins. Unauthenticated by design —
+    // browsers strip credentials from preflights, and it discloses nothing.
     if method == Method::Options {
-        let _ = request.respond(no_content());
+        let _ = request.respond(no_content(origin.as_deref()));
         return;
     }
 
@@ -89,21 +119,88 @@ fn handle(request: Request, web_root: &Option<PathBuf>) {
 
     // Only GET (besides the OPTIONS handled above) is supported.
     if method != Method::Get {
-        let _ = request.respond(json_response(405, &json!({"error": "method not allowed"})));
+        let _ = request.respond(json_response(405, &json!({"error": "method not allowed"}), origin.as_deref()));
         return;
     }
 
     // Anything outside `/api/*` is a static-dashboard request when a web root is configured.
     let is_api = segments.first().map(|s| s == "api").unwrap_or(false);
     if !is_api {
-        if let Some(root) = web_root {
+        if let Some(root) = &ctx.web_root {
             let _ = request.respond(static_file(root, &segments));
             return;
         }
     }
 
+    if let Some(token) = &ctx.token {
+        let authed = header_value(&request, "Authorization")
+            .and_then(|v| v.strip_prefix("Bearer ").map(str::to_string))
+            .is_some_and(|t| t == *token);
+        if !authed {
+            let _ = request.respond(json_response(
+                401,
+                &json!({"error": "missing or invalid bearer token"}),
+                origin.as_deref(),
+            ));
+            return;
+        }
+    }
+
     let (status, body) = route(&segments, query);
-    let _ = request.respond(json_response(status, &body));
+    let _ = request.respond(json_response(status, &body, origin.as_deref()));
+}
+
+/// First value of a (case-insensitively named) request header, if present.
+fn header_value(request: &Request, name: &'static str) -> Option<String> {
+    request
+        .headers()
+        .iter()
+        .find(|h| h.field.equiv(name))
+        .map(|h| h.value.as_str().to_string())
+}
+
+/// The hostname part of a `Host` header or URL authority: strips a `:port`, unbrackets IPv6.
+fn host_name(authority: &str) -> &str {
+    match authority.strip_prefix('[') {
+        Some(rest) => rest.split(']').next().unwrap_or(rest),
+        None => authority.rsplit_once(':').map(|(name, _)| name).unwrap_or(authority),
+    }
+}
+
+/// A name this server answers to: the loopback names, or the configured bind host.
+fn is_local_name(name: &str, bind_host: &str) -> bool {
+    name == "127.0.0.1" || name == "::1" || name.eq_ignore_ascii_case("localhost") || name == bind_host
+}
+
+/// Whether a configured bind host is a loopback name/address.
+pub fn is_loopback_host(host: &str) -> bool {
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .trim_matches(['[', ']'])
+            .parse::<std::net::IpAddr>()
+            .map(|ip| ip.is_loopback())
+            .unwrap_or(false)
+}
+
+/// Whether the `Host` header names this machine. An explicitly non-loopback bind is an opt-in to
+/// remote clients whose Host we can't predict, so the check only bites on loopback binds.
+fn host_allowed(host_header: Option<&str>, bind_host: &str) -> bool {
+    if !is_loopback_host(bind_host) {
+        return true;
+    }
+    host_header.is_some_and(|h| is_local_name(host_name(h), bind_host))
+}
+
+/// The specific `Origin` to echo in `Access-Control-Allow-Origin`, if it's on the allow-list:
+/// the Tauri app's origins, or an http(s) origin on a local name (any port — a dev dashboard on
+/// e.g. `http://localhost:5173` is same-machine).
+fn allowed_origin(origin: Option<&str>, bind_host: &str) -> Option<String> {
+    let o = origin?;
+    if o == "tauri://localhost" || o == "http://tauri.localhost" {
+        return Some(o.to_string());
+    }
+    let authority = o.strip_prefix("http://").or_else(|| o.strip_prefix("https://"))?;
+    is_local_name(host_name(authority), bind_host).then(|| o.to_string())
 }
 
 /// Route a decoded path + raw query string to a `(status, json)` pair. Never panics.
@@ -766,32 +863,36 @@ fn err(status: u16, msg: &str) -> (u16, Value) {
     (status, json!({ "error": msg }))
 }
 
-/// Build a JSON response with permissive CORS headers.
-fn json_response(status: u16, body: &Value) -> Response<std::io::Cursor<Vec<u8>>> {
+/// Build a JSON response, CORS-tagged for `origin` when one was allowed.
+fn json_response(status: u16, body: &Value, origin: Option<&str>) -> Response<std::io::Cursor<Vec<u8>>> {
     let data = serde_json::to_vec(body).unwrap_or_else(|_| b"{\"error\":\"serialize failed\"}".to_vec());
     let mut resp = Response::from_data(data).with_status_code(status);
-    for h in cors_headers() {
+    for h in cors_headers(origin) {
         resp.add_header(h);
     }
     resp.add_header(header("Content-Type", "application/json"));
     resp
 }
 
-/// A 204 No Content with CORS headers, for `OPTIONS` preflight.
-fn no_content() -> Response<std::io::Empty> {
+/// A 204 No Content, CORS-tagged for `origin` when one was allowed — for `OPTIONS` preflight.
+fn no_content(origin: Option<&str>) -> Response<std::io::Empty> {
     let mut resp = Response::empty(204);
-    for h in cors_headers() {
+    for h in cors_headers(origin) {
         resp.add_header(h);
     }
     resp
 }
 
-fn cors_headers() -> Vec<Header> {
-    vec![
-        header("Access-Control-Allow-Origin", "*"),
-        header("Access-Control-Allow-Methods", "GET, OPTIONS"),
-        header("Access-Control-Allow-Headers", "*"),
-    ]
+/// CORS headers echoing the one allowed `origin` — an unlisted origin gets none (the browser then
+/// refuses to share the response with it). `Vary: Origin` keeps caches from mixing the two.
+fn cors_headers(origin: Option<&str>) -> Vec<Header> {
+    let mut headers = vec![header("Vary", "Origin")];
+    if let Some(o) = origin {
+        headers.push(header("Access-Control-Allow-Origin", o));
+        headers.push(header("Access-Control-Allow-Methods", "GET, OPTIONS"));
+        headers.push(header("Access-Control-Allow-Headers", "Authorization, Content-Type"));
+    }
+    headers
 }
 
 fn header(field: &str, value: &str) -> Header {

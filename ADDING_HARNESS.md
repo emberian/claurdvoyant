@@ -18,9 +18,11 @@ pub trait Adapter {
     fn storage_root(&self) -> Option<PathBuf>;   // where its sessions live ($HOME-relative); None = not installed
     fn discover(&self) -> Result<Vec<SessionRef>>; // cheap: list sessions w/ id, cwd, title, times, count
     fn parse(&self, r: &SessionRef) -> Result<Session>; // full: produce the IR
-    fn emit(&self, s: &Session, out: &Path) -> Result<EmitResult> { /* optional: be a conversion target */ }
 }
 ```
+
+(Being a *conversion target* — emitting the IR back out — is deliberately **not** part of the trait;
+see step 6.)
 
 You map the harness's on-disk data onto the IR ([`ir.rs`](crates/cv-core/src/ir.rs)) — see the
 [OpenSession standard](docs/OPENSESSION.md) for what each field means:
@@ -41,8 +43,13 @@ You map the harness's on-disk data onto the IR ([`ir.rs`](crates/cv-core/src/ir.
    `ir.rs` (`as_str` / `parse`). If you read SQLite, gate the module behind the `sqlite` feature.
 5. **Test against real data.** `cargo run -p cv -- ls --harness <name>` then `cv show <id>`. Add a small
    redacted fixture + a unit test.
-6. **(Optional) `emit`.** Implement it to make your harness a *conversion target* — then `cv convert … --to
-   <name>` works. The bar: `parse(emit(s)) == s` (round-trip). Add a round-trip test (see `emit.rs`).
+6. **(Optional) emit.** Make your harness a *conversion target* — then `cv convert … --to <name>` works.
+   Write an emitter with the signature
+   `pub fn emit(&Session, out_dir: &Path, &EmitOptions) -> Result<EmitResult>` (in your adapter module, or
+   in `emit.rs` alongside the others) and register it in **`emitter_for` in
+   [`crates/cv-core/src/emit.rs`](crates/cv-core/src/emit.rs)** — that match is the *single* emit registry;
+   the dispatcher and the CLI's `supported_targets()` list both derive from it, so there is nothing else to
+   keep in sync. The bar: `parse(emit(s)) == s` (round-trip). Add a round-trip test (see `emit.rs`).
 
 ## 🕰️ Historical variants — this is the hard, important part
 
@@ -82,6 +89,6 @@ object that deserves first-class modeling, open an issue — we'd love to grow t
 - [ ] registered in `mod.rs` + `Harness` variant in `ir.rs`
 - [ ] a redacted fixture + test for **each** format variant you've seen
 - [ ] `cargo test` green; `cv ls --harness <name>` shows your sessions
-- [ ] (optional) `emit` + a round-trip test
+- [ ] (optional) an emitter registered in `emitter_for` (`emit.rs`) + a round-trip test
 
 Thank you for making the archive a little more universal. 🔮💜

@@ -2,10 +2,25 @@
 
 use crate::util::{home_rel, parse_harness};
 use anyhow::{bail, Context, Result};
-use cv_core::ir::{Harness, Session};
-use cv_core::EmitOptions;
+use cv_core::ir::{Harness, Session, SessionRef};
+use cv_core::{Adapter, EmitOptions, ParseOptions};
 use std::fs;
 use std::path::{Path, PathBuf};
+
+/// Parse a session at the fidelity the conversion needs. Same-harness (a `cv port` rehome or an
+/// A→A convert) parses **format-complete** so the carrier/replay machinery preserves every record
+/// (meta lines, compact boundaries, exhaustive `extra`) — the emitter replays them verbatim.
+/// Cross-harness sticks to the plain full-fidelity parse: carriers hold *source*-native records
+/// that no other emitter can replay (they'd just surface as empty turns).
+fn parse_for_emit(adapter: &dyn Adapter, r: &SessionRef, to_h: Harness) -> Result<Session> {
+    if r.harness == to_h {
+        let mut s = cv_core::stream::collect_with(adapter, r, &ParseOptions::complete())?;
+        s.materialize();
+        Ok(s)
+    } else {
+        adapter.parse(r)
+    }
+}
 
 pub(crate) fn cmd_convert(
     id: &str,
@@ -17,7 +32,7 @@ pub(crate) fn cmd_convert(
     let from_h = parse_harness(&from)?;
     let to_h = Harness::parse(to).with_context(|| format!("unknown target harness: {to}"))?;
     let (r, adapter) = cv_core::find(id, from_h)?.with_context(|| format!("no session matching {id:?}"))?;
-    let session = adapter.parse(&r)?;
+    let session = parse_for_emit(adapter.as_ref(), &r, to_h)?;
     emit_session(
         &session,
         to_h,
@@ -39,12 +54,12 @@ pub(crate) fn cmd_port(
 ) -> Result<()> {
     let from_h = parse_harness(&from)?;
     let (r, adapter) = cv_core::find(id, from_h)?.with_context(|| format!("no session matching {id:?}"))?;
-    let session = adapter.parse(&r)?;
     // Default to the same harness — a pure rehome.
     let to_h = match to {
         Some(s) => Harness::parse(&s).with_context(|| format!("unknown target harness: {s}"))?,
-        None => session.harness,
+        None => r.harness,
     };
+    let session = parse_for_emit(adapter.as_ref(), &r, to_h)?;
     let new_cwd = to_dir.clone();
     emit_session(
         &session,
@@ -121,10 +136,15 @@ pub(crate) fn emit_session(session: &Session, to_h: Harness, out: Option<PathBuf
             .and_then(|a| a.storage_root())
             .with_context(|| format!("{to_h} doesn't appear installed; pass --out <dir> to write somewhere"))?,
     };
-    let res = cv_core::emit(session, to_h, &out_dir, &opts)?;
+    // Verified emit: after writing, re-parse the output with the target's own adapter and diff it
+    // against the source IR, so a lossy conversion is *visible* instead of silent.
+    let (res, warnings) = cv_core::emit::emit_verified(session, to_h, &out_dir, &opts)?;
     println!("✦ wrote {} ({})", res.path.display(), res.new_id);
     if let Some(hint) = res.resume_hint {
         println!("  ↳ {hint}");
+    }
+    for w in &warnings {
+        eprintln!("  ⚠ lossy: {w}");
     }
     Ok(())
 }

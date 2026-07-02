@@ -61,13 +61,13 @@ pub(crate) fn cmd_share(id: &str, harness: Option<String>, out: Option<PathBuf>,
 
     let size = std::fs::metadata(&out_path).map(|m| m.len()).unwrap_or(0);
     eprintln!(
-        "🔮 wrote {} — {count} message(s), {}",
+        "✦ wrote {} — {count} message(s), {}",
         out_path.display(),
         human_size(size),
     );
     if !no_redact {
         eprintln!(
-            "🛡 redacted {} item(s): {} api_key, {} private_key, {} jwt, {} email, {} blob, {} assignment",
+            "✦ redacted {} item(s): {} api_key, {} private_key, {} jwt, {} email, {} blob, {} assignment",
             stats.total(),
             stats.api_keys,
             stats.private_keys,

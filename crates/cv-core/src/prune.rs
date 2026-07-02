@@ -2,13 +2,16 @@
 //! session. Instead of handing a full context window to the summarizer (which rewrites your history
 //! into a lossy paragraph), prune snips the **bulky old tool payloads** — large file reads, command
 //! logs, base64 screenshots — out of the conversation and into a sidecar, leaving a small `[PRUNED
-//! id=…]` marker in their place. Your prompts and the chronological flow are preserved **verbatim**;
-//! the most recent turns are left untouched so the model stays sharp on what it's doing right now.
+//! id=…]` marker in their place. Your prompts and the chronological flow are preserved; the most
+//! recent turns are left untouched so the model stays sharp on what it's doing right now.
 //!
-//! The approach (and its byte-faithfulness) is adapted from the validated `flatten-mcp` flattener:
-//! we operate on the **raw JSONL lines**, never on our IR — so every Claude-specific field survives
-//! a round-trip and the result resumes cleanly with `claude --resume <new-id>`. What we add on top:
-//! a fresh session id stamped across every line (so it's a genuinely new session, not an in-place
+//! The approach is adapted from the validated `flatten-mcp` flattener: we operate on the **raw
+//! JSONL lines**, never on our IR — so every Claude-specific field survives a round-trip and the
+//! result resumes cleanly with `claude --resume <new-id>`. Fidelity is *value-level*, not
+//! byte-level: lines we rewrite (anything carrying a `sessionId`, or with a snipped payload) go
+//! through serde_json, which may normalize key order and whitespace; the JSON **values** — and the
+//! payloads stashed in the sidecar — are preserved verbatim. What we add on top of the flattener: a
+//! fresh session id stamped across every line (so it's a genuinely new session, not an in-place
 //! rewrite), a copy of the session's sidecar resources (`subagents/`, `workflows/`) under the new
 //! id, and a **keep-last** window so only *old* payloads are snipped.
 //!
@@ -17,6 +20,11 @@
 //!     every turn (this is what actually costs context tokens).
 //!  2. the top-level `toolUseResult` mirror Claude keeps per result line — disk-only (the model never
 //!     sees it), but snipping it shrinks the file and our parse.
+//!
+//! Lines with `isSidechain: true` are sub-agent turns whose token usage belongs to a *different*
+//! context window: they ride along as content (kept, dropped, or snipped by position) but are never
+//! counted as conversational turns, never contribute usage to `--window` sizing or `--revive`
+//! arithmetic, and are never chosen as the re-root of a windowed tail.
 
 use anyhow::{bail, Context, Result};
 use serde_json::Value;
@@ -58,9 +66,12 @@ pub struct PruneOptions {
     /// window and corrects the stale number, so the gate lets you back in. Off by default — it edits
     /// recorded metadata, not just content. The source is still never touched (new id only).
     pub revive: bool,
-    /// Sliding window: keep only the NEWEST conversational turns whose content sums to ≤ this many
-    /// tokens, dropping older turns entirely (lossy — but the source session is never touched, so it
-    /// stays the full backup). The kept tail is re-rooted into a standalone resumable session.
+    /// Sliding window: keep only the NEWEST conversational turns whose content sums to **≤ this many
+    /// tokens**, dropping older turns entirely (lossy — but the source session is never touched, so it
+    /// stays the full backup). The kept tail is re-rooted into a standalone resumable session. If even
+    /// the single newest turn exceeds the budget, that one turn is kept anyway and a warning is
+    /// reported (see [`PruneResult::warnings`]) — resume may still hit the context wall. Snapping the
+    /// tail back to its opening user prompt can also add back a fraction of one turn.
     pub window: Option<u64>,
     /// Explicit message subrange `[start, end)` (turn indices) to keep, dropping everything outside
     /// it. `end = None` ⇒ through the last turn. Like `window` but selected by index, not budget.
@@ -112,6 +123,9 @@ pub struct PruneResult {
     pub revive_tokens: Option<u64>,
     /// `--revive`: the stale figure it replaced — the largest pre-revive usage total in the loaded window.
     pub revive_old_tokens: Option<u64>,
+    /// Data-safety warnings (e.g. a `--window` tail that exceeds its budget because a single turn is
+    /// bigger than the whole budget). Also echoed to stderr.
+    pub warnings: Vec<String>,
     pub dry_run: bool,
 }
 
@@ -134,28 +148,42 @@ struct SidecarEntry {
     kind: String, // "text" | "image" | "mixed"
 }
 
-/// Size a `--window` tail by Claude's OWN recorded token counts — no estimator. Returns the turn to
-/// keep from and the real content-token size of that tail, or `None` if the session has no `usage`
-/// records (then the caller falls back to a byte estimate).
+/// Sub-agent (Task tool) lines carry `isSidechain: true`; their usage belongs to the sub-agent's
+/// own context window, not the main thread's.
+fn is_sidechain(v: &Value) -> bool {
+    v.get("isSidechain").and_then(Value::as_bool).unwrap_or(false)
+}
+
+/// A main-thread conversational turn (sidechain user/assistant lines don't count).
+fn is_main_turn(v: &Value) -> bool {
+    matches!(v.get("type").and_then(Value::as_str), Some("user" | "assistant")) && !is_sidechain(v)
+}
+
+/// Size a `--window` tail by Claude's OWN recorded token counts — no estimator. Returns
+/// `(turn to keep from, real content-token size of that tail, overshoot)`, or `None` if the session
+/// has no `usage` records (then the caller falls back to a byte estimate). `overshoot` is set when
+/// even the single newest turn exceeds the budget — we keep that turn anyway (an empty session
+/// wouldn't be a session), and the caller must warn.
 ///
 /// Why this is exact (not a guess): within the last compaction segment, a turn's recorded `usage`
 /// (input + cache) IS the real context size at that point, monotonically increasing. The standalone
 /// size of the tail kept from turn S is therefore `usage_end - usage[S-1]` — the shared prefix
-/// cancels — so we pick the largest tail whose real size ≤ budget. Capped at the last segment so the
-/// cancellation holds (older segments were compacted away and aren't a clean prefix). This is the
-/// same arithmetic that predicts a resume exactly: a 250k-byte-estimate tail that loads as 373k real
-/// is just `usage_end - usage[cutoff]`, which no byte ratio can know but the recorded numbers do.
-fn usage_window_cutoff(lines: &[&str], budget: u64) -> Option<(usize, u64)> {
-    // Per assistant turn that carries a usage record: (turn index, cumulative usage, starts a new
+/// cancels — so we pick the **largest tail whose real size ≤ budget**. Capped at the last segment so
+/// the cancellation holds (older segments were compacted away and aren't a clean prefix). This is
+/// the same arithmetic that predicts a resume exactly: a 250k-byte-estimate tail that loads as 373k
+/// real is just `usage_end - usage[cutoff]`, which no byte ratio can know but the recorded numbers
+/// do. Sidechain lines are skipped entirely — their usage measures a different context.
+fn usage_window_cutoff(parsed: &[Option<Value>], budget: u64) -> Option<(usize, u64, bool)> {
+    // Per main-thread turn that carries a usage record: (turn index, cumulative usage, starts a new
     // compaction segment). Cumulative usage is monotonic WITHIN a segment but resets across a
     // compaction boundary, so we can't subtract across the whole session — we work in per-turn deltas.
     let mut ti = 0usize;
     let mut recs: Vec<(usize, u64, bool)> = Vec::new();
     let mut boundary_pending = false;
-    for line in lines {
-        let Ok(v) = serde_json::from_str::<Value>(line) else {
+    for v in parsed.iter().flatten() {
+        if is_sidechain(v) {
             continue;
-        };
+        }
         match v.get("type").and_then(Value::as_str) {
             Some("user") | Some("assistant") => {
                 // Prefer `_cv_orig_ctx` (the real count a prior revive stashed) over the live usage,
@@ -197,40 +225,55 @@ fn usage_window_cutoff(lines: &[&str], budget: u64) -> Option<(usize, u64)> {
         costs.push((*t, cost));
         prev = *u;
     }
-    // Accumulate real cost from the newest turn backward until the budget is met — this spans
-    // compaction boundaries correctly (each segment's content counted once, via its deltas).
+    // Accumulate real cost from the newest turn backward, stopping BEFORE the budget would be
+    // exceeded (the ≤-budget contract) — this spans compaction boundaries correctly (each segment's
+    // content counted once, via its deltas). If even the newest turn alone busts the budget, keep it
+    // and flag the overshoot.
     let mut acc = 0u64;
     let mut start = recs.last().unwrap().0 + 1;
+    let mut overshoot = false;
+    let mut fits_whole = true;
     for (t, c) in costs.iter().rev() {
-        acc += c;
-        start = *t;
-        if acc >= budget {
+        if acc.saturating_add(*c) > budget {
+            if acc == 0 {
+                acc = *c;
+                start = *t;
+                overshoot = true;
+            }
+            fits_whole = false;
             break;
         }
+        acc += c;
+        start = *t;
     }
-    Some((start, acc))
+    if fits_whole {
+        start = 0; // the whole session fits — keep everything, incl. turns before the first record
+    }
+    Some((start, acc, overshoot))
 }
 
 /// Resolve which conversational turns (`[start, end)`) a `--window`/`--range` prune keeps, plus the
-/// real token size of the kept tail when known (from `usage`). `--range` is explicit; `--window`
-/// sizes by Claude's recorded usage (falling back to a byte estimate only when usage is absent),
-/// snapped back to a user turn so the tail opens on a prompt. Neither set ⇒ the whole session.
+/// real token size of the kept tail when known (from `usage`) and whether the ≤-budget contract had
+/// to be overshot (a single turn bigger than the budget). `--range` is explicit; `--window` sizes by
+/// Claude's recorded usage (falling back to a byte estimate only when usage is absent), snapped back
+/// to a user turn so the tail opens on a prompt. Neither set ⇒ the whole session.
 fn select_kept_turns(
-    lines: &[&str],
+    parsed: &[Option<Value>],
     opts: &PruneOptions,
     total_turns: usize,
-) -> (usize, usize, Option<u64>) {
+) -> (usize, usize, Option<u64>, bool) {
     if let Some((s, e)) = opts.keep_range {
         let end = e.unwrap_or(total_turns).min(total_turns);
-        return (s.min(end), end, None);
+        return (s.min(end), end, None, false);
     }
     let Some(budget) = opts.window else {
-        return (0, total_turns, None);
+        return (0, total_turns, None, false);
     };
 
-    let is_user: Vec<bool> = lines
+    let is_user: Vec<bool> = parsed
         .iter()
-        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .flatten()
+        .filter(|v| !is_sidechain(v))
         .filter_map(|v| match v.get("type").and_then(Value::as_str) {
             Some(t @ ("user" | "assistant")) => Some(t == "user"),
             _ => None,
@@ -245,27 +288,37 @@ fn select_kept_turns(
     };
 
     // PRINCIPLED path: size by Claude's own recorded token counts.
-    if let Some((start, real)) = usage_window_cutoff(lines, budget) {
-        return (snap(start), total_turns, Some(real));
+    if let Some((start, real, overshoot)) = usage_window_cutoff(parsed, budget) {
+        return (snap(start), total_turns, Some(real), overshoot);
     }
 
-    // Fallback (no usage records): byte estimate of message.content, newest-backward to budget.
-    let per_turn: Vec<u64> = lines
+    // Fallback (no usage records): byte estimate of message.content, newest-backward, keeping the
+    // largest tail whose estimate is ≤ budget (same contract as the usage path).
+    let per_turn: Vec<u64> = parsed
         .iter()
-        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
-        .filter(|v| matches!(v.get("type").and_then(Value::as_str), Some("user" | "assistant")))
+        .flatten()
+        .filter(|v| is_main_turn(v))
         .map(|v| v.get("message").and_then(|m| m.get("content")).map(est_tokens).unwrap_or(0))
         .collect();
     let mut acc = 0u64;
     let mut start = per_turn.len();
+    let mut overshoot = false;
     for i in (0..per_turn.len()).rev() {
-        acc += per_turn[i];
-        start = i;
-        if acc >= budget {
+        if acc.saturating_add(per_turn[i]) > budget {
+            if acc == 0 {
+                // Even the single newest turn exceeds the budget: keep it, but flag the overshoot.
+                start = i;
+                overshoot = true;
+            }
             break;
         }
+        acc += per_turn[i];
+        start = i;
     }
-    (snap(start), total_turns, None)
+    if start == per_turn.len() {
+        start = 0; // no turns at all — degenerate, keep everything
+    }
+    (snap(start), total_turns, None, overshoot)
 }
 
 /// Prune `src_path` (a Claude `<id>.jsonl`) into a new session. Returns what happened.
@@ -273,16 +326,15 @@ pub fn prune_session(src_path: &Path, opts: &PruneOptions) -> Result<PruneResult
     let raw = std::fs::read_to_string(src_path).with_context(|| format!("reading session {}", src_path.display()))?;
     let original_size = raw.len() as u64;
     let lines: Vec<&str> = raw.trim_end().split('\n').collect();
+    // Parse every line ONCE; all later passes (tool-name map, turn counting, window sizing, the
+    // rewrite loop) share this instead of each re-parsing the file. The rewrite loop consumes it,
+    // freeing each Value as its output line is emitted.
+    let parsed: Vec<Option<Value>> = lines.iter().map(|l| serde_json::from_str::<Value>(l).ok()).collect();
 
-    let source_id = lines
+    let source_id = parsed
         .iter()
-        .find_map(|l| {
-            serde_json::from_str::<Value>(l)
-                .ok()?
-                .get("sessionId")?
-                .as_str()
-                .map(String::from)
-        })
+        .flatten()
+        .find_map(|v| v.get("sessionId")?.as_str().map(String::from))
         .unwrap_or_default();
     let new_id = opts.new_id.clone().unwrap_or_else(new_uuid);
     if new_id == source_id {
@@ -296,30 +348,28 @@ pub fn prune_session(src_path: &Path, opts: &PruneOptions) -> Result<PruneResult
 
     // Map tool_use_id -> (name, input) from assistant tool_use blocks (which use `id`, not
     // `tool_use_id`); tool_result blocks only carry the id, not the name.
-    let tool_names = build_tool_name_map(&lines);
+    let tool_names = build_tool_name_map(&parsed);
 
     // Conversational-turn index per line, so keep-last can spare the most recent turns. A line is
-    // "old" (eligible to snip) iff its turn index is before the keep-last window.
-    let total_turns = lines
-        .iter()
-        .filter(|l| {
-            serde_json::from_str::<Value>(l)
-                .ok()
-                .and_then(|v| {
-                    v.get("type")
-                        .and_then(Value::as_str)
-                        .map(|t| t == "user" || t == "assistant")
-                })
-                .unwrap_or(false)
-        })
-        .count();
+    // "old" (eligible to snip) iff its turn index is before the keep-last window. Sidechain lines
+    // are positioned by the surrounding main-thread turn but never counted.
+    let total_turns = parsed.iter().flatten().filter(|v| is_main_turn(v)).count();
     let keep_from = total_turns.saturating_sub(opts.keep_last);
 
     // `--window`/`--range`: select which conversational turns survive; the rest are dropped and the
     // first survivor is re-rooted after the loop. Defaults to the whole session (no-op).
-    let (keep_start, keep_end, window_real) = select_kept_turns(&lines, opts, total_turns);
+    let (keep_start, keep_end, window_real, overshoot) = select_kept_turns(&parsed, opts, total_turns);
     let windowing = keep_start > 0 || keep_end < total_turns;
     let mut dropped_turns = 0usize;
+    let mut warnings: Vec<String> = Vec::new();
+    if overshoot {
+        warnings.push(format!(
+            "--window {}: the single newest turn alone is ~{} tokens — kept it, but the tail EXCEEDS \
+             the requested budget and resume may still hit the context wall",
+            opts.window.unwrap_or(0),
+            window_real.map(|t| t.to_string()).unwrap_or_else(|| "?".into()),
+        ));
+    }
 
     let mut out_lines: Vec<String> = Vec::with_capacity(lines.len());
     let mut sidecar: Vec<SidecarEntry> = Vec::new();
@@ -328,89 +378,107 @@ pub fn prune_session(src_path: &Path, opts: &PruneOptions) -> Result<PruneResult
     let mut est_tokens_saved = 0u64;
     let mut turn = 0usize;
 
-    for line in &lines {
-        let Ok(mut v) = serde_json::from_str::<Value>(line) else {
+    for (idx, (pv, line)) in parsed.into_iter().zip(lines.iter()).enumerate() {
+        let Some(mut v) = pv else {
             out_lines.push((*line).to_string()); // non-JSON line: verbatim
             continue;
         };
 
         // Stamp the new session id on every line that carries one.
-        if v.get("sessionId").is_some() {
+        let had_session_id = v.get("sessionId").is_some();
+        if had_session_id {
             v["sessionId"] = Value::String(new_id.clone());
         }
 
         let ty = v.get("type").and_then(Value::as_str).unwrap_or("");
-        let is_turn = ty == "user" || ty == "assistant";
+        let sidechain = is_sidechain(&v);
+        let is_turn_line = ty == "user" || ty == "assistant";
+        let is_turn = is_turn_line && !sidechain;
         let this_turn = turn;
         if is_turn {
             turn += 1;
         }
-        let is_old = is_turn && this_turn < keep_from;
+        let is_old = is_turn_line && this_turn < keep_from;
 
-        // `--window`/`--range`: drop turns (and the records between them) outside the kept range.
-        if windowing && (this_turn < keep_start || this_turn >= keep_end) {
-            if is_turn {
-                dropped_turns += 1;
+        // `--window`/`--range`: drop turns outside the kept range. Non-turn records (system lines,
+        // file-history snapshots, sidechain lines) travel with the turn they precede — EXCEPT:
+        //  * `summary` (title) records are always kept so the new session keeps its label (their
+        //    `leafUuid` may dangle after a head drop; Claude Code tolerates that);
+        //  * records trailing the FINAL kept turn are kept when the range runs to the end of the
+        //    session (they belong to the kept tail, not to any dropped turn).
+        if windowing {
+            let drop_line = if is_turn {
+                this_turn < keep_start || this_turn >= keep_end
+            } else if ty == "summary" {
+                false
+            } else {
+                this_turn < keep_start || (keep_end < total_turns && this_turn >= keep_end)
+            };
+            if drop_line {
+                if is_turn {
+                    dropped_turns += 1;
+                }
+                continue;
             }
-            continue;
         }
 
-        // Only old user messages carry snippable tool results.
+        // Unique per-line key for sidecar ids when a block has no id of its own: the line's uuid,
+        // or its file line index as a last resort — never a shared constant (collisions would make
+        // earlier sidecar payloads unretrievable).
+        let line_key = v
+            .get("uuid")
+            .and_then(Value::as_str)
+            .map(String::from)
+            .unwrap_or_else(|| format!("L{idx}"));
+
+        let mut modified = false;
         if is_old && ty == "user" {
-            let mut modified = false;
+            // Only old user messages carry snippable tool results.
             prune_user_line(
                 &mut v,
                 opts,
                 &tool_names,
                 &new_id,
+                &line_key,
                 &mut sidecar,
                 &mut pruned_count,
                 &mut image_blocks,
                 &mut est_tokens_saved,
                 &mut modified,
             );
-            out_lines.push(if modified {
-                v.to_string()
-            } else {
-                reserialize_with_id(line, &new_id)
-            });
-            continue;
-        }
-
-        // `--thinking`: flatten the OLDEST assistant reasoning (recent thinking, within keep-last,
-        // stays verbatim so the resumed agent keeps its live train of thought).
-        if is_old && ty == "assistant" && opts.thinking {
-            let mut modified = false;
+        } else if is_old && ty == "assistant" && opts.thinking {
+            // `--thinking`: flatten the OLDEST assistant reasoning (recent thinking, within
+            // keep-last, stays verbatim so the resumed agent keeps its live train of thought).
             prune_assistant_thinking(
                 &mut v,
                 opts,
                 &new_id,
+                &line_key,
                 &mut sidecar,
                 &mut pruned_count,
                 &mut est_tokens_saved,
                 &mut modified,
             );
-            out_lines.push(if modified {
-                v.to_string()
-            } else {
-                reserialize_with_id(line, &new_id)
-            });
-            continue;
         }
 
-        // Untouched line — but still re-emit with the new session id when we changed it.
-        out_lines.push(reserialize_with_id(line, &new_id));
+        // Untouched lines without a sessionId stay byte-identical; anything stamped or snipped is
+        // re-serialized (values preserved; key order/whitespace may normalize).
+        out_lines.push(if modified || had_session_id {
+            v.to_string()
+        } else {
+            (*line).to_string()
+        });
     }
 
-    // Re-root the first surviving turn: its parentUuid points at a now-dropped message, which would
-    // break the resume chain. Null it so the kept tail is a valid standalone conversation.
-    if windowing {
+    // Re-root the first surviving main-thread turn: its parentUuid points at a now-dropped message,
+    // which would break the resume chain. Null it so the kept tail is a valid standalone
+    // conversation. Sidechain lines are skipped — a sub-agent turn can't root the main thread.
+    if windowing && keep_start > 0 {
         for l in out_lines.iter_mut() {
             let Ok(mut v) = serde_json::from_str::<Value>(l) else {
                 continue;
             };
-            let ty = v.get("type").and_then(Value::as_str).unwrap_or("");
-            if ty == "user" || ty == "assistant" {
+            if is_main_turn(&v) {
                 if v.get("parentUuid").is_some_and(|p| !p.is_null()) {
                     v["parentUuid"] = Value::Null;
                     *l = v.to_string();
@@ -463,6 +531,7 @@ pub fn prune_session(src_path: &Path, opts: &PruneOptions) -> Result<PruneResult
         window_real_tokens: window_real,
         revive_tokens,
         revive_old_tokens,
+        warnings,
         dry_run: opts.dry_run,
     })
 }
@@ -477,7 +546,10 @@ pub fn prune_session(src_path: &Path, opts: &PruneOptions) -> Result<PruneResult
 /// We recompute the honest size of the **loaded window** — everything after the last compaction
 /// boundary, which is what Claude actually re-sends on resume — and rewrite every usage record in that
 /// window that still over-reports, pinning it to the honest figure with the cache counters zeroed (a
-/// fresh resume has no live cache anyway). Returns `(records rewritten, honest tokens, stale max)`.
+/// fresh resume has no live cache anyway). The honest figure combines recorded-usage **deltas** (real
+/// evidence, span by span — see [`honest_window_tokens`]) with byte estimates, always preferring the
+/// **higher** supported figure so the gate errs on the safe side: it must never be talked into loading
+/// a session that would blow the real limit. Returns `(records rewritten, honest tokens, stale max)`.
 fn revive_usage(
     out_lines: &mut [String],
     windowed: bool,
@@ -505,21 +577,23 @@ fn revive_usage(
             .unwrap_or(0)
     };
 
-    // Honest size of the loaded window: the tokens Claude will actually re-send. Prefer the REAL
-    // figure derived from recorded `usage` (passed for `--window`); otherwise estimate from bytes.
-    let honest: u64 = real_override.unwrap_or_else(|| {
-        parsed[window..]
-            .iter()
-            .flatten()
-            .filter_map(|v| v.get("message").and_then(|m| m.get("content")))
-            .map(est_tokens)
-            .sum()
-    });
+    // Honest size of the loaded window: the tokens Claude will actually re-send. When `--window`
+    // supplied the REAL tail size (from recorded usage), take the max of the two — a snipped tail is
+    // smaller than that figure, but conservative (higher) keeps the gate honest.
+    // The first record of the scan is untrusted when the window starts at a compaction boundary
+    // (its absolute total is the very stale figure we're correcting) or when turns were dropped
+    // in front of it (`--window` tail) — its span falls back to the byte estimate.
+    let first_record_trusted = window == 0 && !windowed;
+    let evidence = honest_window_tokens(&parsed, out_lines, window, first_record_trusted);
+    let honest: u64 = evidence.max(real_override.unwrap_or(0));
 
     let mut rewritten = 0usize;
     let mut stale_max = 0u64;
     for i in window..out_lines.len() {
         let Some(v) = &parsed[i] else { continue };
+        if is_sidechain(v) {
+            continue; // sub-agent usage measures a different context — never ours to rewrite
+        }
         let Some(usage) = v.pointer("/message/usage").and_then(Value::as_object) else {
             continue;
         };
@@ -555,6 +629,73 @@ fn revive_usage(
     }
 }
 
+/// Honest post-prune token size of `parsed[window..]`, combining recorded-usage deltas with byte
+/// estimates, **span by span** (a span = the lines covered by one usage record, i.e. everything
+/// since the previous record).
+///
+///  * A span whose content was NOT touched by pruning: the recorded delta is real evidence of its
+///    cost, usually HIGHER than the 3.5 B/tok estimate — take `max(delta, estimate)` so we never
+///    write a figure lower than what the recorded evidence supports.
+///  * A span holding a `[PRUNED …]` marker: the recorded delta measured the now-snipped payload, so
+///    only the byte estimate of what's actually left is meaningful.
+///  * A segment-start record (right after a compaction boundary, or the scan start when
+///    `!first_trusted`): its absolute total is not a delta — and after a boundary it's exactly the
+///    stale figure revive exists to correct — so its span is byte-estimated too.
+///  * Lines after the last record (or when there are no records at all): byte estimate.
+///
+/// Sidechain lines contribute neither usage nor bytes — they aren't re-sent on the main thread.
+fn honest_window_tokens(
+    parsed: &[Option<Value>],
+    out_lines: &[String],
+    window: usize,
+    first_trusted: bool,
+) -> u64 {
+    let span_est = |lo: usize, hi: usize| -> u64 {
+        parsed[lo..hi]
+            .iter()
+            .flatten()
+            .filter(|v| !is_sidechain(v))
+            .filter_map(|v| v.get("message").and_then(|m| m.get("content")))
+            .map(est_tokens)
+            .sum()
+    };
+    let mut sum = 0u64;
+    let mut prev = 0u64;
+    let mut seg_start = !first_trusted;
+    let mut span_start = window;
+    for i in window..parsed.len() {
+        let Some(v) = &parsed[i] else { continue };
+        if v.get("type").and_then(Value::as_str) == Some("system")
+            && v.get("subtype").and_then(Value::as_str) == Some("compact_boundary")
+        {
+            seg_start = true;
+            continue;
+        }
+        if is_sidechain(v) {
+            continue;
+        }
+        let total = v
+            .get("_cv_orig_ctx")
+            .and_then(Value::as_u64)
+            .or_else(|| v.pointer("/message/usage").and_then(Value::as_object).map(usage_total))
+            .unwrap_or(0);
+        if total == 0 {
+            continue;
+        }
+        let est = span_est(span_start, i + 1);
+        let span_pruned = out_lines[span_start..=i].iter().any(|l| l.contains(MARKER_PREFIX));
+        sum += if seg_start || span_pruned {
+            est
+        } else {
+            est.max(total.saturating_sub(prev))
+        };
+        prev = total;
+        seg_start = false;
+        span_start = i + 1;
+    }
+    sum + span_est(span_start, parsed.len())
+}
+
 /// Sum the context-bearing token counts of a Claude `usage` object (input + both cache buckets).
 fn usage_total(usage: &serde_json::Map<String, Value>) -> u64 {
     ["input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"]
@@ -563,13 +704,15 @@ fn usage_total(usage: &serde_json::Map<String, Value>) -> u64 {
         .sum()
 }
 
-/// Snip the eligible payloads on one (old) user line, in place.
+/// Snip the eligible payloads on one (old) user line, in place. `line_key` (the line's uuid or a
+/// file-position fallback) keys sidecar ids for blocks that carry no `tool_use_id` of their own.
 #[allow(clippy::too_many_arguments)]
 fn prune_user_line(
     v: &mut Value,
     opts: &PruneOptions,
     tool_names: &HashMap<String, (String, Value)>,
     new_id: &str,
+    line_key: &str,
     sidecar: &mut Vec<SidecarEntry>,
     count: &mut usize,
     images: &mut usize,
@@ -577,19 +720,20 @@ fn prune_user_line(
     modified: &mut bool,
 ) {
     // (1) tool_result blocks in message.content (the context-bearing payloads).
-    let mut line_tool_id: Option<String> = None;
+    let mut mirror_base: Option<String> = None; // sidecar-id base for the toolUseResult mirror
+    let mut mirror_tuid: Option<String> = None; // real tool_use_id for the name/input lookup
     if let Some(blocks) = v.pointer_mut("/message/content").and_then(Value::as_array_mut) {
-        for block in blocks.iter_mut() {
+        for (bi, block) in blocks.iter_mut().enumerate() {
             if block.get("type").and_then(Value::as_str) != Some("tool_result") {
                 continue;
             }
-            let tuid = block
-                .get("tool_use_id")
-                .and_then(Value::as_str)
-                .unwrap_or("unknown")
-                .to_string();
-            if line_tool_id.is_none() {
-                line_tool_id = Some(tuid.clone());
+            let tuid = block.get("tool_use_id").and_then(Value::as_str).map(String::from);
+            // Sidecar id: the tool_use_id when present, else `{line uuid}#tr{block idx}` — unique
+            // per block, never a shared constant (which made colliding entries unretrievable).
+            let entry_id = tuid.clone().unwrap_or_else(|| format!("{line_key}#tr{bi}"));
+            if mirror_base.is_none() {
+                mirror_base = Some(entry_id.clone());
+                mirror_tuid = tuid.clone();
             }
             // Decide using a borrow; commit by cloning the payload out (releasing the borrow), then
             // overwrite the block — so we never hold a read of `block` across the mutation.
@@ -613,17 +757,17 @@ fn prune_user_line(
                 continue;
             };
             let line_count = if text.is_empty() { 1 } else { text.lines().count() };
-            let (name, input) = tool_names
-                .get(&tuid)
-                .cloned()
+            let (name, input) = tuid
+                .as_deref()
+                .and_then(|t| tool_names.get(t).cloned())
                 .unwrap_or_else(|| ("unknown".into(), Value::Null));
-            let marker = build_marker(&tuid, &name, &input, &kind, size, line_count, new_id);
+            let marker = build_marker(&entry_id, &name, &input, &kind, size, line_count, new_id, opts.drop);
 
             *tokens_saved += est_tokens(&content).saturating_sub(str_tokens(&marker));
             *images += img;
             if !opts.drop {
                 sidecar.push(SidecarEntry {
-                    id: tuid.clone(),
+                    id: entry_id,
                     slot: "content".into(),
                     name,
                     input,
@@ -649,15 +793,15 @@ fn prune_user_line(
         _ => None,
     };
     if let Some((tur, size)) = tur_committed {
-        let base = line_tool_id.clone().unwrap_or_else(|| "line".into());
+        let base = mirror_base.unwrap_or_else(|| line_key.to_string());
         let id = format!("{base}{TUR_SUFFIX}");
         let kind = if tur_is_image(&tur) { "image" } else { "text" };
-        let (name, input) = line_tool_id
-            .as_ref()
+        let (name, input) = mirror_tuid
+            .as_deref()
             .and_then(|t| tool_names.get(t).cloned())
             .unwrap_or_else(|| ("unknown".into(), Value::Null));
         let line_count = tur.as_str().map(|s| s.lines().count()).unwrap_or(1);
-        let marker = build_marker(&id, &name, &input, kind, size, line_count, new_id);
+        let marker = build_marker(&id, &name, &input, kind, size, line_count, new_id, opts.drop);
         if !opts.drop {
             sidecar.push(SidecarEntry {
                 id,
@@ -679,18 +823,18 @@ fn prune_user_line(
 /// Flatten large `thinking` blocks on one (old) assistant line. Each is replaced by a small **text**
 /// block carrying the marker (not a thinking block — keeping the original `signature` against altered
 /// text would fail Claude's validation on resume), with the original block stashed verbatim in the
-/// sidecar under `<uuid>#think<i>`.
+/// sidecar under `<line_key>#think<i>` (`line_key` = the line's uuid, or a file-position fallback).
 #[allow(clippy::too_many_arguments)]
 fn prune_assistant_thinking(
     v: &mut Value,
     opts: &PruneOptions,
     new_id: &str,
+    line_key: &str,
     sidecar: &mut Vec<SidecarEntry>,
     count: &mut usize,
     tokens_saved: &mut u64,
     modified: &mut bool,
 ) {
-    let uuid = v.get("uuid").and_then(Value::as_str).unwrap_or("line").to_string();
     let Some(blocks) = v.pointer_mut("/message/content").and_then(Value::as_array_mut) else {
         return;
     };
@@ -712,8 +856,8 @@ fn prune_assistant_thinking(
             .map(|t| t.lines().count().max(1))
             .unwrap_or(1);
         let original = block.clone();
-        let id = format!("{uuid}#think{i}");
-        let marker = build_marker(&id, "thinking", &Value::Null, "text", size, line_count, new_id);
+        let id = format!("{line_key}#think{i}");
+        let marker = build_marker(&id, "thinking", &Value::Null, "text", size, line_count, new_id, opts.drop);
         *tokens_saved += str_tokens(&original.to_string()).saturating_sub(str_tokens(&marker));
         if !opts.drop {
             sidecar.push(SidecarEntry {
@@ -734,20 +878,34 @@ fn prune_assistant_thinking(
 }
 
 /// Retrieve a stashed original from a prune sidecar by its `tool_use_id` (or `<id>#tur`). Returns the
-/// verbatim value (string, content-block array incl. images, or the raw toolUseResult object).
+/// verbatim value (string, content-block array incl. images, or the raw toolUseResult object). Errors
+/// if the id matches more than one entry — a duplicated id means the sidecar can't say which payload
+/// is which, and silently returning one of them would misattribute data.
 pub fn retrieve(sidecar_path: &Path, id: &str) -> Result<Value> {
     let raw =
         std::fs::read_to_string(sidecar_path).with_context(|| format!("reading sidecar {}", sidecar_path.display()))?;
     let mut available = Vec::new();
     let mut found = None;
+    let mut duplicates = 0usize;
     for line in raw.lines().filter(|l| !l.trim().is_empty()) {
         let Ok(entry) = serde_json::from_str::<SidecarEntry>(line) else {
             continue;
         };
         available.push(entry.id.clone());
         if entry.id == id {
-            found = Some(entry.content); // last-wins
+            if found.is_some() {
+                duplicates += 1;
+            } else {
+                found = Some(entry.content);
+            }
         }
+    }
+    if duplicates > 0 {
+        bail!(
+            "id {id:?} appears {} times in sidecar {} — ambiguous, refusing to guess which payload you meant",
+            duplicates + 1,
+            sidecar_path.display()
+        );
     }
     found.ok_or_else(|| {
         let shown: Vec<_> = available.iter().take(20).cloned().collect();
@@ -761,24 +919,9 @@ fn new_uuid() -> String {
     uuid::Uuid::new_v4().to_string()
 }
 
-/// Re-serialize a line only to swap its `sessionId`; if it has none (or isn't JSON), return as-is so
-/// untouched lines stay byte-identical.
-fn reserialize_with_id(line: &str, new_id: &str) -> String {
-    match serde_json::from_str::<Value>(line) {
-        Ok(mut v) if v.get("sessionId").is_some() => {
-            v["sessionId"] = Value::String(new_id.to_string());
-            v.to_string()
-        }
-        _ => line.to_string(),
-    }
-}
-
-fn build_tool_name_map(lines: &[&str]) -> HashMap<String, (String, Value)> {
+fn build_tool_name_map(parsed: &[Option<Value>]) -> HashMap<String, (String, Value)> {
     let mut map = HashMap::new();
-    for line in lines {
-        let Ok(v) = serde_json::from_str::<Value>(line) else {
-            continue;
-        };
+    for v in parsed.iter().flatten() {
         if v.get("type").and_then(Value::as_str) != Some("assistant") {
             continue;
         }
@@ -919,7 +1062,17 @@ fn fmt_arg(k: &str, v: &Value) -> String {
     format!("{k}={s}")
 }
 
-fn build_marker(id: &str, name: &str, input: &Value, kind: &str, size: usize, lines: usize, session: &str) -> String {
+#[allow(clippy::too_many_arguments)]
+fn build_marker(
+    id: &str,
+    name: &str,
+    input: &Value,
+    kind: &str,
+    size: usize,
+    lines: usize,
+    session: &str,
+    dropped: bool,
+) -> String {
     let args = summarize_args(input);
     let args = if args.is_empty() {
         String::new()
@@ -931,7 +1084,13 @@ fn build_marker(id: &str, name: &str, input: &Value, kind: &str, size: usize, li
         "mixed" => "text+image",
         _ => "text",
     };
-    format!("{MARKER_PREFIX}{id} tool={name}{args} | {label} {size}B/{lines}L | session={session} | retrieve: cv prune {session} --retrieve {id}]")
+    // Under --drop the payload is destroyed — never advertise a retrieval that can't work.
+    let tail = if dropped {
+        "dropped (no sidecar)".to_string()
+    } else {
+        format!("retrieve: cv prune {session} --retrieve {id}")
+    };
+    format!("{MARKER_PREFIX}{id} tool={name}{args} | {label} {size}B/{lines}L | session={session} | {tail}]")
 }
 
 /// Recursively copy a directory tree (used to carry `subagents/`/`workflows/` into the new session).

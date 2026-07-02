@@ -4,7 +4,9 @@
 //! distillation prompt, and asks a cheap/fast model to extract durable project memory (the kind of
 //! thing you'd keep in a `MEMORY.md`/`CLAUDE.md`).
 //!
-//! Provider is chosen by environment: `OPENROUTER_API_KEY` (preferred) or `ANTHROPIC_API_KEY`.
+//! Provider is chosen by environment: `LMSTUDIO_API_BASE` (local, wins), then `OPENROUTER_API_KEY`,
+//! then `ANTHROPIC_API_KEY`. Remote providers receive the (truncated) transcript — which can carry
+//! secrets — so every call prints an egress notice to stderr naming the destination and size.
 
 use anyhow::{anyhow, bail, Context, Result};
 use serde_json::{json, Value};
@@ -93,6 +95,24 @@ impl Provider {
             // LM Studio routes to the loaded model; this placeholder works when one model is loaded.
             // Pass `--model <id>` to target a specific loaded model.
             Provider::LmStudio { .. } => "local-model",
+        }
+    }
+}
+
+/// Tell the user (stderr) where their transcript is about to go before it leaves the machine.
+/// Transcripts routinely contain secrets and file contents; egress must never be silent.
+fn egress_notice(provider: &Provider, model: &str, approx_bytes: usize) {
+    let kb = approx_bytes.div_ceil(1024);
+    match provider {
+        Provider::LmStudio { base } => {
+            eprintln!("✦ sending ~{kb} KB to local model {model} at {base} (stays on this machine)");
+        }
+        _ => {
+            eprintln!(
+                "✦ sending ~{kb} KB of transcript to {}/{model} — leaves this machine; \
+                 transcripts can contain secrets (set LMSTUDIO_API_BASE for local/offline)",
+                provider.name()
+            );
         }
     }
 }
@@ -195,6 +215,7 @@ fn ceil_char_boundary(s: &str, i: usize) -> usize {
 
 /// Send the prompt to the model and return its text. Blocking HTTP (this is a CLI-called lib).
 fn call_model(provider: &Provider, model: &str, prompt: &str) -> Result<String> {
+    egress_notice(provider, model, prompt.len());
     let client = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(120))
         .build()
@@ -384,6 +405,11 @@ fn call_chat(
     messages: &[Value],
     max_tokens: u32,
 ) -> Result<String> {
+    let approx: usize = messages
+        .iter()
+        .map(|m| m["content"].as_str().map_or(0, str::len))
+        .sum();
+    egress_notice(provider, model, approx);
     let client = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(180))
         .build()

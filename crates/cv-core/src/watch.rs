@@ -125,7 +125,15 @@ impl Watcher {
     /// Poll once and return any events since the previous poll.
     pub fn poll(&mut self) -> Vec<SessionEvent> {
         let mut events = Vec::new();
-        for r in self.discover() {
+        let refs = self.discover();
+        // Prune entries for sessions that vanished from discovery (deleted/pruned transcripts),
+        // so a long-lived watcher (cvd) doesn't grow `seen` without bound. The size check skips
+        // building the key set on the common nothing-vanished poll.
+        if self.seen.len() > refs.len() {
+            let live: std::collections::HashSet<String> = refs.iter().map(Self::key).collect();
+            self.seen.retain(|k, _| live.contains(k));
+        }
+        for r in refs {
             let key = Self::key(&r);
             let trigger = Self::trigger_of(&r);
             match self.seen.get(&key) {

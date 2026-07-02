@@ -216,9 +216,20 @@ fn load_store(path: &Path) -> Result<Store> {
 
 // ---- embedding -------------------------------------------------------------------------------
 
+/// The id of the model [`load_model`] would load right now: the `CV_SEARCH_MODEL` override (a
+/// local model dir) when set, else [`MODEL_REPO`]. Recorded in the store by [`embed_all`] and
+/// compared at query time — query and store vectors must come from the **same** model, or the
+/// cosine ranking is cross-space noise.
+fn model_id() -> String {
+    std::env::var_os("CV_SEARCH_MODEL")
+        .filter(|v| !v.is_empty())
+        .map(|v| v.to_string_lossy().into_owned())
+        .unwrap_or_else(|| MODEL_REPO.to_string())
+}
+
 /// Load the embedding model, honoring `CV_SEARCH_MODEL` (local dir) before falling back to the Hub.
 fn load_model() -> Result<StaticModel> {
-    if let Some(dir) = std::env::var_os("CV_SEARCH_MODEL") {
+    if let Some(dir) = std::env::var_os("CV_SEARCH_MODEL").filter(|v| !v.is_empty()) {
         return StaticModel::from_pretrained(dir, None, None, None).context("loading model from $CV_SEARCH_MODEL");
     }
     StaticModel::from_pretrained(MODEL_REPO, None, None, None)
@@ -239,7 +250,9 @@ pub fn embed_all(path: &Path) -> Result<usize> {
     let model = load_model()?;
 
     let mut store = Store {
-        model: MODEL_REPO.to_string(),
+        // Record the model *actually* loaded (the CV_SEARCH_MODEL override included), so a query
+        // under a different model is detected instead of silently ranking across spaces.
+        model: model_id(),
         dim: 0,
         meta: Vec::new(),
         vectors: Vec::new(),
@@ -298,11 +311,36 @@ fn encode_batch(model: &StaticModel, pending: &mut Vec<RecordMeta>, bodies: &mut
 /// If `path` doesn't exist but a legacy `embeddings.json` sits next to it (written by an older
 /// build), that store is migrated to the binary format at `path` first — so upgrading doesn't
 /// force a re-embed.
+///
+/// The store's recorded model must match the model the query would embed under (including a
+/// `CV_SEARCH_MODEL` override), and the query vector's dimensionality must match the store's —
+/// cosine across different embedding spaces is noise, so a mismatch is an error with a re-embed
+/// hint rather than silently garbage rankings.
 pub fn semantic_search(path: &Path, query: &str, k: usize) -> Result<Vec<Hit>> {
     migrate_legacy_sibling(path);
     let store = load_store(path)?;
+    if store.meta.is_empty() {
+        return Ok(Vec::new());
+    }
+    let current = model_id();
+    if store.model != current {
+        bail!(
+            "embedding store {} was built with model {:?}, but the current model is {current:?} \
+             — run `cv index --semantic` to re-embed (or set CV_SEARCH_MODEL to match)",
+            path.display(),
+            store.model
+        );
+    }
     let model = load_model()?;
     let q = model.encode_single(query);
+    if q.len() != store.dim {
+        bail!(
+            "query embedding has dim {}, but store {} has dim {} — run `cv index --semantic` to re-embed",
+            q.len(),
+            path.display(),
+            store.dim
+        );
+    }
     Ok(rank(&store, &q, k))
 }
 

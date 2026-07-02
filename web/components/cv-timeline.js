@@ -7,6 +7,9 @@
 import { esc, sortTime, sessionLabel, shortPath, msgCount, harnessBadge, HARNESS_LABELS } from "./util.js";
 
 const DAY_MS = 86400000;
+// Heatmap look-back cap: one mis-dated session (epoch 0, a bad clock) would otherwise
+// stretch the grid to thousands of week columns. Older sessions still show in the feed.
+const HEATMAP_MAX_YEARS = 6;
 
 function dayKey(d) {
   // Local YYYY-MM-DD.
@@ -105,14 +108,18 @@ class CvTimeline extends HTMLElement {
     let max = 1;
     for (const e of byDay.values()) max = Math.max(max, e.count);
 
-    // Build week columns from the Sunday on/before the earliest day through today.
+    // Build week columns from the Sunday on/before the earliest day through today,
+    // clamped to at most HEATMAP_MAX_YEARS back so a mis-dated outlier can't blow
+    // up the grid (days before the clamp simply don't get heatmap cells).
     let earliest = Infinity;
     for (const key of byDay.keys()) {
       const t = new Date(key + "T00:00:00").getTime();
       if (t < earliest) earliest = t;
     }
-    const start = startOfWeek(new Date(earliest));
     const today = startOfDay(new Date());
+    const floor = new Date(today);
+    floor.setFullYear(floor.getFullYear() - HEATMAP_MAX_YEARS);
+    const start = startOfWeek(new Date(Math.max(earliest, floor.getTime())));
 
     const columns = []; // each: { month, year, cells: [{key,count,level,date}|null]×7 }
     let cur = new Date(start);

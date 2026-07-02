@@ -309,7 +309,10 @@ fn thread_matches_message_path() {
 
 #[test]
 fn errors_teach() {
-    assert!(SessionQuery::parse("bogus:1").unwrap_err().contains("unknown field"));
+    // A near-miss of a real field errors with a suggestion (the typo guard) …
+    let err = SessionQuery::parse("harnes:claude").unwrap_err();
+    assert!(err.contains("unknown field") && err.contains("harness"), "{err}");
+    assert!(SessionQuery::parse("titel:x").unwrap_err().contains("title"));
     assert!(SessionQuery::parse("harness:nope").unwrap_err().contains("harness"));
     assert!(SessionQuery::parse("msgs>=abc").unwrap_err().contains("number"));
     assert!(SessionQuery::parse("(harness:claude").unwrap_err().contains(')'));
@@ -334,6 +337,87 @@ fn reference_and_schema_cover_every_field() {
         .collect();
     assert_eq!(names.len(), FIELDS.len());
     assert!(names.contains(&"model"));
+}
+
+#[test]
+fn bare_url_and_unknown_keys_fall_back_to_needles() {
+    // `http://…` is field-shaped ("http" + ':') but not a field — it must search, not error.
+    let query = q("http://example.com/x");
+    assert!(query.prefilter(&refx("a", Harness::Claude, None, Some("see http://example.com/x please"), 1)));
+    assert!(!query.prefilter(&refx("a", Harness::Claude, None, Some("no links here"), 1)));
+    // An unknown key that's nowhere near a real field is a needle too.
+    let query = q("bogus:1");
+    assert!(query.prefilter(&refx("a", Harness::Claude, None, Some("the Bogus:1 flag"), 1)));
+    assert!(!query.prefilter(&refx("a", Harness::Claude, None, Some("nothing"), 1)));
+}
+
+#[test]
+fn quoted_values_keep_commas_literal() {
+    // Quoted value: the comma is text, not an OR-list.
+    let query = q(r#"title:"foo, bar""#);
+    assert!(query.prefilter(&refx("a", Harness::Claude, None, Some("FOO, bar baz"), 1)));
+    assert!(!query.prefilter(&refx("a", Harness::Claude, None, Some("just foo here"), 1)));
+    // Unquoted still OR-splits (unchanged).
+    let or = q("title:foo,bar");
+    assert!(or.prefilter(&refx("a", Harness::Claude, None, Some("just foo here"), 1)));
+    // A fully-quoted word is a needle even when it looks like a field term.
+    let needle = q(r#""text: hello""#);
+    assert!(!needle.needs_index(), "quoted phrase must not parse as the text: field");
+    assert!(needle.prefilter(&refx("a", Harness::Claude, None, Some("prefix text: hello suffix"), 1)));
+    assert!(!needle.prefilter(&refx("a", Harness::Claude, None, Some("hello text"), 1)));
+}
+
+#[test]
+fn until_since_sugar_and_explicit_ops_on_sugar_error() {
+    let r = refx("a", Harness::Claude, None, None, 1); // updated 2026-06-01
+    assert!(q("until:2026-07-01").prefilter(&r));
+    assert!(!q("until:2026-01-01").prefilter(&r));
+    assert!(q("since:2026-01-01").prefilter(&r));
+    assert!(!q("since:2026-07-01").prefilter(&r));
+    // The sugar pairs are spelled differently but parse identically.
+    assert_eq!(q("before:2026-07-01").expr, q("until:2026-07-01").expr);
+    assert_eq!(q("after:2026-01-01").expr, q("since:2026-01-01").expr);
+    // An explicit comparison on sugar contradicts the implied one — it must teach, not override.
+    for s in ["before>=2026-01-01", "after<2026-01-01", "until=2026-01-01", "since>2026-01-01"] {
+        assert!(SessionQuery::parse(s).unwrap_err().contains("sugar"), "{s}");
+    }
+}
+
+#[test]
+fn plain_date_contains_means_whole_day() {
+    let mut r = refx("a", Harness::Claude, None, None, 1);
+    r.updated_at = "2026-06-01T15:30:00Z".parse().ok();
+    assert!(q("updated:2026-06-01").prefilter(&r)); // any instant that day, not just midnight
+    assert!(!q("updated:2026-05-31").prefilter(&r));
+    assert!(!q("updated:2026-06-02").prefilter(&r));
+    // `=` keeps exact-instant semantics, and an RFC3339 `:` value stays exact.
+    assert!(!q("updated=2026-06-01").prefilter(&r));
+    assert!(q("updated:2026-06-01T15:30:00Z").prefilter(&r));
+    // Comparisons are unchanged: midnight boundary.
+    assert!(q("updated>=2026-06-01").prefilter(&r));
+    assert!(!q("updated<2026-06-01").prefilter(&r));
+}
+
+#[test]
+fn msgs_counts_user_assistant_only_in_matches_session() {
+    // SessionRef.message_count is contractually user+assistant turns only (ir.rs) — the ref view
+    // matches_session builds must count the same way, or prefilter and full match disagree.
+    let mut s = sess(None, &[Some("m1"), Some("m2")]); // two assistant turns
+    let extra = |role: Role| Message {
+        id: None,
+        parent_id: None,
+        role,
+        timestamp: None,
+        model: None,
+        content: vec![],
+        usage: None,
+        extra: serde_json::Map::new(),
+    };
+    s.messages.push(extra(Role::User));
+    s.messages.push(extra(Role::Tool));
+    s.messages.push(extra(Role::System));
+    assert!(q("msgs:3").matches_session(&s)); // 2 assistant + 1 user
+    assert!(!q("msgs:5").matches_session(&s)); // NOT all five records
 }
 
 // --- helpers ---

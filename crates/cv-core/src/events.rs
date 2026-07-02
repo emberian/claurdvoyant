@@ -20,7 +20,7 @@
 //! Like [`crate::catalog`], the persistence side is best-effort: SQLite errors degrade to empty
 //! results / no-ops, never failing the caller.
 
-use crate::ir::{truncate, Block, Message, Session, SessionRef};
+use crate::ir::{truncate, Block, Harness, Message, Session, SessionRef};
 use crate::stream::{Flow, MessageSink};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
@@ -287,8 +287,8 @@ fn absolutize(p: &str, cwd: Option<&Path>) -> String {
     }
 }
 
-/// File mtime in integer nanoseconds (0 when unreadable) — the incremental-ingest skip key,
-/// identical semantics to the FTS indexer's.
+/// File mtime in integer nanoseconds (0 when unreadable) — half of the `(mtime, size)`
+/// incremental-ingest skip key, identical semantics to the FTS indexer's.
 pub fn file_mtime_ns(path: &Path) -> i64 {
     std::fs::metadata(path)
         .ok()
@@ -296,6 +296,31 @@ pub fn file_mtime_ns(path: &Path) -> i64 {
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|d| d.as_nanos() as i64)
         .unwrap_or(0)
+}
+
+/// File size in bytes (0 when unreadable) — the other half of the `(mtime, size)` ingest key.
+pub fn file_size(path: &Path) -> i64 {
+    std::fs::metadata(path).map(|m| m.len() as i64).unwrap_or(0)
+}
+
+/// Whether this session source can use file **size** as its primary freshness key — the policy
+/// shared by every incremental store (the FTS index, this event catalog, the message-offsets
+/// store). These are the append-only JSONL transcript logs where an mtime-only check caused the
+/// live re-index spiral: a pure mtime bump (touch / rsync / restore) does not mean new content,
+/// while a real append grows the file. Other stores (SQLite DBs, JSON arrays/objects, and metadata
+/// files) can rewrite in place at the same byte length, so they must keep mtime in the freshness
+/// predicate.
+pub fn size_primary_freshness(r: &SessionRef) -> bool {
+    let is_jsonl = r
+        .path
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("jsonl"));
+    is_jsonl
+        && matches!(
+            r.harness,
+            Harness::Claude | Harness::Codex | Harness::Gemini | Harness::Qwen | Harness::Kimi | Harness::OpenClaw
+        )
 }
 
 /// Provenance for a sub-agent event source: which parent session, which workflow run (if any), and
@@ -485,29 +510,57 @@ mod db {
                  id       TEXT NOT NULL,
                  path     TEXT NOT NULL,
                  mtime_ns INTEGER NOT NULL,
+                 size     INTEGER,
                  PRIMARY KEY(harness, id, path)
              );",
         )
         .ok()?;
+        // Lazy migration: a pre-`size` `event_sync` (the CREATE above is a no-op on it) gets the
+        // column added in place. Old rows read back a NULL size, which [`sync_fresh`] treats as
+        // stale — each session re-ingests once and is stamped with its size; no wholesale drop.
+        let has_size: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('event_sync') WHERE name='size')",
+                [],
+                |r| r.get(0),
+            )
+            .ok()?;
+        if !has_size {
+            conn.execute_batch("ALTER TABLE event_sync ADD COLUMN size INTEGER;").ok()?;
+        }
         Some(conn)
     }
 
-    /// Whether `r` needs an event (re)ingest: its file mtime differs from the `event_sync` row
-    /// (or there is none). `false` when the catalog can't be opened — events degrade silently
-    /// rather than re-streaming the corpus into a broken db forever.
+    /// The event-catalog freshness predicate over a stored `(mtime_ns, size)` stamp, mirroring the
+    /// FTS indexer's policy ([`size_primary_freshness`]): for append-only transcript logs an
+    /// unchanged size means no new content even when mtimes were mass-bumped (touch / rsync /
+    /// restore — the whole-corpus re-parse trigger); rewriteable stores must match on mtime too.
+    /// A missing stored size (a pre-`size` catalog row) or a 0 size (unreadable file) is never
+    /// fresh, so those re-ingest — best-effort-cache semantics: errors mean re-ingest, never skip.
+    fn sync_fresh(r: &SessionRef, stored: Option<(i64, Option<i64>)>, mtime_ns: i64, size: i64) -> bool {
+        stored.is_some_and(|(stored_mtime, stored_size)| {
+            stored_size == Some(size)
+                && size != 0
+                && (size_primary_freshness(r) || (stored_mtime == mtime_ns && mtime_ns != 0))
+        })
+    }
+
+    /// Whether `r` needs an event (re)ingest: its file `(mtime, size)` signature differs from the
+    /// `event_sync` row (or there is none). `false` when the catalog can't be opened — events
+    /// degrade silently rather than re-streaming the corpus into a broken db forever.
     ///
     /// Opens a fresh connection per call — fine for a one-off check (`cv events <id>`), wrong for
     /// a corpus sweep: bulk callers use [`SyncTable`] (one query for the whole skip-table).
     pub fn needs_ingest(r: &SessionRef, mtime_ns: i64) -> bool {
         let Some(conn) = open() else { return false };
-        let synced: Option<i64> = conn
+        let stored: Option<(i64, Option<i64>)> = conn
             .query_row(
-                "SELECT mtime_ns FROM event_sync WHERE harness=?1 AND id=?2 AND path=?3",
+                "SELECT mtime_ns, size FROM event_sync WHERE harness=?1 AND id=?2 AND path=?3",
                 params![r.harness.as_str(), r.id, r.path.to_string_lossy()],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .ok();
-        !(synced == Some(mtime_ns) && mtime_ns != 0)
+        !sync_fresh(r, stored, mtime_ns, file_size(&r.path))
     }
 
     /// The whole `event_sync` skip-table, loaded with **one** connection + query, for bulk passes
@@ -517,17 +570,21 @@ mod db {
     ///
     /// Answers exactly like [`needs_ingest`], including the degrade: when the catalog can't be
     /// opened, every check returns `false` (don't re-stream the corpus into a broken db).
+    /// `(harness, id, path) → (mtime_ns, size)` — one loaded `event_sync` stamp per session
+    /// (size is `None` on rows written before the size column existed).
+    type SyncRows = std::collections::HashMap<(String, String, String), (i64, Option<i64>)>;
+
     pub struct SyncTable {
-        /// `(harness, id, path) → mtime_ns`; `None` when the catalog is unavailable.
-        rows: Option<std::collections::HashMap<(String, String, String), i64>>,
+        /// The loaded skip-table; `None` when the catalog is unavailable.
+        rows: Option<SyncRows>,
     }
 
     impl SyncTable {
         pub fn load() -> SyncTable {
-            let load = || -> Option<std::collections::HashMap<(String, String, String), i64>> {
+            let load = || -> Option<SyncRows> {
                 let conn = open()?;
                 let mut stmt = conn
-                    .prepare("SELECT harness, id, path, mtime_ns FROM event_sync")
+                    .prepare("SELECT harness, id, path, mtime_ns, size FROM event_sync")
                     .ok()?;
                 let rows = stmt
                     .query_map([], |row| {
@@ -537,7 +594,7 @@ mod db {
                                 row.get::<_, String>(1)?,
                                 row.get::<_, String>(2)?,
                             ),
-                            row.get::<_, i64>(3)?,
+                            (row.get::<_, i64>(3)?, row.get::<_, Option<i64>>(4)?),
                         ))
                     })
                     .ok()?;
@@ -546,35 +603,39 @@ mod db {
             SyncTable { rows: load() }
         }
 
-        /// Same answer [`needs_ingest`] would give for `r`, from the preloaded table.
-        pub fn needs_ingest(&self, r: &SessionRef, mtime_ns: i64) -> bool {
+        /// Same answer [`needs_ingest`] would give for `r`, from the preloaded table. Takes the
+        /// file `size` the caller already stat'ed (bulk sweeps have it from `file_sig`) instead of
+        /// re-stat'ing per row.
+        pub fn needs_ingest(&self, r: &SessionRef, mtime_ns: i64, size: i64) -> bool {
             let Some(rows) = &self.rows else { return false };
             let key = (
                 r.harness.as_str().to_string(),
                 r.id.clone(),
                 r.path.to_string_lossy().into_owned(),
             );
-            !(rows.get(&key) == Some(&mtime_ns) && mtime_ns != 0)
+            !sync_fresh(r, rows.get(&key).copied(), mtime_ns, size)
         }
     }
 
     /// Persist `events` as the complete event set for session `r` (one transaction: delete prior
-    /// rows, insert, stamp `event_sync`). Idempotent — a re-ingest of an unchanged session rewrites
-    /// identical rows. Best-effort: any sqlite error leaves the previous state and returns quietly.
+    /// rows, insert, stamp `event_sync` with the `(mtime_ns, size)` signature — captured by the
+    /// caller **before** streaming, so content appended mid-parse reads as stale next time).
+    /// Idempotent — a re-ingest of an unchanged session rewrites identical rows. Best-effort: any
+    /// sqlite error leaves the previous state and returns quietly.
     ///
     /// Dedup invariant (what replaced v1's unique expression index): the DELETE-by-session +
     /// batch-INSERT shape makes cross-session duplicates impossible by construction, and
     /// duplicates *within* this batch — same `(msg_idx, kind, target)`, matching the old index's
     /// `COALESCE(target,'')` semantics — are dropped by the in-memory set below.
-    pub fn record(r: &SessionRef, events: &[Event], mtime_ns: i64) {
-        record_with(r, events, mtime_ns, &Provenance::default());
+    pub fn record(r: &SessionRef, events: &[Event], mtime_ns: i64, size: i64) {
+        record_with(r, events, mtime_ns, size, &Provenance::default());
     }
 
     /// [`record`], additionally stamping sub-agent `prov`enance onto the `event_sessions` row so the
     /// stored events are attributable to the orchestrator that spawned the agent. A top-level
     /// session passes an empty [`Provenance`] (this is exactly what [`record`] does); the columns
     /// stay NULL and existing queries are unaffected.
-    pub fn record_with(r: &SessionRef, events: &[Event], mtime_ns: i64, prov: &Provenance) {
+    pub fn record_with(r: &SessionRef, events: &[Event], mtime_ns: i64, size: i64, prov: &Provenance) {
         let Some(mut conn) = open() else { return };
         let Ok(tx) = conn.transaction() else { return };
         let harness = r.harness.as_str();
@@ -642,21 +703,24 @@ mod db {
             }
         }
         let _ = tx.execute(
-            "INSERT OR REPLACE INTO event_sync(harness,id,path,mtime_ns) VALUES(?1,?2,?3,?4)",
-            params![harness, r.id, r.path.to_string_lossy(), mtime_ns],
+            "INSERT OR REPLACE INTO event_sync(harness,id,path,mtime_ns,size) VALUES(?1,?2,?3,?4,?5)",
+            params![harness, r.id, r.path.to_string_lossy(), mtime_ns, size],
         );
         let _ = tx.commit();
     }
 
     /// (Re)ingest events for one session: stream it (lazily — large content stays on disk) through
-    /// an [`EventSink`] and persist the rows. Returns the number of events extracted.
+    /// an [`EventSink`] and persist the rows. Returns the number of events extracted. The
+    /// `(mtime, size)` stamp is captured **before** the streamed pass, so anything appended while
+    /// we were reading still shows as stale next time.
     pub fn ingest_ref(r: &SessionRef) -> Result<usize> {
         let adapter =
             crate::harness::for_harness(r.harness).ok_or_else(|| anyhow::anyhow!("no adapter for {}", r.harness))?;
+        let (mtime_ns, size) = crate::offsets::file_sig(&r.path);
         let mut sink = EventSink::new(r.cwd.clone());
         adapter.stream(r, &crate::stream::ParseOptions::lazy(), &mut sink)?;
         let events = sink.into_events();
-        record(r, &events, file_mtime_ns(&r.path));
+        record(r, &events, mtime_ns, size);
         Ok(events.len())
     }
 
@@ -666,15 +730,16 @@ mod db {
     pub fn ingest_subagent(r: &SessionRef, prov: &Provenance) -> Result<usize> {
         let adapter =
             crate::harness::for_harness(r.harness).ok_or_else(|| anyhow::anyhow!("no adapter for {}", r.harness))?;
+        let (mtime_ns, size) = crate::offsets::file_sig(&r.path);
         let mut sink = EventSink::new(r.cwd.clone());
         adapter.stream(r, &crate::stream::ParseOptions::lazy(), &mut sink)?;
         let events = sink.into_events();
-        record_with(r, &events, file_mtime_ns(&r.path), prov);
+        record_with(r, &events, mtime_ns, size, prov);
         Ok(events.len())
     }
 
-    /// (Re)ingest events for every discovered session, skipping unchanged ones (by `event_sync`
-    /// mtime) unless `force`. The standalone entry point for users who don't run the tantivy
+    /// (Re)ingest events for every discovered session, skipping unchanged ones (by the
+    /// `event_sync` `(mtime, size)` signature) unless `force`. The standalone entry point for users who don't run the tantivy
     /// indexer (which otherwise ingests events as a ride-along). Returns sessions (re)ingested.
     ///
     /// With `subagents`, also fold each top-level Claude session's whole sub-agent **forest**
@@ -686,7 +751,8 @@ mod db {
         let mut n = 0usize;
         let sync = SyncTable::load();
         for r in crate::discover_all() {
-            let top_stale = sync.needs_ingest(&r, file_mtime_ns(&r.path));
+            let (mtime_ns, size) = crate::offsets::file_sig(&r.path);
+            let top_stale = sync.needs_ingest(&r, mtime_ns, size);
             if force || top_stale {
                 match ingest_ref(&r) {
                     Ok(_) => n += 1,
@@ -703,13 +769,15 @@ mod db {
     }
 
     /// Fold the sub-agent forest of one top-level session into the catalog, skipping unchanged
-    /// transcripts (by `event_sync` mtime) unless `force`. Best-effort per agent: an unreadable
-    /// sub-agent transcript is skipped, not fatal. Returns the number of agents (re)ingested.
+    /// transcripts (by the `event_sync` `(mtime, size)` signature) unless `force`. Best-effort per
+    /// agent: an unreadable sub-agent transcript is skipped, not fatal. Returns the number of
+    /// agents (re)ingested.
     fn ingest_forest(parent: &SessionRef, sync: &SyncTable, force: bool) -> usize {
         let mut n = 0usize;
         for sub in crate::subagent_tree_of(parent) {
             let sr = &sub.session;
-            if !force && !sync.needs_ingest(sr, file_mtime_ns(&sr.path)) {
+            let (mtime_ns, size) = crate::offsets::file_sig(&sr.path);
+            if !force && !sync.needs_ingest(sr, mtime_ns, size) {
                 continue;
             }
             let prov = Provenance {
@@ -904,12 +972,12 @@ mod db_stub {
         pub fn load() -> SyncTable {
             SyncTable
         }
-        pub fn needs_ingest(&self, _r: &SessionRef, _mtime_ns: i64) -> bool {
+        pub fn needs_ingest(&self, _r: &SessionRef, _mtime_ns: i64, _size: i64) -> bool {
             false
         }
     }
-    pub fn record(_r: &SessionRef, _events: &[Event], _mtime_ns: i64) {}
-    pub fn record_with(_r: &SessionRef, _events: &[Event], _mtime_ns: i64, _prov: &Provenance) {}
+    pub fn record(_r: &SessionRef, _events: &[Event], _mtime_ns: i64, _size: i64) {}
+    pub fn record_with(_r: &SessionRef, _events: &[Event], _mtime_ns: i64, _size: i64, _prov: &Provenance) {}
     pub fn ingest_ref(_r: &SessionRef) -> Result<usize> {
         Ok(0)
     }
@@ -1221,6 +1289,33 @@ mod tests {
 
         // Kind filter narrows.
         assert_eq!(events_for("claude", "evt-e2e", Some("command")).len(), 1);
+
+        // Freshness keys on (mtime, size), size-primary for this append-only jsonl: a pure mtime
+        // bump (byte-identical rewrite) is still fresh — the mass-mtime-bump condition that used
+        // to re-parse the whole corpus — while a real append reads stale.
+        let content = std::fs::read(&path).unwrap();
+        std::fs::write(&path, &content).unwrap();
+        assert!(
+            !needs_ingest(&r, file_mtime_ns(&r.path)),
+            "a pure mtime bump (size unchanged) must not force an event re-ingest"
+        );
+        {
+            use std::io::Write as _;
+            let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+            writeln!(
+                f,
+                "{}",
+                serde_json::json!({"type": "user", "uuid": "u3", "sessionId": "evt-e2e",
+                                   "message": {"role": "user", "content": "and one more thing"}})
+            )
+            .unwrap();
+        }
+        assert!(
+            needs_ingest(&r, file_mtime_ns(&r.path)),
+            "a real append (size grew) must read stale"
+        );
+        ingest_ref(&r).unwrap();
+        assert!(!needs_ingest(&r, file_mtime_ns(&r.path)));
 
         // The touched query finds the session by absolute path and by suffix.
         let touched = sessions_touching("/repo/src/parser.rs", false);

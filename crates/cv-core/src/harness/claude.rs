@@ -106,9 +106,6 @@ impl Adapter for Claude {
         ))
     }
 
-    fn can_emit(&self) -> bool {
-        false // TODO: Claude as a conversion target
-    }
 }
 
 /// Fully parse a Claude `.jsonl` transcript from its text contents into a [`Session`] (full
@@ -325,8 +322,10 @@ fn ingest_value(
         }
     }
     if let Some(ts) = v.get("timestamp").and_then(Value::as_str).and_then(parse_ts) {
-        session.created_at.get_or_insert(ts);
-        session.updated_at = Some(ts);
+        // min/max, not first/last: real transcripts contain out-of-order timestamps (sub-ms clock
+        // skew between queued writes), and created_at > updated_at breaks downstream invariants.
+        session.created_at = Some(session.created_at.map_or(ts, |c| c.min(ts)));
+        session.updated_at = Some(session.updated_at.map_or(ts, |u| u.max(ts)));
     }
 
     if let Some(mut msg) = parse_message(ty, v, opts, span) {
@@ -617,8 +616,9 @@ fn scan(path: &std::path::Path) -> Result<SessionRef> {
             }
         }
         if let Some(ts) = v.get("timestamp").and_then(Value::as_str).and_then(parse_ts) {
-            created_at.get_or_insert(ts);
-            updated_at = Some(ts);
+            // min/max, not first/last — transcripts can carry out-of-order timestamps (clock skew).
+            created_at = Some(created_at.map_or(ts, |c: DateTime<Utc>| c.min(ts)));
+            updated_at = Some(updated_at.map_or(ts, |u: DateTime<Utc>| u.max(ts)));
         }
         if matches!(ty, "user" | "assistant") {
             message_count += 1;

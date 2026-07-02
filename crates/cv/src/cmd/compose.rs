@@ -113,6 +113,9 @@ pub(crate) fn cmd_prune(
             _ => eprintln!("  revive: recorded usage already honest (≤ loaded content) — nothing to rewrite"),
         }
     }
+    for w in &res.warnings {
+        eprintln!("  ⚠ {w}");
+    }
     if !dry_run {
         eprintln!("  new session: {}", res.new_path.display());
         if let Some(sc) = &res.sidecar_path {

@@ -7,7 +7,7 @@ use anyhow::Result;
 use chrono::{DateTime, Utc};
 use serde_json::Value;
 use std::io::BufRead;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 pub mod chatgpt_app;
 pub mod claude;
@@ -163,18 +163,12 @@ pub trait Adapter: Send + Sync {
         }
         Ok(session)
     }
-
-    /// Emit an IR session into this harness's native format under `out_dir`.
-    /// Default: unsupported. Adapters override to enable being a *conversion target*.
-    fn emit(&self, _session: &Session, _out_dir: &Path) -> Result<EmitResult> {
-        anyhow::bail!("emitting to {} is not implemented yet", self.harness())
-    }
-
-    /// Whether [`emit`] is implemented (so the CLI can list valid `--to` targets).
-    fn can_emit(&self) -> bool {
-        false
-    }
 }
+// NOTE: emitting (being a *conversion target*) is deliberately NOT part of this trait. The single
+// emit registry is `crate::emit::emitter_for` — an adapter becomes a target by exposing a
+// `pub fn emit(&Session, &Path, &EmitOptions) -> Result<EmitResult>` and registering it there.
+// (A previous `Adapter::emit`/`can_emit` pair had zero call sites and drifted out of sync with the
+// real dispatcher, with `can_emit` returning `false` for supported targets.)
 
 /// All registered adapters.
 pub fn all() -> Vec<Box<dyn Adapter>> {

@@ -15,12 +15,18 @@
 //! ## False-positive guardrails
 //!
 //! Ordinary prose and code must survive untouched. To that end:
-//! * Token recognizers require a known, distinctive prefix (`sk-`, `ghp_`, `AKIA…`, etc.).
-//! * Generic hex/base64 blobs are only redacted when they're long (≥ 40 chars), are *pure*
-//!   hex/base64url, AND a secret-ish keyword (`secret`, `token`, `password`, `api_key`, `key`)
-//!   appears shortly before them. This avoids nuking commit hashes, code identifiers, and base64
-//!   data that isn't actually a credential.
-//! * Assignment redaction (`password = "…"`) only fires for a small allowlist of key names.
+//! * Token recognizers require a known, distinctive prefix (`sk-`, `ghp_`, `AKIA…`, etc.); short
+//!   prefixes that collide with identifiers (`npm_`, `hf_`) additionally require a long, pure
+//!   alphanumeric tail.
+//! * Generic hex/base64 blobs are only redacted when they're long (≥ 32 chars for pure hex, ≥ 40
+//!   for base64), are *pure* hex/base64url, AND a secret-ish keyword (`secret`, `token`,
+//!   `password`, `api_key`, `key`) appears within ~48 chars before them. This avoids nuking
+//!   commit hashes, code identifiers, and base64 data that isn't actually a credential.
+//! * Assignment redaction (`password = "…"`) only fires for a small allowlist of key names, and
+//!   skips values that look like code (`token = get_token()`) or short prose words
+//!   (`password: use a strong one`).
+//! * Connection-string passwords (`scheme://user:password@host`) are redacted; user and host stay
+//!   visible.
 //!
 //! The transform is idempotent: a `[REDACTED:kind]` placeholder contains no characters that any
 //! matcher will re-trigger on, so redacting twice yields the same string.
@@ -124,12 +130,32 @@ pub fn redact(session: &Session) -> Session {
 }
 
 /// Like [`redact`], but with [`RedactOptions`]; also returns [`RedactStats`].
+///
+/// # Scope
+///
+/// Scrubbed: the title; every message (all text/thinking/tool blocks via [`redact_message`], plus
+/// each message's harness-specific `extra` map); the session-level `extra` map; and `git.remote` —
+/// remotes can embed credentials (`https://x-access-token:ghs_…@github.com/o/r.git`). Note that an
+/// scp-style `git@host:…` remote has its `user@host` scrubbed as an email; that's cosmetic, not a
+/// leak.
+///
+/// Not scrubbed: `cwd` and `source_path` (filesystem paths — a placeholder would corrupt them, and
+/// path privacy is a separate concern from secret redaction), `model`, ids, timestamps, and
+/// `git.branch`/`git.commit` (user-visible refs, not credential carriers).
 pub fn redact_with(session: &Session, opts: &RedactOptions) -> (Session, RedactStats) {
     let mut out = session.clone();
     let mut stats = RedactStats::default();
 
     if let Some(title) = out.title.as_mut() {
         *title = scrub(title, opts, &mut stats);
+    }
+    if let Some(remote) = out.git.as_mut().and_then(|g| g.remote.as_mut()) {
+        if let Cow::Owned(scrubbed) = scrub_cow(remote, opts, &mut stats) {
+            *remote = scrubbed;
+        }
+    }
+    for (_k, v) in out.extra.iter_mut() {
+        scrub_value(v, opts, &mut stats);
     }
     for msg in &mut out.messages {
         redact_message(msg, opts, &mut stats);
@@ -169,6 +195,11 @@ pub fn redact_message(msg: &mut Message, opts: &RedactOptions, stats: &mut Redac
             }
             Block::Image { .. } | Block::File { .. } => {}
         }
+    }
+    // Harness-specific passthrough fields can carry anything the harness logged (env snapshots,
+    // request metadata) — scrub their string leaves too.
+    for (_k, v) in msg.extra.iter_mut() {
+        scrub_value(v, opts, stats);
     }
 }
 
@@ -336,6 +367,9 @@ fn match_at(s: &str, i: usize, opts: &RedactOptions) -> Option<Match> {
         if let Some(hit) = match_assignment(s, i) {
             return Some(hit);
         }
+        if let Some(hit) = match_url_userinfo_password(s, i) {
+            return Some(hit);
+        }
     }
     if c.api_keys {
         if let Some(hit) = match_authorization_header(s, i) {
@@ -411,6 +445,11 @@ fn boundary_before(s: &str, i: usize) -> bool {
 // ---------------------------------------------------------------------------
 
 /// `-----BEGIN ... PRIVATE KEY-----` ... `-----END ... PRIVATE KEY-----`
+///
+/// Transcripts routinely clip tool output, losing the `-----END …-----` marker. A truncated key is
+/// still a key: when no END marker exists, we redact the header plus the contiguous run of
+/// base64-ish body lines that follows it (stopping at the first line that doesn't look like PEM
+/// body), rather than leaving lines 2..n to leak.
 fn match_private_key(s: &str, i: usize) -> Option<usize> {
     let begin = "-----BEGIN ";
     if !s[i..].starts_with(begin) {
@@ -427,14 +466,86 @@ fn match_private_key(s: &str, i: usize) -> Option<usize> {
     // Find the matching END marker.
     let end_marker = "PRIVATE KEY-----";
     let search_from = i + header_close;
-    let end_pos = s[search_from..].find(end_marker)?;
-    Some(search_from + end_pos + end_marker.len())
+    if let Some(end_pos) = s[search_from..].find(end_marker) {
+        return Some(search_from + end_pos + end_marker.len());
+    }
+    // No END marker: truncated key. Consume the base64 body that's present.
+    truncated_pem_body_end(s, search_from)
+}
+
+/// End offset of the contiguous PEM body following a truncated `-----BEGIN …-----` header at
+/// `body_start`, or `None` if no body follows (a bare marker in prose stays untouched).
+///
+/// A body line is a whole line of base64 characters. To avoid eating prose after a marker
+/// mention, the first body lines must be ≥ 16 chars; once one real body line is seen, a single
+/// shorter trailing base64 fragment (the clipped tail) is also consumed. Encrypted-PEM header
+/// lines (`Proc-Type: …`, `DEK-Info: …` — the latter carries the IV) before the body are
+/// consumed too.
+fn truncated_pem_body_end(s: &str, body_start: usize) -> Option<usize> {
+    let bytes = s.as_bytes();
+    let mut pos = body_start;
+    let mut end: Option<usize> = None;
+    let mut seen_body = false;
+    while pos < bytes.len() {
+        // Skip line terminators between lines.
+        while pos < bytes.len() && (bytes[pos] == b'\n' || bytes[pos] == b'\r') {
+            pos += 1;
+        }
+        if pos >= bytes.len() {
+            break;
+        }
+        let line_start = pos;
+        let mut line_end = pos;
+        while line_end < bytes.len() && bytes[line_end] != b'\n' && bytes[line_end] != b'\r' {
+            line_end += 1;
+        }
+        let line = s[line_start..line_end].trim();
+        if line.is_empty() {
+            pos = line_end;
+            continue;
+        }
+        if line.bytes().all(is_base64_std_char) {
+            if line.len() >= 16 {
+                seen_body = true;
+                end = Some(line_end);
+                pos = line_end;
+                continue;
+            }
+            if seen_body {
+                // A short base64 fragment right after real body lines: the clipped tail.
+                end = Some(line_end);
+            }
+            break;
+        }
+        // Encrypted-PEM header line ("Proc-Type: 4,ENCRYPTED" / "DEK-Info: AES-128-CBC,…")
+        // before the body: key has no spaces, then ": ".
+        if !seen_body {
+            if let Some(colon) = line.find(": ") {
+                if !line[..colon].contains(' ') && line.len() < 64 {
+                    end = Some(line_end);
+                    pos = line_end;
+                    continue;
+                }
+            }
+        }
+        break;
+    }
+    if seen_body {
+        end
+    } else {
+        None
+    }
 }
 
 /// `Authorization: <value>` — keeps the header name + colon, redacts the value to end of line.
+/// Also fires mid-word after a `-`, so `Proxy-Authorization:` / `X-Authorization:` are covered.
 fn match_authorization_header(s: &str, i: usize) -> Option<Match> {
-    if !boundary_before(s, i) {
-        return None;
+    if i > 0 {
+        let prev = s.as_bytes()[i - 1];
+        // Allow '-' (compound header names) but reject e.g. `FooAuthorization:`.
+        if prev.is_ascii_alphanumeric() || prev == b'_' {
+            return None;
+        }
     }
     let rest = &s[i..];
     let prefix = "Authorization:";
@@ -467,17 +578,17 @@ fn match_authorization_header(s: &str, i: usize) -> Option<Match> {
     })
 }
 
-/// `Bearer <token>`
+/// `Bearer <token>` — the scheme is case-insensitive (RFC 7235), so `bearer`/`BEARER` count too.
 fn match_bearer(s: &str, i: usize) -> Option<usize> {
     if !boundary_before(s, i) {
         return None;
     }
     let rest = &s[i..];
-    if !rest.starts_with("Bearer ") {
+    if !rest.get(..7).is_some_and(|p| p.eq_ignore_ascii_case("Bearer ")) {
         return None;
     }
     let bytes = rest.as_bytes();
-    let mut j = "Bearer ".len();
+    let mut j = 7;
     while j < bytes.len() && bytes[j] == b' ' {
         j += 1;
     }
@@ -488,10 +599,28 @@ fn match_bearer(s: &str, i: usize) -> Option<usize> {
     if j - start < 8 {
         return None; // too short to be a real token
     }
+    // Prose guard: matching lowercase "bearer" means "bearer instruments are…" would otherwise
+    // redact the next word. Real bearer tokens are long or contain digits/symbols.
+    let token = &rest[start..j];
+    if token.len() < 16 && token.bytes().all(|b| b.is_ascii_alphabetic()) {
+        return None;
+    }
     Some(i + j)
 }
 
-/// Known credential prefixes: sk-, sk-ant-, xoxb-, xoxp-, ghp_, gho_, ghs_, ghu_, ghr_, AKIA…, AIza…
+/// What characters a token's tail may contain after its prefix.
+#[derive(Clone, Copy)]
+enum Tail {
+    /// Alphanumeric plus `-` and `_`.
+    Token,
+    /// Strictly alphanumeric. Used for short prefixes that collide with ordinary identifiers
+    /// (`npm_config_registry`, `hf_hub_download`): the real token tails are pure base62, so
+    /// stopping at `_`/`-` rejects the identifier without missing keys.
+    Alnum,
+}
+
+/// Known credential prefixes: sk-, sk-ant-, sk_live_, xox?-, xapp-, gh?_, glpat-, npm_, hf_,
+/// gsk_, xai-, dop_v1_, shpat_/shpss_, AKIA…, AIza…
 fn match_token_prefix(s: &str, i: usize) -> Option<usize> {
     if !boundary_before(s, i) {
         return None;
@@ -499,41 +628,61 @@ fn match_token_prefix(s: &str, i: usize) -> Option<usize> {
     let rest = &s[i..];
     let bytes = rest.as_bytes();
 
-    // AWS access key: AKIA + 16 uppercase alnum.
+    // AWS access key: AKIA + 16 uppercase alnum. Real key IDs are exactly 20 chars, but if the
+    // run continues past that we redact the *whole* run rather than slicing 20 chars out of it —
+    // a placeholder plus a leftover tail would leak most of a concatenated/overlong key.
     if rest.starts_with("AKIA") {
-        let mut n = 0;
         let mut j = 4;
         while j < bytes.len() && (bytes[j].is_ascii_uppercase() || bytes[j].is_ascii_digit()) {
             j += 1;
-            n += 1;
         }
-        if n >= 16 {
-            return Some(i + 4 + 16);
+        if j - 4 >= 16 {
+            return Some(i + j);
         }
         return None;
     }
 
-    // Prefixes that are followed by a run of token chars.
-    const PREFIXES: &[(&str, usize)] = &[
-        ("sk-ant-", 10),
-        ("sk-", 10),
-        ("xoxb-", 8),
-        ("xoxp-", 8),
-        ("xoxa-", 8),
-        ("xoxr-", 8),
-        ("ghp_", 20),
-        ("gho_", 20),
-        ("ghs_", 20),
-        ("ghu_", 20),
-        ("ghr_", 20),
-        ("github_pat_", 20),
-        ("AIza", 30),
+    // Prefixes that are followed by a run of tail chars. Min tail lengths sit safely below each
+    // family's real length so we don't miss keys, but high enough that prose/identifiers don't
+    // trip them. Order matters only for prefix-of-prefix pairs (sk-ant- before sk-).
+    const PREFIXES: &[(&str, usize, Tail)] = &[
+        ("sk-ant-", 10, Tail::Token),
+        ("sk-", 10, Tail::Token),
+        ("sk_live_", 20, Tail::Alnum),  // Stripe secret key (live)
+        ("rk_live_", 20, Tail::Alnum),  // Stripe restricted key (live)
+        ("xoxb-", 8, Tail::Token),
+        ("xoxp-", 8, Tail::Token),
+        ("xoxa-", 8, Tail::Token),
+        ("xoxr-", 8, Tail::Token),
+        ("xoxc-", 8, Tail::Token),      // Slack client token
+        ("xoxs-", 8, Tail::Token),      // Slack session token
+        ("xapp-", 8, Tail::Token),      // Slack app-level token
+        ("ghp_", 20, Tail::Token),
+        ("gho_", 20, Tail::Token),
+        ("ghs_", 20, Tail::Token),
+        ("ghu_", 20, Tail::Token),
+        ("ghr_", 20, Tail::Token),
+        ("github_pat_", 20, Tail::Token),
+        ("glpat-", 20, Tail::Token),    // GitLab personal access token
+        ("npm_", 36, Tail::Alnum),      // npm token: npm_ + exactly 36 base62
+        ("hf_", 30, Tail::Alnum),       // Hugging Face token: hf_ + 34 base62
+        ("gsk_", 40, Tail::Alnum),      // Groq: gsk_ + 52 base62
+        ("xai-", 40, Tail::Alnum),      // xAI: xai- + ~80 base62
+        ("dop_v1_", 40, Tail::Alnum),   // DigitalOcean: dop_v1_ + 64 hex
+        ("shpat_", 32, Tail::Alnum),    // Shopify private app token: + 32 hex
+        ("shpss_", 32, Tail::Alnum),    // Shopify shared secret: + 32 hex
+        ("AIza", 30, Tail::Token),
     ];
-    for (pfx, min_tail) in PREFIXES {
+    for (pfx, min_tail, tail) in PREFIXES {
         if rest.starts_with(pfx) {
             let mut j = pfx.len();
             let start_tail = j;
-            while j < bytes.len() && is_token_char(bytes[j]) {
+            while j < bytes.len()
+                && match tail {
+                    Tail::Token => is_token_char(bytes[j]),
+                    Tail::Alnum => bytes[j].is_ascii_alphanumeric(),
+                }
+            {
                 j += 1;
             }
             if j - start_tail >= *min_tail {
@@ -713,7 +862,17 @@ fn match_assignment(s: &str, i: usize) -> Option<Match> {
         // unquoted: value runs to whitespace / end-of-line / common delimiters
         let mut k = value_start;
         while k < bytes.len() && !matches!(bytes[k], b' ' | b'\t' | b'\n' | b'\r' | b',' | b';' | b')') {
+            if bytes[k] == b'(' {
+                // `let token = get_token();` — a call expression, not a literal secret. Redacting
+                // the value side would corrupt code.
+                return None;
+            }
             k += 1;
+        }
+        // `password: use a strong one` — a short bare word after the key is prose (YAML comments,
+        // docs), not a credential. Real inline secrets are longer or contain digits/symbols.
+        if k - value_start < 8 && bytes[value_start..k].iter().all(|b| b.is_ascii_alphabetic()) {
+            return None;
         }
         (value_start, k)
     };
@@ -743,46 +902,92 @@ fn match_keyworded_blob(s: &str, i: usize) -> Option<usize> {
         return None;
     }
 
-    // Measure a maximal run of base64/hex-ish characters.
+    // Measure a maximal run of base64/hex-ish characters. Decide inclusion *before* updating the
+    // purity flags: the terminating character (a closing quote, space, newline…) is not part of
+    // the run and must not poison them — it used to, which limited this matcher to blobs sitting
+    // at the very end of the input.
     let mut j = i;
     let mut all_hex = true;
     let mut all_b64url = true;
     let mut all_b64std = true;
     while j < bytes.len() {
         let b = bytes[j];
-        let mut any = false;
-        if is_hex_char(b) {
-            any = true;
-        } else {
-            all_hex = false;
-        }
-        if is_base64url_char(b) {
-            any = true;
-        } else {
-            all_b64url = false;
-        }
-        if is_base64_std_char(b) {
-            any = true;
-        } else {
-            all_b64std = false;
-        }
-        if !any {
+        if !is_hex_char(b) && !is_base64url_char(b) && !is_base64_std_char(b) {
             break;
         }
+        all_hex &= is_hex_char(b);
+        all_b64url &= is_base64url_char(b);
+        all_b64std &= is_base64_std_char(b);
         j += 1;
     }
     let len = j - i;
-    if len < 40 {
-        return None;
-    }
     if !(all_hex || all_b64url || all_b64std) {
         return None;
     }
-    // Guardrail: must have a secret-ish keyword within ~24 chars before the blob.
-    if !keyword_before(s, i, 24) {
+    // Pure hex gets a lower floor (32-hex secrets — MD5-width, `secrets.token_hex(16)` — are
+    // common); base64 keeps the 40 floor since short base64-ish runs show up in ordinary code.
+    let min_len = if all_hex { 32 } else { 40 };
+    if len < min_len {
+        return None;
+    }
+    // Guardrail: must have a secret-ish keyword within ~48 chars before the blob (enough to span
+    // JSON like `"credentials": {"value": "…"}`).
+    if !keyword_before(s, i, 48) {
         return None;
     }
     Some(j)
+}
+
+/// `scheme://user:password@host` — redacts the userinfo password, keeping scheme, user, and host
+/// visible. Any scheme counts (postgres, mysql, redis, amqp, https git remotes, …).
+///
+/// Gated under the `assignments` class (it's a key/value credential, counted as one). The user
+/// part must end at `:` before any `/`, whitespace, or `@`-less end, so `https://host:8080/path`
+/// (a port) and path colons never match. Passwords starting with `$` (env-var references like
+/// `${DB_PASSWORD}`) are left alone.
+fn match_url_userinfo_password(s: &str, i: usize) -> Option<Match> {
+    if !boundary_before(s, i) {
+        return None;
+    }
+    let bytes = s.as_bytes();
+    if !bytes[i].is_ascii_alphabetic() {
+        return None;
+    }
+    // scheme: alpha, then alnum / '+' / '-' / '.'
+    let mut j = i + 1;
+    while j < bytes.len() && (bytes[j].is_ascii_alphanumeric() || matches!(bytes[j], b'+' | b'-' | b'.')) {
+        j += 1;
+    }
+    if !s[j..].starts_with("://") {
+        return None;
+    }
+    j += 3;
+    // user: runs to ':'; hitting '@', '/', whitespace, or a quote first means no password present.
+    while j < bytes.len() && !matches!(bytes[j], b':' | b'@' | b'/' | b' ' | b'\t' | b'\n' | b'\r' | b'"' | b'\'') {
+        j += 1;
+    }
+    if j >= bytes.len() || bytes[j] != b':' {
+        return None;
+    }
+    j += 1;
+    let pass_start = j;
+    // Idempotency: an already-redacted password stays put; env-var refs aren't secrets.
+    if s[pass_start..].starts_with(PLACEHOLDER_OPEN) || bytes.get(pass_start) == Some(&b'$') {
+        return None;
+    }
+    // password: anything up to the '@' that introduces the host. A '/' or whitespace first means
+    // what we took for a user was a host and the ':' introduced a port/path — no match.
+    while j < bytes.len() && !matches!(bytes[j], b'@' | b'/' | b' ' | b'\t' | b'\n' | b'\r' | b'"' | b'\'') {
+        j += 1;
+    }
+    if j >= bytes.len() || bytes[j] != b'@' || j == pass_start {
+        return None;
+    }
+    Some(Match {
+        keep_prefix: pass_start - i,
+        end: j, // leave '@host' intact
+        kind: Kind::Assignment,
+    })
 }
 
 /// Does a secret-ish keyword appear in the `window` chars (roughly) before `i`?
@@ -810,7 +1015,7 @@ fn keyword_before(s: &str, i: usize, window: usize) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ir::{Block, Harness, Message, Role, Session};
+    use crate::ir::{Block, GitInfo, Harness, Message, Role, Session};
 
     fn empty_session() -> Session {
         Session {
@@ -1005,16 +1210,30 @@ mod tests {
         assert_eq!(out, input, "got: {out}");
     }
 
+    /// Join a token prefix to its fixture tail at runtime so secret-shaped literals never appear
+    /// in the source blob — GitHub push protection (and every downstream clone's scanner) would
+    /// flag them as real credentials.
+    fn fixture(prefix: &str, tail: &str) -> String {
+        format!("{prefix}{tail}")
+    }
+
     #[test]
     fn idempotent() {
         let inputs = [
-            "sk-abcDEF1234567890ghijkl",
-            "email a@b.com and key sk-zzzzzzzzzzzzzzzzzzzz",
-            "-----BEGIN PRIVATE KEY-----\nAAAA\nBBBB\n-----END PRIVATE KEY-----",
-            r#"password = "hunter2supersecret""#,
-            "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c",
+            "sk-abcDEF1234567890ghijkl".to_string(),
+            "email a@b.com and key sk-zzzzzzzzzzzzzzzzzzzz".to_string(),
+            "-----BEGIN PRIVATE KEY-----\nAAAA\nBBBB\n-----END PRIVATE KEY-----".to_string(),
+            "-----BEGIN PRIVATE KEY-----\nMIIEowIBAAKCAQEA1234567890abcdef\nqrstuvwx".to_string(), // truncated
+            r#"password = "hunter2supersecret""#.to_string(),
+            "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c".to_string(),
+            "postgres://app_user:hunter2secret@db.example.com:5432/prod".to_string(),
+            "npm_abcdefghijklmnopqrstuvwxyz0123456789".to_string(),
+            fixture("glpat-", "abcDEF1234567890ghij"),
+            "Proxy-Authorization: Basic dXNlcjpwYXNzd29yZA==".to_string(),
+            "bearer abcdef1234567890XYZ".to_string(),
+            "key AKIAIOSFODNN7EXAMPLEEXTRA9 tail".to_string(),
         ];
-        for input in inputs {
+        for input in &inputs {
             let once = redact_one(input);
             let twice = redact_one(&once);
             assert_eq!(once, twice, "not idempotent for {input}");
@@ -1140,6 +1359,242 @@ mod tests {
         assert_eq!(stats.total(), 2);
     }
 
+    // --- R1: truncated PEM ---------------------------------------------------
+
+    #[test]
+    fn redacts_truncated_private_key() {
+        // Tool-output clipping loses the END marker; the body must still be scrubbed.
+        let pem = "output:\n-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEA1234567890abcdefMIIEowIBAAKCAQEA1234567890abcdef\nqrstuvwxyzABCDEF0123456789abcdefqrstuvwxyzABCDEF0123456789abcdef\nZZZZclipped\n[output clipped]";
+        let out = redact_one(pem);
+        assert!(out.contains("[REDACTED:private_key]"), "got: {out}");
+        assert!(!out.contains("MIIEowIBAAKCAQEA"), "line 1 leaked: {out}");
+        assert!(!out.contains("qrstuvwxyzABCDEF"), "line 2 leaked: {out}");
+        assert!(!out.contains("ZZZZclipped"), "clipped tail leaked: {out}");
+        assert!(out.starts_with("output:\n"));
+        assert!(out.ends_with("\n[output clipped]"));
+    }
+
+    #[test]
+    fn redacts_truncated_encrypted_private_key_headers() {
+        let pem = "-----BEGIN RSA PRIVATE KEY-----\nProc-Type: 4,ENCRYPTED\nDEK-Info: AES-128-CBC,A1B2C3D4E5F60718\n\nMIIEowIBAAKCAQEA1234567890abcdefMIIEowIBAAKCAQEA1234567890abcdef";
+        let out = redact_one(pem);
+        assert!(!out.contains("DEK-Info"), "IV header leaked: {out}");
+        assert!(!out.contains("MIIEowIBAAKCAQEA"), "body leaked: {out}");
+        assert!(out.contains("[REDACTED:private_key]"), "got: {out}");
+    }
+
+    #[test]
+    fn bare_begin_marker_in_prose_survives() {
+        // A mention of the marker with no base64 body following is prose, not a key.
+        let input = "PEM blocks start with -----BEGIN PRIVATE KEY----- and look like\nthis line";
+        assert_eq!(redact_one(input), input);
+    }
+
+    // --- R2: new token families + connection strings -------------------------
+
+    #[test]
+    fn redacts_new_token_families() {
+        let tokens = [
+            fixture("sk_live_", "4eC39HqLyjWDarjtT1zdp7dc"),
+            fixture("rk_live_", "4eC39HqLyjWDarjtT1zdp7dc"),
+            fixture("glpat-", "abcDEF1234567890ghij"),
+            fixture("xoxc-", "1234567890-abcdefghij"),
+            fixture("xoxs-", "1234567890-abcdefghij"),
+            fixture("xapp-", "1-A0123456789-abcdefghijklmnop"),
+            fixture("npm_", "abcdefghijklmnopqrstuvwxyz0123456789"),
+            fixture("hf_", "abcdefghijklmnopqrstuvwxyzABCDEFGH"),
+            fixture("gsk_", "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKL"),
+            fixture("xai-", "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcd"),
+            fixture("dop_v1_", "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"),
+            fixture("shpat_", "0123456789abcdef0123456789abcdef"),
+            fixture("shpss_", "0123456789abcdef0123456789abcdef"),
+        ];
+        for t in &tokens {
+            let out = redact_one(&format!("deploy with {t} now"));
+            assert!(!out.contains(t.as_str()), "{t} leaked: {out}");
+            assert!(out.contains("[REDACTED:api_key]"), "{t}: got {out}");
+            assert!(out.starts_with("deploy with "), "{t}: got {out}");
+            assert!(out.ends_with(" now"), "{t}: got {out}");
+        }
+    }
+
+    #[test]
+    fn short_prefix_families_skip_identifiers() {
+        let inputs = [
+            "npm_config_registry points at the default registry",
+            "npm_package_version is set by npm",
+            "use hf_hub_download to fetch the model",
+            "hf_transfer speeds things up",
+            "the sk_live_key variable name",
+        ];
+        for input in inputs {
+            assert_eq!(redact_one(input), input, "identifier was eaten");
+        }
+    }
+
+    #[test]
+    fn redacts_connection_string_password() {
+        let out = redact_one("DATABASE_URL=postgres://app_user:sup3rS3cret!@db.internal:5432/prod");
+        assert!(!out.contains("sup3rS3cret!"), "got: {out}");
+        assert_eq!(
+            out,
+            "DATABASE_URL=postgres://app_user:[REDACTED:secret]@db.internal:5432/prod"
+        );
+
+        // Empty user (redis style) still counts; user stays visible in the general case.
+        let out2 = redact_one("redis://:opensesame123@cache.local:6379");
+        assert_eq!(out2, "redis://:[REDACTED:secret]@cache.local:6379");
+
+        // Git remote with an embedded installation token.
+        let out3 = redact_one("https://x-access-token:ghs_0123456789abcdefABCD@github.com/o/r.git");
+        assert_eq!(out3, "https://x-access-token:[REDACTED:secret]@github.com/o/r.git");
+    }
+
+    #[test]
+    fn connection_string_false_positives_survive() {
+        let inputs = [
+            "https://example.com:8080/path?q=1",
+            "see http://localhost:3000 for the dev server",
+            "mongodb://replica1.example.com:27017,replica2.example.com:27017/db",
+            "postgres://app:$DB_PASSWORD@db/prod",   // env ref, not a secret
+            "postgres://app:${DB_PASSWORD}@db/prod", // env ref, not a secret
+        ];
+        for input in inputs {
+            assert_eq!(redact_one(input), input, "false positive");
+        }
+    }
+
+    // --- R3: header/bearer case + compound header names ----------------------
+
+    #[test]
+    fn redacts_compound_authorization_headers() {
+        let out = redact_one("Proxy-Authorization: Basic dXNlcjpwYXNzd29yZA==");
+        assert_eq!(out, "Proxy-Authorization: [REDACTED:api_key]");
+
+        let out2 = redact_one("X-Authorization: t0ken-value-1234");
+        assert_eq!(out2, "X-Authorization: [REDACTED:api_key]");
+    }
+
+    #[test]
+    fn redacts_lowercase_bearer() {
+        let out = redact_one("sending bearer abcdef1234567890XYZ along");
+        assert!(!out.contains("abcdef1234567890XYZ"), "got: {out}");
+        assert_eq!(out, "sending [REDACTED:api_key] along");
+    }
+
+    #[test]
+    fn bearer_prose_survives() {
+        let inputs = [
+            "bearer instruments are negotiable",
+            "the bearer of this note",
+        ];
+        for input in inputs {
+            assert_eq!(redact_one(input), input, "prose was eaten");
+        }
+    }
+
+    // --- R4: assignment code/prose false positives ---------------------------
+
+    #[test]
+    fn assignment_skips_code_and_prose() {
+        let inputs = [
+            "let token = get_token();",
+            "let token = client.fetch_token(scope);",
+            "password: use a strong one",
+            "# token: set via the environment",
+        ];
+        for input in inputs {
+            assert_eq!(redact_one(input), input, "code/prose was corrupted");
+        }
+    }
+
+    // --- R5: wider keyword window + hex floor ---------------------------------
+
+    #[test]
+    fn redacts_hex_secret_behind_wider_keyword_window() {
+        // 39-hex value, keyword ~26 chars back (old 24-char window missed it).
+        let input = r#""credentials": {"value": "0123456789abcdef0123456789abcdef0123456"}"#;
+        let out = redact_one(input);
+        assert!(
+            !out.contains("0123456789abcdef0123456789abcdef0123456"),
+            "39-hex leaked: {out}"
+        );
+
+        // 32-hex secret with the keyword >24 but <48 chars before it.
+        let input2 = "the api key for that environment is 0123456789abcdef0123456789abcdef";
+        let out2 = redact_one(input2);
+        assert!(
+            !out2.contains("0123456789abcdef0123456789abcdef"),
+            "32-hex leaked: {out2}"
+        );
+    }
+
+    #[test]
+    fn preserves_multiline_base64_without_keyword() {
+        // Certificate-style base64 (public data, no secret keyword nearby) must survive.
+        let cert = "MIIDdzCCAlgAwIBAgIEbGRkbDANBgcshgiG9w0BAQsFADBsMQswCQYDVQQGEwJV\nUzEQMA4GA1UECBMHQXJpem9uYTETMBEGA1UEBxMSU2NvdHRzZGFsZTEaMBgGA1UE\n";
+        assert_eq!(redact_one(cert), cert);
+    }
+
+    // --- R6: scope beyond title + message blocks -----------------------------
+
+    /// Documents the redaction scope of [`redact_with`]: `git.remote`, `Session.extra`, and
+    /// `Message.extra` are scrubbed; `cwd`/`source_path` deliberately are not (see the fn docs).
+    #[test]
+    fn scrubs_git_remote_and_extra_maps() {
+        let mut sess = empty_session();
+        sess.git = Some(GitInfo {
+            branch: Some("main".into()),
+            commit: Some("abc1234".into()),
+            remote: Some("https://x-access-token:ghs_0123456789abcdefABCD@github.com/o/r.git".into()),
+        });
+        sess.extra.insert(
+            "apiKey".into(),
+            serde_json::json!("sk-abcDEF1234567890ghijkl"),
+        );
+        let mut m = Message::new(Role::User);
+        m.content.push(Block::Text { text: "hi".into() });
+        m.extra.insert(
+            "env".into(),
+            serde_json::json!({ "GITHUB_TOKEN": "ghp_0123456789abcdefABCDEF0123456789abcd" }),
+        );
+        sess.messages.push(m);
+
+        let (out, stats) = redact_with(&sess, &RedactOptions::default());
+        let remote = out.git.as_ref().unwrap().remote.as_deref().unwrap();
+        assert_eq!(
+            remote,
+            "https://x-access-token:[REDACTED:secret]@github.com/o/r.git"
+        );
+        assert_eq!(out.git.as_ref().unwrap().branch.as_deref(), Some("main"));
+        let extra = serde_json::Value::Object(out.extra.clone()).to_string();
+        assert!(!extra.contains("sk-abcDEF"), "session extra leaked: {extra}");
+        let mextra = serde_json::Value::Object(out.messages[0].extra.clone()).to_string();
+        assert!(!mextra.contains("ghp_"), "message extra leaked: {mextra}");
+        assert!(stats.total() >= 3, "stats: {stats:?}");
+
+        // Idempotent across the whole session too.
+        let (again, again_stats) = redact_with(&out, &RedactOptions::default());
+        assert_eq!(
+            again.git.as_ref().unwrap().remote,
+            out.git.as_ref().unwrap().remote
+        );
+        assert_eq!(again.extra, out.extra);
+        assert_eq!(again.messages[0].extra, out.messages[0].extra);
+        assert_eq!(again_stats.total(), 0);
+    }
+
+    // --- R7: AKIA over-long runs ----------------------------------------------
+
+    #[test]
+    fn akia_overlong_run_fully_redacted() {
+        // Slicing exactly 20 chars out of a longer run would leave a tail of the key behind.
+        let out = redact_one("key AKIAIOSFODNN7EXAMPLEEXTRA9 tail");
+        assert!(!out.contains("AKIA"), "got: {out}");
+        assert!(!out.contains("EXTRA9"), "tail leaked: {out}");
+        assert_eq!(out, "key [REDACTED:api_key] tail");
+    }
+
     #[test]
     fn no_panic_on_weird_input() {
         let weird = [
@@ -1155,6 +1610,33 @@ mod tests {
         ];
         for w in weird {
             let _ = redact_one(w); // must not panic
+        }
+    }
+
+    /// Property-ish: every matcher must survive arbitrary truncation/suffixing of real-looking
+    /// secrets (clipped tool output produces exactly these shapes), including through multi-byte
+    /// UTF-8, and redacting any fragment must stay idempotent.
+    #[test]
+    fn no_panic_on_mutated_inputs() {
+        let corpus = [
+            "-----BEGIN RSA PRIVATE KEY-----\nProc-Type: 4,ENCRYPTED\nMIIEowIBAAKCAQEA1234567890abcdef\nqrstuvwx\n-----END RSA PRIVATE KEY-----".to_string(),
+            "postgres://app_user:sup3rS3cret!@db.example.com:5432/prod".to_string(),
+            "Proxy-Authorization: bearer abcdef1234567890XYZ".to_string(),
+            "password = \"hunter2supersecret\" et café 日本語".to_string(),
+            fixture("npm_", "abcdefghijklmnopqrstuvwxyz0123456789 ") + &fixture("hf_", "abcdefghijklmnopqrstuvwxyzABCDEFGH"),
+            "key AKIAIOSFODNN7EXAMPLEEXTRA9 [REDACTED:api_key] eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.sig".to_string(),
+        ];
+        for base in &corpus {
+            for cut in 0..=base.len() {
+                if !base.is_char_boundary(cut) {
+                    continue;
+                }
+                for frag in [&base[..cut], &base[cut..]] {
+                    let once = redact_one(frag);
+                    let twice = redact_one(&once);
+                    assert_eq!(once, twice, "not idempotent for fragment {frag:?}");
+                }
+            }
         }
     }
 }

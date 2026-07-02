@@ -297,13 +297,19 @@ fn resolve_id(
                 continue;
             }
         }
+        if !r.id.starts_with(id) {
+            continue;
+        }
+        // Mirror the fast path: never return a session whose file has vanished (deleted between
+        // the scan and now, or a stale probe-path catalog row). Stat only the id matches — cheap.
+        if !r.path.exists() {
+            continue;
+        }
         if r.id == id {
             let a = harness::for_harness(r.harness);
             return Ok(a.map(|a| (r, a)));
         }
-        if r.id.starts_with(id) {
-            prefix_hits.push(r);
-        }
+        prefix_hits.push(r);
     }
     match prefix_hits.len() {
         0 => Ok(None),

@@ -154,9 +154,6 @@ impl Adapter for Codex {
         ))
     }
 
-    fn can_emit(&self) -> bool {
-        false // TODO: Codex as a conversion target (the headline MVP)
-    }
 }
 
 /// Parse a Codex transcript from its text contents into a [`Session`].

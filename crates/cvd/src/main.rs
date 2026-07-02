@@ -58,6 +58,13 @@ enum Command {
         /// `cvd serve --web ./web` is a complete hub: UI at `/`, JSON API at `/api/*`.
         #[arg(long, value_name = "DIR")]
         web: Option<PathBuf>,
+        /// Require `Authorization: Bearer <token>` on every /api/* request ($CVD_TOKEN also works).
+        #[arg(long, value_name = "TOKEN")]
+        token: Option<String>,
+        /// Allow a non-loopback --host without a token. The transcript corpus can contain
+        /// secrets; anyone who can reach the port can read all of it.
+        #[arg(long)]
+        insecure_expose: bool,
     },
     /// List what's in the archive.
     Ls,
@@ -72,13 +79,44 @@ fn main() -> Result<()> {
     match cli.command {
         Command::Sync => cmd_sync(&archive),
         Command::Watch { interval, harness, cwd } => cmd_watch(&archive, interval, harness, cwd),
-        Command::Serve { port, host, web } => serve::run(&host, port, web),
+        Command::Serve {
+            port,
+            host,
+            web,
+            token,
+            insecure_expose,
+        } => cmd_serve(&host, port, web, token, insecure_expose),
         Command::Ls => cmd_ls(&archive),
         Command::Path => {
             println!("{}", archive.home().display());
             Ok(())
         }
     }
+}
+
+/// Gatekeep `serve`'s exposure before handing off to [`serve::run`]: a non-loopback bind serves
+/// the whole transcript corpus (secrets included) to anyone who can reach the port, so it demands
+/// a bearer token or an explicit `--insecure-expose` — and warns loudly either way.
+fn cmd_serve(host: &str, port: u16, web: Option<PathBuf>, token: Option<String>, insecure_expose: bool) -> Result<()> {
+    let token = token
+        .or_else(|| std::env::var("CVD_TOKEN").ok())
+        .filter(|t| !t.is_empty());
+
+    if !serve::is_loopback_host(host) {
+        if token.is_none() && !insecure_expose {
+            anyhow::bail!(
+                "refusing to bind non-loopback host {host:?} without auth: the API serves your full \
+                 transcript corpus (which can contain secrets) to anyone who can reach the port.\n\
+                 Set a token (--token or $CVD_TOKEN), or pass --insecure-expose to serve it open."
+            );
+        }
+        eprintln!("cvd serve: WARNING: binding non-loopback host {host:?} — the API is reachable from the network.");
+        if token.is_none() {
+            eprintln!("cvd serve: WARNING: --insecure-expose without a token: anyone who can reach {host}:{port} can read every archived transcript.");
+        }
+    }
+
+    serve::run(host, port, web, token)
 }
 
 /// Parse a harness name into a [`Harness`], erroring with the valid set.

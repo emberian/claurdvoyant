@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/cv-core", "crates/cv", "crates/cv-mcp", "crates/cvd", "crates/cv-web", "crates/cv-search", "crates/cv-llm", "crates/cv-tui"]
 
 [workspace.package]
-version = "0.9.18"
+version = "0.9.20"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/emberian/cv"
@@ -11,7 +11,11 @@ authors = ["ember"]
 
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }
-serde_json = { version = "1", features = ["raw_value"] }
+# `preserve_order` keeps JSON object keys in source order (IndexMap-backed Map). Emit/convert
+# round-trips replay captured records and re-serialize stashed `extra` JSON; without it the
+# BTreeMap re-sorts keys — and worse, *iteration* order changes: ChatGPT-export's `mapping.values()`
+# fallback shuffled messages by UUID and Zed's `tool_results` map lost its insertion order.
+serde_json = { version = "1", features = ["raw_value", "preserve_order"] }
 chrono = { version = "0.4", features = ["serde"] }
 anyhow = "1"
 thiserror = "2"

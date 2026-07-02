@@ -106,6 +106,12 @@ impl Hermes {
         Hermes { dbs }
     }
 
+    /// An adapter over exactly one `state.db` — lets emit-verification and tests re-parse a
+    /// just-written DB without mutating `HERMES_HOME` (process-global env, races other threads).
+    pub fn with_db(db: PathBuf) -> Self {
+        Hermes { dbs: vec![db] }
+    }
+
     fn open_path(path: &PathBuf) -> Result<Connection> {
         // Read-only so we never touch the user's live DB / take a write lock.
         let conn =
@@ -159,9 +165,6 @@ impl Adapter for Hermes {
         stream_conn(&conn, r, sink)
     }
 
-    fn can_emit(&self) -> bool {
-        false
-    }
 }
 
 /// Which optional columns exist on the `messages` table of this DB (for historical schemas).

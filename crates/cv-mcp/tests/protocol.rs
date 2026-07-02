@@ -346,6 +346,78 @@ fn protocol_error_handling() {
     assert!(resp["result"]["tools"].is_array(), "{resp}");
 }
 
+/// Requests are dispatched concurrently: a parked long-poll (board_await on a channel nobody
+/// posts to) must not head-of-line-block a fast request issued after it. Responses come back out
+/// of order — the fast one first — and both complete well under the long-poll's timeout budget.
+#[test]
+fn slow_long_poll_does_not_block_other_requests() {
+    let mut s = Server::spawn("concurrent");
+    s.request(1, "initialize", json!({}));
+
+    let start = std::time::Instant::now();
+    s.send(&json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {
+        "name": "board_await",
+        "arguments": {"channel": "quiet", "regex": "NEVER_MATCHES", "timeout_secs": 6, "interval_secs": 1}}}));
+    s.send(&json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {
+        "name": "list_sessions", "arguments": {}}}));
+
+    let first = s.recv();
+    let elapsed = start.elapsed();
+    assert_eq!(first["id"], json!(3), "the fast request must answer first: {first}");
+    assert!(
+        elapsed < Duration::from_secs(4),
+        "list_sessions took {elapsed:?} — blocked behind the 6s long-poll?"
+    );
+    assert_eq!(first["result"]["isError"], false, "{first}");
+
+    // The long-poll still completes on its own schedule (timed out, unmatched).
+    let second = s.recv();
+    assert_eq!(second["id"], json!(2), "{second}");
+    let text = second["result"]["content"][0]["text"].as_str().unwrap_or_default();
+    assert!(text.contains("\"timed_out\": true"), "{second}");
+}
+
+/// A present-but-malformed numeric argument is the caller's protocol mistake: JSON-RPC `-32602
+/// Invalid params`, not a silent fallback to the default (and not an isError tool result). An
+/// integral float is tolerated — clients often serialize `1` as `1.0`.
+#[test]
+fn malformed_numeric_args_are_invalid_params() {
+    let mut s = Server::spawn("badparams");
+    s.request(1, "initialize", json!({}));
+
+    for (id, bad) in [(2u64, json!("ten")), (3, json!(-3)), (4, json!(1.5))] {
+        let resp = s.request(
+            id,
+            "tools/call",
+            json!({"name": "list_sessions", "arguments": {"limit": bad}}),
+        );
+        assert_eq!(resp["error"]["code"], -32602, "limit={bad}: {resp}");
+        assert!(
+            resp["error"]["message"].as_str().unwrap_or_default().contains("limit"),
+            "the error must name the offending argument: {resp}"
+        );
+        assert!(resp["result"].is_null(), "an error response carries no result: {resp}");
+    }
+
+    // Integral float: accepted, behaves like the integer.
+    let (text, is_err) = s.call_tool(5, "list_sessions", json!({"limit": 1.0}));
+    assert!(!is_err, "{text}");
+    let v: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(v.as_array().unwrap().len(), 1, "{text}");
+
+    // Other tools route through the same guard (spot-check a long-poll's timeout).
+    let resp = s.request(
+        6,
+        "tools/call",
+        json!({"name": "board_await", "arguments": {"channel": "c", "regex": ".", "timeout_secs": "soon"}}),
+    );
+    assert_eq!(resp["error"]["code"], -32602, "{resp}");
+
+    // Still alive afterwards.
+    let resp = s.request(7, "ping", json!({}));
+    assert!(resp["result"].is_object(), "{resp}");
+}
+
 
 /// `observe_stream` is the non-blocking tail of `await_omen`: bounded, read-only, cursor-driven.
 /// Covers the spec's required cases — an absent/empty corpus yields a bounded EMPTY result, the

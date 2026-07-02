@@ -87,9 +87,6 @@ impl Adapter for Gemini {
         stream_for(Harness::Gemini, r, opts, sink)
     }
 
-    fn can_emit(&self) -> bool {
-        false
-    }
 }
 
 /// Discovery scan of one Gemini-format file into 0..n [`SessionRef`]s, tagged as `harness`.

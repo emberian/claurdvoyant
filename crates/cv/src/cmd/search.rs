@@ -67,6 +67,12 @@ fn render_search_hits(hits: &[cv_search::Hit], want: Option<Harness>, limit: usi
             "(index; try `cv index` to refresh)"
         };
         println!("no matches for {query:?} {hint}");
+        // The likely reason a recent conversation isn't findable: the index has fallen behind.
+        if source == "index" {
+            if let Some(days) = index_days_behind() {
+                println!("(note: the index is ~{days} day(s) behind the newest session — run `cv index`)");
+            }
+        }
         return;
     }
     for h in rows {
@@ -90,51 +96,44 @@ fn render_search_hits(hits: &[cv_search::Hit], want: Option<Harness>, limit: usi
     }
 }
 
+/// Whole days the FTS index lags the newest session file on disk, when ≥ 1. Cheap enough for the
+/// no-matches path it decorates: one stored-field scan of the index (the newest indexed mtime
+/// stamp) plus a metadata-only discovery sweep (a stat per session, no parsing).
+fn index_days_behind() -> Option<u64> {
+    const DAY_NS: i64 = 86_400 * 1_000_000_000;
+    let indexed = cv_search::fts::newest_indexed_mtime(&cv_search::default_tantivy_dir())?;
+    let newest_on_disk = cv_core::discover_all()
+        .iter()
+        .map(|r| cv_core::offsets::file_sig(&r.path).0)
+        .max()?;
+    let days = newest_on_disk.saturating_sub(indexed) / DAY_NS;
+    (days >= 1).then_some(days as u64)
+}
+
 fn cmd_search_live(query: &str, want: Option<Harness>, limit: usize) -> Result<()> {
-    use cv_core::{Flow, Message, MessageSink, ParseOptions, Role};
+    use cv_core::ParseOptions;
     let needle = query.to_lowercase();
     let mut hits = 0;
 
-    // A sink that builds one session's lowercased searchable haystack as messages stream past (each
-    // dropped immediately), and grabs the first user text for the label fallback. Peak per session is
-    // O(haystack) instead of O(whole Session) + a separate searchable_text copy + a lowercase copy.
-    struct HaySink {
-        hay: String,
-        first_user: Option<String>,
-        resolver: cv_core::Resolver,
-    }
-    impl MessageSink for HaySink {
-        fn message(&mut self, mut m: Message) -> Flow {
-            m.materialize(&self.resolver);
-            if self.first_user.is_none() && m.role == Role::User {
-                if let Some(t) = m.text() {
-                    if !t.trim().is_empty() {
-                        self.first_user = Some(t);
-                    }
-                }
-            }
-            let mut piece = String::new();
-            cv_core::stream::append_searchable(&mut piece, &m);
-            self.hay.push_str(&piece.to_lowercase());
-            Flow::Continue
-        }
-    }
-
+    // Streams each session into pack's head-capped `CapSink` under a lazy parse: peak per session
+    // is O(LIVE_HAY_BYTES), never O(session) — this is exactly the first-run (no index yet) path,
+    // where the old bulk parse materialized every message plus a lowercased copy of the whole
+    // transcript (multi-GB RSS on a big corpus). Trade-off: a match beyond the capped head is
+    // missed here; finding those is the index's job (`cv index`).
     for adapter in cv_core::harness::all() {
         if want.is_some_and(|h| adapter.harness() != h) || adapter.storage_root().is_none() {
             continue;
         }
         for r in adapter.discover()? {
-            let mut sink = HaySink {
-                hay: String::new(),
-                first_user: None,
-                resolver: cv_core::Resolver::new(Some(r.path.clone())),
-            };
-            let meta = match adapter.stream(&r, &ParseOptions::bulk(), &mut sink) {
+            let mut sink = super::pack::CapSink::new(&r.path);
+            let meta = match adapter.stream(&r, &ParseOptions::lazy(), &mut sink) {
                 Ok(m) => m,
                 Err(_) => continue,
             };
-            if let Some(pos) = sink.hay.find(&needle) {
+            // Lowercase only the bounded head (the match check), windowing the snippet from the
+            // original-case haystack.
+            let low = sink.hay.to_lowercase();
+            if let Some(pos) = low.find(&needle) {
                 hits += 1;
                 let label = cv_core::label_from(meta.title.as_deref(), sink.first_user.as_deref());
                 println!(
@@ -146,7 +145,10 @@ fn cmd_search_live(query: &str, want: Option<Harness>, limit: usize) -> Result<(
                         .unwrap_or_else(|| "----------".into()),
                     label,
                 );
-                println!("          … {}", snippet(&sink.hay, pos, needle.len()));
+                println!(
+                    "          … {}",
+                    snippet(&sink.hay, pos.min(sink.hay.len()), needle.len())
+                );
                 if hits >= limit {
                     println!("\n(stopped at {limit} hits; use --limit)");
                     return Ok(());
