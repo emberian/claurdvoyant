@@ -576,7 +576,10 @@ fn prune_session(args: &Value) -> anyhow::Result<String> {
         revive: args.get("revive").and_then(Value::as_bool).unwrap_or(true),
         window: args.get("window").and_then(Value::as_u64),
         keep_range: None,
+        declassify: args.get("declassify").and_then(Value::as_bool).unwrap_or(false),
+        // declassify_tokens + declassify_min_hits come from Default (built-in security list, >=2).
         dry_run: args.get("dry_run").and_then(Value::as_bool).unwrap_or(false),
+        ..Default::default()
     };
     let r = cv_core::prune::prune_session(&sref.path, &opts)?;
     Ok(serde_json::to_string_pretty(&json!({

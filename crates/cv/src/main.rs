@@ -371,6 +371,13 @@ enum Cmd {
         /// `650-`, `650-900`, or `-900`), dropping everything outside it. Like --window but by index.
         #[arg(long, value_name = "RANGE")]
         range: Option<String>,
+        /// Also snip OLD security-dense message TEXT (user prompts + assistant replies) into the
+        /// sidecar, leaving a `[PRUNED …]` marker. A safeguard classifier scores the WHOLE loaded
+        /// context, so security-heavy PROSE in the history can silently downgrade a resumed seat's
+        /// model tier — and tool/`--thinking` snipping leaves that prose verbatim. This clears it too.
+        /// Lossless (retrievable). A message is snipped iff it holds ≥2 distinct security terms.
+        #[arg(long)]
+        declassify: bool,
         /// Report what would be pruned without writing anything.
         #[arg(long)]
         dry_run: bool,
@@ -715,6 +722,7 @@ fn main() -> Result<()> {
             no_revive,
             window,
             range,
+            declassify,
             dry_run,
         } => compose::cmd_prune(
             &id,
@@ -729,6 +737,7 @@ fn main() -> Result<()> {
             !no_revive,
             window,
             range.map(|s| parse_keep_range(&s)).transpose()?,
+            declassify,
             dry_run,
         ),
         Cmd::Config { add_export, rm_export } => config::cmd_config(add_export, rm_export),

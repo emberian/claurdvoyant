@@ -26,6 +26,7 @@ pub(crate) fn cmd_prune(
     revive: bool,
     window: Option<u64>,
     keep_range: Option<(usize, Option<usize>)>,
+    declassify: bool,
     dry_run: bool,
 ) -> Result<()> {
     let want = parse_harness(&harness)?;
@@ -69,7 +70,9 @@ pub(crate) fn cmd_prune(
         revive,
         window,
         keep_range,
-        dry_run,
+        declassify,
+        // declassify_tokens + declassify_min_hits come from Default (the built-in security list, ≥2).
+        ..Default::default()
     };
     let res = cv_core::prune::prune_session(&r.path, &opts)?;
 

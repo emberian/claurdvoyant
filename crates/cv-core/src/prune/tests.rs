@@ -51,7 +51,10 @@ fn window_cutoff_sizes_by_real_recorded_usage() {
     // budget beyond the whole session → keep everything.
     assert_eq!(usage_window_cutoff(&parsed, 9_000_000), Some((0, 500_000, false)));
     // no usage records → None (caller falls back to a byte estimate).
-    assert_eq!(usage_window_cutoff(&pv(&[serde_json::json!({"type":"user"})]), 100), None);
+    assert_eq!(
+        usage_window_cutoff(&pv(&[serde_json::json!({"type":"user"})]), 100),
+        None
+    );
 }
 
 #[test]
@@ -172,8 +175,11 @@ fn drop_mode_writes_no_sidecar_and_never_advertises_retrieve() {
     let out = std::fs::read_to_string(&r.new_path).unwrap();
     assert!(out.contains("[PRUNED id=toolu_1"));
     assert!(!out.contains(&big)); // dropped entirely (nothing retained, no sidecar)
-    // the payload is destroyed — the marker must say so, not point at a sidecar that doesn't exist
-    assert!(out.contains("dropped (no sidecar)"), "drop markers say the payload is gone");
+                                  // the payload is destroyed — the marker must say so, not point at a sidecar that doesn't exist
+    assert!(
+        out.contains("dropped (no sidecar)"),
+        "drop markers say the payload is gone"
+    );
     assert!(!out.contains("--retrieve"), "drop markers must not advertise retrieval");
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -254,7 +260,12 @@ fn revive_rewrites_stale_usage_below_loaded_content() {
         serde_json::json!({"type":"system","subtype":"compact_boundary","sessionId":sid,"uuid":"b0",
             "timestamp":"2026-06-19T00:00:01Z"}),
         line("u1", "user", serde_json::json!("hi again"), None),
-        line("a1", "assistant", serde_json::json!([{"type":"text","text":"small reply"}]), Some(stale)),
+        line(
+            "a1",
+            "assistant",
+            serde_json::json!([{"type":"text","text":"small reply"}]),
+            Some(stale),
+        ),
     ];
     let path = dir.join(format!("{sid}.jsonl"));
     std::fs::write(&path, lines.iter().map(|l| l.to_string() + "\n").collect::<String>()).unwrap();
@@ -266,10 +277,20 @@ fn revive_rewrites_stale_usage_below_loaded_content() {
     };
     let r = prune_session(&path, &opts).unwrap();
 
-    assert_eq!(r.usage_rewritten, 1, "the one inflated post-boundary usage record corrected");
-    assert_eq!(r.revive_old_tokens, Some(975_298), "reports the stale total it replaced");
+    assert_eq!(
+        r.usage_rewritten, 1,
+        "the one inflated post-boundary usage record corrected"
+    );
+    assert_eq!(
+        r.revive_old_tokens,
+        Some(975_298),
+        "reports the stale total it replaced"
+    );
     let honest = r.revive_tokens.expect("honest figure written");
-    assert!(honest < 1000, "tiny post-boundary content → tiny honest figure (got {honest})");
+    assert!(
+        honest < 1000,
+        "tiny post-boundary content → tiny honest figure (got {honest})"
+    );
 
     // the written file carries the corrected usage, caches zeroed
     let out = std::fs::read_to_string(&r.new_path).unwrap();
@@ -290,9 +311,8 @@ fn revive_honors_recorded_delta_evidence_over_low_byte_estimate() {
     // a1) is hard evidence that span really costs 30k, even though its byte estimate is tiny (e.g.
     // dense code that tokenizes far above 3.5 B/tok). Revive must never write a figure below that
     // evidence — the old byte-only estimator did, and let resumes through that blew the real limit.
-    let usage = |n: u64| {
-        serde_json::json!({"input_tokens":n,"cache_read_input_tokens":0,"cache_creation_input_tokens":0})
-    };
+    let usage =
+        |n: u64| serde_json::json!({"input_tokens":n,"cache_read_input_tokens":0,"cache_creation_input_tokens":0});
     let big = "B".repeat(5000);
     let lines = [
         serde_json::json!({"type":"user","sessionId":sid,"uuid":"u0","timestamp":"2026-06-20T00:00:00Z",
@@ -322,7 +342,10 @@ fn revive_honors_recorded_delta_evidence_over_low_byte_estimate() {
         honest >= 30_000,
         "honest figure must respect the recorded 30k delta evidence, got {honest}"
     );
-    assert!(honest < 80_000, "…but still shed the snipped payload's stale total, got {honest}");
+    assert!(
+        honest < 80_000,
+        "…but still shed the snipped payload's stale total, got {honest}"
+    );
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -330,9 +353,8 @@ fn revive_honors_recorded_delta_evidence_over_low_byte_estimate() {
 /// pairs with recorded usage, and a trailing non-turn record.
 fn window_fixture(dir: &Path) -> PathBuf {
     let sid = "55555555-5555-4555-8555-555555555555";
-    let usage = |n: u64| {
-        serde_json::json!({"input_tokens":n,"cache_read_input_tokens":0,"cache_creation_input_tokens":0})
-    };
+    let usage =
+        |n: u64| serde_json::json!({"input_tokens":n,"cache_read_input_tokens":0,"cache_creation_input_tokens":0});
     let lines = [
         serde_json::json!({"type":"summary","summary":"my session title","leafUuid":"u0"}),
         serde_json::json!({"type":"user","sessionId":sid,"uuid":"u0","parentUuid":null,"timestamp":"2026-06-21T00:00:00Z",
@@ -404,9 +426,16 @@ fn window_overshoot_keeps_the_huge_turn_and_warns() {
     let r = prune_session(&path, &opts).unwrap();
     assert_eq!(r.dropped_turns, 2, "everything but the huge newest turn dropped");
     assert!(!r.warnings.is_empty(), "overshoot must be reported loudly");
-    assert!(r.warnings[0].contains("EXCEEDS"), "warning names the busted budget: {:?}", r.warnings);
+    assert!(
+        r.warnings[0].contains("EXCEEDS"),
+        "warning names the busted budget: {:?}",
+        r.warnings
+    );
     let out = std::fs::read_to_string(&r.new_path).unwrap();
-    assert!(out.contains(&huge), "the one oversized turn is still kept — never an empty session");
+    assert!(
+        out.contains(&huge),
+        "the one oversized turn is still kept — never an empty session"
+    );
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -414,9 +443,8 @@ fn window_overshoot_keeps_the_huge_turn_and_warns() {
 fn window_and_revive_ignore_sidechain_turns() {
     let dir = tmpdir();
     let sid = "77777777-7777-4777-8777-777777777777";
-    let usage = |n: u64| {
-        serde_json::json!({"input_tokens":n,"cache_read_input_tokens":0,"cache_creation_input_tokens":0})
-    };
+    let usage =
+        |n: u64| serde_json::json!({"input_tokens":n,"cache_read_input_tokens":0,"cache_creation_input_tokens":0});
     let lines = [
         serde_json::json!({"type":"user","sessionId":sid,"uuid":"u0","parentUuid":null,"timestamp":"2026-06-23T00:00:00Z",
             "message":{"role":"user","content":"old prompt"}}),
@@ -448,18 +476,30 @@ fn window_and_revive_ignore_sidechain_turns() {
 
     let out = std::fs::read_to_string(&r.new_path).unwrap();
     // The sidechain line rides along in the kept region as content…
-    let sc = out.lines().find(|l| l.contains("\"uuid\":\"sc0\"")).expect("sidechain line kept");
+    let sc = out
+        .lines()
+        .find(|l| l.contains("\"uuid\":\"sc0\""))
+        .expect("sidechain line kept");
     // …but revive never rewrites ITS usage (a different context's number) …
     let scv: Value = serde_json::from_str(sc).unwrap();
-    assert_eq!(scv.pointer("/message/usage/input_tokens").and_then(Value::as_u64), Some(950_000));
+    assert_eq!(
+        scv.pointer("/message/usage/input_tokens").and_then(Value::as_u64),
+        Some(950_000)
+    );
     // …and the main-thread stale record was pinned to the honest main figure.
     assert_eq!(r.revive_tokens, Some(100_000));
     let a1: Value = serde_json::from_str(out.lines().find(|l| l.contains("\"uuid\":\"a1\"")).unwrap()).unwrap();
-    assert_eq!(a1.pointer("/message/usage/input_tokens").and_then(Value::as_u64), Some(100_000));
+    assert_eq!(
+        a1.pointer("/message/usage/input_tokens").and_then(Value::as_u64),
+        Some(100_000)
+    );
     // The re-root must be the first MAIN turn (u1), never the sidechain line.
     let u1: Value = serde_json::from_str(out.lines().find(|l| l.contains("\"uuid\":\"u1\"")).unwrap()).unwrap();
     assert!(u1["parentUuid"].is_null());
-    assert!(scv["parentUuid"].is_null(), "sidechain parent untouched (was already null)");
+    assert!(
+        scv["parentUuid"].is_null(),
+        "sidechain parent untouched (was already null)"
+    );
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -500,7 +540,12 @@ fn sidecar_ids_are_unique_and_round_trip_arrays_and_objects() {
     let ids: Vec<String> = raw
         .lines()
         .filter(|l| !l.trim().is_empty())
-        .map(|l| serde_json::from_str::<Value>(l).unwrap()["id"].as_str().unwrap().to_string())
+        .map(|l| {
+            serde_json::from_str::<Value>(l).unwrap()["id"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        })
         .collect();
     let mut deduped = ids.clone();
     deduped.sort();
@@ -531,7 +576,11 @@ fn retrieve_errors_on_duplicate_ids_instead_of_guessing() {
             "content":content,"size":content.len(),"line_count":1,"kind":"text"})
         .to_string()
     };
-    std::fs::write(&sc, format!("{}\n{}\n", entry("first payload"), entry("second payload"))).unwrap();
+    std::fs::write(
+        &sc,
+        format!("{}\n{}\n", entry("first payload"), entry("second payload")),
+    )
+    .unwrap();
     let err = retrieve(&sc, "dup").unwrap_err().to_string();
     assert!(err.contains("2 times"), "duplicate id must be an error, got: {err}");
     // a non-duplicated id in the same file still errors as not-found (with the listing)
@@ -579,11 +628,7 @@ fn pruned_session_reparses_via_claude_adapter_with_intact_turns() {
     };
     let r = prune_session(&src, &opts).unwrap();
 
-    let orig = crate::harness::claude::parse_str(
-        "orig",
-        &std::fs::read_to_string(&src).unwrap(),
-        None,
-    );
+    let orig = crate::harness::claude::parse_str("orig", &std::fs::read_to_string(&src).unwrap(), None);
     let pruned_text = std::fs::read_to_string(&r.new_path).unwrap();
     let pruned = crate::harness::claude::parse_str("pruned", &pruned_text, None);
 
@@ -600,11 +645,7 @@ fn pruned_session_reparses_via_claude_adapter_with_intact_turns() {
     };
     let src2 = window_fixture(&dir);
     let r2 = prune_session(&src2, &opts).unwrap();
-    let tail = crate::harness::claude::parse_str(
-        "tail",
-        &std::fs::read_to_string(&r2.new_path).unwrap(),
-        None,
-    );
+    let tail = crate::harness::claude::parse_str("tail", &std::fs::read_to_string(&r2.new_path).unwrap(), None);
     assert!(!tail.messages.is_empty(), "windowed tail still parses into turns");
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -636,5 +677,92 @@ fn keep_last_large_spares_everything() {
     };
     let r = prune_session(&src, &opts).unwrap();
     assert_eq!(r.pruned_count, 0, "nothing is old enough to snip");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn declassify_snips_all_security_prose_keeps_benign() {
+    // A safeguard classifier scores the WHOLE loaded context, so security-dense PROSE anywhere — old
+    // OR recent — can downgrade a resumed seat. --declassify snips EVERY security-dense message (user
+    // string + assistant text blocks) into the sidecar (recency does NOT protect it, unlike the
+    // tool/thinking passes), while leaving benign turns verbatim.
+    let dir = tmpdir();
+    let sid = "22222222-2222-4222-8222-222222222222";
+    let secret_user = "We have a cross-tenant auth bypass exploit; the credential exfil risk is high.";
+    let secret_asst = "The vulnerability lets an attacker exfil credentials via the exploit chain.";
+    let benign_user = "Great, unrelated. Remember: my favorite color is teal.";
+    let recent_secret = "Recent turn: the security exploit vulnerability detail is also cleared.";
+    let lines = [
+        serde_json::json!({"type":"user","sessionId":sid,"uuid":"u0","timestamp":"2026-07-01T00:00:00Z",
+            "message":{"role":"user","content":secret_user}}),
+        serde_json::json!({"type":"assistant","sessionId":sid,"uuid":"a1","parentUuid":"u0","timestamp":"2026-07-01T00:00:01Z",
+            "message":{"role":"assistant","content":[{"type":"text","text":secret_asst}]}}),
+        // benign turn -> keep verbatim (0 security terms)
+        serde_json::json!({"type":"user","sessionId":sid,"uuid":"u1","parentUuid":"a1","timestamp":"2026-07-01T00:00:02Z",
+            "message":{"role":"user","content":benign_user}}),
+        serde_json::json!({"type":"assistant","sessionId":sid,"uuid":"a2","parentUuid":"u1","timestamp":"2026-07-01T00:00:03Z",
+            "message":{"role":"assistant","content":[{"type":"text","text":"Noted, teal."}]}}),
+        // RECENT but security-dense -> ALSO snipped (recency does not protect a trigger span)
+        serde_json::json!({"type":"user","sessionId":sid,"uuid":"u2","parentUuid":"a2","timestamp":"2026-07-01T00:00:04Z",
+            "message":{"role":"user","content":recent_secret}}),
+    ];
+    let path = dir.join(format!("{sid}.jsonl"));
+    std::fs::write(&path, lines.iter().map(|l| l.to_string() + "\n").collect::<String>()).unwrap();
+
+    // keep_last default (25) would mark all turns "recent" — declassify must snip regardless.
+    let opts = PruneOptions {
+        declassify: true,
+        ..Default::default()
+    };
+    let r = prune_session(&path, &opts).unwrap();
+    let out = std::fs::read_to_string(&r.new_path).unwrap();
+
+    // ALL security-dense prose is snipped: originals gone, markers present.
+    assert!(!out.contains(secret_user), "security user prose must be snipped");
+    assert!(!out.contains(secret_asst), "security assistant prose must be snipped");
+    assert!(
+        !out.contains(recent_secret),
+        "RECENT security prose is also snipped (recency is no shield)"
+    );
+    assert!(out.contains("tool=declassified"), "a declassify marker must be present");
+    assert!(r.pruned_count >= 3, "all three dense messages snipped");
+    // benign turn is untouched.
+    assert!(out.contains("my favorite color is teal"), "benign prose kept verbatim");
+    // lossless: the snipped user text is retrievable from the sidecar.
+    let sidecar = r.sidecar_path.clone().expect("sidecar written");
+    let got = retrieve(&sidecar, "u0#declass").unwrap();
+    assert_eq!(got.as_str(), Some(secret_user), "snipped prose retrievable verbatim");
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn declassify_spares_benign_sessions_entirely() {
+    // A session with < min_hits security terms per message must be left byte-untouched by declassify.
+    let dir = tmpdir();
+    let sid = "33333333-3333-4333-8333-333333333333";
+    let lines = [
+        serde_json::json!({"type":"user","sessionId":sid,"uuid":"u0","timestamp":"2026-07-01T00:00:00Z",
+            "message":{"role":"user","content":"Let's talk about the security fix we shipped."}}), // 1 term only
+        serde_json::json!({"type":"assistant","sessionId":sid,"uuid":"a1","parentUuid":"u0","timestamp":"2026-07-01T00:00:01Z",
+            "message":{"role":"assistant","content":[{"type":"text","text":"Sounds good, all resolved."}]}}),
+    ];
+    let path = dir.join(format!("{sid}.jsonl"));
+    std::fs::write(&path, lines.iter().map(|l| l.to_string() + "\n").collect::<String>()).unwrap();
+    let opts = PruneOptions {
+        keep_last: 0,
+        declassify: true,
+        ..Default::default()
+    };
+    let r = prune_session(&path, &opts).unwrap();
+    let out = std::fs::read_to_string(&r.new_path).unwrap();
+    assert_eq!(
+        r.pruned_count, 0,
+        "a single security term (< min_hits=2) must not trip the snip"
+    );
+    assert!(
+        out.contains("the security fix we shipped"),
+        "benign-density prose kept verbatim"
+    );
     std::fs::remove_dir_all(&dir).ok();
 }
