@@ -13,7 +13,7 @@ authors = ["ember"]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 chrono = { version = "0.4", features = ["serde"] }
-anyhow = "1"
+anyhow = ">=1.0.103, <2"
 thiserror = "2"
 walkdir = "2"
 rayon = "1"
