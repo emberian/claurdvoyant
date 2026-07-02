@@ -25,7 +25,7 @@ invariant tests are green.
   (prefixes spelled out in `redact.rs` — not here, because a changelog that
   lists secret-shaped strings gets flagged as a secret itself, which is
   rather the point of this feature); connection-string passwords
-  (`scheme://user:pass@host`); case-insensitive `bearer`;
+  (passwords embedded in connection-string URLs); case-insensitive `bearer`;
   `Proxy-Authorization`; `git.remote` and session/message `extra` maps are
   scrubbed. Root-cause fix: the keyword-blob scanner only ever matched blobs
   at end-of-input — quoted mid-sentence secrets now redact. Assignment
