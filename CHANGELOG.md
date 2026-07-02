@@ -19,15 +19,17 @@ invariant tests are green.
   `--insecure-expose`; `/api/*` supports bearer-token auth; workers are
   panic-isolated.
 - **Redaction got real teeth.** Truncated PEM bodies (the common
-  clipped-tool-output case) are now caught; new token families: Stripe
-  `sk_live_`/`rk_live_`, GitLab `glpat-`, Slack `xoxc-/xoxs-/xapp-`, `npm_`,
-  HuggingFace `hf_`, Groq `gsk_`, xAI `xai-`, DigitalOcean `dop_v1_`, Shopify
-  `shpat_/shpss_`; connection-string passwords (`scheme://user:pass@host`);
-  case-insensitive `bearer`; `Proxy-Authorization`; `git.remote` and
-  session/message `extra` maps are scrubbed. Root-cause fix: the keyword-blob
-  scanner only ever matched blobs at end-of-input — quoted mid-sentence secrets
-  now redact. Assignment matching no longer mangles code like
-  `let token = get_token();`.
+  clipped-tool-output case) are now caught; new token families: Stripe live
+  and restricted keys, GitLab personal access tokens, Slack session/app
+  tokens, npm, Hugging Face, Groq, xAI, DigitalOcean, and Shopify tokens
+  (prefixes spelled out in `redact.rs` — not here, because a changelog that
+  lists secret-shaped strings gets flagged as a secret itself, which is
+  rather the point of this feature); connection-string passwords
+  (`scheme://user:pass@host`); case-insensitive `bearer`;
+  `Proxy-Authorization`; `git.remote` and session/message `extra` maps are
+  scrubbed. Root-cause fix: the keyword-blob scanner only ever matched blobs
+  at end-of-input — quoted mid-sentence secrets now redact. Assignment
+  matching no longer mangles code like `let token = get_token();`.
 - **The web viewer bounds zip extraction** (256 MB/entry, 512 MB total,
   header sizes distrusted) and markdown links reject protocol-relative
   `//evil.com` navigation.
