@@ -12,7 +12,7 @@ mod util;
 pub(crate) use cmd::view::{show_header, show_message, stream_session_render};
 pub(crate) use util::short_id;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use cmd::live::BoardCmd;
 use cmd::{browse, compose, config, convert, doctor, live, pack, provenance, query, search, share, view, workflow};
@@ -22,6 +22,37 @@ use std::path::PathBuf;
 /// `-900`, bare `650` = that single turn) so range syntax is uniform across the CLI.
 fn parse_keep_range(s: &str) -> Result<(usize, Option<usize>)> {
     util::parse_msg_range(s)
+}
+
+/// Resolve the caller-supplied `--declassify` term list from a CSV flag and/or a file (one term per
+/// line, `#` comments + blanks ignored). Terms are lowercased + de-duplicated. cv ships NO built-in
+/// list — the terms are always external (config/data), so cv's own source carries no domain shitlist.
+fn resolve_declassify_tokens(
+    csv: Option<String>,
+    file: Option<PathBuf>,
+) -> Result<Vec<String>> {
+    let mut seen = std::collections::BTreeSet::new();
+    let mut out = Vec::new();
+    let mut push = |t: &str| {
+        let t = t.trim().to_ascii_lowercase();
+        if !t.is_empty() && seen.insert(t.clone()) {
+            out.push(t);
+        }
+    };
+    if let Some(csv) = csv {
+        for t in csv.split(',') {
+            push(t);
+        }
+    }
+    if let Some(path) = file {
+        let body = std::fs::read_to_string(&path)
+            .with_context(|| format!("reading --declassify-tokens-file {}", path.display()))?;
+        for line in body.lines() {
+            let line = line.split('#').next().unwrap_or("");
+            push(line);
+        }
+    }
+    Ok(out)
 }
 
 /// Footer for `cv --help`. The auto `Commands:` list above stays tight (the common path); every
@@ -371,13 +402,22 @@ enum Cmd {
         /// `650-`, `650-900`, or `-900`), dropping everything outside it. Like --window but by index.
         #[arg(long, value_name = "RANGE")]
         range: Option<String>,
-        /// Also snip OLD security-dense message TEXT (user prompts + assistant replies) into the
-        /// sidecar, leaving a `[PRUNED …]` marker. A safeguard classifier scores the WHOLE loaded
-        /// context, so security-heavy PROSE in the history can silently downgrade a resumed seat's
-        /// model tier — and tool/`--thinking` snipping leaves that prose verbatim. This clears it too.
-        /// Lossless (retrievable). A message is snipped iff it holds ≥2 distinct security terms.
+        /// Snip message TEXT (user prompts + assistant replies) whose density of caller-supplied
+        /// TERMS is high, into the sidecar with a `[PRUNED …]` marker. Motivation: a safeguard
+        /// classifier scores the WHOLE loaded context, so term-dense PROSE in the history can silently
+        /// downgrade a resumed seat's model tier — and tool/`--thinking` snipping leaves prose verbatim.
+        /// Lossless (retrievable). A message is snipped iff it holds ≥2 distinct terms. cv ships NO
+        /// built-in term list (that would trip the very classifier this dodges, and can't adapt);
+        /// supply the terms with --declassify-tokens / --declassify-tokens-file, else this is a no-op.
         #[arg(long)]
         declassify: bool,
+        /// Comma-separated terms for --declassify (lowercase; case-insensitive substring match).
+        #[arg(long, value_name = "T1,T2,…")]
+        declassify_tokens: Option<String>,
+        /// File of --declassify terms, one per line (`#` comments + blank lines ignored). The external,
+        /// version-controllable home for your term list — e.g. tuned from a classifier-trip corpus.
+        #[arg(long, value_name = "PATH")]
+        declassify_tokens_file: Option<PathBuf>,
         /// Report what would be pruned without writing anything.
         #[arg(long)]
         dry_run: bool,
@@ -723,23 +763,35 @@ fn main() -> Result<()> {
             window,
             range,
             declassify,
+            declassify_tokens,
+            declassify_tokens_file,
             dry_run,
-        } => compose::cmd_prune(
-            &id,
-            harness,
-            retrieve,
-            min_size,
-            keep_last,
-            to,
-            drop,
-            thinking,
-            copy_resources,
-            !no_revive,
-            window,
-            range.map(|s| parse_keep_range(&s)).transpose()?,
-            declassify,
-            dry_run,
-        ),
+        } => {
+            let tokens = resolve_declassify_tokens(declassify_tokens, declassify_tokens_file)?;
+            if declassify && tokens.is_empty() {
+                eprintln!(
+                    "cv prune --declassify: no terms supplied (--declassify-tokens / \
+                     --declassify-tokens-file) — nothing will be snipped. cv ships no built-in list."
+                );
+            }
+            compose::cmd_prune(
+                &id,
+                harness,
+                retrieve,
+                min_size,
+                keep_last,
+                to,
+                drop,
+                thinking,
+                copy_resources,
+                !no_revive,
+                window,
+                range.map(|s| parse_keep_range(&s)).transpose()?,
+                declassify,
+                tokens,
+                dry_run,
+            )
+        }
         Cmd::Config { add_export, rm_export } => config::cmd_config(add_export, rm_export),
         Cmd::Query { json } => query::cmd_query(json),
         Cmd::Resume { id, harness, launch } => convert::cmd_resume(&id, harness, launch),

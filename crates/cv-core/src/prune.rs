@@ -33,29 +33,12 @@ use std::path::{Path, PathBuf};
 
 /// Marker prefix stamped where a payload used to be; carries enough to retrieve the original.
 const MARKER_PREFIX: &str = "[PRUNED id=";
-/// Default security terms whose presence (≥ `declassify_min_hits` DISTINCT terms) marks a message as
-/// classifier-tripping content for `--declassify`. Lowercase; matched case-insensitively as substrings.
-const DEFAULT_DECLASSIFY_TOKENS: &[&str] = &[
-    "security",
-    "exploit",
-    "vulnerability",
-    "vuln",
-    "cve",
-    "xtenant",
-    "cross-tenant",
-    "auth bypass",
-    "authentication bypass",
-    "credential",
-    "exfil",
-    "privesc",
-    "backdoor",
-    "rce",
-    "malware",
-    "breach",
-    "compromise",
-    "attacker",
-    "0day",
-];
+// NOTE: `--declassify` is a token-AGNOSTIC primitive. cv-core ships NO built-in token list — the
+// terms are always caller-supplied (CLI `--declassify-tokens` / `--declassify-tokens-file`, i.e.
+// external config/data). This keeps cv itself free of any domain "shitlist" (Ember, PR #9): a
+// list of security badwords baked into the source would (a) be un-adaptable and (b) trip the very
+// classifier this feature exists to dodge whenever an agent reads cv's own code. `declassify` with
+// no tokens is a safe no-op. Composing a security-declassify tool = supply your token file.
 /// Suffix distinguishing a flattened `toolUseResult` mirror entry from its `content` sibling.
 const TUR_SUFFIX: &str = "#tur";
 /// Token-estimate constants (Claude tokenizer ≈ 3.3–3.7 B/tok; a screenshot tile ≈ 1500 tok).
@@ -107,7 +90,8 @@ pub struct PruneOptions {
     /// trigger span anywhere in the loaded context downgrades the seat, so recent security prose is
     /// snipped too (still retrievable). Benign turns (< `declassify_min_hits` terms) are untouched.
     pub declassify: bool,
-    /// Terms (lowercase) counted for `--declassify` density. Matched case-insensitively as substrings.
+    /// Terms (lowercase) counted for `--declassify` density — ALWAYS caller-supplied (no built-in
+    /// list; empty ⇒ `--declassify` is a no-op). Matched case-insensitively as substrings.
     pub declassify_tokens: Vec<String>,
     /// Snip a message iff it holds at least this many DISTINCT `declassify_tokens` (default 2).
     pub declassify_min_hits: usize,
@@ -128,7 +112,7 @@ impl Default for PruneOptions {
             window: None,
             keep_range: None,
             declassify: false,
-            declassify_tokens: DEFAULT_DECLASSIFY_TOKENS.iter().map(|s| s.to_string()).collect(),
+            declassify_tokens: Vec::new(), // token-agnostic: caller supplies the terms (no baked-in list)
             declassify_min_hits: 2,
             dry_run: false,
         }

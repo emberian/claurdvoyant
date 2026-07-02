@@ -577,7 +577,18 @@ fn prune_session(args: &Value) -> anyhow::Result<String> {
         window: args.get("window").and_then(Value::as_u64),
         keep_range: None,
         declassify: args.get("declassify").and_then(Value::as_bool).unwrap_or(false),
-        // declassify_tokens + declassify_min_hits come from Default (built-in security list, >=2).
+        // Caller-supplied terms (comma-separated); cv ships no built-in list, so declassify without
+        // tokens is a no-op. min_hits comes from Default (2).
+        declassify_tokens: args
+            .get("declassify_tokens")
+            .and_then(Value::as_str)
+            .map(|s| {
+                s.split(',')
+                    .map(|t| t.trim().to_ascii_lowercase())
+                    .filter(|t| !t.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default(),
         dry_run: args.get("dry_run").and_then(Value::as_bool).unwrap_or(false),
         ..Default::default()
     };

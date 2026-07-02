@@ -710,8 +710,16 @@ fn declassify_snips_all_security_prose_keeps_benign() {
     std::fs::write(&path, lines.iter().map(|l| l.to_string() + "\n").collect::<String>()).unwrap();
 
     // keep_last default (25) would mark all turns "recent" — declassify must snip regardless.
+    // Tokens are caller-supplied (cv ships no built-in list); supply the ones this session uses.
     let opts = PruneOptions {
         declassify: true,
+        declassify_tokens: [
+            "security", "exploit", "vulnerability", "cross-tenant", "auth bypass", "credential",
+            "exfil", "attacker",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect(),
         ..Default::default()
     };
     let r = prune_session(&path, &opts).unwrap();
@@ -752,6 +760,10 @@ fn declassify_spares_benign_sessions_entirely() {
     let opts = PruneOptions {
         keep_last: 0,
         declassify: true,
+        declassify_tokens: ["security", "exploit", "vulnerability", "credential", "exfil"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
         ..Default::default()
     };
     let r = prune_session(&path, &opts).unwrap();
