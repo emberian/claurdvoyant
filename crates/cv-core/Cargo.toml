@@ -29,7 +29,7 @@ dirs.workspace = true
 uuid.workspace = true
 regex.workspace = true
 toml.workspace = true
-memmap2 = { version = "0.9", optional = true }
+memmap2 = { version = ">=0.9.11, <0.10", optional = true }
 
 # Real OS advisory locks for the board's per-channel lockfile (flock on unix, LockFileEx on
 # windows) — already in the workspace tree via tantivy. wasm32 has neither file locking nor
