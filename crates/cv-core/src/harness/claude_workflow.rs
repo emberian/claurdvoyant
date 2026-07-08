@@ -62,6 +62,24 @@ pub struct Workflow {
     /// The run this one resumed from (`resumeFromRunId`), for resumed/cached workflows.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resume_from: Option<String>,
+    /// The workflow script's aggregated **return value** (`result`) — what the script's final
+    /// `return` produced. The harvest payload; a run without it either returned nothing or died.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result: Option<Value>,
+    /// The script's `log()` lines, in order — the run's own progress narration (includes per-agent
+    /// failure notes like rate-limit hits).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub logs: Vec<String>,
+    /// The `args` value the workflow was invoked with (verbatim; may itself be a JSON-encoded
+    /// string if the caller stringified).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub args: Option<Value>,
+    /// The background task id (`taskId`) — matches the "Task ID: …" in the launch tool_result.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
+    /// When the run started (`startTime` epoch-ms, falling back to the ISO `timestamp`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<chrono::DateTime<chrono::Utc>>,
     /// The declared phases, in order, each with the agents that ran under it (from
     /// `workflowProgress`). The phase tree the brief asks to surface richly.
     pub phases: Vec<WorkflowPhase>,
@@ -129,6 +147,23 @@ pub struct WorkflowAgent {
     /// Head of the agent's structured return value (`resultPreview`) — the real outcome.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub result_preview: Option<String>,
+    /// Retry attempt number (`attempt`), 1-based; >1 means the agent was re-issued.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attempt: Option<u64>,
+    /// When the agent started running (`startedAt`, epoch-ms).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// The agent's last recorded heartbeat (`lastProgressAt`, epoch-ms). For a non-terminal agent
+    /// (crash/kill mid-run), this is when it was last alive.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_progress_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// The last tool the agent was seen using (`lastToolName`) — for a dead/interrupted agent,
+    /// where it was when it stopped.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_tool_name: Option<String>,
+    /// One-line summary of that last tool call (`lastToolSummary`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_tool_summary: Option<String>,
 }
 
 impl Workflow {
@@ -191,28 +226,48 @@ pub fn workflows(parent_path: &Path) -> Vec<Workflow> {
     out
 }
 
-/// One workflow run by its `runId`, or `None` if no `workflows/wf_<runId>.json` exists. Accepts the
-/// id with or without the `wf_` prefix and as a unique prefix of a full run id.
-pub fn workflow(parent_path: &Path, run_id: &str) -> Option<Workflow> {
-    let want = run_id.strip_prefix("wf_").unwrap_or(run_id);
-    let mut hits: Vec<Workflow> = workflows(parent_path)
-        .into_iter()
+/// One workflow run by its `runId` **or its workflow name**, or `None` if nothing matches
+/// unambiguously. Run ids accept the bare/`wf_`-prefixed form and unique prefixes; names accept an
+/// exact match (newest run wins when a name was re-run) and a unique name-prefix.
+pub fn workflow(parent_path: &Path, key: &str) -> Option<Workflow> {
+    let want = key.strip_prefix("wf_").unwrap_or(key);
+    let all = workflows(parent_path);
+
+    let mut hits: Vec<Workflow> = all
+        .iter()
         .filter(|w| {
             let id = w.run_id.strip_prefix("wf_").unwrap_or(&w.run_id);
-            id == want || w.run_id == run_id || id.starts_with(want)
+            id == want || w.run_id == key || id.starts_with(want)
         })
+        .cloned()
         .collect();
-    // Exact match wins over a prefix collision.
+    // Exact id match wins over a prefix collision.
     if let Some(exact) = hits.iter().position(|w| {
         let id = w.run_id.strip_prefix("wf_").unwrap_or(&w.run_id);
-        id == want || w.run_id == run_id
+        id == want || w.run_id == key
     }) {
         return Some(hits.swap_remove(exact));
     }
-    match hits.len() {
-        1 => Some(hits.pop().unwrap()),
-        _ => None,
+    if hits.len() == 1 {
+        return hits.pop();
     }
+
+    // No id match → try the workflow NAME. `all` is newest-first, so the first exact-name hit is
+    // the newest run of a re-run name — the one you want when addressing by name.
+    if let Some(w) = all.iter().find(|w| w.name.as_deref() == Some(key)) {
+        return Some(w.clone());
+    }
+    let name_hits: Vec<&Workflow> = all
+        .iter()
+        .filter(|w| w.name.as_deref().is_some_and(|n| n.starts_with(key)))
+        .collect();
+    // A unique name-prefix — unique as a NAME, not as a run (re-runs of one name still resolve;
+    // `all` is newest-first so the first hit is the newest run of that name).
+    let distinct: std::collections::HashSet<&str> = name_hits.iter().filter_map(|w| w.name.as_deref()).collect();
+    if distinct.len() == 1 {
+        return name_hits.first().map(|w| (*w).clone());
+    }
+    None
 }
 
 /// Parse one `wf_<runId>.json` state file into a [`Workflow`]. Tolerant: a missing/odd field is an
@@ -314,9 +369,27 @@ pub(crate) fn parse_state(v: &Value) -> Workflow {
         script_path: s("scriptPath").map(PathBuf::from),
         script: s("script"),
         resume_from: s("resumeFromRunId"),
+        result: v.get("result").filter(|r| !r.is_null()).cloned(),
+        logs: v
+            .get("logs")
+            .and_then(Value::as_array)
+            .map(|a| a.iter().filter_map(Value::as_str).map(str::to_string).collect())
+            .unwrap_or_default(),
+        args: v.get("args").filter(|a| !a.is_null()).cloned(),
+        task_id: s("taskId"),
+        started_at: u("startTime").and_then(ms_to_utc).or_else(|| {
+            s("timestamp")
+                .and_then(|t| chrono::DateTime::parse_from_rfc3339(&t).ok())
+                .map(|d| d.with_timezone(&chrono::Utc))
+        }),
         phases,
         orphan_agents,
     }
+}
+
+/// Epoch-milliseconds → UTC instant (the state files' `startTime`/`startedAt`/… shape).
+fn ms_to_utc(ms: u64) -> Option<chrono::DateTime<chrono::Utc>> {
+    chrono::DateTime::from_timestamp_millis(ms as i64)
 }
 
 /// Map phase index (1-based) → `detail` from the state's declared `phases[]` array.
@@ -375,8 +448,17 @@ pub fn launches(session_path: &Path) -> Vec<WorkflowLaunch> {
     let mut out: Vec<WorkflowLaunch> = Vec::new();
     for line in reader.lines() {
         let Ok(line) = line else { break };
-        // Prefilter: a launch line names the tool; a result line carries a tool_use_id we know.
-        if !line.contains("\"Workflow\"") && !line.contains("tool_use_id") {
+        // Prefilter, cheapest test first: a launch line names the tool; a result line is only
+        // worth parsing when we still await a pending tool_use_id AND that id appears. Matching
+        // on the bare "tool_use_id" literal would JSON-parse nearly every tool-result line of the
+        // transcript; scanning for pending ids on lines without "tool_use_id" would rescan huge
+        // result payloads. Pending ids are removed once resolved, so the set stays ≤ a few.
+        let is_launch = line.contains("\"Workflow\"");
+        if !is_launch
+            && (by_use_id.is_empty()
+                || !line.contains("tool_use_id")
+                || !by_use_id.keys().any(|id| line.contains(id.as_str())))
+        {
             continue;
         }
         let Ok(v) = serde_json::from_str::<Value>(&line) else {
@@ -416,13 +498,15 @@ pub fn launches(session_path: &Path) -> Vec<WorkflowLaunch> {
                     out.push(launch);
                 }
                 Some("tool_result") => {
+                    // Resolve (and retire) the pending launch — keeping the pending set small is
+                    // what keeps the prefilter above cheap.
                     if let Some(idx) = c
                         .get("tool_use_id")
                         .and_then(Value::as_str)
-                        .and_then(|id| by_use_id.get(id))
+                        .and_then(|id| by_use_id.remove(id))
                     {
                         if c.get("is_error").and_then(Value::as_bool).unwrap_or(false) {
-                            out[*idx].errored = true;
+                            out[idx].errored = true;
                         }
                     }
                 }
@@ -522,6 +606,11 @@ fn parse_agent(e: &Value) -> WorkflowAgent {
         cached: e.get("cached").and_then(Value::as_bool).unwrap_or(false),
         prompt_preview: s("promptPreview"),
         result_preview: s("resultPreview"),
+        attempt: u("attempt"),
+        started_at: u("startedAt").and_then(ms_to_utc),
+        last_progress_at: u("lastProgressAt").and_then(ms_to_utc),
+        last_tool_name: s("lastToolName"),
+        last_tool_summary: s("lastToolSummary"),
     }
 }
 
@@ -616,6 +705,74 @@ mod tests {
         assert_eq!(w.phases[0].title.as_deref(), Some("P1"));
         assert_eq!(w.phases[0].agents[0].agent_id.as_deref(), Some("a1"));
         assert_eq!(w.phases[1].agents[0].agent_id.as_deref(), Some("a2"));
+    }
+
+    #[test]
+    fn parses_result_logs_args_task_and_timing() {
+        let v = json!({
+            "runId": "wf_rich-1",
+            "workflowName": "harvest-me",
+            "status": "completed",
+            "taskId": "w9mkonv48",
+            "startTime": 1783423014394u64,
+            "args": {"seeds_file": "/tmp/seeds.json"},
+            "logs": ["20 families queued", "[refine:temporal] failed: session limit"],
+            "result": {"confirmed": [1, 2], "notes": "ok"},
+            "workflowProgress": [
+                {"type": "workflow_phase", "index": 1, "title": "P"},
+                {"type": "workflow_agent", "index": 1, "phaseIndex": 1, "agentId": "a1",
+                 "state": "error", "attempt": 2, "startedAt": 1783389189922u64,
+                 "lastProgressAt": 1783389200000u64, "lastToolName": "Bash",
+                 "lastToolSummary": "cd /x && grep -n def"}
+            ]
+        });
+        let w = parse_state(&v);
+        assert_eq!(w.task_id.as_deref(), Some("w9mkonv48"));
+        assert_eq!(w.started_at.unwrap().timestamp_millis(), 1_783_423_014_394);
+        assert_eq!(w.args.as_ref().unwrap()["seeds_file"], "/tmp/seeds.json");
+        assert_eq!(w.logs.len(), 2);
+        assert!(w.logs[1].contains("session limit"));
+        assert_eq!(w.result.as_ref().unwrap()["confirmed"][1], 2);
+        let a = &w.phases[0].agents[0];
+        assert_eq!(a.attempt, Some(2));
+        assert_eq!(a.started_at.unwrap().timestamp_millis(), 1_783_389_189_922);
+        assert_eq!(a.last_progress_at.unwrap().timestamp_millis(), 1_783_389_200_000);
+        assert_eq!(a.last_tool_name.as_deref(), Some("Bash"));
+        assert!(a.last_tool_summary.as_deref().unwrap().starts_with("cd /x"));
+        // Null result stays absent, not Some(Null).
+        let w2 = parse_state(&json!({"runId": "wf_x", "result": null}));
+        assert!(w2.result.is_none());
+    }
+
+    #[test]
+    fn workflow_resolves_by_run_id_and_by_name() {
+        let dir = std::env::temp_dir().join(format!("cv-wf-byname-test-{}", std::process::id()));
+        let wfdir = dir.join("sess").join("workflows");
+        std::fs::create_dir_all(&wfdir).unwrap();
+        let sess = dir.join("sess.jsonl");
+        std::fs::write(&sess, "").unwrap();
+        let mk = |rid: &str, name: &str| {
+            std::fs::write(
+                wfdir.join(format!("{rid}.json")),
+                json!({"runId": rid, "workflowName": name}).to_string(),
+            )
+            .unwrap()
+        };
+        mk("wf_aaa-111", "stark-kill-emit-swarm");
+        mk("wf_bbb-222", "stark-kill-assurance-audit");
+        mk("wf_ccc-333", "stark-kill-assurance-audit"); // a re-run of the same name
+
+        // By run id (prefix, with/without wf_).
+        assert_eq!(workflow(&sess, "wf_aaa-111").unwrap().run_id, "wf_aaa-111");
+        assert_eq!(workflow(&sess, "aaa").unwrap().run_id, "wf_aaa-111");
+        // By exact name; a re-run name resolves (to one of its runs) instead of failing.
+        assert_eq!(workflow(&sess, "stark-kill-emit-swarm").unwrap().run_id, "wf_aaa-111");
+        let audit = workflow(&sess, "stark-kill-assurance-audit").unwrap();
+        assert_eq!(audit.name.as_deref(), Some("stark-kill-assurance-audit"));
+        // Unique name-prefix resolves; ambiguous prefix (two distinct names) does not.
+        assert_eq!(workflow(&sess, "stark-kill-emit").unwrap().run_id, "wf_aaa-111");
+        assert!(workflow(&sess, "stark-kill").is_none());
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     fn launch(name: Option<&str>, script_run_id: Option<&str>, errored: bool) -> WorkflowLaunch {

@@ -235,6 +235,57 @@ pub fn workflows_of(r: &SessionRef) -> Vec<Workflow> {
     }
 }
 
+/// Find workflow runs by **name** (exact, else prefix) across the whole catalog — so a workflow
+/// can be addressed without knowing which session launched it (session titles are auto-generated
+/// and rarely mention the workflow's name). Returns `(session, run)` pairs, newest-session first.
+/// Cheap: the sidecar `workflows/` dir is only read for sessions that have one.
+pub fn find_workflows_by_name(name: &str) -> Vec<(SessionRef, Workflow)> {
+    let mut refs = sessions();
+    refs.retain(|r| r.harness == Harness::Claude);
+    refs.sort_by_key(|r| std::cmp::Reverse(r.updated_at.or(r.created_at)));
+    let want = name.to_string();
+    let per_session: Vec<Vec<(SessionRef, Workflow)>> = par_filter_map(refs, move |r| {
+        let hits: Vec<(SessionRef, Workflow)> = harness::claude_workflow::workflows(&r.path)
+            .into_iter()
+            .filter(|w| w.name.as_deref().is_some_and(|n| n.starts_with(want.as_str())))
+            .map(|w| (r.clone(), w))
+            .collect();
+        (!hits.is_empty()).then_some(hits)
+    });
+    let all: Vec<(SessionRef, Workflow)> = per_session.into_iter().flatten().collect();
+    let (exact, prefix): (Vec<_>, Vec<_>) = all.into_iter().partition(|(_, w)| w.name.as_deref() == Some(name));
+    if exact.is_empty() {
+        prefix
+    } else {
+        exact
+    }
+}
+
+/// Fleet-wide ghost hunt by name-prefix: [`workflow_ghosts_of`] across every Claude session that
+/// recorded at least one workflow (the bounded set where the transcript-vs-state cross-check is
+/// meaningful), in parallel. For finding a swarm you remember by name that left no run record.
+pub fn find_ghost_launches_by_name(name: &str) -> Vec<(SessionRef, WorkflowLaunch)> {
+    let mut refs = sessions();
+    refs.retain(|r| r.harness == Harness::Claude);
+    let name = name.to_string();
+    let mut out: Vec<(SessionRef, WorkflowLaunch)> = par_filter_map(refs, move |r| {
+        if harness::claude_workflow::workflows(&r.path).is_empty() {
+            return None;
+        }
+        let hits: Vec<(SessionRef, WorkflowLaunch)> = harness::claude_workflow::ghost_launches(&r.path)
+            .into_iter()
+            .filter(|g| g.name.as_deref().is_some_and(|n| n.starts_with(name.as_str())))
+            .map(|g| (r.clone(), g))
+            .collect();
+        (!hits.is_empty()).then_some(hits)
+    })
+    .into_iter()
+    .flatten()
+    .collect();
+    out.sort_by_key(|(_, g)| std::cmp::Reverse(g.ts));
+    out
+}
+
 /// Transcript `Workflow` launches with **no recorded run** — the crash-forensics view: a power
 /// loss / hard kill can leave a launch in the transcript whose `workflows/wf_*.json` state file
 /// was never persisted (its sub-agent debris, if any, sits under `subagents/workflows/`).

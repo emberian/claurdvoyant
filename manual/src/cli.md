@@ -316,14 +316,20 @@ A deep agent session isn't a flat transcript — it's a *forest* of sub-agents, 
 
 ### `cv workflow`
 
-A [`Workflow`](https://docs.claude.com/en/docs/claude-code)-tool run, first-class: its phase tree, the agents under each phase (with state, tokens, tool-calls, duration, and a result preview), run totals, and the driving script. Without a `<run_id>`, it lists the session's runs.
+A [`Workflow`](https://docs.claude.com/en/docs/claude-code)-tool run, first-class: its phase tree, the agents under each phase (with state, tokens, tool-calls, duration, and a result preview), run totals, the run's `log()` lines and aggregated **result** (the script's return value — the harvest payload), and the driving script. Without a `<run>`, it lists the session's runs.
 
 ```sh
 cv workflow 3b829648                  # list every workflow run in the session
 cv workflow 3b829648 wf_ab915970      # render one run (run-id prefix is enough)
+cv workflow 3b829648 census           # …or address the run by its NAME (unique prefix ok)
+cv workflow stark-kill-emit-swarm     # no session id? the name resolves fleet-wide
 cv workflow 3b829648 wf_ab915970 --script   # print the driving JS instead
-cv workflow 3b829648 wf_ab915970 --json     # the structured Workflow IR
+cv workflow 3b829648 wf_ab915970 --json     # the structured Workflow IR (full result, all logs)
 ```
+
+Both arguments accept names: the `<run>` position matches a workflow name (exact, else unique prefix; a re-run name resolves to its newest run), and a first argument that matches no session id is resolved as a workflow name across the whole catalog — session titles are auto-generated and rarely mention the workflow you actually remember. A fleet-wide name miss falls through to a ghost-launch scan, so a swarm that died before its state was persisted is still findable by name.
+
+Agents that didn't finish (`error`/`progress`) show where they last were — `↪ last: Bash · cd /x && grep … @ 07-06 23:05` — which is exactly what you want after a crash or rate-limit hit.
 
 Runs are read from the session's `workflows/wf_*.json` state files; the per-agent transcripts live a tier deeper under `subagents/workflows/<run>/` (see [`cv tools`](#cv-tools) and [`cv show --subagents`](#cv-show)).
 

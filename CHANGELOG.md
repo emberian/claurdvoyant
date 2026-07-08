@@ -19,6 +19,24 @@ now closed:
   dropped — is now visible in the listing itself.
 - **`cv timeline` marks multi-day sessions** with `⇠ since MM-DD`. Feed rows
   sit at last-activity; without the marker they read as start times.
+- **Workflows are addressable by NAME.** `cv workflow <session> <name>`
+  resolves a run by its workflow name (exact, else unique prefix; a re-run
+  name → its newest run), and `cv workflow <name>` with no session resolves
+  the name across the whole catalog — session titles are auto-generated and
+  rarely mention the workflow you remember ("the stark-kill session" was
+  titled "Review recent work across three projects"). A fleet-wide miss falls
+  through to a ghost-launch scan, so a swarm that died before persisting is
+  still findable by name. Run-not-found errors now list the session's run
+  names.
+- **The workflow parser stops dropping load-bearing fields.** Now parsed and
+  rendered: the run's aggregated **`result`** (the script's return value —
+  the harvest payload, previously discarded entirely), `logs` (the script's
+  `log()` narration; tail shown, full in `--json`), `args`, `taskId`,
+  `startTime`; per-agent `attempt`, `startedAt`, `lastProgressAt`, and
+  `lastToolName`/`lastToolSummary` — for a dead or interrupted agent, exactly
+  where it was when it stopped. Also fixed a hot-loop prefilter in the
+  transcript launch scan (pending-id set instead of parsing every tool-result
+  line).
 - **`cv workflow <session>` detects ghost launches**: `Workflow` tool
   invocations visible in the transcript with **no persisted run state** — the
   signature of a crash/power loss/hard kill before the harness wrote

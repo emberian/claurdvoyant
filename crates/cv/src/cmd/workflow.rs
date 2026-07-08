@@ -9,9 +9,12 @@ use cv_core::tools::{ForestTools, ToolHistogram};
 
 // ===================== cv workflow =====================
 
-/// `cv workflow <runId>`: render one workflow run richly — its phases, the agents grouped under
-/// each phase with their outcomes, the run totals, and (optionally) the driving script. Without a
-/// `run_id`, lists every workflow the session launched.
+/// `cv workflow <session> [run]`: render one workflow run richly — its phases, the agents grouped
+/// under each phase with their outcomes, the run totals, the aggregated result, and (optionally)
+/// the driving script. Without a `run`, lists every workflow the session launched. Both arguments
+/// accept **names**: `run` matches a workflow name (exact, else unique prefix) as well as a run id,
+/// and when `<session>` matches no session id it's resolved as a workflow name across the whole
+/// catalog — session titles are auto-generated and rarely mention the workflow you remember.
 pub(crate) fn cmd_workflow(
     id: &str,
     run_id: Option<String>,
@@ -20,7 +23,10 @@ pub(crate) fn cmd_workflow(
     script: bool,
 ) -> Result<()> {
     let want = crate::util::parse_harness(&harness)?;
-    let (r, _adapter) = cv_core::find(id, want)?.with_context(|| format!("no session matching {id:?}"))?;
+    let Some((r, _adapter)) = cv_core::find(id, want)? else {
+        // Not a session id → maybe it's a workflow name ("the stark-kill session" problem).
+        return workflow_by_name_fleetwide(id, json, script);
+    };
 
     // No run id → list the session's workflows (a directory of runs).
     let Some(run_id) = run_id else {
@@ -29,11 +35,16 @@ pub(crate) fn cmd_workflow(
 
     let wf = cv_core::workflow_of(&r, &run_id).with_context(|| {
         let runs = cv_core::workflows_of(&r);
+        let names: Vec<&str> = runs.iter().filter_map(|w| w.name.as_deref()).collect();
         format!(
-            "no workflow {run_id:?} in {} ({} workflow(s); try `cv workflow {}`)",
+            "no workflow {run_id:?} in {} — {} run(s): {}",
             short_id(&r.id),
             runs.len(),
-            short_id(&r.id),
+            if names.is_empty() {
+                "(unnamed)".into()
+            } else {
+                names.join(", ")
+            },
         )
     })?;
 
@@ -43,6 +54,63 @@ pub(crate) fn cmd_workflow(
     }
 
     render_workflow(&wf, script);
+    Ok(())
+}
+
+/// Resolve a bare `cv workflow <name>` against every session's workflow runs. One hit renders it;
+/// several list themselves with ready-to-paste commands. A miss falls through to a ghost-launch
+/// scan — a name with no recorded run anywhere may still be a launch whose state was never
+/// persisted (crash/power loss), and that is precisely when someone hunts it by name.
+fn workflow_by_name_fleetwide(name: &str, json: bool, script: bool) -> Result<()> {
+    let hits = cv_core::find_workflows_by_name(name);
+    if hits.is_empty() {
+        let ghosts = cv_core::find_ghost_launches_by_name(name);
+        if !ghosts.is_empty() {
+            println!(
+                "no recorded run named {name:?} — but {} GHOST launch(es) match (state never persisted; crash/kill before write?):\n",
+                ghosts.len()
+            );
+            for (r, g) in &ghosts {
+                let when =
+                    g.ts.map(|t| crate::util::fmt_local(t, "%Y-%m-%d %H:%M"))
+                        .unwrap_or_else(|| "(no timestamp)".into());
+                println!(
+                    "   {}  launched {when} in session {} ({})",
+                    g.name.as_deref().unwrap_or("(unnamed)"),
+                    short_id(&r.id),
+                    r.title.as_deref().unwrap_or("untitled"),
+                );
+            }
+            println!("\n→ any sub-agent debris sits under the session dir's subagents/workflows/");
+            return Ok(());
+        }
+        bail!("no session and no workflow name matching {name:?} (try `cv ls -q 'workflow:{name}'`)");
+    }
+    if hits.len() == 1 {
+        let (r, wf) = &hits[0];
+        if json {
+            println!("{}", serde_json::to_string_pretty(wf)?);
+            return Ok(());
+        }
+        println!(
+            "(in session {} — {})\n",
+            short_id(&r.id),
+            r.title.as_deref().unwrap_or("untitled")
+        );
+        render_workflow(wf, script);
+        return Ok(());
+    }
+    println!("# {} workflow run(s) matching {name:?}:\n", hits.len());
+    for (r, w) in &hits {
+        println!(
+            "cv workflow {} {}   # {} · {} · {} agent(s)",
+            short_id(&r.id),
+            w.run_id,
+            w.name.as_deref().unwrap_or("(unnamed)"),
+            w.status.as_deref().unwrap_or("?"),
+            w.agent_count,
+        );
+    }
     Ok(())
 }
 
@@ -121,17 +189,28 @@ fn render_workflow(w: &cv_core::Workflow, show_script: bool) {
         .duration_ms
         .map(|ms| format!(" · {}", fmt_duration(ms)))
         .unwrap_or_default();
+    let started = w
+        .started_at
+        .map(|t| format!(" · started {}", crate::util::fmt_local(t, "%Y-%m-%d %H:%M")))
+        .unwrap_or_default();
     println!(
-        "{} · {} agent(s) · {} phase(s) · {} tokens · {} tool calls{}",
+        "{} · {} agent(s) · {} phase(s) · {} tokens · {} tool calls{}{}",
         w.status.as_deref().unwrap_or("?"),
         w.agent_count,
         w.phases.len(),
         fmt_int(w.total_tokens),
         fmt_int(w.total_tool_calls),
         dur,
+        started,
     );
     if let Some(m) = &w.default_model {
         println!("model: {m}");
+    }
+    if let Some(t) = &w.task_id {
+        println!("task: {t}");
+    }
+    if let Some(a) = &w.args {
+        println!("args: {}", truncate(&a.to_string(), 200));
     }
     if let Some(rf) = &w.resume_from {
         println!("resumed from: {rf}");
@@ -167,6 +246,36 @@ fn render_workflow(w: &cv_core::Workflow, show_script: bool) {
         for a in &w.orphan_agents {
             render_workflow_agent(a);
         }
+    }
+
+    // The run's own narration: log() lines. Tail-biased — the end is where a run explains how it
+    // finished (or what was failing when it stopped).
+    if !w.logs.is_empty() {
+        const TAIL: usize = 8;
+        println!("\n## log ({} line(s))", w.logs.len());
+        if w.logs.len() > TAIL {
+            println!("   … {} earlier (--json for all)", w.logs.len() - TAIL);
+        }
+        for l in w.logs.iter().rev().take(TAIL).rev() {
+            println!("   {}", truncate(l, 160));
+        }
+    }
+
+    // The aggregated return value — the harvest payload.
+    match &w.result {
+        Some(r) => {
+            let pretty = serde_json::to_string_pretty(r).unwrap_or_else(|_| r.to_string());
+            println!("\n## result");
+            if pretty.len() > 2000 {
+                println!(
+                    "{}\n(truncated — `--json` for the full result)",
+                    truncate(&pretty, 2000)
+                );
+            } else {
+                println!("{pretty}");
+            }
+        }
+        None => println!("\n(no result recorded — the run returned nothing or died before finishing)"),
     }
 
     if show_script {
@@ -213,6 +322,9 @@ fn render_workflow_agent(a: &cv_core::WorkflowAgent) {
     if a.cached {
         tele.push("cached".into());
     }
+    if let Some(n) = a.attempt.filter(|n| *n > 1) {
+        tele.push(format!("attempt {n}"));
+    }
     let tele = if tele.is_empty() {
         String::new()
     } else {
@@ -221,6 +333,22 @@ fn render_workflow_agent(a: &cv_core::WorkflowAgent) {
     println!("   {glyph} {label}  {id}{tele}");
     if let Some(e) = &a.error {
         println!("       ✗ {}", truncate(e, 120));
+    }
+    // A non-terminal agent (crash/kill/interrupt) — show where it was when last alive.
+    if !matches!(a.state.as_deref(), Some("done")) {
+        if let Some(tool) = &a.last_tool_name {
+            let when = a
+                .last_progress_at
+                .map(|t| format!(" @ {}", crate::util::fmt_local(t, "%m-%d %H:%M")))
+                .unwrap_or_default();
+            println!(
+                "       ↪ last: {tool} · {}{when}",
+                a.last_tool_summary
+                    .as_deref()
+                    .map(|s| truncate(s, 100))
+                    .unwrap_or_default(),
+            );
+        }
     }
     if let Some(rp) = &a.result_preview {
         println!("       ↩ {}", truncate(rp, 200));
