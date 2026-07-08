@@ -21,11 +21,12 @@ pub(crate) fn cmd_workflow(
     harness: Option<String>,
     json: bool,
     script: bool,
+    results: bool,
 ) -> Result<()> {
     let want = crate::util::parse_harness(&harness)?;
     let Some((r, _adapter)) = cv_core::find(id, want)? else {
         // Not a session id → maybe it's a workflow name ("the stark-kill session" problem).
-        return workflow_by_name_fleetwide(id, json, script);
+        return workflow_by_name_fleetwide(id, json, script, results);
     };
 
     // No run id → list the session's workflows (a directory of runs).
@@ -33,7 +34,7 @@ pub(crate) fn cmd_workflow(
         return list_workflows(&r, json);
     };
 
-    let wf = cv_core::workflow_of(&r, &run_id).with_context(|| {
+    let mut wf = cv_core::workflow_of(&r, &run_id).with_context(|| {
         let runs = cv_core::workflows_of(&r);
         let names: Vec<&str> = runs.iter().filter_map(|w| w.name.as_deref()).collect();
         format!(
@@ -47,21 +48,62 @@ pub(crate) fn cmd_workflow(
             },
         )
     })?;
+    wf.attach_journal(&r.path);
+    emit_workflow(&wf, json, script, results)
+}
 
+/// Shared single-run output: `--json` gets the full structure (journal results included);
+/// otherwise the rendered view, with `--results` appending each agent's full journaled return.
+fn emit_workflow(wf: &cv_core::Workflow, json: bool, script: bool, results: bool) -> Result<()> {
     if json {
-        println!("{}", serde_json::to_string_pretty(&wf)?);
+        println!("{}", serde_json::to_string_pretty(wf)?);
         return Ok(());
     }
-
-    render_workflow(&wf, script);
+    render_workflow(wf, script);
+    if results {
+        render_journal_results(wf);
+    } else if wf
+        .phases
+        .iter()
+        .flat_map(|p| &p.agents)
+        .chain(&wf.orphan_agents)
+        .any(|a| a.journal_result.is_some())
+    {
+        println!("→ `--results` for each agent's FULL journaled return (previews above are ~400 chars)");
+    }
     Ok(())
+}
+
+/// The `--results` tail: every agent's FULL journaled return value, pretty-printed.
+fn render_journal_results(w: &cv_core::Workflow) {
+    let agents: Vec<&cv_core::WorkflowAgent> = w
+        .phases
+        .iter()
+        .flat_map(|p| &p.agents)
+        .chain(&w.orphan_agents)
+        .filter(|a| a.journal_result.is_some())
+        .collect();
+    if agents.is_empty() {
+        println!("\n(no journaled per-agent results — the run's journal is absent or empty)");
+        return;
+    }
+    println!("\n## full per-agent returns ({} journaled)", agents.len());
+    for a in agents {
+        println!(
+            "\n### {}  {}",
+            a.label.as_deref().unwrap_or("(agent)"),
+            a.agent_id.as_deref().map(short_id).unwrap_or_default(),
+        );
+        let r = a.journal_result.as_ref().unwrap();
+        println!("{}", serde_json::to_string_pretty(r).unwrap_or_else(|_| r.to_string()));
+    }
 }
 
 /// Resolve a bare `cv workflow <name>` against every session's workflow runs. One hit renders it;
 /// several list themselves with ready-to-paste commands. A miss falls through to a ghost-launch
 /// scan — a name with no recorded run anywhere may still be a launch whose state was never
 /// persisted (crash/power loss), and that is precisely when someone hunts it by name.
-fn workflow_by_name_fleetwide(name: &str, json: bool, script: bool) -> Result<()> {
+fn workflow_by_name_fleetwide(name: &str, json: bool, script: bool, results: bool) -> Result<()> {
     let hits = cv_core::find_workflows_by_name(name);
     if hits.is_empty() {
         let ghosts = cv_core::find_ghost_launches_by_name(name);
@@ -88,17 +130,16 @@ fn workflow_by_name_fleetwide(name: &str, json: bool, script: bool) -> Result<()
     }
     if hits.len() == 1 {
         let (r, wf) = &hits[0];
-        if json {
-            println!("{}", serde_json::to_string_pretty(wf)?);
-            return Ok(());
+        let mut wf = wf.clone();
+        wf.attach_journal(&r.path);
+        if !json {
+            println!(
+                "(in session {} — {})\n",
+                short_id(&r.id),
+                r.title.as_deref().unwrap_or("untitled")
+            );
         }
-        println!(
-            "(in session {} — {})\n",
-            short_id(&r.id),
-            r.title.as_deref().unwrap_or("untitled")
-        );
-        render_workflow(wf, script);
-        return Ok(());
+        return emit_workflow(&wf, json, script, results);
     }
     println!("# {} workflow run(s) matching {name:?}:\n", hits.len());
     for (r, w) in &hits {

@@ -164,6 +164,11 @@ pub struct WorkflowAgent {
     /// One-line summary of that last tool call (`lastToolSummary`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_tool_summary: Option<String>,
+    /// The agent's **full** journaled return value, from the run's `journal.jsonl` — the complete
+    /// structured result, where `result_preview` is a ~400-char head. Populated by
+    /// [`Workflow::attach_journal`], not by the state-file parse.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub journal_result: Option<Value>,
 }
 
 impl Workflow {
@@ -184,6 +189,59 @@ impl Workflow {
         }
         m
     }
+
+    /// Enrich every agent with its **full** journaled return value from the run's
+    /// `subagents/workflows/<runId>/journal.jsonl` (the state file only keeps a ~400-char
+    /// `resultPreview`). No-op when the journal is absent (e.g. a crashed run).
+    pub fn attach_journal(&mut self, parent_path: &Path) {
+        let results = journal_results(parent_path, &self.run_id);
+        if results.is_empty() {
+            return;
+        }
+        for a in self
+            .phases
+            .iter_mut()
+            .flat_map(|p| &mut p.agents)
+            .chain(&mut self.orphan_agents)
+        {
+            if let Some(id) = &a.agent_id {
+                a.journal_result = results.get(id).cloned();
+            }
+        }
+    }
+}
+
+/// A run's `journal.jsonl` reduced to `agentId → full result Value` (the LAST result per agent —
+/// a re-issued agent journals more than once). Empty when the journal is absent or unreadable.
+pub fn journal_results(parent_path: &Path, run_id: &str) -> BTreeMap<String, Value> {
+    let mut map = BTreeMap::new();
+    let Some(stem) = parent_path.file_stem().and_then(|s| s.to_str()) else {
+        return map;
+    };
+    let Some(journal) = parent_path.parent().map(|d| {
+        d.join(stem)
+            .join("subagents")
+            .join("workflows")
+            .join(run_id)
+            .join("journal.jsonl")
+    }) else {
+        return map;
+    };
+    let Ok(txt) = fs::read_to_string(&journal) else {
+        return map;
+    };
+    for line in txt.lines() {
+        let Ok(v) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if v.get("type").and_then(Value::as_str) != Some("result") {
+            continue;
+        }
+        if let (Some(id), Some(r)) = (v.get("agentId").and_then(Value::as_str), v.get("result")) {
+            map.insert(id.to_string(), r.clone());
+        }
+    }
+    map
 }
 
 /// The directory holding a session's workflow *state* files: `<sessionId>/workflows/`. (Distinct
@@ -611,6 +669,7 @@ fn parse_agent(e: &Value) -> WorkflowAgent {
         last_progress_at: u("lastProgressAt").and_then(ms_to_utc),
         last_tool_name: s("lastToolName"),
         last_tool_summary: s("lastToolSummary"),
+        journal_result: None,
     }
 }
 
@@ -742,6 +801,42 @@ mod tests {
         // Null result stays absent, not Some(Null).
         let w2 = parse_state(&json!({"runId": "wf_x", "result": null}));
         assert!(w2.result.is_none());
+    }
+
+    #[test]
+    fn attach_journal_fills_full_results_last_write_wins() {
+        let dir = std::env::temp_dir().join(format!("cv-wf-journal-test-{}", std::process::id()));
+        let run_dir = dir.join("sess").join("subagents").join("workflows").join("wf_j-1");
+        std::fs::create_dir_all(&run_dir).unwrap();
+        let sess = dir.join("sess.jsonl");
+        std::fs::write(&sess, "").unwrap();
+        let journal = [
+            json!({"type":"started","key":"v2:k1","agentId":"a1"}).to_string(),
+            json!({"type":"result","key":"v2:k1","agentId":"a1","result":{"status":"RED","try":1}}).to_string(),
+            // A re-issued agent journals again — the LAST result must win.
+            json!({"type":"result","key":"v2:k1","agentId":"a1","result":{"status":"GREEN","try":2,"detail":"x".repeat(600)}})
+                .to_string(),
+        ];
+        std::fs::write(run_dir.join("journal.jsonl"), journal.join("\n")).unwrap();
+
+        let mut w = parse_state(&json!({
+            "runId": "wf_j-1",
+            "phases": [{"title": "P"}],
+            "workflowProgress": [
+                {"type": "workflow_agent", "index": 1, "phaseIndex": 1, "agentId": "a1",
+                 "state": "done", "resultPreview": "{\"status\":\"GREEN\"…"},
+                {"type": "workflow_agent", "index": 2, "phaseIndex": 1, "agentId": "a2", "state": "done"}
+            ]
+        }));
+        w.attach_journal(&sess);
+        std::fs::remove_dir_all(&dir).ok();
+
+        let a1 = &w.phases[0].agents[0];
+        let jr = a1.journal_result.as_ref().unwrap();
+        assert_eq!(jr["status"], "GREEN");
+        assert_eq!(jr["try"], 2);
+        assert_eq!(jr["detail"].as_str().unwrap().len(), 600); // FULL, beyond any preview cap
+        assert!(w.phases[0].agents[1].journal_result.is_none()); // no journal entry → stays absent
     }
 
     #[test]

@@ -418,9 +418,10 @@ enum Cmd {
     /// outcomes, run totals, and the driving script. Without `<run_id>`, lists the session's runs.
     #[command(hide = true)]
     Workflow {
-        /// The session that launched the workflow.
+        /// The session that launched the workflow — or a workflow NAME, resolved fleet-wide.
         id: String,
-        /// The workflow run id (`wf_…`, or a unique prefix). Omit to list all runs.
+        /// The workflow run id (`wf_…`, or a unique prefix) or the workflow's name. Omit to list
+        /// all runs.
         run_id: Option<String>,
         #[arg(long)]
         harness: Option<String>,
@@ -430,6 +431,10 @@ enum Cmd {
         /// Also print the driving workflow script (the JS that fanned out the agents).
         #[arg(long)]
         script: bool,
+        /// Print each agent's FULL journaled return value (the state file keeps only a ~400-char
+        /// preview; the complete results live in the run's journal).
+        #[arg(long)]
+        results: bool,
     },
     /// Cross-agent tool analytics: per-agent histograms, which-agent-used-what, aggregate usage,
     /// and a tool-call timeline — across the orchestrator and its whole sub-agent forest.
@@ -741,7 +746,8 @@ fn main() -> Result<()> {
             harness,
             json,
             script,
-        } => workflow::cmd_workflow(&id, run_id, harness, json, script),
+            results,
+        } => workflow::cmd_workflow(&id, run_id, harness, json, script, results),
         Cmd::Tools {
             id,
             harness,

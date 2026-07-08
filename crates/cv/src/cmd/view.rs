@@ -17,7 +17,14 @@ pub(crate) fn cmd_show(
     pre_compaction: Option<usize>,
 ) -> Result<()> {
     let want = parse_harness(&harness)?;
-    let (r, adapter) = cv_core::find(id, want)?.with_context(|| format!("no session matching {id:?}"))?;
+    let found = cv_core::find(id, want)?;
+    // Not a session id → maybe it's a sub-agent id. Resolve its parent fleet-wide and render the
+    // agent directly — sub-agents aren't in the main pool, but `cv show <agent-id>` should still
+    // just work (harvest reports hand out bare agent ids all the time).
+    let Some((r, adapter)) = found else {
+        let range = range.as_deref().map(parse_msg_range).transpose()?;
+        return show_agent_fleetwide(id, json, range).with_context(|| format!("no session matching {id:?}"));
+    };
     let mut range = range.as_deref().map(parse_msg_range).transpose()?;
 
     // `--pre-compaction <N>`: resolve the Nth (1-based) compaction's pre-span into a window. This
@@ -71,6 +78,37 @@ pub(crate) fn cmd_show(
     use std::io::Write;
     out.flush()?;
     Ok(())
+}
+
+/// `cv show <agent-id>` with no parent given: find which session(s) spawned the agent (filename
+/// scan across the fleet) and render it through the one parent — or list the candidates when the
+/// prefix is ambiguous.
+fn show_agent_fleetwide(agent_id: &str, json: bool, range: Option<(usize, Option<usize>)>) -> Result<()> {
+    let parents = cv_core::find_subagent_parents(agent_id);
+    match parents.as_slice() {
+        [] => bail!("…and no sub-agent matches {agent_id:?} either"),
+        [parent] => {
+            let adapter = cv_core::harness::for_harness(parent.harness)
+                .with_context(|| format!("no adapter for {}", parent.harness))?;
+            eprintln!(
+                "✦ sub-agent of session {} ({})",
+                short_id(&parent.id),
+                parent.title.as_deref().unwrap_or("untitled"),
+            );
+            show_one_subagent(parent, adapter.as_ref(), agent_id, json, range)
+        }
+        many => {
+            println!("# {} session(s) have a sub-agent matching {agent_id:?}:\n", many.len());
+            for p in many {
+                println!(
+                    "cv show {} --agent {agent_id}   # {}",
+                    short_id(&p.id),
+                    p.title.as_deref().unwrap_or("untitled"),
+                );
+            }
+            Ok(())
+        }
+    }
 }
 
 /// List the sub-agent forest a session spawned (the `--subagents` view): every direct/`Workflow`

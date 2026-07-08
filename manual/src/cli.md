@@ -324,12 +324,15 @@ cv workflow 3b829648 wf_ab915970      # render one run (run-id prefix is enough)
 cv workflow 3b829648 census           # …or address the run by its NAME (unique prefix ok)
 cv workflow stark-kill-emit-swarm     # no session id? the name resolves fleet-wide
 cv workflow 3b829648 wf_ab915970 --script   # print the driving JS instead
-cv workflow 3b829648 wf_ab915970 --json     # the structured Workflow IR (full result, all logs)
+cv workflow 3b829648 wf_ab915970 --results  # each agent's FULL journaled return value
+cv workflow 3b829648 wf_ab915970 --json     # the structured Workflow IR (full results, all logs)
 ```
 
 Both arguments accept names: the `<run>` position matches a workflow name (exact, else unique prefix; a re-run name resolves to its newest run), and a first argument that matches no session id is resolved as a workflow name across the whole catalog — session titles are auto-generated and rarely mention the workflow you actually remember. A fleet-wide name miss falls through to a ghost-launch scan, so a swarm that died before its state was persisted is still findable by name.
 
 Agents that didn't finish (`error`/`progress`) show where they last were — `↪ last: Bash · cd /x && grep … @ 07-06 23:05` — which is exactly what you want after a crash or rate-limit hit.
+
+The default agent lines carry ~400-char result *previews* (that's all the state file keeps); `--results` (and `--json`) read the run's `journal.jsonl` and print each agent's **complete** journaled return — the full lane harvest.
 
 Runs are read from the session's `workflows/wf_*.json` state files; the per-agent transcripts live a tier deeper under `subagents/workflows/<run>/` (see [`cv tools`](#cv-tools) and [`cv show --subagents`](#cv-show)).
 
@@ -474,6 +477,7 @@ The header line gives you harness, full id, cwd (home-relative), and model; then
 - `--range <start>-<end>` — render only that 0-based, end-exclusive message window (`<start>-`, `-<end>`, and negative `-N` from the end all work). Messages outside the window are never resolved, so a windowed view of a huge session reads only the bytes it shows.
 - `--pre-compaction [N]` — read the span *before* a compaction boundary (the context a continued agent lost); defaults to the first boundary, `--pre-compaction 2` for the Nth. It sets `--range` for you. Pair with [`cv compaction`](#cv-compaction) to see where the seams are.
 - `--subagents` — instead of the transcript, list the sub-agent forest this session spawned (each child's type, journaled outcome, and return value). `--agent <agent-id>` renders one specific sub-agent's transcript, resolved through this parent.
+- `cv show <agent-id>` also works **without** the parent: an id that matches no session is resolved as a sub-agent id across the fleet (a filename scan of every session's `subagents/` sidecar) — one parent renders the agent directly with a provenance banner; several (fork lineages share sidecars) list ready-to-paste `cv show <parent> --agent …` commands.
 
 ### `cv export`
 

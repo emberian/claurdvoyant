@@ -28,6 +28,17 @@ now closed:
   through to a ghost-launch scan, so a swarm that died before persisting is
   still findable by name. Run-not-found errors now list the session's run
   names.
+- **Full per-agent lane returns.** `cv workflow <sess> <run> --results` reads
+  the run's `journal.jsonl` and prints each agent's **complete** journaled
+  return value (the state file keeps only a ~400-char `resultPreview`); the
+  run's `--json` now carries them as `journal_result` per agent. This closes
+  the long-standing "per-agent returns truncated to ~400-char previews" gap.
+- **`cv show <agent-id>` works without knowing the parent.** An id that
+  matches no session resolves as a sub-agent id fleet-wide (parallel filename
+  scan of `subagents/` sidecars, both tiers); one parent → the agent renders
+  directly with a provenance banner, several (fork lineages share sidecars) →
+  ready-to-paste disambiguation commands. Closes the "workflow sub-agents
+  aren't indexed as sessions" gap.
 - **The workflow parser stops dropping load-bearing fields.** Now parsed and
   rendered: the run's aggregated **`result`** (the script's return value —
   the harvest payload, previously discarded entirely), `logs` (the script's

@@ -261,6 +261,36 @@ pub fn find_workflows_by_name(name: &str) -> Vec<(SessionRef, Workflow)> {
     }
 }
 
+/// Find the parent session(s) of a sub-agent by its `agent-…` id (or bare/prefix form) — so an
+/// agent can be opened directly (`cv show <agent-id>`) without first knowing which session
+/// spawned it. Pure filename scan over each Claude session's `subagents/` sidecar (both tiers:
+/// direct agents and `subagents/workflows/<run>/`), in parallel; nothing is parsed.
+pub fn find_subagent_parents(agent_id: &str) -> Vec<SessionRef> {
+    let want = format!("agent-{}", agent_id.strip_prefix("agent-").unwrap_or(agent_id));
+    let mut refs = sessions();
+    refs.retain(|r| r.harness == Harness::Claude);
+    let mut out = par_filter_map(refs, move |r| {
+        let stem = r.path.file_stem()?.to_str()?.to_string();
+        let base = r.path.parent()?.join(stem).join("subagents");
+        let has_match = |dir: &std::path::Path| {
+            std::fs::read_dir(dir).into_iter().flatten().flatten().any(|e| {
+                e.file_name()
+                    .to_str()
+                    .is_some_and(|n| n.ends_with(".jsonl") && n.starts_with(&want))
+            })
+        };
+        let hit = has_match(&base)
+            || std::fs::read_dir(base.join("workflows"))
+                .into_iter()
+                .flatten()
+                .flatten()
+                .any(|run| has_match(&run.path()));
+        hit.then_some(r)
+    });
+    out.sort_by_key(|r| std::cmp::Reverse(r.updated_at.or(r.created_at)));
+    out
+}
+
 /// Fleet-wide ghost hunt by name-prefix: [`workflow_ghosts_of`] across every Claude session that
 /// recorded at least one workflow (the bounded set where the transcript-vs-state cross-check is
 /// meaningful), in parallel. For finding a swarm you remember by name that left no run record.
