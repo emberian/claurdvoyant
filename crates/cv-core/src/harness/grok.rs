@@ -135,7 +135,6 @@ impl Adapter for Grok {
         super::note_skipped_lines(&mut s, skipped);
         Ok(s)
     }
-
 }
 
 fn grok_git(summary: &Value) -> Option<GitInfo> {

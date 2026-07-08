@@ -22,28 +22,19 @@ fn bar(frac: f64) -> String {
     "█".repeat((frac * 24.0).round() as usize)
 }
 
-pub(crate) fn cmd_doctor(
-    id: Option<String>,
-    harness: Option<String>,
-    recent: usize,
-    json: bool,
-) -> Result<()> {
+pub(crate) fn cmd_doctor(id: Option<String>, harness: Option<String>, recent: usize, json: bool) -> Result<()> {
     let want = crate::util::parse_harness(&harness)?;
 
     // Resolve the target session(s).
     let targets: Vec<SessionRef> = if let Some(id) = &id {
-        let (r, _ad) =
-            cv_core::find(id, want)?.with_context(|| format!("no session matching {id:?}"))?;
+        let (r, _ad) = cv_core::find(id, want)?.with_context(|| format!("no session matching {id:?}"))?;
         vec![r]
     } else {
         let cwd = std::env::current_dir().ok();
         let mut refs: Vec<SessionRef> = cv_core::sessions()
             .into_iter()
             .filter(|r| want.is_none_or(|h| r.harness == h))
-            .filter(|r| {
-                cwd.as_ref()
-                    .is_none_or(|c| r.cwd.as_deref() == Some(c.as_path()))
-            })
+            .filter(|r| cwd.as_ref().is_none_or(|c| r.cwd.as_deref() == Some(c.as_path())))
             .collect();
         refs.sort_by_key(|r| std::cmp::Reverse(r.updated_at));
         refs.truncate(recent.max(1));
@@ -59,8 +50,8 @@ pub(crate) fn cmd_doctor(
     let mut rep = Report::default();
     let mut label = String::new();
     for r in &targets {
-        let (rr, adapter) = cv_core::find(&r.id, Some(r.harness))?
-            .with_context(|| format!("could not load session {}", r.id))?;
+        let (rr, adapter) =
+            cv_core::find(&r.id, Some(r.harness))?.with_context(|| format!("could not load session {}", r.id))?;
         let session = adapter.parse(&rr)?;
         if label.is_empty() {
             label = crate::short_id(&rr.id);
@@ -136,7 +127,13 @@ fn print_report(rep: &Report, label: &str, n_targets: usize) {
             continue;
         }
         let frac = v as f64 / total as f64;
-        println!("  {:<15} {:>4.0}%  {:<24} {}", name, frac * 100.0, bar(frac), fmt_tok(v));
+        println!(
+            "  {:<15} {:>4.0}%  {:<24} {}",
+            name,
+            frac * 100.0,
+            bar(frac),
+            fmt_tok(v)
+        );
     }
 
     // Top tools by result tokens (the usual variable bloat).
@@ -183,9 +180,8 @@ fn verdict(rep: &Report) -> String {
     // Tool output is the lever to pull when it's the single largest source (even below 50%) or
     // when tool results + call args together dominate the window.
     let tool_activity = rep.tool_results + rep.tool_call_args;
-    let tool_results_is_top = rep.tool_results >= rep.thinking
-        && rep.tool_results >= rep.assistant_text
-        && rep.tool_results >= rep.user_text;
+    let tool_results_is_top =
+        rep.tool_results >= rep.thinking && rep.tool_results >= rep.assistant_text && rep.tool_results >= rep.user_text;
     if rep.tool_results > 0 && (tool_results_is_top || tool_activity * 2 >= total) {
         let mut t: Vec<_> = rep.by_tool.iter().filter(|(_, s)| s.result_tokens > 0).collect();
         t.sort_by_key(|e| std::cmp::Reverse(e.1.result_tokens));

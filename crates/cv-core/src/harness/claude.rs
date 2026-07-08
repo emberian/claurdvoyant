@@ -105,7 +105,6 @@ impl Adapter for Claude {
             sink,
         ))
     }
-
 }
 
 /// Fully parse a Claude `.jsonl` transcript from its text contents into a [`Session`] (full

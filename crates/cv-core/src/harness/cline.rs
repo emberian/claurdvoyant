@@ -94,7 +94,6 @@ impl Adapter for Cline {
     fn stream(&self, r: &SessionRef, opts: &ParseOptions, sink: &mut dyn MessageSink) -> Result<Session> {
         stream_task_dir(&r.path, &r.id, Harness::Cline, opts, sink)
     }
-
 }
 
 // ---------------------------------------------------------------------------

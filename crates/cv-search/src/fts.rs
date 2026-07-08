@@ -140,8 +140,7 @@ fn open_or_create(dir: &Path) -> Result<(Index, Fields)> {
 /// failure during a search must not wipe an index that took an hour to build. A stale-schema index
 /// is an error pointing at `cv index` (whose path is the one allowed to rebuild).
 fn open_existing(dir: &Path) -> Result<(Index, Fields)> {
-    let index =
-        Index::open_in_dir(dir).with_context(|| format!("opening tantivy index at {}", dir.display()))?;
+    let index = Index::open_in_dir(dir).with_context(|| format!("opening tantivy index at {}", dir.display()))?;
     if !schema_current(&index.schema()) {
         anyhow::bail!(
             "full-text index at {} was built by an older cv — run `cv index` to rebuild it",

@@ -189,7 +189,6 @@ impl Adapter for OpenCode {
 
         Ok(s)
     }
-
 }
 
 /// Count a session's conversational turns: message records whose `role` is `user`/`assistant`.

@@ -648,29 +648,29 @@ fn match_token_prefix(s: &str, i: usize) -> Option<usize> {
     const PREFIXES: &[(&str, usize, Tail)] = &[
         ("sk-ant-", 10, Tail::Token),
         ("sk-", 10, Tail::Token),
-        ("sk_live_", 20, Tail::Alnum),  // Stripe secret key (live)
-        ("rk_live_", 20, Tail::Alnum),  // Stripe restricted key (live)
+        ("sk_live_", 20, Tail::Alnum), // Stripe secret key (live)
+        ("rk_live_", 20, Tail::Alnum), // Stripe restricted key (live)
         ("xoxb-", 8, Tail::Token),
         ("xoxp-", 8, Tail::Token),
         ("xoxa-", 8, Tail::Token),
         ("xoxr-", 8, Tail::Token),
-        ("xoxc-", 8, Tail::Token),      // Slack client token
-        ("xoxs-", 8, Tail::Token),      // Slack session token
-        ("xapp-", 8, Tail::Token),      // Slack app-level token
+        ("xoxc-", 8, Tail::Token), // Slack client token
+        ("xoxs-", 8, Tail::Token), // Slack session token
+        ("xapp-", 8, Tail::Token), // Slack app-level token
         ("ghp_", 20, Tail::Token),
         ("gho_", 20, Tail::Token),
         ("ghs_", 20, Tail::Token),
         ("ghu_", 20, Tail::Token),
         ("ghr_", 20, Tail::Token),
         ("github_pat_", 20, Tail::Token),
-        ("glpat-", 20, Tail::Token),    // GitLab personal access token
-        ("npm_", 36, Tail::Alnum),      // npm token: npm_ + exactly 36 base62
-        ("hf_", 30, Tail::Alnum),       // Hugging Face token: hf_ + 34 base62
-        ("gsk_", 40, Tail::Alnum),      // Groq: gsk_ + 52 base62
-        ("xai-", 40, Tail::Alnum),      // xAI: xai- + ~80 base62
-        ("dop_v1_", 40, Tail::Alnum),   // DigitalOcean: dop_v1_ + 64 hex
-        ("shpat_", 32, Tail::Alnum),    // Shopify private app token: + 32 hex
-        ("shpss_", 32, Tail::Alnum),    // Shopify shared secret: + 32 hex
+        ("glpat-", 20, Tail::Token),  // GitLab personal access token
+        ("npm_", 36, Tail::Alnum),    // npm token: npm_ + exactly 36 base62
+        ("hf_", 30, Tail::Alnum),     // Hugging Face token: hf_ + 34 base62
+        ("gsk_", 40, Tail::Alnum),    // Groq: gsk_ + 52 base62
+        ("xai-", 40, Tail::Alnum),    // xAI: xai- + ~80 base62
+        ("dop_v1_", 40, Tail::Alnum), // DigitalOcean: dop_v1_ + 64 hex
+        ("shpat_", 32, Tail::Alnum),  // Shopify private app token: + 32 hex
+        ("shpss_", 32, Tail::Alnum),  // Shopify shared secret: + 32 hex
         ("AIza", 30, Tail::Token),
     ];
     for (pfx, min_tail, tail) in PREFIXES {
@@ -963,7 +963,12 @@ fn match_url_userinfo_password(s: &str, i: usize) -> Option<Match> {
     }
     j += 3;
     // user: runs to ':'; hitting '@', '/', whitespace, or a quote first means no password present.
-    while j < bytes.len() && !matches!(bytes[j], b':' | b'@' | b'/' | b' ' | b'\t' | b'\n' | b'\r' | b'"' | b'\'') {
+    while j < bytes.len()
+        && !matches!(
+            bytes[j],
+            b':' | b'@' | b'/' | b' ' | b'\t' | b'\n' | b'\r' | b'"' | b'\''
+        )
+    {
         j += 1;
     }
     if j >= bytes.len() || bytes[j] != b':' {
@@ -1404,8 +1409,14 @@ mod tests {
             fixture("npm_", "abcdefghijklmnopqrstuvwxyz0123456789"),
             fixture("hf_", "abcdefghijklmnopqrstuvwxyzABCDEFGH"),
             fixture("gsk_", "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKL"),
-            fixture("xai-", "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcd"),
-            fixture("dop_v1_", "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"),
+            fixture(
+                "xai-",
+                "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcd",
+            ),
+            fixture(
+                "dop_v1_",
+                "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            ),
             fixture("shpat_", "0123456789abcdef0123456789abcdef"),
             fixture("shpss_", "0123456789abcdef0123456789abcdef"),
         ];
@@ -1484,10 +1495,7 @@ mod tests {
 
     #[test]
     fn bearer_prose_survives() {
-        let inputs = [
-            "bearer instruments are negotiable",
-            "the bearer of this note",
-        ];
+        let inputs = ["bearer instruments are negotiable", "the bearer of this note"];
         for input in inputs {
             assert_eq!(redact_one(input), input, "prose was eaten");
         }
@@ -1548,10 +1556,8 @@ mod tests {
             commit: Some("abc1234".into()),
             remote: Some("https://x-access-token:ghs_0123456789abcdefABCD@github.com/o/r.git".into()),
         });
-        sess.extra.insert(
-            "apiKey".into(),
-            serde_json::json!("sk-abcDEF1234567890ghijkl"),
-        );
+        sess.extra
+            .insert("apiKey".into(), serde_json::json!("sk-abcDEF1234567890ghijkl"));
         let mut m = Message::new(Role::User);
         m.content.push(Block::Text { text: "hi".into() });
         m.extra.insert(
@@ -1562,10 +1568,7 @@ mod tests {
 
         let (out, stats) = redact_with(&sess, &RedactOptions::default());
         let remote = out.git.as_ref().unwrap().remote.as_deref().unwrap();
-        assert_eq!(
-            remote,
-            "https://x-access-token:[REDACTED:secret]@github.com/o/r.git"
-        );
+        assert_eq!(remote, "https://x-access-token:[REDACTED:secret]@github.com/o/r.git");
         assert_eq!(out.git.as_ref().unwrap().branch.as_deref(), Some("main"));
         let extra = serde_json::Value::Object(out.extra.clone()).to_string();
         assert!(!extra.contains("sk-abcDEF"), "session extra leaked: {extra}");
@@ -1575,10 +1578,7 @@ mod tests {
 
         // Idempotent across the whole session too.
         let (again, again_stats) = redact_with(&out, &RedactOptions::default());
-        assert_eq!(
-            again.git.as_ref().unwrap().remote,
-            out.git.as_ref().unwrap().remote
-        );
+        assert_eq!(again.git.as_ref().unwrap().remote, out.git.as_ref().unwrap().remote);
         assert_eq!(again.extra, out.extra);
         assert_eq!(again.messages[0].extra, out.messages[0].extra);
         assert_eq!(again_stats.total(), 0);

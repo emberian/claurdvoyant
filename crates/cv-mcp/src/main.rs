@@ -925,10 +925,7 @@ fn observe_stream(args: &Value) -> anyhow::Result<String> {
     // (nanosecond mtime + size), and an actively-tailed session is by definition recently updated.
     // Blind spot: an in-place append to a session outside that window is seen only at the ~900s
     // backstop.
-    let mut refs: Vec<SessionRef> = cv_core::sessions()
-        .into_iter()
-        .filter(|r| filter.matches(r))
-        .collect();
+    let mut refs: Vec<SessionRef> = cv_core::sessions().into_iter().filter(|r| filter.matches(r)).collect();
     // Drain oldest-touched first so a bounded call yields a coherent chronological slice.
     refs.sort_by(|a, b| {
         let ka = a.updated_at.or(a.created_at);
@@ -936,7 +933,10 @@ fn observe_stream(args: &Value) -> anyhow::Result<String> {
         ka.cmp(&kb)
     });
 
-    let mut next = StreamCursor { v: STREAM_CURSOR_VERSION, o: std::collections::HashMap::new() };
+    let mut next = StreamCursor {
+        v: STREAM_CURSOR_VERSION,
+        o: std::collections::HashMap::new(),
+    };
     let mut out_msgs: Vec<Value> = Vec::new();
     let mut chars_used = 0usize;
     let mut budget_hit = false;

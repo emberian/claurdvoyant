@@ -135,7 +135,6 @@ impl Adapter for OpenClaw {
         };
         Ok(stream_core(lines, r, sink))
     }
-
 }
 
 /// Core parse, split out so tests can drive it from a fixture string. Full fidelity (collects).

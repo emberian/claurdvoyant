@@ -948,7 +948,11 @@ fn parse_term(w: &Word) -> Result<Expr, String> {
             // teaches instead of being silently overridden.
             let op = match field.to_ascii_lowercase().as_str() {
                 f @ ("before" | "until" | "after" | "since") => {
-                    let sugar = if matches!(f, "before" | "until") { Op::Lt } else { Op::Ge };
+                    let sugar = if matches!(f, "before" | "until") {
+                        Op::Lt
+                    } else {
+                        Op::Ge
+                    };
                     if op != Op::Contains {
                         return Err(format!(
                             "{f}: is sugar for `updated{}` and only takes `:` — write `updated{}` for an explicit comparison — see `cv query`",
@@ -999,8 +1003,8 @@ fn within_one_edit(a: &str, b: &str) -> bool {
         0 => {
             let diffs: Vec<usize> = (0..a.len()).filter(|&i| a[i] != b[i]).collect();
             match diffs.as_slice() {
-                [_] => true,                                                   // one substitution
-                [i, j] => *j == *i + 1 && a[*i] == b[*j] && a[*j] == b[*i],    // one transposition
+                [_] => true,                                                // one substitution
+                [i, j] => *j == *i + 1 && a[*i] == b[*j] && a[*j] == b[*i], // one transposition
                 _ => false,
             }
         }
@@ -1096,7 +1100,10 @@ fn parse_value(def: &FieldDef, op: Op, raw: &str, quoted: bool) -> Result<Val, S
         if quoted {
             std::iter::once(norm(raw)).filter(|s| !s.is_empty()).collect()
         } else {
-            raw.split(',').map(|s| norm(s.trim())).filter(|s| !s.is_empty()).collect()
+            raw.split(',')
+                .map(|s| norm(s.trim()))
+                .filter(|s| !s.is_empty())
+                .collect()
         }
     }
     match def.kind {

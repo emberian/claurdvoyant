@@ -9,7 +9,10 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(name = "cv-search", about = "Full-text + semantic search over clustervision sessions")]
+#[command(
+    name = "cv-search",
+    about = "Full-text + semantic search over clustervision sessions"
+)]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
