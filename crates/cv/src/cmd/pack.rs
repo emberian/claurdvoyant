@@ -656,8 +656,7 @@ fn rollup_files(sources: &[PackSource]) -> Vec<(String, usize, i64, i64)> {
 fn hit_date(hit: &cv_search::Hit) -> String {
     hit.updated_at
         .or(hit.created_at)
-        .and_then(|t| chrono::DateTime::from_timestamp(t, 0))
-        .map(|d| d.format("%Y-%m-%d").to_string())
+        .and_then(|t| crate::util::fmt_local_ts(t, "%Y-%m-%d"))
         .unwrap_or_else(|| "----------".into())
 }
 

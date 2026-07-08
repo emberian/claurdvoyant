@@ -47,18 +47,29 @@ pub(crate) fn cmd_workflow(
 }
 
 /// List every workflow run a session launched, newest first — name, status, phase/agent counts,
-/// and the run summary.
+/// and the run summary — plus any **ghost launches**: `Workflow` invocations visible in the
+/// transcript whose run state was never persisted (a crash / power loss / hard kill before the
+/// harness wrote `workflows/wf_*.json`). Without the ghost check, a run that died at launch is
+/// simply invisible here — exactly the run whose debris most needs finding.
 fn list_workflows(r: &cv_core::SessionRef, json: bool) -> Result<()> {
     let runs = cv_core::workflows_of(r);
+    let ghosts = cv_core::workflow_ghosts_of(r);
     if json {
-        println!("{}", serde_json::to_string_pretty(&runs)?);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({"runs": runs, "ghost_launches": ghosts}))?
+        );
         return Ok(());
     }
-    if runs.is_empty() {
+    if runs.is_empty() && ghosts.is_empty() {
         println!("no workflows launched by {}", short_id(&r.id));
         return Ok(());
     }
-    println!("# {} workflow(s) in {}\n", runs.len(), short_id(&r.id));
+    if runs.is_empty() {
+        println!("# 0 recorded workflow(s) in {}", short_id(&r.id));
+    } else {
+        println!("# {} workflow(s) in {}\n", runs.len(), short_id(&r.id));
+    }
     for w in &runs {
         let status = w.status.as_deref().unwrap_or("?");
         let states = w.state_counts();
@@ -80,6 +91,19 @@ fn list_workflows(r: &cv_core::SessionRef, json: bool) -> Result<()> {
         if let Some(s) = &w.summary {
             println!("    {}", truncate(s, 120));
         }
+    }
+    if !ghosts.is_empty() {
+        println!(
+            "\n⚠ {} launch(es) with NO recorded run — state never persisted (crash/kill before write?):",
+            ghosts.len()
+        );
+        for g in &ghosts {
+            let when =
+                g.ts.map(|t| crate::util::fmt_local(t, "%Y-%m-%d %H:%M"))
+                    .unwrap_or_else(|| "(no timestamp)".into());
+            println!("   {}  launched {}", g.name.as_deref().unwrap_or("(unnamed)"), when);
+        }
+        println!("   → any sub-agent debris sits under the session dir's subagents/workflows/");
     }
     println!("\n→ `cv workflow {} <runId>` for one run's phase tree", short_id(&r.id));
     Ok(())
@@ -382,8 +406,7 @@ fn tools_timeline(r: &cv_core::SessionRef, agent: Option<&str>, json: bool) -> R
     println!("# {} tool call(s) (chronological)\n", events.len());
     for e in &events {
         let time =
-            e.ts.and_then(|t| chrono::DateTime::from_timestamp(t, 0))
-                .map(|d| d.format("%m-%d %H:%M:%S").to_string())
+            e.ts.and_then(|t| crate::util::fmt_local_ts(t, "%m-%d %H:%M:%S"))
                 .unwrap_or_else(|| "--------------".into());
         let who = if e.agent == cv_core::tools::ORCHESTRATOR {
             "orch".to_string()

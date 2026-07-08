@@ -391,7 +391,7 @@ pub(crate) fn cmd_distill(
                 let date = session
                     .updated_at
                     .or(session.created_at)
-                    .map(|d| d.format("%Y-%m-%d").to_string())
+                    .map(|d| crate::util::fmt_local(d, "%Y-%m-%d"))
                     .unwrap_or_else(|| "----------".into());
                 let header = format!("\n\n## {} ({})\n", session.label(), date);
                 let mut f = fs::OpenOptions::new()

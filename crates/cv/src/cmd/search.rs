@@ -80,8 +80,7 @@ fn render_search_hits(hits: &[cv_search::Hit], want: Option<Harness>, limit: usi
         let date = h
             .updated_at
             .or(h.created_at)
-            .and_then(|t| chrono::DateTime::from_timestamp(t, 0))
-            .map(|d| d.format("%Y-%m-%d").to_string())
+            .and_then(|t| crate::util::fmt_local_ts(t, "%Y-%m-%d"))
             .unwrap_or_else(|| "----------".into());
         println!(
             "{:8}  {:8}  {:10}  {}",
@@ -141,7 +140,7 @@ fn cmd_search_live(query: &str, want: Option<Harness>, limit: usize) -> Result<(
                     r.harness.as_str(),
                     short_id(&r.id),
                     r.updated_at
-                        .map(|d| d.format("%Y-%m-%d").to_string())
+                        .map(|d| crate::util::fmt_local(d, "%Y-%m-%d"))
                         .unwrap_or_else(|| "----------".into()),
                     label,
                 );

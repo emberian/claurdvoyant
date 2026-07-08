@@ -1,5 +1,35 @@
 # Changelog
 
+## v0.9.22 (2026-07-08)
+
+Crash-forensics release, paid for the hard way: a real power loss killed a
+~7-lane swarm mid-run, and reconstructing "which orchestrators resumed, which
+dropped, and what died holding what" surfaced three blind spots. All three are
+now closed:
+
+- **Local time everywhere.** Every human-facing time cv prints (`ls`,
+  `timeline`, `events`, `touched`, `tools --timeline`, `stats`, `search`,
+  `blame`, `board`) now renders in the local timezone instead of UTC. The
+  transcripts store UTC, but `git log` and human memory are local — silently
+  mixing the two skewed the reconstructed outage window by the UTC offset
+  (a real 4-hour miss during the recovery).
+- **`cv ls` shows each session's `created → last-active` span** (minute
+  granularity, same-day sessions compress the right side) instead of a bare
+  date. A long-lived orchestrator vs a one-shot — and post-crash, resumed vs
+  dropped — is now visible in the listing itself.
+- **`cv timeline` marks multi-day sessions** with `⇠ since MM-DD`. Feed rows
+  sit at last-activity; without the marker they read as start times.
+- **`cv workflow <session>` detects ghost launches**: `Workflow` tool
+  invocations visible in the transcript with **no persisted run state** — the
+  signature of a crash/power loss/hard kill before the harness wrote
+  `workflows/wf_*.json`. (The power loss left two such swarms completely
+  invisible to the old list — including the one whose uncommitted debris most
+  needed finding.) Errored-at-launch calls and `scriptPath` resumes of
+  recorded runs are excluded, so no false positives. New core API:
+  `workflow_launches`/`ghost_launches` + `WorkflowLaunch`. The list form's
+  `--json` output is now `{"runs": […], "ghost_launches": […]}` (was a bare
+  array).
+
 ## v0.9.21 (2026-07-02)
 
 Security-advisory dependency bumps on top of the v0.9.20 audit, plus a CI fix.

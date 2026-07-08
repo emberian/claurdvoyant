@@ -333,6 +333,177 @@ fn phase_detail_map(v: &Value) -> BTreeMap<u64, Option<String>> {
     m
 }
 
+// ===================== ghost launches =====================
+
+/// One `Workflow` tool invocation as recorded in the session **transcript** — the launch-side
+/// record, independent of whether a `workflows/wf_*.json` state file ever got persisted.
+///
+/// The distinction matters for crash forensics: a run's state file is written *by the live
+/// harness*, so a power loss / hard kill can leave a launch visible in the transcript with **no
+/// run record at all** (its sub-agent work, if any, sits unindexed under
+/// `subagents/workflows/`). [`ghost_launches`] surfaces exactly those.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct WorkflowLaunch {
+    /// Transcript timestamp of the tool_use (UTC).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ts: Option<chrono::DateTime<chrono::Utc>>,
+    /// The workflow's name: the inline script's `meta.name`, the `name` input (a saved workflow),
+    /// or the `<name>` half of a `scriptPath` basename (`<name>-wf_<runId>.js`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// The `wf_<runId>` embedded in a `scriptPath` relaunch's basename — identifies the run family
+    /// the relaunch belongs to (its state file, when the family completed any run).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub script_run_id: Option<String>,
+    /// The `resumeFromRunId` input, when this launch resumed a prior run.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resume_from: Option<String>,
+    /// The launch's paired tool_result was an error (`<tool_use_error>…`) — the run never started.
+    pub errored: bool,
+}
+
+/// Every `Workflow` tool invocation in a session's transcript, in order. Reads the `.jsonl`
+/// directly (cheap substring prefilter, then a JSON parse per candidate line).
+pub fn launches(session_path: &Path) -> Vec<WorkflowLaunch> {
+    let Ok(file) = fs::File::open(session_path) else {
+        return vec![];
+    };
+    use std::io::BufRead;
+    let reader = std::io::BufReader::new(file);
+    // tool_use_id → index into `out`, so the (later) tool_result line can set `errored`.
+    let mut by_use_id: BTreeMap<String, usize> = BTreeMap::new();
+    let mut out: Vec<WorkflowLaunch> = Vec::new();
+    for line in reader.lines() {
+        let Ok(line) = line else { break };
+        // Prefilter: a launch line names the tool; a result line carries a tool_use_id we know.
+        if !line.contains("\"Workflow\"") && !line.contains("tool_use_id") {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        let ts = v
+            .get("timestamp")
+            .and_then(Value::as_str)
+            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+            .map(|d| d.with_timezone(&chrono::Utc));
+        let Some(content) = v
+            .get("message")
+            .and_then(|m| m.get("content"))
+            .and_then(Value::as_array)
+        else {
+            continue;
+        };
+        for c in content {
+            match c.get("type").and_then(Value::as_str) {
+                Some("tool_use") if c.get("name").and_then(Value::as_str) == Some("Workflow") => {
+                    let input = c.get("input");
+                    let g = |k: &str| input.and_then(|i| i.get(k)).and_then(Value::as_str);
+                    let (path_name, path_run) = g("scriptPath").map(script_path_identity).unwrap_or((None, None));
+                    let launch = WorkflowLaunch {
+                        ts,
+                        name: g("script")
+                            .and_then(meta_name)
+                            .or_else(|| g("name").map(str::to_string))
+                            .or(path_name),
+                        script_run_id: path_run,
+                        resume_from: g("resumeFromRunId").map(str::to_string),
+                        errored: false,
+                    };
+                    if let Some(id) = c.get("id").and_then(Value::as_str) {
+                        by_use_id.insert(id.to_string(), out.len());
+                    }
+                    out.push(launch);
+                }
+                Some("tool_result") => {
+                    if let Some(idx) = c
+                        .get("tool_use_id")
+                        .and_then(Value::as_str)
+                        .and_then(|id| by_use_id.get(id))
+                    {
+                        if c.get("is_error").and_then(Value::as_bool).unwrap_or(false) {
+                            out[*idx].errored = true;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    out
+}
+
+/// Transcript launches with **no recorded run**: launched successfully per the transcript, but no
+/// `workflows/wf_*.json` state file accounts for them — the signature of a crash / power loss /
+/// hard kill before the harness persisted (or synced) the run's state.
+pub fn ghost_launches(session_path: &Path) -> Vec<WorkflowLaunch> {
+    compute_ghosts(launches(session_path), &workflows(session_path))
+}
+
+/// The pure matcher behind [`ghost_launches`]: each launch is accounted for by (a) having errored
+/// at launch (no run to record), (b) a state file for its `scriptPath`-embedded run family, or
+/// (c) consuming one same-named state file (multiset — N inline launches of one name need N
+/// recorded runs). Unidentifiable launches (no name, no run id) are skipped rather than guessed at.
+fn compute_ghosts(launches: Vec<WorkflowLaunch>, states: &[Workflow]) -> Vec<WorkflowLaunch> {
+    use std::collections::HashMap;
+    let ids: std::collections::HashSet<&str> = states.iter().map(|w| w.run_id.as_str()).collect();
+    let mut name_budget: HashMap<&str, usize> = HashMap::new();
+    for w in states {
+        if let Some(n) = &w.name {
+            *name_budget.entry(n.as_str()).or_default() += 1;
+        }
+    }
+    launches
+        .into_iter()
+        .filter(|l| {
+            if l.errored {
+                return false;
+            }
+            if let Some(rid) = &l.script_run_id {
+                if ids.contains(rid.as_str()) {
+                    return false;
+                }
+            }
+            if let Some(rf) = &l.resume_from {
+                // A resume's new run may keep the resumed family's id in `resume_from`.
+                if states.iter().any(|w| w.resume_from.as_deref() == Some(rf)) {
+                    return false;
+                }
+            }
+            match &l.name {
+                Some(n) => match name_budget.get_mut(n.as_str()) {
+                    Some(b) if *b > 0 => {
+                        *b -= 1;
+                        false
+                    }
+                    _ => true,
+                },
+                None => false, // unidentifiable — don't report a guess
+            }
+        })
+        .collect()
+}
+
+/// `meta.name` from an inline workflow script: the first `name: '<…>'` / `name: "<…>"` after the
+/// script head (the `meta` literal is required to open the script, so first occurrence is it).
+fn meta_name(script: &str) -> Option<String> {
+    let i = script.find("name")?;
+    let rest = script[i + 4..].trim_start().strip_prefix(':')?.trim_start();
+    let quote = rest.chars().next().filter(|q| *q == '\'' || *q == '"')?;
+    let body = &rest[1..];
+    Some(body[..body.find(quote)?].to_string())
+}
+
+/// Split a `scriptPath` basename `<name>-wf_<runId>.js` into `(name, wf_<runId>)`. Either half is
+/// `None` when the basename doesn't carry it.
+fn script_path_identity(p: &str) -> (Option<String>, Option<String>) {
+    let stem = Path::new(p).file_stem().and_then(|s| s.to_str()).unwrap_or(p);
+    match stem.rsplit_once("-wf_") {
+        Some((name, rid)) => (Some(name.to_string()), Some(format!("wf_{rid}"))),
+        None => (Some(stem.to_string()), None),
+    }
+}
+
 /// Parse one `workflow_agent` progress entry into a [`WorkflowAgent`].
 fn parse_agent(e: &Value) -> WorkflowAgent {
     let s = |k: &str| e.get(k).and_then(Value::as_str).map(str::to_string);
@@ -445,6 +616,101 @@ mod tests {
         assert_eq!(w.phases[0].title.as_deref(), Some("P1"));
         assert_eq!(w.phases[0].agents[0].agent_id.as_deref(), Some("a1"));
         assert_eq!(w.phases[1].agents[0].agent_id.as_deref(), Some("a2"));
+    }
+
+    fn launch(name: Option<&str>, script_run_id: Option<&str>, errored: bool) -> WorkflowLaunch {
+        WorkflowLaunch {
+            ts: None,
+            name: name.map(str::to_string),
+            script_run_id: script_run_id.map(str::to_string),
+            resume_from: None,
+            errored,
+        }
+    }
+
+    fn state(run_id: &str, name: &str) -> Workflow {
+        parse_state(&json!({"runId": run_id, "workflowName": name}))
+    }
+
+    #[test]
+    fn ghosts_are_launches_without_a_recorded_run() {
+        // The real 2026-07-08 power-loss shape: census/audit runs recorded, the two final
+        // launches' state files never persisted.
+        let states = vec![state("wf_aaa-111", "census"), state("wf_bbb-222", "audit")];
+        let launches = vec![
+            launch(Some("census"), None, false),
+            launch(Some("audit"), None, false),
+            launch(Some("final-flips"), None, false),  // ghost
+            launch(Some("bugfix-swarm"), None, false), // ghost
+        ];
+        let ghosts = compute_ghosts(launches, &states);
+        assert_eq!(
+            ghosts.iter().filter_map(|g| g.name.as_deref()).collect::<Vec<_>>(),
+            vec!["final-flips", "bugfix-swarm"]
+        );
+    }
+
+    #[test]
+    fn errored_and_resume_launches_are_not_ghosts() {
+        let states = vec![state("wf_aaa-111", "swarm")];
+        let launches = vec![
+            launch(Some("swarm"), None, false),               // consumes the state
+            launch(Some("swarm"), Some("wf_aaa-111"), false), // scriptPath resume of a recorded family
+            launch(Some("swarm"), Some("wf_aaa-111"), true),  // errored at launch — never ran
+        ];
+        assert!(compute_ghosts(launches, &states).is_empty());
+        // But a second *inline* launch of the same name with only one recorded run IS a ghost.
+        let launches = vec![launch(Some("swarm"), None, false), launch(Some("swarm"), None, false)];
+        assert_eq!(compute_ghosts(launches, &states).len(), 1);
+    }
+
+    #[test]
+    fn meta_name_and_script_path_identity() {
+        assert_eq!(
+            meta_name("export const meta = {\n  name: 'stark-kill-bugfix-swarm',\n  description: 'x'}"),
+            Some("stark-kill-bugfix-swarm".into())
+        );
+        assert_eq!(
+            meta_name(r#"export const meta = { name: "dq", phases: [] }"#),
+            Some("dq".into())
+        );
+        assert_eq!(meta_name("no meta here"), None);
+        assert_eq!(
+            script_path_identity("/x/workflows/scripts/rung1-swarm-wf_1ee0382f-94a.js"),
+            (Some("rung1-swarm".into()), Some("wf_1ee0382f-94a".into()))
+        );
+        assert_eq!(script_path_identity("/x/custom.js"), (Some("custom".into()), None));
+    }
+
+    #[test]
+    fn launches_parses_a_transcript() {
+        let dir = std::env::temp_dir().join(format!("cv-wf-launch-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("sess.jsonl");
+        let lines = [
+            json!({"type":"assistant","timestamp":"2026-07-08T09:02:20.652Z","message":{"content":[
+                {"type":"tool_use","id":"tu_1","name":"Workflow","input":{"script":"export const meta = { name: 'doomed-swarm' }"}}]}})
+            .to_string(),
+            json!({"type":"user","message":{"content":[
+                {"type":"tool_result","tool_use_id":"tu_1","content":"Workflow launched in background. Task ID: w123"}]}})
+            .to_string(),
+            json!({"type":"assistant","message":{"content":[
+                {"type":"tool_use","id":"tu_2","name":"Workflow","input":{"scriptPath":"/x/scripts/doomed-swarm-wf_abc-123.js","resumeFromRunId":"wf_abc-123"}}]}})
+            .to_string(),
+            json!({"type":"user","message":{"content":[
+                {"type":"tool_result","tool_use_id":"tu_2","is_error":true,"content":"<tool_use_error>still running</tool_use_error>"}]}})
+            .to_string(),
+        ];
+        std::fs::write(&p, lines.join("\n")).unwrap();
+        let ls = launches(&p);
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(ls.len(), 2);
+        assert_eq!(ls[0].name.as_deref(), Some("doomed-swarm"));
+        assert!(!ls[0].errored);
+        assert_eq!(ls[0].ts.unwrap().to_rfc3339(), "2026-07-08T09:02:20.652+00:00");
+        assert_eq!(ls[1].script_run_id.as_deref(), Some("wf_abc-123"));
+        assert_eq!(ls[1].resume_from.as_deref(), Some("wf_abc-123"));
+        assert!(ls[1].errored);
     }
 
     #[test]

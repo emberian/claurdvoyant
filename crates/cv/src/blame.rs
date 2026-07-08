@@ -534,9 +534,7 @@ pub(crate) fn parse_line_spec(spec: &str) -> Result<(u32, u32)> {
 }
 
 fn date(ts: i64) -> String {
-    chrono::DateTime::from_timestamp(ts, 0)
-        .map(|d| d.format("%Y-%m-%d").to_string())
-        .unwrap_or_else(|| "----------".into())
+    crate::util::fmt_local_ts(ts, "%Y-%m-%d").unwrap_or_else(|| "----------".into())
 }
 
 /// Humanize a commit↔edit delta: `8m before commit`, `2h10m before commit`, `30s after commit`.

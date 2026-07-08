@@ -11,8 +11,8 @@ pub mod catalog;
 pub mod compaction;
 pub mod config;
 pub mod dataset;
-pub mod doctor;
 pub mod discover_cache;
+pub mod doctor;
 pub mod emit;
 pub mod events;
 pub mod harmony;
@@ -223,7 +223,7 @@ pub fn subagent_tree_of(r: &SessionRef) -> Vec<SubagentInfo> {
     }
 }
 
-pub use harness::claude_workflow::{Workflow, WorkflowAgent, WorkflowPhase};
+pub use harness::claude_workflow::{Workflow, WorkflowAgent, WorkflowLaunch, WorkflowPhase};
 
 /// Every `Workflow`-tool run a session launched, as first-class [`Workflow`] objects (phase tree →
 /// agents → outcomes + the driving script), newest first. Read from the session's
@@ -231,6 +231,17 @@ pub use harness::claude_workflow::{Workflow, WorkflowAgent, WorkflowPhase};
 pub fn workflows_of(r: &SessionRef) -> Vec<Workflow> {
     match r.harness {
         Harness::Claude => harness::claude_workflow::workflows(&r.path),
+        _ => Vec::new(),
+    }
+}
+
+/// Transcript `Workflow` launches with **no recorded run** — the crash-forensics view: a power
+/// loss / hard kill can leave a launch in the transcript whose `workflows/wf_*.json` state file
+/// was never persisted (its sub-agent debris, if any, sits under `subagents/workflows/`).
+/// Non-Claude harnesses return empty.
+pub fn workflow_ghosts_of(r: &SessionRef) -> Vec<WorkflowLaunch> {
+    match r.harness {
+        Harness::Claude => harness::claude_workflow::ghost_launches(&r.path),
         _ => Vec::new(),
     }
 }

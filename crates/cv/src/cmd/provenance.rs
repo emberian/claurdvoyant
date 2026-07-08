@@ -120,8 +120,7 @@ fn print_event_row(
     detail: Option<&str>,
 ) {
     let time = ts
-        .and_then(|t| chrono::DateTime::from_timestamp(t, 0))
-        .map(|d| d.format("%m-%d %H:%M").to_string())
+        .and_then(|t| crate::util::fmt_local_ts(t, "%m-%d %H:%M"))
         .unwrap_or_else(|| "-----------".into());
     println!(
         "{:>5}  {:11}  {:9}  {:14}  {}",
@@ -149,8 +148,7 @@ pub(crate) fn cmd_touched(path: &str, edits_only: bool) -> Result<()> {
     for t in &rows {
         let date = t
             .last_ts
-            .and_then(|s| chrono::DateTime::from_timestamp(s, 0))
-            .map(|d| d.format("%Y-%m-%d").to_string())
+            .and_then(|s| crate::util::fmt_local_ts(s, "%Y-%m-%d"))
             .unwrap_or_else(|| "----------".into());
         let counts = match (t.edits, t.reads) {
             (0, n) => format!("{n} read(s)"),

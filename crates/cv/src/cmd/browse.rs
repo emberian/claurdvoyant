@@ -66,13 +66,10 @@ pub(crate) fn cmd_ls(
     // the probe last looked — and is bounded by `limit`, not the fleet (it stats only listed rows).
     for r in refs.iter().filter(|r| r.path.exists()).take(limit) {
         println!(
-            "{:8}  {:8}  {:10}  {:>4} msg  {}",
+            "{:8}  {:8}  {}  {:>4} msg  {}",
             r.harness.as_str(),
             short_id(&r.id),
-            r.updated_at
-                .or(r.created_at)
-                .map(|d| d.format("%Y-%m-%d").to_string())
-                .unwrap_or_else(|| "----------".into()),
+            crate::util::fmt_span(r.created_at, r.updated_at),
             r.message_count,
             r.title
                 .clone()
@@ -126,28 +123,39 @@ pub(crate) fn cmd_timeline(
     // exists(): same catalog-read guard as `cmd_ls` — O(shown window), not O(fleet).
     for r in shown.iter().filter(|r| r.path.exists()) {
         let when = key(r);
+        // The feed instant is the session's LAST activity (its `updated_at`), local time — a
+        // long-lived session appears at where it went quiet, with a `⇠ since` start marker.
         let day = when
-            .map(|d| d.format("%Y-%m-%d").to_string())
+            .map(|d| crate::util::fmt_local(d, "%Y-%m-%d"))
             .unwrap_or_else(|| "----------".into());
         if last_day.as_deref() != Some(day.as_str()) {
             println!("── {day} ──");
             last_day = Some(day.clone());
         }
         let time = when
-            .map(|d| d.format("%H:%M").to_string())
+            .map(|d| crate::util::fmt_local(d, "%H:%M"))
             .unwrap_or_else(|| "--:--".into());
         let title = r
             .title
             .clone()
             .map(|t| truncate(&t, 50))
             .unwrap_or_else(|| dim_cwd(r.cwd.as_deref()));
+        let since = match (r.created_at, when) {
+            (Some(c), Some(u))
+                if c.with_timezone(&chrono::Local).date_naive() != u.with_timezone(&chrono::Local).date_naive() =>
+            {
+                format!("  ⇠ since {}", crate::util::fmt_local(c, "%m-%d"))
+            }
+            _ => String::new(),
+        };
         println!(
-            "  {}  {:8}  {:8}  {:24}  {}",
+            "  {}  {:8}  {:8}  {:24}  {}{}",
             time,
             r.harness.as_str(),
             short_id(&r.id),
             truncate(&dim_cwd(r.cwd.as_deref()), 24),
             title,
+            since,
         );
     }
     println!("\n{total} session(s)");
@@ -212,13 +220,13 @@ pub(crate) fn cmd_stats(query: Option<String>) -> Result<()> {
     println!(
         "  earliest created: {}",
         min_created
-            .map(|d| d.format("%Y-%m-%d %H:%M").to_string())
+            .map(|d| crate::util::fmt_local(d, "%Y-%m-%d %H:%M"))
             .unwrap_or_else(|| "?".into())
     );
     println!(
         "  latest updated:   {}",
         max_updated
-            .map(|d| d.format("%Y-%m-%d %H:%M").to_string())
+            .map(|d| crate::util::fmt_local(d, "%Y-%m-%d %H:%M"))
             .unwrap_or_else(|| "?".into())
     );
     Ok(())

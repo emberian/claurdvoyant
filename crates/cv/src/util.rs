@@ -55,6 +55,44 @@ pub(crate) fn short_id(id: &str) -> String {
     id.chars().take(8).collect()
 }
 
+/// Format a UTC instant in the **local** timezone. Every human-facing time cv prints goes through
+/// here (or [`fmt_local_ts`]): transcripts store UTC, but the user's other clocks — `git log`,
+/// their memory of the evening — are local, and silently mixing the two skews forensics by the
+/// UTC offset (a real 4-hour miss reconstructing a power-loss window prompted this).
+pub(crate) fn fmt_local(d: chrono::DateTime<chrono::Utc>, fmt: &str) -> String {
+    d.with_timezone(&chrono::Local).format(fmt).to_string()
+}
+
+/// [`fmt_local`] from unix seconds (the events catalog's timestamp shape).
+pub(crate) fn fmt_local_ts(secs: i64, fmt: &str) -> Option<String> {
+    chrono::DateTime::from_timestamp(secs, 0).map(|d| fmt_local(d, fmt))
+}
+
+/// A session's `created → last-active` span, local time, fixed width (pads to [`SPAN_WIDTH`]).
+/// Same-day sessions compress the right side to its time; a missing `created` shows only the
+/// last-active instant. The span is what distinguishes a long-lived orchestrator from a one-shot —
+/// and, after a crash, the resumed from the dropped.
+pub(crate) const SPAN_WIDTH: usize = 31;
+pub(crate) fn fmt_span(
+    created: Option<chrono::DateTime<chrono::Utc>>,
+    updated: Option<chrono::DateTime<chrono::Utc>>,
+) -> String {
+    const FMT: &str = "%y-%m-%d %H:%M";
+    let s = match (created, updated) {
+        (Some(c), Some(u)) => {
+            let (lc, lu) = (c.with_timezone(&chrono::Local), u.with_timezone(&chrono::Local));
+            if lc.date_naive() == lu.date_naive() {
+                format!("{} → {}", lc.format(FMT), lu.format("%H:%M"))
+            } else {
+                format!("{} → {}", lc.format(FMT), lu.format(FMT))
+            }
+        }
+        (Some(t), None) | (None, Some(t)) => fmt_local(t, FMT),
+        (None, None) => "?".into(),
+    };
+    format!("{s:<SPAN_WIDTH$}")
+}
+
 pub(crate) fn home_rel(p: &Path) -> String {
     if let Some(home) = dirs_home() {
         if let Ok(rest) = p.strip_prefix(&home) {

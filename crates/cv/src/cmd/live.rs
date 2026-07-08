@@ -224,7 +224,7 @@ pub(crate) fn cmd_board(action: BoardCmd) -> Result<()> {
                     println!(
                         "GRANTED  {key} → {} (expires {})",
                         l.owner,
-                        l.expires_at.format("%Y-%m-%d %H:%M:%S")
+                        crate::util::fmt_local(l.expires_at, "%Y-%m-%d %H:%M:%S")
                     );
                 }
                 None => {
@@ -263,7 +263,10 @@ pub(crate) fn cmd_board(action: BoardCmd) -> Result<()> {
         BoardCmd::Claims { channel } => {
             let claims = board::active_claims(&channel)?;
             for (key, owner, expires) in &claims {
-                println!("{key:30}  {owner:16}  expires {}", expires.format("%Y-%m-%d %H:%M:%S"));
+                println!(
+                    "{key:30}  {owner:16}  expires {}",
+                    crate::util::fmt_local(*expires, "%Y-%m-%d %H:%M:%S")
+                );
             }
             if claims.is_empty() {
                 println!("(no active claims on #{channel})");
@@ -294,5 +297,11 @@ pub(crate) fn cmd_board(action: BoardCmd) -> Result<()> {
 }
 
 fn print_board_msg(m: &cv_core::board::BoardMessage) {
-    println!("{}  {}  ({}) {}", m.ts.format("%H:%M:%S"), m.from, m.kind, m.body);
+    println!(
+        "{}  {}  ({}) {}",
+        crate::util::fmt_local(m.ts, "%H:%M:%S"),
+        m.from,
+        m.kind,
+        m.body
+    );
 }

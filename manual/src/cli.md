@@ -82,12 +82,16 @@ cv ls --sort-by messages      # updated (default) | created | messages
 ```text
 2245 session(s)
 
-claude    da9174f4  2026-05-28    87 msg  the flux inference refactor
-codex     019e75e0  2026-05-27   142 msg  porting the parser to nom
-grok      7c0b1a3e  2026-05-26    19 msg  ~/scratch/throwaway
+claude    da9174f4  26-05-28 09:14 → 17:03            87 msg  the flux inference refactor
+codex     019e75e0  26-05-25 11:20 → 26-05-27 22:41  142 msg  porting the parser to nom
+grok      7c0b1a3e  26-05-26 14:02 → 14:09            19 msg  ~/scratch/throwaway
 …
 … 2205 more (use --limit)
 ```
+
+Each row shows the session's `created → last-active` span in **local time** (same-day sessions
+compress the right side to a bare time). The span is what separates a long-lived orchestrator from
+a one-shot — and, after a crash, the resumed sessions from the dropped ones.
 
 When a session has no title, `cv` falls back to a dimmed cwd so the row still tells you *where* it happened.
 
@@ -115,6 +119,8 @@ cv timeline --harness codex --cwd clustervision --limit 80
 ```
 
 It shows the most-recent `--limit` rows (default `60`) but still prints them oldest-first, like a chat log. Same `--harness` / `--cwd` filters as `ls`.
+
+Each row sits at the session's **last activity** (local time); a session that started on an earlier day carries a `⇠ since 05-25` marker so a long-lived orchestrator isn't mistaken for one that just began.
 
 ### `cv stats`
 
@@ -320,6 +326,16 @@ cv workflow 3b829648 wf_ab915970 --json     # the structured Workflow IR
 ```
 
 Runs are read from the session's `workflows/wf_*.json` state files; the per-agent transcripts live a tier deeper under `subagents/workflows/<run>/` (see [`cv tools`](#cv-tools) and [`cv show --subagents`](#cv-show)).
+
+The list view also cross-checks the transcript's `Workflow` tool invocations against those state files and flags **ghost launches** — a launch the transcript witnessed whose run state was never persisted (a crash, power loss, or hard kill before the harness wrote it):
+
+```text
+⚠ 1 launch(es) with NO recorded run — state never persisted (crash/kill before write?):
+   stark-kill-bugfix-swarm  launched 2026-07-08 01:02
+   → any sub-agent debris sits under the session dir's subagents/workflows/
+```
+
+In `--json` the list form emits `{"runs": […], "ghost_launches": […]}`.
 
 ### `cv tools`
 
