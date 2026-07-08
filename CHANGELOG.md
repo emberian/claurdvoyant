@@ -28,6 +28,22 @@ now closed:
   through to a ghost-launch scan, so a swarm that died before persisting is
   still findable by name. Run-not-found errors now list the session's run
   names.
+- **The by-name and by-agent fallbacks are fast.** A cheap run-name index
+  (script filenames + a byte-scan for `"workflowName"`) means the fleet-wide
+  name search parses only matching state files; and the fallbacks now resolve
+  through `find_cheap` (catalog + probe, no full re-discovery) with the full
+  fleet scan reserved for the genuinely-unknown-id case. Fleet name hit:
+  3.9s → 0.3s; direct agent open: 2.5s → 0.1s; ghost hunt: 10s → 1s.
+- **Ghosts carry their harvest map.** A ghost launch is enriched from what
+  DID survive the crash: its orphaned script file (written at launch)
+  recovers the run id, which keys the `subagents/workflows/<runId>/` debris
+  dir — reported as `· run wf_… · DEBRIS: 10 agent transcript(s), 1 journaled
+  result(s)`. The power-loss ghosts turned out to be sitting on 16
+  transcripts + 4 journaled results nobody could see.
+- **`cv workflow --follow` (`-f`) tails a live run**: one line per agent
+  state transition as the harness flushes the state file, then the full
+  render (honoring `--json`/`--script`/`--results`) at terminal status.
+  Waits for a run that hasn't registered yet.
 - **Full per-agent lane returns.** `cv workflow <sess> <run> --results` reads
   the run's `journal.jsonl` and prints each agent's **complete** journaled
   return value (the state file keeps only a ~400-char `resultPreview`); the

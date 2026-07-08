@@ -449,8 +449,9 @@ fn error_paths_exit_nonzero_with_stderr() {
     let w = World::new("errs");
     standard_corpus(&w);
 
+    // `show` tries the id as a sub-agent too before giving up — its message says so.
     let (_, err) = w.cv_fails(&["show", "nonexistent-id"]);
-    assert!(err.contains("no session matching"), "{err}");
+    assert!(err.contains("no session (and no sub-agent) matching"), "{err}");
 
     let (_, err) = w.cv_fails(&["export", "nonexistent-id"]);
     assert!(err.contains("no session matching"), "{err}");

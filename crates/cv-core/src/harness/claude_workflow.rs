@@ -328,6 +328,125 @@ pub fn workflow(parent_path: &Path, key: &str) -> Option<Workflow> {
     None
 }
 
+/// The `(name, run_id)` pairs readable from `workflows/scripts/*.js` **filenames** alone — the
+/// zero-parse half of the run-name index (the persisted basename is `<name>-wf_<runId>.js`).
+fn scripts_index(parent_path: &Path) -> Vec<(String, String)> {
+    let Some(dir) = workflows_dir(parent_path).map(|d| d.join("scripts")) else {
+        return vec![];
+    };
+    let mut out = Vec::new();
+    if let Ok(rd) = fs::read_dir(&dir) {
+        for e in rd.flatten() {
+            if let Some(stem) = e.path().file_stem().and_then(|s| s.to_str()) {
+                if let (Some(name), Some(rid)) = script_path_identity(stem) {
+                    if rid.len() > "wf_".len() {
+                        out.push((name, rid));
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Cheap, complete `(name, run_id)` index over a session's recorded runs — WITHOUT parsing the
+/// (often multi-MB) state JSONs. Names come from the script filenames where a script was
+/// persisted; the rest fall back to a byte-scan of the state file for its `"workflowName":"…"`
+/// (the files are compact single-line JSON, so the pattern is stable). Sessions with no
+/// `workflows/` dir return empty at the cost of one failed `read_dir`.
+pub fn run_names(parent_path: &Path) -> Vec<(String, String)> {
+    let Some(dir) = workflows_dir(parent_path) else {
+        return vec![];
+    };
+    let by_script: BTreeMap<String, String> = scripts_index(parent_path).into_iter().map(|(n, r)| (r, n)).collect();
+    let mut out = Vec::new();
+    if let Ok(rd) = fs::read_dir(&dir) {
+        for e in rd.flatten() {
+            let p = e.path();
+            let Some(rid) = p
+                .file_name()
+                .and_then(|n| n.to_str())
+                .filter(|n| n.starts_with("wf_") && n.ends_with(".json"))
+                .map(|n| n.trim_end_matches(".json").to_string())
+            else {
+                continue;
+            };
+            let name = by_script.get(&rid).cloned().or_else(|| {
+                fs::read_to_string(&p)
+                    .ok()
+                    .and_then(|txt| scan_json_str_field(&txt, "workflowName"))
+            });
+            if let Some(name) = name {
+                out.push((name, rid));
+            }
+        }
+    }
+    out
+}
+
+/// Extract a top-ish-level string field from compact JSON by byte-scan (`"key":"value"`), without
+/// parsing. Used as a prefilter/index only — anything acting on the value re-parses properly.
+fn scan_json_str_field(txt: &str, key: &str) -> Option<String> {
+    let pat = format!("\"{key}\":\"");
+    let start = txt.find(&pat)? + pat.len();
+    let rest = &txt[start..];
+    // Workflow names come from `meta.name` (plain identifiers); stop at the first unescaped quote.
+    let mut end = 0;
+    let bytes = rest.as_bytes();
+    while end < bytes.len() {
+        match bytes[end] {
+            b'"' => return Some(rest[..end].to_string()),
+            b'\\' => end += 2,
+            _ => end += 1,
+        }
+    }
+    None
+}
+
+/// Script files whose run has **no state file** — a launch that persisted its script (written at
+/// launch) but whose state JSON never made it to disk. The on-disk half of ghost evidence, and
+/// the only place a ghost's run id (→ its `subagents/workflows/<runId>/` debris dir) survives.
+pub fn orphan_scripts(parent_path: &Path) -> Vec<(String, String)> {
+    let Some(dir) = workflows_dir(parent_path) else {
+        return vec![];
+    };
+    scripts_index(parent_path)
+        .into_iter()
+        .filter(|(_, rid)| !dir.join(format!("{rid}.json")).exists())
+        .collect()
+}
+
+/// Whether a session recorded anything workflow-shaped at all (state files OR persisted scripts)
+/// — the cheap bound for fleet-wide scans, replacing a full parse of every state file.
+pub fn has_workflow_records(parent_path: &Path) -> bool {
+    let Some(dir) = workflows_dir(parent_path) else {
+        return false;
+    };
+    let any_state = fs::read_dir(&dir).into_iter().flatten().flatten().any(|e| {
+        e.file_name()
+            .to_str()
+            .is_some_and(|n| n.starts_with("wf_") && n.ends_with(".json"))
+    });
+    any_state
+        || fs::read_dir(dir.join("scripts"))
+            .map(|mut rd| rd.next().is_some())
+            .unwrap_or(false)
+}
+
+/// The runs whose name starts with `prefix`, fully parsed — but ONLY those: the cheap
+/// [`run_names`] index picks the candidates, so non-matching (multi-MB) state files are never
+/// parsed. The fleet-wide by-name search rides on this.
+pub fn workflows_named(parent_path: &Path, prefix: &str) -> Vec<Workflow> {
+    let Some(dir) = workflows_dir(parent_path) else {
+        return vec![];
+    };
+    run_names(parent_path)
+        .into_iter()
+        .filter(|(n, _)| n.starts_with(prefix))
+        .filter_map(|(_, rid)| parse_state_file(&dir.join(format!("{rid}.json"))))
+        .collect()
+}
+
 /// Parse one `wf_<runId>.json` state file into a [`Workflow`]. Tolerant: a missing/odd field is an
 /// absent option, never a failure (the catalog/forest views degrade gracefully).
 fn parse_state_file(path: &Path) -> Option<Workflow> {
@@ -491,6 +610,19 @@ pub struct WorkflowLaunch {
     pub resume_from: Option<String>,
     /// The launch's paired tool_result was an error (`<tool_use_error>…`) — the run never started.
     pub errored: bool,
+    /// For a GHOST: the run id recovered from its orphaned script file (`scripts/<name>-wf_….js`
+    /// is written at launch and survives the crash that ate the state file). The key into the
+    /// debris dir.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
+    /// For a GHOST with a recovered run id: how many `agent-*.jsonl` transcripts sit in its
+    /// `subagents/workflows/<runId>/` debris dir — the harvestable work.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub debris_agents: Option<usize>,
+    /// For a GHOST with a recovered run id: how many full agent results its `journal.jsonl`
+    /// recorded before the crash.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub journal_result_count: Option<usize>,
 }
 
 /// Every `Workflow` tool invocation in a session's transcript, in order. Reads the `.jsonl`
@@ -549,6 +681,9 @@ pub fn launches(session_path: &Path) -> Vec<WorkflowLaunch> {
                         script_run_id: path_run,
                         resume_from: g("resumeFromRunId").map(str::to_string),
                         errored: false,
+                        run_id: None,
+                        debris_agents: None,
+                        journal_result_count: None,
                     };
                     if let Some(id) = c.get("id").and_then(Value::as_str) {
                         by_use_id.insert(id.to_string(), out.len());
@@ -578,8 +713,43 @@ pub fn launches(session_path: &Path) -> Vec<WorkflowLaunch> {
 /// Transcript launches with **no recorded run**: launched successfully per the transcript, but no
 /// `workflows/wf_*.json` state file accounts for them — the signature of a crash / power loss /
 /// hard kill before the harness persisted (or synced) the run's state.
+///
+/// Each ghost is enriched from what DID survive: its orphaned script file (written at launch)
+/// recovers the run id, which keys the `subagents/workflows/<runId>/` debris dir — agent
+/// transcripts and journaled results produced before the crash, i.e. the harvestable work.
 pub fn ghost_launches(session_path: &Path) -> Vec<WorkflowLaunch> {
-    compute_ghosts(launches(session_path), &workflows(session_path))
+    let mut ghosts = compute_ghosts(launches(session_path), &workflows(session_path));
+    let mut orphans = orphan_scripts(session_path);
+    let stem_dir = session_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .and_then(|stem| session_path.parent().map(|d| d.join(stem)));
+    for g in &mut ghosts {
+        let Some(name) = g.name.as_deref() else { continue };
+        // Consume one same-named orphan script per ghost (each launch persists its own script).
+        let Some(pos) = orphans.iter().position(|(n, _)| n == name) else {
+            continue;
+        };
+        let (_, rid) = orphans.swap_remove(pos);
+        if let Some(base) = &stem_dir {
+            let debris = base.join("subagents").join("workflows").join(&rid);
+            g.debris_agents = Some(
+                fs::read_dir(&debris)
+                    .into_iter()
+                    .flatten()
+                    .flatten()
+                    .filter(|e| {
+                        e.file_name()
+                            .to_str()
+                            .is_some_and(|n| n.starts_with("agent-") && n.ends_with(".jsonl"))
+                    })
+                    .count(),
+            );
+            g.journal_result_count = Some(journal_results(session_path, &rid).len());
+        }
+        g.run_id = Some(rid);
+    }
+    ghosts
 }
 
 /// The pure matcher behind [`ghost_launches`]: each launch is accounted for by (a) having errored
@@ -804,6 +974,82 @@ mod tests {
     }
 
     #[test]
+    fn run_names_orphans_and_ghost_debris() {
+        let dir = std::env::temp_dir().join(format!("cv-wf-index-test-{}", std::process::id()));
+        let wfdir = dir.join("sess").join("workflows");
+        std::fs::create_dir_all(wfdir.join("scripts")).unwrap();
+        let sess = dir.join("sess.jsonl");
+        // A transcript with two successful launches: one recorded, one ghosted.
+        let lines = [
+            json!({"type":"assistant","timestamp":"2026-07-08T09:00:00Z","message":{"content":[
+                {"type":"tool_use","id":"t1","name":"Workflow","input":{"script":"export const meta = { name: 'alive-swarm' }"}}]}})
+            .to_string(),
+            json!({"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1","content":"Workflow launched in background. Task ID: w1"}]}}).to_string(),
+            json!({"type":"assistant","timestamp":"2026-07-08T09:02:00Z","message":{"content":[
+                {"type":"tool_use","id":"t2","name":"Workflow","input":{"script":"export const meta = { name: 'doomed-swarm' }"}}]}})
+            .to_string(),
+            json!({"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t2","content":"Workflow launched in background. Task ID: w2"}]}}).to_string(),
+        ];
+        std::fs::write(&sess, lines.join("\n")).unwrap();
+        // Recorded run: state file WITHOUT a script file (the byte-scan fallback path).
+        std::fs::write(
+            wfdir.join("wf_alive-1.json"),
+            json!({"runId": "wf_alive-1", "workflowName": "alive-swarm"}).to_string(),
+        )
+        .unwrap();
+        // Ghost: script file only (written at launch; the crash ate the state file) + debris.
+        std::fs::write(
+            wfdir.join("scripts").join("doomed-swarm-wf_dead-2.js"),
+            "export const meta = {}",
+        )
+        .unwrap();
+        let debris = dir.join("sess").join("subagents").join("workflows").join("wf_dead-2");
+        std::fs::create_dir_all(&debris).unwrap();
+        std::fs::write(debris.join("agent-a1.jsonl"), "").unwrap();
+        std::fs::write(debris.join("agent-a2.jsonl"), "").unwrap();
+        std::fs::write(
+            debris.join("journal.jsonl"),
+            json!({"type":"result","key":"v2:k","agentId":"a1","result":{"ok":true}}).to_string(),
+        )
+        .unwrap();
+
+        // The cheap index sees both halves without parsing the recorded state fully.
+        let mut names = run_names(&sess);
+        names.sort();
+        assert_eq!(names, vec![("alive-swarm".into(), "wf_alive-1".into())]);
+        assert_eq!(orphan_scripts(&sess), vec![("doomed-swarm".into(), "wf_dead-2".into())]);
+        assert!(has_workflow_records(&sess));
+        assert_eq!(workflows_named(&sess, "alive").len(), 1);
+        assert!(workflows_named(&sess, "nope").is_empty());
+
+        // The ghost carries its recovered run id + debris counts.
+        let ghosts = ghost_launches(&sess);
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(ghosts.len(), 1);
+        let g = &ghosts[0];
+        assert_eq!(g.name.as_deref(), Some("doomed-swarm"));
+        assert_eq!(g.run_id.as_deref(), Some("wf_dead-2"));
+        assert_eq!(g.debris_agents, Some(2));
+        assert_eq!(g.journal_result_count, Some(1));
+    }
+
+    #[test]
+    fn scan_json_str_field_handles_escapes_and_misses() {
+        assert_eq!(
+            scan_json_str_field(
+                r#"{"runId":"wf_x","workflowName":"my-swarm","status":"completed"}"#,
+                "workflowName"
+            ),
+            Some("my-swarm".into())
+        );
+        assert_eq!(
+            scan_json_str_field(r#"{"workflowName":"a\"b","x":1}"#, "workflowName"),
+            Some(r#"a\"b"#.into())
+        );
+        assert_eq!(scan_json_str_field(r#"{"other":"x"}"#, "workflowName"), None);
+    }
+
+    #[test]
     fn attach_journal_fills_full_results_last_write_wins() {
         let dir = std::env::temp_dir().join(format!("cv-wf-journal-test-{}", std::process::id()));
         let run_dir = dir.join("sess").join("subagents").join("workflows").join("wf_j-1");
@@ -877,6 +1123,9 @@ mod tests {
             script_run_id: script_run_id.map(str::to_string),
             resume_from: None,
             errored,
+            run_id: None,
+            debris_agents: None,
+            journal_result_count: None,
         }
     }
 

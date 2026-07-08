@@ -22,17 +22,24 @@ pub(crate) fn cmd_workflow(
     json: bool,
     script: bool,
     results: bool,
+    follow: bool,
 ) -> Result<()> {
     let want = crate::util::parse_harness(&harness)?;
-    let Some((r, _adapter)) = cv_core::find(id, want)? else {
+    // find_cheap: don't pay a full fleet re-discovery before trying the id as a workflow name —
+    // the name path escalates to a full `find` itself once every cheaper reading has missed.
+    let Some((r, _adapter)) = cv_core::find_cheap(id, want)? else {
         // Not a session id → maybe it's a workflow name ("the stark-kill session" problem).
-        return workflow_by_name_fleetwide(id, json, script, results);
+        return workflow_by_name_fleetwide(id, want, json, script, results);
     };
 
     // No run id → list the session's workflows (a directory of runs).
     let Some(run_id) = run_id else {
         return list_workflows(&r, json);
     };
+
+    if follow {
+        return follow_workflow(&r, &run_id, json, script, results);
+    }
 
     let mut wf = cv_core::workflow_of(&r, &run_id).with_context(|| {
         let runs = cv_core::workflows_of(&r);
@@ -50,6 +57,61 @@ pub(crate) fn cmd_workflow(
     })?;
     wf.attach_journal(&r.path);
     emit_workflow(&wf, json, script, results)
+}
+
+/// `--follow`: poll the run's state file (the harness flushes it as agents progress) and stream
+/// agent state TRANSITIONS as feed lines — `12:03:41  ✓ verify:merkle → done (312,004 tok)` —
+/// then, when the run reaches a terminal status, emit the full render (honoring
+/// `--json`/`--script`/`--results`). Waits for the state file if the run hasn't registered yet.
+fn follow_workflow(r: &cv_core::SessionRef, key: &str, json: bool, script: bool, results: bool) -> Result<()> {
+    use std::collections::HashMap;
+    let mut seen: HashMap<u64, String> = HashMap::new(); // agent index → last printed state
+    let mut announced = false;
+    loop {
+        let Some(wf) = cv_core::workflow_of(r, key) else {
+            if !announced {
+                eprintln!("… waiting for run {key:?} to register (Ctrl-C to stop)");
+                announced = true;
+            }
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            continue;
+        };
+        if !announced {
+            eprintln!(
+                "✦ following {} ({}) — Ctrl-C to stop",
+                wf.name.as_deref().unwrap_or("(unnamed)"),
+                wf.run_id,
+            );
+            announced = true;
+        }
+        let now = crate::util::fmt_local(chrono::Utc::now(), "%H:%M:%S");
+        for a in wf.phases.iter().flat_map(|p| &p.agents).chain(&wf.orphan_agents) {
+            let state = a.state.clone().unwrap_or_default();
+            if seen.get(&a.index).is_some_and(|s| *s == state) {
+                continue;
+            }
+            seen.insert(a.index, state.clone());
+            let glyph = match state.as_str() {
+                "done" => "✓",
+                "error" => "✗",
+                "progress" => "…",
+                _ => "▸",
+            };
+            let tok = a.tokens.map(|t| format!(" ({} tok)", fmt_int(t))).unwrap_or_default();
+            println!(
+                "{now}  {glyph} {} → {state}{tok}",
+                a.label.as_deref().unwrap_or("(agent)")
+            );
+        }
+        let live = matches!(wf.status.as_deref(), None | Some("running") | Some("started"));
+        if !live {
+            println!("\n── run reached {} ──\n", wf.status.as_deref().unwrap_or("?"));
+            let mut wf = wf;
+            wf.attach_journal(&r.path);
+            return emit_workflow(&wf, json, script, results);
+        }
+        std::thread::sleep(std::time::Duration::from_secs(2));
+    }
 }
 
 /// Shared single-run output: `--json` gets the full structure (journal results included);
@@ -103,27 +165,37 @@ fn render_journal_results(w: &cv_core::Workflow) {
 /// several list themselves with ready-to-paste commands. A miss falls through to a ghost-launch
 /// scan — a name with no recorded run anywhere may still be a launch whose state was never
 /// persisted (crash/power loss), and that is precisely when someone hunts it by name.
-fn workflow_by_name_fleetwide(name: &str, json: bool, script: bool, results: bool) -> Result<()> {
+fn workflow_by_name_fleetwide(
+    name: &str,
+    want: Option<cv_core::ir::Harness>,
+    json: bool,
+    script: bool,
+    results: bool,
+) -> Result<()> {
     let hits = cv_core::find_workflows_by_name(name);
     if hits.is_empty() {
         let ghosts = cv_core::find_ghost_launches_by_name(name);
+        if ghosts.is_empty() {
+            // Very last reading: a session id living in the discovery probe's blind spots (what
+            // the full `find` covers and `find_cheap` deliberately skipped).
+            if let Some((r, _adapter)) = cv_core::find(name, want)? {
+                return list_workflows(&r, json);
+            }
+        }
         if !ghosts.is_empty() {
             println!(
                 "no recorded run named {name:?} — but {} GHOST launch(es) match (state never persisted; crash/kill before write?):\n",
                 ghosts.len()
             );
             for (r, g) in &ghosts {
-                let when =
-                    g.ts.map(|t| crate::util::fmt_local(t, "%Y-%m-%d %H:%M"))
-                        .unwrap_or_else(|| "(no timestamp)".into());
                 println!(
-                    "   {}  launched {when} in session {} ({})",
-                    g.name.as_deref().unwrap_or("(unnamed)"),
+                    "   {} — session {} ({})",
+                    ghost_line(g),
                     short_id(&r.id),
                     r.title.as_deref().unwrap_or("untitled"),
                 );
             }
-            println!("\n→ any sub-agent debris sits under the session dir's subagents/workflows/");
+            println!("\n→ debris dirs live under the session dir's subagents/workflows/<runId>/ (`cv show <agent-id>` opens a transcript)");
             return Ok(());
         }
         bail!("no session and no workflow name matching {name:?} (try `cv ls -q 'workflow:{name}'`)");
@@ -207,15 +279,30 @@ fn list_workflows(r: &cv_core::SessionRef, json: bool) -> Result<()> {
             ghosts.len()
         );
         for g in &ghosts {
-            let when =
-                g.ts.map(|t| crate::util::fmt_local(t, "%Y-%m-%d %H:%M"))
-                    .unwrap_or_else(|| "(no timestamp)".into());
-            println!("   {}  launched {}", g.name.as_deref().unwrap_or("(unnamed)"), when);
+            println!("   {}", ghost_line(g));
         }
-        println!("   → any sub-agent debris sits under the session dir's subagents/workflows/");
+        println!("   → debris dirs live under the session dir's subagents/workflows/<runId>/ (`cv show <agent-id>` opens a transcript)");
     }
     println!("\n→ `cv workflow {} <runId>` for one run's phase tree", short_id(&r.id));
     Ok(())
+}
+
+/// One ghost launch, with everything the crash left behind: launch time, the run id recovered
+/// from its orphaned script file, and the debris counts (agent transcripts + journaled results).
+fn ghost_line(g: &cv_core::WorkflowLaunch) -> String {
+    let when =
+        g.ts.map(|t| crate::util::fmt_local(t, "%Y-%m-%d %H:%M"))
+            .unwrap_or_else(|| "(no timestamp)".into());
+    let mut line = format!("{}  launched {when}", g.name.as_deref().unwrap_or("(unnamed)"));
+    if let Some(rid) = &g.run_id {
+        line.push_str(&format!(" · run {rid}"));
+    }
+    match (g.debris_agents, g.journal_result_count) {
+        (Some(0), Some(0)) => line.push_str(" · no debris"),
+        (Some(a), Some(j)) => line.push_str(&format!(" · DEBRIS: {a} agent transcript(s), {j} journaled result(s)")),
+        _ => {}
+    }
+    line
 }
 
 /// Render one workflow run: header (name/status/totals) → each phase with its agents and outcomes

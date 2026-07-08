@@ -17,14 +17,22 @@ pub(crate) fn cmd_show(
     pre_compaction: Option<usize>,
 ) -> Result<()> {
     let want = parse_harness(&harness)?;
-    let found = cv_core::find(id, want)?;
-    // Not a session id → maybe it's a sub-agent id. Resolve its parent fleet-wide and render the
-    // agent directly — sub-agents aren't in the main pool, but `cv show <agent-id>` should still
-    // just work (harvest reports hand out bare agent ids all the time).
-    let Some((r, adapter)) = found else {
-        let range = range.as_deref().map(parse_msg_range).transpose()?;
-        return show_agent_fleetwide(id, json, range).with_context(|| format!("no session matching {id:?}"));
+    // find_cheap first: don't pay a full fleet re-discovery before trying the id as a sub-agent
+    // id — sub-agents aren't in the main pool, but `cv show <agent-id>` should still just work
+    // (harvest reports hand out bare agent ids all the time). Only when the id is neither a
+    // cataloged session nor an agent does the full-scan `find` escalation run (a session in the
+    // discovery probe's blind spots).
+    let found = match cv_core::find_cheap(id, want)? {
+        Some(hit) => Some(hit),
+        None => {
+            let range = range.as_deref().map(parse_msg_range).transpose()?;
+            if show_agent_fleetwide(id, json, range)? {
+                return Ok(());
+            }
+            cv_core::find(id, want)?
+        }
     };
+    let (r, adapter) = found.with_context(|| format!("no session (and no sub-agent) matching {id:?}"))?;
     let mut range = range.as_deref().map(parse_msg_range).transpose()?;
 
     // `--pre-compaction <N>`: resolve the Nth (1-based) compaction's pre-span into a window. This
@@ -82,11 +90,12 @@ pub(crate) fn cmd_show(
 
 /// `cv show <agent-id>` with no parent given: find which session(s) spawned the agent (filename
 /// scan across the fleet) and render it through the one parent — or list the candidates when the
-/// prefix is ambiguous.
-fn show_agent_fleetwide(agent_id: &str, json: bool, range: Option<(usize, Option<usize>)>) -> Result<()> {
+/// prefix is ambiguous. Returns `false` when nothing agent-shaped matched (the caller has one
+/// more reading of the id to try).
+fn show_agent_fleetwide(agent_id: &str, json: bool, range: Option<(usize, Option<usize>)>) -> Result<bool> {
     let parents = cv_core::find_subagent_parents(agent_id);
     match parents.as_slice() {
-        [] => bail!("…and no sub-agent matches {agent_id:?} either"),
+        [] => Ok(false),
         [parent] => {
             let adapter = cv_core::harness::for_harness(parent.harness)
                 .with_context(|| format!("no adapter for {}", parent.harness))?;
@@ -95,7 +104,8 @@ fn show_agent_fleetwide(agent_id: &str, json: bool, range: Option<(usize, Option
                 short_id(&parent.id),
                 parent.title.as_deref().unwrap_or("untitled"),
             );
-            show_one_subagent(parent, adapter.as_ref(), agent_id, json, range)
+            show_one_subagent(parent, adapter.as_ref(), agent_id, json, range)?;
+            Ok(true)
         }
         many => {
             println!("# {} session(s) have a sub-agent matching {agent_id:?}:\n", many.len());
@@ -106,7 +116,7 @@ fn show_agent_fleetwide(agent_id: &str, json: bool, range: Option<(usize, Option
                     p.title.as_deref().unwrap_or("untitled"),
                 );
             }
-            Ok(())
+            Ok(true)
         }
     }
 }

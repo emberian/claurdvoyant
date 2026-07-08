@@ -435,6 +435,10 @@ enum Cmd {
         /// preview; the complete results live in the run's journal).
         #[arg(long)]
         results: bool,
+        /// Follow a LIVE run: stream agent state transitions as they land in the state file, then
+        /// render the full run when it reaches a terminal status.
+        #[arg(long, short = 'f')]
+        follow: bool,
     },
     /// Cross-agent tool analytics: per-agent histograms, which-agent-used-what, aggregate usage,
     /// and a tool-call timeline — across the orchestrator and its whole sub-agent forest.
@@ -747,7 +751,8 @@ fn main() -> Result<()> {
             json,
             script,
             results,
-        } => workflow::cmd_workflow(&id, run_id, harness, json, script, results),
+            follow,
+        } => workflow::cmd_workflow(&id, run_id, harness, json, script, results, follow),
         Cmd::Tools {
             id,
             harness,

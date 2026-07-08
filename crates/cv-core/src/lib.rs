@@ -245,9 +245,9 @@ pub fn find_workflows_by_name(name: &str) -> Vec<(SessionRef, Workflow)> {
     refs.sort_by_key(|r| std::cmp::Reverse(r.updated_at.or(r.created_at)));
     let want = name.to_string();
     let per_session: Vec<Vec<(SessionRef, Workflow)>> = par_filter_map(refs, move |r| {
-        let hits: Vec<(SessionRef, Workflow)> = harness::claude_workflow::workflows(&r.path)
+        // The cheap name index picks candidates; only matching state files get fully parsed.
+        let hits: Vec<(SessionRef, Workflow)> = harness::claude_workflow::workflows_named(&r.path, &want)
             .into_iter()
-            .filter(|w| w.name.as_deref().is_some_and(|n| n.starts_with(want.as_str())))
             .map(|w| (r.clone(), w))
             .collect();
         (!hits.is_empty()).then_some(hits)
@@ -299,7 +299,7 @@ pub fn find_ghost_launches_by_name(name: &str) -> Vec<(SessionRef, WorkflowLaunc
     refs.retain(|r| r.harness == Harness::Claude);
     let name = name.to_string();
     let mut out: Vec<(SessionRef, WorkflowLaunch)> = par_filter_map(refs, move |r| {
-        if harness::claude_workflow::workflows(&r.path).is_empty() {
+        if !harness::claude_workflow::has_workflow_records(&r.path) {
             return None;
         }
         let hits: Vec<(SessionRef, WorkflowLaunch)> = harness::claude_workflow::ghost_launches(&r.path)
@@ -342,20 +342,44 @@ pub fn workflow_of(r: &SessionRef, run_id: &str) -> Option<Workflow> {
 /// a single prefix hit is returned, but *multiple* distinct prefix hits are an error rather than a
 /// silent "first one wins" — callers should disambiguate (e.g. by passing a longer id or a harness).
 pub fn find(id: &str, harness: Option<Harness>) -> Result<Option<(SessionRef, Box<dyn Adapter>)>> {
+    match find_inner(id, harness)? {
+        (Some(hit), _) => Ok(Some(hit)),
+        // A probe-path miss escalates to the full scan (a session in one of the probe's documented
+        // blind spots) — unless the probe path already was one (cold catalog): a miss is a miss.
+        (None, true) => Ok(None),
+        (None, false) => resolve_id(discover_all(), id, harness),
+    }
+}
+
+/// [`find`] without the final full-fleet escalation: the catalog fast path plus the (cheap)
+/// staleness probe, but never a full re-discovery. For callers with their own fallback
+/// interpretations of a non-matching id — a workflow name, a sub-agent id — that shouldn't pay a
+/// multi-second full scan on every such miss. Escalate yourself via [`find`] once every cheaper
+/// interpretation has failed.
+pub fn find_cheap(id: &str, harness: Option<Harness>) -> Result<Option<(SessionRef, Box<dyn Adapter>)>> {
+    Ok(find_inner(id, harness)?.0)
+}
+
+/// A resolved session: its catalog ref plus the harness adapter that reads it.
+type FoundSession = (SessionRef, Box<dyn Adapter>);
+
+/// The shared catalog-then-probe resolution behind [`find`]/[`find_cheap`]. The `bool` reports
+/// whether the probe path was already a full discovery (cold catalog).
+fn find_inner(id: &str, harness: Option<Harness>) -> Result<(Option<FoundSession>, bool)> {
     // Fast path: the persisted catalog resolves the id without touching the fleet. We trust a row
     // only if its file still exists (a stale row — session deleted/moved — falls through to scan).
     let cataloged = catalog::lookup(id, harness);
     if !cataloged.is_empty() {
         if let Some(r) = cataloged.iter().find(|r| r.id == id && r.path.exists()) {
             if let Some(a) = harness::for_harness(r.harness) {
-                return Ok(Some((r.clone(), a)));
+                return Ok((Some((r.clone(), a)), false));
             }
         }
         let live: Vec<&SessionRef> = cataloged.iter().filter(|r| r.path.exists()).collect();
         match live.len() {
             1 => {
                 if let Some(a) = harness::for_harness(live[0].harness) {
-                    return Ok(Some((live[0].clone(), a)));
+                    return Ok((Some((live[0].clone(), a)), false));
                 }
             }
             n if n > 1 => return Err(ambiguous(id, live.into_iter())),
@@ -363,16 +387,10 @@ pub fn find(id: &str, harness: Option<Harness>) -> Result<Option<(SessionRef, Bo
         }
     }
 
-    // Slow path (cold/stale catalog): freshen via the probe first — usually a few hundred stats
-    // plus at most a scoped re-discovery, and it re-warms the catalog. Only when the id *still*
-    // isn't there (a session in one of the probe's documented blind spots) escalate to the full
-    // scan — unless the probe path already was one (cold catalog), in which case a miss is a miss.
+    // Slow path (cold/stale catalog): freshen via the probe — usually a few hundred stats plus at
+    // most a scoped re-discovery, and it re-warms the catalog.
     let (refs, was_full) = sessions_impl();
-    match resolve_id(refs, id, harness)? {
-        Some(hit) => Ok(Some(hit)),
-        None if was_full => Ok(None),
-        None => resolve_id(discover_all(), id, harness),
-    }
+    Ok((resolve_id(refs, id, harness)?, was_full))
 }
 
 /// Match `id` (exact first, then as a prefix) against `refs` — `find`'s matching contract.

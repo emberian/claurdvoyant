@@ -325,6 +325,7 @@ cv workflow 3b829648 census           # …or address the run by its NAME (uniqu
 cv workflow stark-kill-emit-swarm     # no session id? the name resolves fleet-wide
 cv workflow 3b829648 wf_ab915970 --script   # print the driving JS instead
 cv workflow 3b829648 wf_ab915970 --results  # each agent's FULL journaled return value
+cv workflow 3b829648 wf_ab915970 --follow   # stream a LIVE run's agent transitions (-f)
 cv workflow 3b829648 wf_ab915970 --json     # the structured Workflow IR (full results, all logs)
 ```
 
@@ -333,6 +334,10 @@ Both arguments accept names: the `<run>` position matches a workflow name (exact
 Agents that didn't finish (`error`/`progress`) show where they last were — `↪ last: Bash · cd /x && grep … @ 07-06 23:05` — which is exactly what you want after a crash or rate-limit hit.
 
 The default agent lines carry ~400-char result *previews* (that's all the state file keeps); `--results` (and `--json`) read the run's `journal.jsonl` and print each agent's **complete** journaled return — the full lane harvest.
+
+`--follow` (`-f`) tails a live run: the harness flushes the state file as agents progress, so cv polls it and prints one line per agent state transition (`18:37:15  ✓ gate1:verify → done (63,198 tok)`), then emits the full render when the run reaches a terminal status. If the run hasn't registered yet it waits.
+
+Ghost launches are reported with everything the crash left behind: the run id recovered from the orphaned script file (written at launch, so it survives the crash that ate the state JSON) and the **debris counts** — `· run wf_be00… · DEBRIS: 10 agent transcript(s), 1 journaled result(s)` — pointing straight at the harvestable work under `subagents/workflows/<runId>/`.
 
 Runs are read from the session's `workflows/wf_*.json` state files; the per-agent transcripts live a tier deeper under `subagents/workflows/<run>/` (see [`cv tools`](#cv-tools) and [`cv show --subagents`](#cv-show)).
 
