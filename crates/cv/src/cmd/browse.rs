@@ -30,6 +30,7 @@ pub(crate) fn cmd_ls(
     limit: usize,
     sort_by: &str,
     fresh: bool, // force a full re-discovery instead of trusting the probed catalog
+    json: bool,  // emit the rows as one JSON array (OpenSession-aligned fields) instead of the table
 ) -> Result<()> {
     let want = parse_harness(&harness)?;
     let query = crate::cmd::query::build(query)?;
@@ -57,6 +58,32 @@ pub(crate) fn cmd_ls(
     }
 
     let total = refs.len();
+    if json {
+        // Machine-readable listing: the SAME rows the table below would print (same filters, sort,
+        // exists() guard, and limit), as one JSON array on stdout — no header/footer, so it pipes
+        // cleanly. Field names are camelCase, aligned with docs/OPENSESSION.md where it names the
+        // concept (harness/id/cwd/title/createdAt/updatedAt); the catalog doesn't store the model
+        // or file size, so those aren't emitted.
+        let rows: Vec<serde_json::Value> = refs
+            .iter()
+            .filter(|r| r.path.exists())
+            .take(limit)
+            .map(|r| {
+                serde_json::json!({
+                    "harness": r.harness.as_str(),
+                    "id": r.id,
+                    "cwd": r.cwd.as_ref().map(|p| p.to_string_lossy()),
+                    "title": r.title,
+                    "messageCount": r.message_count,
+                    "createdAt": r.created_at.map(|t| t.to_rfc3339()),
+                    "updatedAt": r.updated_at.map(|t| t.to_rfc3339()),
+                    "path": r.path.to_string_lossy(),
+                })
+            })
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&rows)?);
+        return Ok(());
+    }
     if total < discovered {
         println!("{total} session(s) (of {discovered} discovered; filtered)\n");
     } else {

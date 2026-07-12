@@ -77,6 +77,7 @@ cv ls --harness claude        # only Claude Code sessions
 cv ls --cwd flux              # only sessions whose cwd contains "flux"
 cv ls --limit 100
 cv ls --sort-by messages      # updated (default) | created | messages
+cv ls --json                  # the same rows as one JSON array (for tools/scripts)
 ```
 
 ```text
@@ -98,6 +99,9 @@ When a session has no title, `cv` falls back to a dimmed cwd so the row still te
 - `--harness <name>` — restrict to one harness.
 - `--cwd <substr>` — substring match on the working directory.
 - `--limit <n>` — rows to show (default `40`).
+- `--json` — emit the same rows as one JSON array on stdout (nothing else), for downstream
+  tools. Fields are camelCase and OpenSession-aligned: `harness`, `id`, `cwd`, `title`,
+  `messageCount`, `createdAt`/`updatedAt` (ISO-8601 UTC), plus the on-disk `path`.
 
 ### `cv timeline`
 

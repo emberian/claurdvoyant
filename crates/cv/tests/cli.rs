@@ -214,6 +214,44 @@ fn ls_sort_modes_and_filters() {
     assert!(err.contains("unknown harness"), "{err}");
 }
 
+#[test]
+fn ls_json_emits_the_same_rows_machine_readably() {
+    let w = World::new("lsjson");
+    standard_corpus(&w);
+
+    // Stdout is exactly one JSON array — no header/footer — with one object per table row,
+    // in table order (updated: alpha first), carrying the OpenSession-aligned camelCase fields.
+    let (out, _) = w.cv_ok(&["ls", "--json"]);
+    let rows: Vec<serde_json::Value> = serde_json::from_str(out.trim()).expect("stdout must be pure JSON");
+    assert_eq!(rows.len(), 2, "{out}");
+    assert_eq!(rows[0]["id"], "alphasess", "updated order:\n{out}");
+    assert_eq!(rows[0]["harness"], "claude");
+    assert_eq!(rows[0]["title"], "alpha adventures");
+    assert_eq!(rows[0]["messageCount"], 3);
+    assert_eq!(rows[0]["cwd"], "/work/proj");
+    assert!(
+        rows[0]["createdAt"].as_str().unwrap().starts_with("2026-01-01"),
+        "{out}"
+    );
+    assert!(
+        rows[0]["updatedAt"].as_str().unwrap().starts_with("2026-06-01"),
+        "{out}"
+    );
+    assert!(rows[0]["path"].as_str().unwrap().ends_with("alphasess.jsonl"), "{out}");
+    // betasess has no title: present as an explicit null, not absent.
+    assert!(rows[1]["title"].is_null(), "{out}");
+
+    // --limit bounds the array just like the table, with no "… N more" footer polluting stdout.
+    let (out, _) = w.cv_ok(&["ls", "--json", "--limit", "1"]);
+    let rows: Vec<serde_json::Value> = serde_json::from_str(out.trim()).unwrap();
+    assert_eq!(rows.len(), 1, "{out}");
+
+    // Filters apply identically; an empty result is an empty array, still valid JSON.
+    let (out, _) = w.cv_ok(&["ls", "--json", "--harness", "codex"]);
+    let rows: Vec<serde_json::Value> = serde_json::from_str(out.trim()).unwrap();
+    assert!(rows.is_empty(), "{out}");
+}
+
 // ───────────────────────────── search ─────────────────────────────
 
 #[test]
