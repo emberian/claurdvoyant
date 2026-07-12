@@ -78,6 +78,13 @@ now closed:
   filters, sort, and `--limit` as the table; camelCase, OpenSession-aligned
   fields), so downstream tools can consume the catalog instead of scraping
   the table or re-scanning transcript files. (@akapug)
+- **`cv prune --json`** — the prune report as one JSON object on stdout
+  (camelCase; FULL `sourceId`/`newId`, before/after bytes, snipped-payload
+  and freed-token counts, revive detail, `newPath`/`sidecarPath`), for
+  downstream resume-optimizers that today regex-scrape the human report off
+  stderr. Dry-run honest: nothing is written, so paths — and `newId`, unless
+  `--to` pinned it — are explicit nulls plus a `note`. The human report stays
+  on stderr (compose-family convention), so stdout is pure JSON. (@akapug)
 
 ## v0.9.21 (2026-07-02)
 

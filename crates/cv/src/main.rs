@@ -379,6 +379,12 @@ enum Cmd {
         /// Report what would be pruned without writing anything.
         #[arg(long)]
         dry_run: bool,
+        /// Also emit the prune report as ONE JSON object on stdout (camelCase fields, FULL ids).
+        /// The human report stays on stderr, so stdout carries only the JSON. Dry-run honest:
+        /// nothing was written, so `newPath`/`sidecarPath` are null and `newId` is null unless
+        /// `--to` pinned it (see `note`). Ignored by `--retrieve`, which prints the payload itself.
+        #[arg(long)]
+        json: bool,
     },
     /// View the user config (`~/.config/clustervision/config.toml`) and manage the export-source index.
     /// With no flag, prints the config path + registered export sources. Account data exports
@@ -731,6 +737,7 @@ fn main() -> Result<()> {
             window,
             range,
             dry_run,
+            json,
         } => compose::cmd_prune(
             &id,
             harness,
@@ -745,6 +752,7 @@ fn main() -> Result<()> {
             window,
             range.map(|s| parse_keep_range(&s)).transpose()?,
             dry_run,
+            json,
         ),
         Cmd::Config { add_export, rm_export } => config::cmd_config(add_export, rm_export),
         Cmd::Query { json } => query::cmd_query(json),

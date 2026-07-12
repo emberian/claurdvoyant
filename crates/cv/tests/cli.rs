@@ -381,6 +381,137 @@ fn export_formats() {
     assert!(err.contains("unknown format"), "{err}");
 }
 
+// ───────────────────────────── prune --json ─────────────────────────────
+
+#[test]
+fn prune_json_emits_machine_readable_report() {
+    let w = World::new("prunejson");
+    let big = "x".repeat(4096);
+    // A realistic Claude fixture: the in-file sessionId matches the filename (prune reads the
+    // source id from the lines, not the path).
+    w.write_session(
+        "prunesrc",
+        &[
+            serde_json::json!({
+                "type": "user", "uuid": "u1", "sessionId": "prunesrc", "timestamp": "2026-01-01T10:00:00Z",
+                "cwd": "/work/proj",
+                "message": {"role": "user", "content": "read the big file"}
+            }),
+            serde_json::json!({
+                "type": "assistant", "uuid": "a1", "sessionId": "prunesrc", "timestamp": "2026-01-01T10:01:00Z",
+                "cwd": "/work/proj",
+                "message": {"role": "assistant", "model": "claude-test-1", "content": [
+                    {"type": "text", "text": "reading"},
+                    {"type": "tool_use", "id": "t1", "name": "Read", "input": {"file_path": "/big.txt"}}
+                ]}
+            }),
+            serde_json::json!({
+                "type": "user", "uuid": "u2", "sessionId": "prunesrc", "timestamp": "2026-01-01T10:02:00Z",
+                "message": {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "t1", "content": big, "is_error": false}
+                ]}
+            }),
+            serde_json::json!({
+                "type": "assistant", "uuid": "a2", "sessionId": "prunesrc", "timestamp": "2026-01-01T10:03:00Z",
+                "cwd": "/work/proj",
+                "message": {"role": "assistant", "model": "claude-test-1", "content": [
+                    {"type": "text", "text": "done"}
+                ]}
+            }),
+        ],
+    );
+    let dir = w.home.join(".claude/projects/-work-proj");
+    let source_before = fs::read_to_string(dir.join("prunesrc.jsonl")).unwrap();
+
+    // Dry run first: stdout is ONE JSON object; nothing written means honest nulls + a note,
+    // and the fixture dir is untouched.
+    let (out, _) = w.cv_ok(&[
+        "prune",
+        "prunesrc",
+        "--min-size",
+        "100",
+        "--keep-last",
+        "0",
+        "--dry-run",
+        "--json",
+    ]);
+    let v: serde_json::Value = serde_json::from_str(out.trim()).expect("stdout must be pure JSON");
+    assert_eq!(v["sourceId"], "prunesrc", "{out}");
+    assert_eq!(v["dryRun"], true, "{out}");
+    assert!(v["newId"].is_null(), "unpinned dry-run id must be null:\n{out}");
+    assert!(v["newPath"].is_null(), "{out}");
+    assert!(v["sidecarPath"].is_null(), "{out}");
+    assert!(v["note"].as_str().unwrap().contains("dry run"), "{out}");
+    assert_eq!(v["snippedPayloads"], 1, "{out}");
+    assert!(
+        v["beforeBytes"].as_u64().unwrap() > v["afterBytes"].as_u64().unwrap(),
+        "{out}"
+    );
+    assert_eq!(fs::read_dir(&dir).unwrap().count(), 1, "dry run must write nothing");
+
+    // A dry run with --to CAN report the id — it's caller-chosen, not minted.
+    let (out, _) = w.cv_ok(&[
+        "prune",
+        "prunesrc",
+        "--min-size",
+        "100",
+        "--keep-last",
+        "0",
+        "--dry-run",
+        "--to",
+        "pinnedsess",
+        "--json",
+    ]);
+    let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+    assert_eq!(v["newId"], "pinnedsess", "{out}");
+    assert!(v["newPath"].is_null(), "still nothing written:\n{out}");
+
+    // Real prune: full ids + real paths in the JSON; the files exist; the source is untouched.
+    let (out, _) = w.cv_ok(&[
+        "prune",
+        "prunesrc",
+        "--min-size",
+        "100",
+        "--keep-last",
+        "0",
+        "--to",
+        "prunedsess",
+        "--json",
+    ]);
+    let v: serde_json::Value = serde_json::from_str(out.trim()).expect("stdout must be pure JSON");
+    assert_eq!(v["sourceId"], "prunesrc", "{out}");
+    assert_eq!(v["newId"], "prunedsess", "{out}");
+    assert_eq!(v["harness"], "claude", "{out}");
+    assert_eq!(v["dryRun"], false, "{out}");
+    assert!(v["note"].is_null(), "{out}");
+    assert_eq!(v["snippedPayloads"], 1, "{out}");
+    assert!(v["tokensFreed"].as_u64().unwrap() > 0, "{out}");
+    let new_path = PathBuf::from(v["newPath"].as_str().unwrap());
+    assert!(new_path.ends_with("prunedsess.jsonl"), "{out}");
+    assert!(new_path.exists(), "pruned session must exist at newPath");
+    let sidecar = PathBuf::from(v["sidecarPath"].as_str().unwrap());
+    assert!(sidecar.ends_with("prunedsess.flat.jsonl"), "{out}");
+    assert!(sidecar.exists(), "sidecar must exist at sidecarPath");
+    assert_eq!(
+        fs::read_to_string(dir.join("prunesrc.jsonl")).unwrap(),
+        source_before,
+        "prune must never modify the source session"
+    );
+
+    // Without --json the report stays off stdout entirely (status goes to stderr).
+    let (out, err) = w.cv_ok(&[
+        "prune",
+        "prunesrc",
+        "--min-size",
+        "100",
+        "--keep-last",
+        "0",
+        "--dry-run",
+    ]);
+    assert!(out.trim().is_empty(), "non-json prune must keep stdout empty:\n{out}");
+    assert!(err.contains("pruned"), "{err}");
+}
+
 // ───────────────────────────── dataset ─────────────────────────────
 
 #[test]

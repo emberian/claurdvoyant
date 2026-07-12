@@ -27,6 +27,7 @@ pub(crate) fn cmd_prune(
     window: Option<u64>,
     keep_range: Option<(usize, Option<usize>)>,
     dry_run: bool,
+    json: bool, // also emit the report as one JSON object on stdout (the human report stays on stderr)
 ) -> Result<()> {
     let want = parse_harness(&harness)?;
     let (r, _adapter) = cv_core::find(id, want)?.with_context(|| format!("no session matching {id:?}"))?;
@@ -59,6 +60,7 @@ pub(crate) fn cmd_prune(
         );
     }
 
+    let pinned_id = to.is_some(); // --to: the new id is caller-chosen, so a dry run can still report it
     let opts = cv_core::prune::PruneOptions {
         min_size,
         keep_last,
@@ -72,6 +74,58 @@ pub(crate) fn cmd_prune(
         dry_run,
     };
     let res = cv_core::prune::prune_session(&r.path, &opts)?;
+
+    if json {
+        // Machine-readable prune report: ONE camelCase JSON object on stdout — the human report
+        // below stays on stderr (compose-family convention: status → stderr, data → stdout), so
+        // stdout carries only the JSON and pipes cleanly. Dry-run honesty: nothing was written,
+        // so newPath/sidecarPath/copiedResources are null, and newId is null too unless --to
+        // pinned it — the core mints a throwaway UUID a real run would NOT reuse (see `note`).
+        let report_id = (!res.dry_run || pinned_id).then(|| res.new_id.clone());
+        let note = match (res.dry_run, pinned_id) {
+            (false, _) => None,
+            (true, true) => Some("dry run — nothing written".to_string()),
+            (true, false) => Some(
+                "dry run — nothing written; a real run mints a fresh session id (pass --to to pin one)".to_string(),
+            ),
+        };
+        // revived: false when revive is off or the recorded usage was already honest; else the
+        // stale → honest rewrite detail (what the human report prints as "revived: …k → …k").
+        let revived = match (res.revive_tokens, res.revive_old_tokens) {
+            (Some(honest), Some(stale)) => serde_json::json!({
+                "recordedTokensBefore": stale,
+                "recordedTokensAfter": honest,
+                "usageRecordsRewritten": res.usage_rewritten,
+            }),
+            _ => serde_json::Value::Bool(false),
+        };
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "sourceId": res.source_id,
+                "newId": report_id,
+                "harness": "claude",
+                "beforeBytes": res.original_size,
+                "afterBytes": res.new_size,
+                "snippedPayloads": res.pruned_count,
+                "imageBlocks": res.image_blocks,
+                "tokensFreed": res.est_context_tokens_saved,
+                "droppedTurns": res.dropped_turns,
+                "windowRealTokens": res.window_real_tokens,
+                "revived": revived,
+                "warnings": res.warnings,
+                "newPath": (!res.dry_run).then(|| res.new_path.display().to_string()),
+                "sidecarPath": (!res.dry_run)
+                    .then(|| res.sidecar_path.as_ref().map(|p| p.display().to_string()))
+                    .flatten(),
+                "copiedResources": (!res.dry_run)
+                    .then(|| res.copied_resources.as_ref().map(|p| p.display().to_string()))
+                    .flatten(),
+                "dryRun": res.dry_run,
+                "note": note,
+            }))?
+        );
+    }
 
     let pct = if res.original_size > 0 {
         100.0 * res.bytes_saved() as f64 / res.original_size as f64
