@@ -74,6 +74,10 @@ now closed:
   `workflow_launches`/`ghost_launches` + `WorkflowLaunch`. The list form's
   `--json` output is now `{"runs": […], "ghost_launches": […]}` (was a bare
   array).
+- **`cv ls --json`** — the listing as one JSON array on stdout (same rows,
+  filters, sort, and `--limit` as the table; camelCase, OpenSession-aligned
+  fields), so downstream tools can consume the catalog instead of scraping
+  the table or re-scanning transcript files. (@akapug)
 
 ## v0.9.21 (2026-07-02)
 

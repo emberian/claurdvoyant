@@ -75,6 +75,11 @@ enum Cmd {
         /// Force a full fleet re-discovery instead of trusting the catalog's staleness probe.
         #[arg(long)]
         fresh: bool,
+        /// Emit the rows as one JSON array instead of the table — the same rows the table would
+        /// show (all filters, sort, and --limit respected), with OpenSession-aligned camelCase
+        /// fields. Nothing else goes to stdout, so the output pipes cleanly.
+        #[arg(long)]
+        json: bool,
     },
     /// Full-text search across all session content.
     Search {
@@ -631,7 +636,8 @@ fn main() -> Result<()> {
             limit,
             sort_by,
             fresh,
-        } => browse::cmd_ls(harness, cwd, query, limit, &sort_by, fresh),
+            json,
+        } => browse::cmd_ls(harness, cwd, query, limit, &sort_by, fresh, json),
         Cmd::Search {
             query,
             harness,
