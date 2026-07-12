@@ -167,6 +167,7 @@ Full-text search across the *content* of every session.
 cv search "flux inference refactor"
 cv search "nom parser" --harness codex --limit 10
 cv search "formalizing proofs" --semantic
+cv search "flux inference" --json     # the same hits as one JSON array (for tools/scripts)
 ```
 
 ```text
@@ -179,6 +180,10 @@ By default `cv` uses the tantivy full-text index if you've built one (real token
 - `--semantic` — rank by *meaning* using stored embeddings instead of keywords. Requires `cv index --semantic` first; it downloads a small embedding model on first use.
 - `--harness <name>` — restrict to one harness.
 - `--limit <n>` — results (default `20`).
+- `--json` — emit the same hits as one JSON array on stdout (nothing else), for downstream
+  tools. Fields are camelCase: `harness`, `id` (the FULL session id — the table truncates to
+  8 chars), `cwd`, `title`, `score` (BM25, cosine for `--semantic`, `null` on a live scan),
+  `snippet` (untruncated), `createdAt`/`updatedAt` (ISO-8601 UTC).
 
 ### `cv recall`
 

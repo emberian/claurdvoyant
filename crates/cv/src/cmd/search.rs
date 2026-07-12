@@ -5,14 +5,20 @@ use anyhow::{Context, Result};
 use cv_core::ir::{truncate, Harness};
 use std::path::{Path, PathBuf};
 
-pub(crate) fn cmd_search(query: &str, harness: Option<String>, limit: usize, semantic: bool) -> Result<()> {
+pub(crate) fn cmd_search(
+    query: &str,
+    harness: Option<String>,
+    limit: usize,
+    semantic: bool,
+    json: bool, // emit the hits as one JSON array (camelCase fields, full ids) instead of the table
+) -> Result<()> {
     let want = parse_harness(&harness)?;
 
     // Semantic search: embed the query and rank stored vectors. Requires `cv index --semantic`.
     if semantic {
         let hits = cv_search::semantic_search(None, query, limit.saturating_mul(4))
             .context("semantic search failed (run `cv index --semantic` first?)")?;
-        render_search_hits(&hits, want, limit, query, "semantic");
+        render_search_hits(&hits, want, limit, query, "semantic", json)?;
         return Ok(());
     }
 
@@ -32,7 +38,7 @@ pub(crate) fn cmd_search(query: &str, harness: Option<String>, limit: usize, sem
     if cv_search::default_tantivy_dir().exists() {
         match cv_search::text_search(None, query, limit.saturating_mul(4)) {
             Ok(hits) => {
-                render_search_hits(&hits, want, limit, query, "index");
+                render_search_hits(&hits, want, limit, query, "index", json)?;
                 return Ok(());
             }
             Err(e) => eprintln!("(tantivy index unavailable: {e:#}; scanning live)"),
@@ -40,7 +46,7 @@ pub(crate) fn cmd_search(query: &str, harness: Option<String>, limit: usize, sem
     } else {
         eprintln!("(no index yet — scanning live; run `cv index` for instant search)");
     }
-    cmd_search_live(query, want, limit)
+    cmd_search_live(query, want, limit, json)
 }
 
 /// Where the retired sqlite FTS index used to live: `$CLUSTERVISION_HOME/index.sqlite` or
@@ -54,12 +60,30 @@ fn legacy_sqlite_index_path() -> Option<PathBuf> {
 
 /// Render a slice of cv-search [`cv_search::Hit`]s with harness/short-id/date/title/snippet,
 /// applying the `--harness` filter and `--limit`. `source` labels the empty-result hint.
-fn render_search_hits(hits: &[cv_search::Hit], want: Option<Harness>, limit: usize, query: &str, source: &str) {
+/// With `json`, the SAME hits in the same order go to stdout as one JSON array instead —
+/// no hint lines, an empty result is `[]` — so the output pipes cleanly.
+fn render_search_hits(
+    hits: &[cv_search::Hit],
+    want: Option<Harness>,
+    limit: usize,
+    query: &str,
+    source: &str,
+    json: bool,
+) -> Result<()> {
     let rows: Vec<&cv_search::Hit> = hits
         .iter()
         .filter(|h| want.is_none_or(|w| h.harness == w.as_str()))
         .take(limit)
         .collect();
+    if json {
+        // Machine-readable hits: camelCase fields, the FULL session id (the table shows an
+        // 8-char prefix), the untruncated snippet, and the index's relevance score (BM25 for
+        // FTS, cosine similarity for --semantic). Timestamps are ISO-8601 UTC, null when the
+        // index carries none (e.g. semantic hits from a pre-dates embedding store).
+        let vals: Vec<serde_json::Value> = rows.iter().map(|h| hit_json(h)).collect();
+        println!("{}", serde_json::to_string_pretty(&vals)?);
+        return Ok(());
+    }
     if rows.is_empty() {
         let hint = if source == "semantic" {
             "(semantic; run `cv index --semantic` to (re)build embeddings)"
@@ -73,7 +97,7 @@ fn render_search_hits(hits: &[cv_search::Hit], want: Option<Harness>, limit: usi
                 println!("(note: the index is ~{days} day(s) behind the newest session — run `cv index`)");
             }
         }
-        return;
+        return Ok(());
     }
     for h in rows {
         // Dates ride on the hit straight from the index (FTS); semantic hits carry none.
@@ -93,6 +117,22 @@ fn render_search_hits(hits: &[cv_search::Hit], want: Option<Harness>, limit: usi
             println!("          … {}", truncate(&h.snippet, 120));
         }
     }
+    Ok(())
+}
+
+/// One `--json` object for an index/semantic hit: what the table row shows, machine-readably —
+/// plus the full id, cwd, and score the table drops or truncates.
+fn hit_json(h: &cv_search::Hit) -> serde_json::Value {
+    serde_json::json!({
+        "harness": h.harness,
+        "id": h.id,
+        "cwd": h.cwd,
+        "title": h.title,
+        "score": h.score,
+        "snippet": h.snippet,
+        "createdAt": h.created_at.and_then(|t| chrono::DateTime::from_timestamp(t, 0)).map(|d| d.to_rfc3339()),
+        "updatedAt": h.updated_at.and_then(|t| chrono::DateTime::from_timestamp(t, 0)).map(|d| d.to_rfc3339()),
+    })
 }
 
 /// Whole days the FTS index lags the newest session file on disk, when ≥ 1. Cheap enough for the
@@ -109,10 +149,14 @@ fn index_days_behind() -> Option<u64> {
     (days >= 1).then_some(days as u64)
 }
 
-fn cmd_search_live(query: &str, want: Option<Harness>, limit: usize) -> Result<()> {
+fn cmd_search_live(query: &str, want: Option<Harness>, limit: usize, json: bool) -> Result<()> {
     use cv_core::ParseOptions;
     let needle = query.to_lowercase();
     let mut hits = 0;
+    // --json: accumulate the SAME hits the table would print (same order, same snippet), emitted
+    // as one array at the end. No live-scan score exists, so `score` is an explicit null; ids are
+    // full (the table truncates to 8 chars).
+    let mut rows: Vec<serde_json::Value> = Vec::new();
 
     // Streams each session into pack's head-capped `CapSink` under a lazy parse: peak per session
     // is O(LIVE_HAY_BYTES), never O(session) — this is exactly the first-run (no index yet) path,
@@ -135,25 +179,46 @@ fn cmd_search_live(query: &str, want: Option<Harness>, limit: usize) -> Result<(
             if let Some(pos) = low.find(&needle) {
                 hits += 1;
                 let label = cv_core::label_from(meta.title.as_deref(), sink.first_user.as_deref());
-                println!(
-                    "{:8}  {:8}  {:10}  {}",
-                    r.harness.as_str(),
-                    short_id(&r.id),
-                    r.updated_at
-                        .map(|d| crate::util::fmt_local(d, "%Y-%m-%d"))
-                        .unwrap_or_else(|| "----------".into()),
-                    label,
-                );
-                println!(
-                    "          … {}",
-                    snippet(&sink.hay, pos.min(sink.hay.len()), needle.len())
-                );
+                let snip = snippet(&sink.hay, pos.min(sink.hay.len()), needle.len());
+                if json {
+                    rows.push(serde_json::json!({
+                        "harness": r.harness.as_str(),
+                        "id": r.id,
+                        "cwd": r.cwd.as_ref().map(|p| p.to_string_lossy()),
+                        "title": label,
+                        "score": serde_json::Value::Null,
+                        "snippet": snip,
+                        "createdAt": r.created_at.map(|t| t.to_rfc3339()),
+                        "updatedAt": r.updated_at.map(|t| t.to_rfc3339()),
+                    }));
+                } else {
+                    println!(
+                        "{:8}  {:8}  {:10}  {}",
+                        r.harness.as_str(),
+                        short_id(&r.id),
+                        r.updated_at
+                            .map(|d| crate::util::fmt_local(d, "%Y-%m-%d"))
+                            .unwrap_or_else(|| "----------".into()),
+                        label,
+                    );
+                    println!("          … {snip}");
+                }
                 if hits >= limit {
-                    println!("\n(stopped at {limit} hits; use --limit)");
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&rows)?);
+                        eprintln!("(stopped at {limit} hits; use --limit)");
+                    } else {
+                        println!("\n(stopped at {limit} hits; use --limit)");
+                    }
                     return Ok(());
                 }
             }
         }
+    }
+    if json {
+        // Pure JSON on stdout even for a miss: an empty array, no prose.
+        println!("{}", serde_json::to_string_pretty(&rows)?);
+        return Ok(());
     }
     if hits == 0 {
         println!("no matches for {query:?}");

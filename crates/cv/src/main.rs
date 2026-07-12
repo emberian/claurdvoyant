@@ -87,6 +87,12 @@ enum Cmd {
         /// to have been run; downloads a small embedding model on first use.
         #[arg(long)]
         semantic: bool,
+        /// Emit the hits as one JSON array instead of the table — the same hits in the same
+        /// order (--harness/--limit/--semantic respected), with camelCase fields and the FULL
+        /// session id (the table truncates ids to 8 chars for display). Nothing else goes to
+        /// stdout, so the output pipes cleanly.
+        #[arg(long)]
+        json: bool,
     },
     /// Print a single session (by id or id-prefix).
     Show {
@@ -637,7 +643,8 @@ fn main() -> Result<()> {
             harness,
             limit,
             semantic,
-        } => search::cmd_search(&query, harness, limit, semantic),
+            json,
+        } => search::cmd_search(&query, harness, limit, semantic, json),
         Cmd::Show {
             id,
             harness,
