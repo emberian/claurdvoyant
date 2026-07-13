@@ -72,6 +72,15 @@ fn render_search_hits(hits: &[cv_search::Hit], want: Option<Harness>, limit: usi
             if let Some(days) = index_days_behind() {
                 println!("(note: the index is ~{days} day(s) behind the newest session — run `cv index`)");
             }
+            // The other common miss: the wanted text lives in a *sub-agent* transcript, which the
+            // default index doesn't fold in. Say so — a search that came back empty for something an
+            // Agent/Workflow lane discussed is exactly this case.
+            if !cv_search::fts::has_subagent_docs(&cv_search::default_tantivy_dir()) {
+                println!(
+                    "(note: sub-agent transcripts aren't searched yet — rebuild with \
+                     `cv index --subagents` to include the Agent/Workflow lanes)"
+                );
+            }
         }
         return;
     }
@@ -82,12 +91,25 @@ fn render_search_hits(hits: &[cv_search::Hit], want: Option<Harness>, limit: usi
             .or(h.created_at)
             .and_then(|t| crate::util::fmt_local_ts(t, "%Y-%m-%d"))
             .unwrap_or_else(|| "----------".into());
+        // A folded-in sub-agent hit (`cv index --subagents`): its own id is `agent-<hex>`, so a
+        // bare `short_id` would render the shared `agent-` prefix, useless for drill-in. Show the
+        // bare agentId (what `cv show <id>` resolves) and tag the row with its parent + workflow so
+        // the reader sees it's a lane, not a top-level session.
+        let (id_disp, provenance) = match h.agent_id.as_deref() {
+            Some(aid) => {
+                let parent = h.parent_id.as_deref().map(short_id).unwrap_or_default();
+                let wf = h.workflow.as_deref().map(|w| format!(" · ⟐{w}")).unwrap_or_default();
+                (short_id(aid), format!("   ⤷ sub-agent of {parent}{wf}"))
+            }
+            None => (short_id(&h.id), String::new()),
+        };
         println!(
-            "{:8}  {:8}  {:10}  {}",
+            "{:8}  {:8}  {:10}  {}{}",
             h.harness,
-            short_id(&h.id),
+            id_disp,
             date,
             h.title.clone().unwrap_or_default(),
+            provenance,
         );
         if !h.snippet.trim().is_empty() {
             println!("          … {}", truncate(&h.snippet, 120));

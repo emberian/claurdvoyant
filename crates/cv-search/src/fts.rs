@@ -851,6 +851,22 @@ pub fn newest_indexed_mtime(dir: &Path) -> Option<i64> {
     sigs.values().map(|&(mt, _)| mt).max()
 }
 
+/// Whether the index holds any folded-in sub-agent transcripts (the `cv index --subagents` forest,
+/// detected by a stored `parent_id` on a doc). The empty-result path uses this to nudge toward
+/// `--subagents` **only** when the forest is genuinely absent — not when a query simply didn't
+/// match a corpus that already includes it. An open/read error reads as `true` (assume present) so
+/// a transient failure never spams the hint. One stored-field scan — the same cheap pass
+/// [`newest_indexed_mtime`] makes (no body is stored).
+pub fn has_subagent_docs(dir: &Path) -> bool {
+    let Ok((index, f)) = open_existing(dir) else {
+        return true;
+    };
+    match read_indexed_sigs(&index, &f) {
+        Ok((_, folded)) => !folded.is_empty(),
+        Err(_) => true,
+    }
+}
+
 /// Index an explicit set of sessions through the real production [`index_session`] path — the same
 /// indexer [`index_all`] drives, minus only the global `discover_all()` scan. Full rebuild: clears
 /// prior contents first. Used by tests so date-field (and chunk) indexing is exercised against the
@@ -1763,10 +1779,19 @@ mod tests {
         );
         // The parent itself is still indexed.
         assert_eq!(text_search(&dir, "orchestrator", 10).unwrap().len(), 1);
+        // The empty-result nudge fires: a top-level-only index carries no folded forest.
+        assert!(
+            !has_subagent_docs(&dir),
+            "a top-level-only index must report no sub-agent forest (so `cv search` nudges --subagents)"
+        );
 
         // (b) Fold the forest: the marker becomes findable, tagged back to its parent + agent.
         let folded = index_refs_with_subagents(&dir, std::slice::from_ref(&parent), false).unwrap();
         assert_eq!(folded, 1, "exactly one sub-agent transcript folded in");
+        assert!(
+            has_subagent_docs(&dir),
+            "once folded, the index must report a sub-agent forest (so the nudge goes quiet)"
+        );
         let hits = text_search(&dir, "zqsubmarker", 10).unwrap();
         assert_eq!(hits.len(), 1, "sub-agent term findable once folded");
         let h = &hits[0];
