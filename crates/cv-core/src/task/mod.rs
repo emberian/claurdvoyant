@@ -22,10 +22,15 @@
 //! same crash-safe flock recipe as the board.
 
 pub mod model;
+pub mod reduce;
 
 pub use model::{
     harness_family, IndependenceCheck, MergeFailure, Revision, RevisionState, TaskEvent,
     TaskEventKind, TaskState,
+};
+pub use reduce::{
+    EffectiveState, Note, PassEvidence, ReduceError, RefuteEvidence, RerouteEvidence,
+    RevisionProjection, TaskIssue, TaskProjection, TaskReadModel, TaskReducer,
 };
 
 use std::path::PathBuf;
