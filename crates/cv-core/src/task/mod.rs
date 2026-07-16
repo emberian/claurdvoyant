@@ -23,6 +23,7 @@
 
 pub mod model;
 pub mod reduce;
+pub mod store;
 
 pub use model::{
     harness_family, IndependenceCheck, MergeFailure, Revision, RevisionState, TaskEvent,
@@ -32,6 +33,27 @@ pub use reduce::{
     EffectiveState, Note, PassEvidence, ReduceError, RefuteEvidence, RerouteEvidence,
     RevisionProjection, TaskIssue, TaskProjection, TaskReadModel, TaskReducer,
 };
+pub use store::{new_event, replay, ReplayOutcome, TaskStore};
+
+/// Best-effort board notification for an appended task event (never called while the store lock
+/// is held — the append has already returned). Failures are returned for the caller to warn
+/// about, never to fail the operation.
+pub fn notify_board(event: &TaskEvent, channel: &str) -> anyhow::Result<()> {
+    let short = &event.task_id[..event.task_id.len().min(8)];
+    let body = format!("task {short}: {}", event.kind.tag());
+    crate::board::post(
+        channel,
+        &event.by,
+        &body,
+        Some("task"),
+        vec![
+            format!("task:{}", event.task_id),
+            format!("ev:{}", event.kind.tag()),
+        ],
+        Some(event.task_id.clone()),
+    )?;
+    Ok(())
+}
 
 use std::path::PathBuf;
 
