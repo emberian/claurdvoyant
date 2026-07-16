@@ -1,5 +1,28 @@
 # Changelog
 
+## Unreleased
+
+- **The task substrate (`cv task`, `task_*` MCP tools, `/api/tasks*`).** Durable,
+  replayable dispatch objects for agent fleets, designed against the failure mode
+  that killed a 200k-line predecessor (mission-control): progress trackers that
+  trust agents' own claims. Four laws: (1) landing state is **observed, not
+  attested** — only cv's git verifier (ancestry + `git cherry` patch-id
+  equivalence + whole-branch range patch-id recomputed from a recorded base) can
+  write `merged_local`/`landed`, and agent-facing append paths reject those
+  kinds at the store seam; (2) reviewer independence is **read from transcripts**
+  (harness family via the catalog), advisory-warn, never a gate; (3) **no
+  authority machinery** — landing authority is whoever can push, cv only tracks
+  and verifies; (4) **small**. Lifecycle grammar and its 9-test invariant roster
+  ported from mission-control's one pure module (`land_request.rs`): reviewer
+  binding, refute-is-terminal, `MergedLocal ≠ Landed`, issues-without-state-change,
+  merge/land evidence must match reviewed content. Storage is a locked CAS
+  append log (`tasks/events.jsonl`, board's flock recipe via the extracted
+  `lockfile::FileLock`) that never contains an event replay would refuse;
+  interior corruption is loud, torn tails tolerated. Projections: `list`,
+  per-agent `inbox`, and `debt` — reviewed-but-unlanded work, the honest number.
+  `cvd watch --verify-interval N` runs the verifier as a daemon; board channels
+  carry the notification trail.
+
 ## v0.9.22 (2026-07-08)
 
 Crash-forensics release, paid for the hard way: a real power loss killed a

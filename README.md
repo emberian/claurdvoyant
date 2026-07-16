@@ -127,11 +127,33 @@ claude mcp add clustervision -- /path/to/target/release/cv-mcp
 
 Tools incl: `list_sessions` · `search_sessions` · `read_session` · `project_sessions` · **`recall`** (semantic "where was this solved before") · `await_omen` (block until a sibling's message matches a regex) · **`observe_stream`** (its non-blocking sibling — poll a junior agent's live message tail on your own cadence) · `prune_session`/`prune_retrieve` (custom compaction, in-place). …and a few more your agents can discover for themselves. 😉
 
+## 📋 Dispatch work you can trust (`cv task`)
+
+A durable task object for agent fleets, built on one law: **landing state is observed, never
+attested**. An agent can claim a task and propose a reviewed branch — but `landed` is only ever
+written by cv itself, after running git (`merge-base` ancestry, `git cherry` patch-id
+equivalence, whole-branch range patch-id). An agent *saying* "done" moves nothing.
+
+```sh
+cv task open "port the auth module" --repo ~/proj      # dispatch
+cv task claim <id> --from agent:claude-1               # first writer wins (flock CAS)
+cv task propose <id> --branch task/auth                # sha + patch-id read FROM git
+cv task pass <id> --from agent:codex-1 --session <sid> # cross-family check read from transcripts
+cv task verify --all                                   # cv observes what actually landed
+cv task debt                                           # reviewed-but-unlanded work, loudly
+```
+
+Same substrate over MCP (`task_open` … `task_verify`) and cvd HTTP (`/api/tasks`,
+`/api/tasks/debt`, `/api/tasks/inbox/{who}`). Notifications ride the board; state lives in a
+replayed event log (`~/.clustervision/tasks/events.jsonl`) that refuses events its own reducer
+would reject.
+
 ## 📡 Archive your whole fleet (`cvd`)
 
 ```sh
 cvd sync     # snapshot every session into ~/.clustervision
 cvd watch    # follow live + archive as sessions change → a fleet activity feed
+cvd watch --verify-interval 300   # + run the task git-verifier every 5 min
 ```
 
 ## 🧬 The OpenSession standard

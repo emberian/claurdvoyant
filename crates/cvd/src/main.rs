@@ -45,6 +45,10 @@ enum Command {
         /// Only sessions whose cwd contains this substring.
         #[arg(long)]
         cwd: Option<String>,
+        /// Also run the task git-verifier every N seconds (0 = off). The daemon becomes the
+        /// engine that keeps landing state and the debt view honest without anyone asking.
+        #[arg(long = "verify-interval", default_value_t = 0)]
+        verify_interval: u64,
     },
     /// Serve fleet state as JSON over HTTP for a live browser dashboard.
     Serve {
@@ -78,7 +82,9 @@ fn main() -> Result<()> {
 
     match cli.command {
         Command::Sync => cmd_sync(&archive),
-        Command::Watch { interval, harness, cwd } => cmd_watch(&archive, interval, harness, cwd),
+        Command::Watch { interval, harness, cwd, verify_interval } => {
+            cmd_watch(&archive, interval, harness, cwd, verify_interval)
+        }
         Command::Serve {
             port,
             host,
@@ -162,7 +168,13 @@ fn cmd_sync(archive: &Archive) -> Result<()> {
     Ok(())
 }
 
-fn cmd_watch(archive: &Archive, interval: u64, harness: Option<String>, cwd: Option<String>) -> Result<()> {
+fn cmd_watch(
+    archive: &Archive,
+    interval: u64,
+    harness: Option<String>,
+    cwd: Option<String>,
+    verify_interval: u64,
+) -> Result<()> {
     let filter = Filter {
         harness: match harness {
             Some(h) => Some(parse_harness(&h)?),
@@ -182,11 +194,31 @@ fn cmd_watch(archive: &Archive, interval: u64, harness: Option<String>, cwd: Opt
         archive.home().display()
     );
 
+    if verify_interval > 0 {
+        eprintln!("cvd: task verifier every {verify_interval}s");
+    }
+
     // We don't use Watcher::run because it returns `!` (never returns) and we want to keep
     // ownership of `archive` for the closure; a manual loop reads identically and stays robust.
+    let mut last_verify = std::time::Instant::now();
     loop {
         for ev in watcher.poll() {
             archive_event(archive, &ev.reference, ev.kind, ev.new_messages.len());
+        }
+        if verify_interval > 0 && last_verify.elapsed().as_secs() >= verify_interval {
+            last_verify = std::time::Instant::now();
+            let store = cv_core::task::TaskStore::default_store();
+            match cv_core::task::verify::run_verify(&store, None, false) {
+                Ok((appended, warnings)) => {
+                    for w in warnings {
+                        eprintln!("cvd: verify: {w}");
+                    }
+                    for ev in appended {
+                        eprintln!("cvd: observed {} on task {}", ev.kind.tag(), &ev.task_id[..8]);
+                    }
+                }
+                Err(e) => eprintln!("cvd: verify pass failed: {e:#}"),
+            }
         }
         std::thread::sleep(interval);
     }

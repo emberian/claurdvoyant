@@ -245,8 +245,126 @@ fn route(segments: &[String], query: &str) -> (u16, Value) {
             Err(e) => err(500, &e.to_string()),
         },
 
+        ["api", "tasks"] => tasks(query),
+
+        ["api", "tasks", "debt"] => tasks_debt(query),
+
+        ["api", "tasks", "inbox", who] => tasks_inbox(who),
+
+        ["api", "task", id] => task_one(id, false),
+
+        ["api", "task", id, "events"] => task_one(id, true),
+
         _ => err(404, "not found"),
     }
+}
+
+/// Replay the task log; on success hand the outcome to `f`. Log warnings ride every response so
+/// a corrupted coordination log is visible from any consumer.
+fn with_tasks(f: impl FnOnce(&cv_core::task::ReplayOutcome) -> (u16, Value)) -> (u16, Value) {
+    match cv_core::task::replay() {
+        Ok(outcome) => f(&outcome),
+        Err(e) => err(500, &e.to_string()),
+    }
+}
+
+/// `GET /api/tasks?state=&assignee=&repo=&all=` — task projections, oldest first.
+fn tasks(query: &str) -> (u16, Value) {
+    let params = Query::parse(query);
+    with_tasks(|outcome| {
+        let filter = cv_core::task::TaskFilter {
+            state: params.get("state").map(String::from),
+            assignee: params.get("assignee").map(String::from),
+            repo: params.get("repo").map(std::path::PathBuf::from),
+            include_terminal: params.get("all").is_some_and(|v| v == "1" || v == "true"),
+        };
+        let tasks: Vec<Value> = cv_core::task::list(&outcome.model, &filter)
+            .into_iter()
+            .map(|t| {
+                json!({
+                    "id": t.task_id,
+                    "title": t.title,
+                    "effective_state": cv_core::task::effective_display(t),
+                    "assignee": t.assignee,
+                    "repo": t.repo,
+                    "channel": t.channel,
+                    "opened_at": t.opened_at,
+                    "last_ts": t.last_ts,
+                })
+            })
+            .collect();
+        ok(json!({ "tasks": tasks, "warnings": outcome.warnings }))
+    })
+}
+
+/// `GET /api/task/{id}` (full projection) / `GET /api/task/{id}/events` (raw history).
+fn task_one(id: &str, events: bool) -> (u16, Value) {
+    with_tasks(|outcome| {
+        let id = match cv_core::task::resolve_id(&outcome.model, id) {
+            Ok(id) => id.to_string(),
+            Err(e) => return err(404, &e),
+        };
+        if events {
+            let history: Vec<&cv_core::task::TaskEvent> =
+                outcome.events.iter().filter(|e| e.task_id == id).collect();
+            ok(json!({ "events": history, "warnings": outcome.warnings }))
+        } else {
+            let t = &outcome.model.tasks[&id];
+            ok(json!({
+                "task": t,
+                "effective_state": cv_core::task::effective_display(t),
+                "warnings": outcome.warnings,
+            }))
+        }
+    })
+}
+
+/// `GET /api/tasks/debt?repo=` — reviewed-but-unlanded work, grouped by repo, oldest first.
+fn tasks_debt(query: &str) -> (u16, Value) {
+    let params = Query::parse(query);
+    with_tasks(|outcome| {
+        let want = params.get("repo").map(std::path::PathBuf::from);
+        let mut rows = Vec::new();
+        for (repo, entries) in &cv_core::task::debt(&outcome.model) {
+            if let Some(want) = &want {
+                if repo.as_deref() != Some(want.as_path()) {
+                    continue;
+                }
+            }
+            for e in entries {
+                rows.push(json!({
+                    "id": e.task.task_id,
+                    "title": e.task.title,
+                    "repo": repo,
+                    "revision": e.revision_n,
+                    "branch": e.branch,
+                    "upstream": e.upstream,
+                    "state": e.state,
+                    "since": e.since,
+                    "issues": e.issues,
+                }));
+            }
+        }
+        ok(json!({ "debt": rows, "warnings": outcome.warnings }))
+    })
+}
+
+/// `GET /api/tasks/inbox/{who}` — what needs this endpoint.
+fn tasks_inbox(who: &str) -> (u16, Value) {
+    with_tasks(|outcome| {
+        let entries: Vec<Value> = cv_core::task::inbox(&outcome.model, who)
+            .into_iter()
+            .map(|e| {
+                json!({
+                    "id": e.task.task_id,
+                    "title": e.task.title,
+                    "reason": e.reason,
+                    "effective_state": cv_core::task::effective_display(e.task),
+                })
+            })
+            .collect();
+        ok(json!({ "inbox": entries, "warnings": outcome.warnings }))
+    })
 }
 
 /// `GET /api/sessions?harness=&cwd=&limit=` — session metadata, filtered + newest-first.
