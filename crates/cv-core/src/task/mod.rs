@@ -22,6 +22,7 @@
 //! same crash-safe flock recipe as the board.
 
 pub mod model;
+pub mod project;
 pub mod reduce;
 pub mod store;
 
@@ -32,6 +33,10 @@ pub use model::{
 pub use reduce::{
     EffectiveState, Note, PassEvidence, ReduceError, RefuteEvidence, RerouteEvidence,
     RevisionProjection, TaskIssue, TaskProjection, TaskReadModel, TaskReducer,
+};
+pub use project::{
+    debt, effective_display, inbox, list, resolve_id, DebtEntry, InboxEntry, InboxReason,
+    TaskFilter,
 };
 pub use store::{new_event, replay, ReplayOutcome, TaskStore};
 
