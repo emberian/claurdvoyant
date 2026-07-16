@@ -29,6 +29,7 @@ pub mod query;
 pub mod redact;
 pub mod render;
 pub mod stream;
+pub mod task;
 pub mod tools;
 pub mod watch;
 
