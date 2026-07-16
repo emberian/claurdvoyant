@@ -172,13 +172,21 @@ pub struct Revision {
     pub worktree: Option<PathBuf>,
     /// The ref the revision must reach to count as landed, e.g. `origin/main`.
     pub upstream: String,
+    /// The merge-base of `upstream` and `review_sha` **at propose time**. Recorded so the range
+    /// patch-id stays recomputable between two fixed commits forever — after a direct-FF land,
+    /// a live `merge-base(upstream, sha)` would equal `sha` and the range would vanish.
+    pub base: String,
     /// Full 40-hex review commit sha.
     pub review_sha: String,
-    /// 40-hex range patch-id (`git diff <merge-base> <sha> | git patch-id --stable`).
+    /// 40-hex range patch-id (`git diff <base> <review_sha> | git patch-id --stable`).
     pub patch_id: String,
     /// Active reviewer endpoint. Reroute is the only reassignment.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reviewer: Option<String>,
+    /// The author's session (cv session id) that produced this revision, when known — the
+    /// author-side input to the advisory independence check.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_ref: Option<String>,
 }
 
 /// Why a verification pass could not observe the revision as merged/landed. These are
@@ -328,9 +336,11 @@ mod tests {
             branch: "task/demo".to_string(),
             worktree: None,
             upstream: "origin/main".to_string(),
+            base: "0".repeat(40),
             review_sha: "a".repeat(40),
             patch_id: "b".repeat(40),
             reviewer: Some("agent:reviewer".to_string()),
+            session_ref: None,
         }
     }
 

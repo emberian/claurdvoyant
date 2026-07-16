@@ -15,7 +15,8 @@ pub(crate) use util::short_id;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use cmd::live::BoardCmd;
-use cmd::{browse, compose, config, convert, doctor, live, pack, provenance, query, search, share, view, workflow};
+use cmd::task::TaskCmd;
+use cmd::{browse, compose, config, convert, doctor, live, pack, provenance, query, search, share, task, view, workflow};
 use std::path::PathBuf;
 
 /// Parse a `cv prune --range` spec. Same grammar as `cv show --range` (`650-`, `650-900`,
@@ -506,6 +507,11 @@ enum Cmd {
         #[command(subcommand)]
         action: BoardCmd,
     },
+    /// Fleet task substrate: dispatch, review, and git-observed landing.
+    Task {
+        #[command(subcommand)]
+        action: TaskCmd,
+    },
     /// Unified chronological feed across all harnesses (oldest → newest).
     #[command(hide = true)]
     Timeline {
@@ -782,6 +788,7 @@ fn main() -> Result<()> {
             json,
         } => doctor::cmd_doctor(id, harness, recent, json),
         Cmd::Board { action } => live::cmd_board(action),
+        Cmd::Task { action } => task::cmd_task(action),
         Cmd::Timeline {
             harness,
             cwd,

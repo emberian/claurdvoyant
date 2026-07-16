@@ -249,9 +249,11 @@ mod tests {
                     branch: "task/x".into(),
                     worktree: None,
                     upstream: "origin/main".into(),
+                    base: sha('0'),
                     review_sha: sha('1'),
                     patch_id: sha('b'),
                     reviewer: Some("agent:reviewer".into()),
+                    session_ref: None,
                 },
             },
         );
@@ -314,9 +316,11 @@ mod tests {
                     branch: "task/r".into(),
                     worktree: None,
                     upstream: "origin/main".into(),
+                    base: sha('7'),
                     review_sha: sha('2'),
                     patch_id: sha('c'),
                     reviewer: Some("agent:b".into()),
+                    session_ref: None,
                 },
             },
         );

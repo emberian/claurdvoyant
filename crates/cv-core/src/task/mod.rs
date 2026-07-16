@@ -25,6 +25,8 @@ pub mod model;
 pub mod project;
 pub mod reduce;
 pub mod store;
+#[cfg(not(target_family = "wasm"))]
+pub mod verify;
 
 pub use model::{
     harness_family, IndependenceCheck, MergeFailure, Revision, RevisionState, TaskEvent,

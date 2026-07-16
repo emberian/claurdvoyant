@@ -638,6 +638,7 @@ fn validate_revision(revision: &Revision) -> Result<(), ReduceError> {
     }
     require_nonempty("revision.branch", &revision.branch)?;
     require_nonempty("revision.upstream", &revision.upstream)?;
+    require_git_oid("revision.base", &revision.base)?;
     require_git_oid("revision.review_sha", &revision.review_sha)?;
     require_patch_id("revision.patch_id", &revision.patch_id)?;
     if let Some(reviewer) = &revision.reviewer {
@@ -764,9 +765,11 @@ mod tests {
             branch: format!("task/demo-r{n}"),
             worktree: None,
             upstream: "origin/main".into(),
+            base: sha('0'),
             review_sha: sha(char::from_digit(n, 10).unwrap()),
             patch_id: sha('b'),
             reviewer: reviewer.map(String::from),
+            session_ref: None,
         }
     }
 
