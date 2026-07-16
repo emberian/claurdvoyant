@@ -187,6 +187,203 @@ fn initialize_result() -> Value {
 }
 
 fn tool_list() -> Value {
+    // Two json! blocks concatenated: one macro invocation over the whole list blows the macro
+    // recursion limit.
+    let mut tools = base_tool_list();
+    if let (Value::Array(list), Value::Array(tasks)) = (&mut tools, task_tool_list()) {
+        list.extend(tasks);
+    }
+    tools
+}
+
+
+fn task_tool_list() -> Value {
+    json!([
+        {
+            "name": "task_open",
+            "description": "Open a durable fleet task (dispatch object). Unlike a board message, a task has a lifecycle: open → claimed → done, with optional code revisions whose landing is OBSERVED from git by cv — an agent saying 'landed' never counts. Returns the new task.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "title": { "type": "string", "description": "Short imperative title." },
+                    "body": { "type": "string", "description": "Details / acceptance criteria." },
+                    "repo": { "type": "string", "description": "Absolute path of the git repo the code work happens in (enables propose/verify/debt)." },
+                    "issue": { "type": "string", "description": "External issue/work handle, free-form." },
+                    "channel": { "type": "string", "description": "Board channel for task notifications (default 'tasks')." },
+                    "assignee": { "type": "string", "description": "Endpoint this task is assigned to, if pre-assigned." },
+                    "from": { "type": "string", "description": "Who's opening. Default 'agent'." }
+                },
+                "required": ["title"]
+            }
+        },
+        {
+            "name": "task_list",
+            "description": "List fleet tasks (non-terminal by default). Filter by effective state (open|claimed|awaiting_review|ready|merged_local|landed|done|abandoned|superseded), assignee, or repo.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "state": { "type": "string", "description": "Effective-state filter." },
+                    "assignee": { "type": "string", "description": "Assignee endpoint filter." },
+                    "repo": { "type": "string", "description": "Repo path filter." },
+                    "all": { "type": "boolean", "description": "Include terminal tasks (default false)." }
+                }
+            }
+        },
+        {
+            "name": "task_show",
+            "description": "Show one task's full projection: state, revisions, review evidence, landed observation, notes, recorded issues.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string", "description": "Task id (unique prefix ok)." }
+                },
+                "required": ["id"]
+            }
+        },
+        {
+            "name": "task_claim",
+            "description": "Claim an open task for yourself. First writer wins — a durable, race-free claim (losers get a rejection, not a duplicate).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string", "description": "Task id (prefix ok)." },
+                    "from": { "type": "string", "description": "Your endpoint. Default 'agent'." }
+                },
+                "required": ["id", "from"]
+            }
+        },
+        {
+            "name": "task_release",
+            "description": "Release your claim on a task back to open.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string", "description": "Task id (prefix ok)." },
+                    "from": { "type": "string", "description": "Your endpoint. Default 'agent'." }
+                },
+                "required": ["id", "from"]
+            }
+        },
+        {
+            "name": "task_note",
+            "description": "Record a progress note on a task (never changes state).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string", "description": "Task id (prefix ok)." },
+                    "text": { "type": "string", "description": "The note." },
+                    "session_ref": { "type": "string", "description": "Your cv session id, for provenance." },
+                    "from": { "type": "string", "description": "Your endpoint. Default 'agent'." }
+                },
+                "required": ["id", "text"]
+            }
+        },
+        {
+            "name": "task_done",
+            "description": "Complete a NON-CODE task, optionally pointing at observable evidence. Refused while a code revision is live — land it (task_verify observes that) or abandon the task.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string", "description": "Task id (prefix ok)." },
+                    "observed": { "type": "string", "description": "Pointer to observable evidence (URL, path, session id)." },
+                    "from": { "type": "string", "description": "Your endpoint. Default 'agent'." }
+                },
+                "required": ["id"]
+            }
+        },
+        {
+            "name": "task_abandon",
+            "description": "Kill a task (always allowed on a non-terminal task, live revision or not).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string", "description": "Task id (prefix ok)." },
+                    "reason": { "type": "string", "description": "Why." },
+                    "from": { "type": "string", "description": "Your endpoint. Default 'agent'." }
+                },
+                "required": ["id"]
+            }
+        },
+        {
+            "name": "task_propose",
+            "description": "Propose a reviewed code revision on a task: cv resolves the branch tip and computes the whole-branch range patch-id FROM GIT ITSELF — revision identity is observed, never typed. Re-proposing supersedes the prior revision (the only cure for a refute).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string", "description": "Task id (prefix ok)." },
+                    "branch": { "type": "string", "description": "Branch whose tip is the review sha." },
+                    "upstream": { "type": "string", "description": "Ref the revision must reach to count as landed (default 'origin/main')." },
+                    "sha": { "type": "string", "description": "Optional: assert this sha is the branch tip (refused if not)." },
+                    "worktree": { "type": "string", "description": "Worktree path, if the branch lives in one." },
+                    "reviewer": { "type": "string", "description": "Reviewer endpoint bound to this revision (else the first verdict binds)." },
+                    "session_ref": { "type": "string", "description": "YOUR cv session id — the author side of the reviewer-independence check." },
+                    "from": { "type": "string", "description": "Your endpoint. Default 'agent'." }
+                },
+                "required": ["id", "branch"]
+            }
+        },
+        {
+            "name": "task_pass",
+            "description": "Record a review PASS on the current revision (you must be its active reviewer). Pass your cv session id so the advisory cross-family independence check can read your harness — same-family review is recorded and warned about, never blocked.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string", "description": "Task id (prefix ok)." },
+                    "session": { "type": "string", "description": "Your cv session id (reviewer side of the independence check)." },
+                    "from": { "type": "string", "description": "Your reviewer endpoint. Default 'agent'." }
+                },
+                "required": ["id", "from"]
+            }
+        },
+        {
+            "name": "task_refute",
+            "description": "Record a review REFUTE on the current revision — terminal for that revision; the author must propose a new revision to continue. A refute cannot be cured by a later pass.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string", "description": "Task id (prefix ok)." },
+                    "session": { "type": "string", "description": "Your cv session id." },
+                    "from": { "type": "string", "description": "Your reviewer endpoint. Default 'agent'." }
+                },
+                "required": ["id", "from"]
+            }
+        },
+        {
+            "name": "task_verify",
+            "description": "Run cv's git verifier: for Ready/MergedLocal revisions it OBSERVES whether the reviewed patch is on its upstream (ancestry or patch-id equivalence) and records Landed/MergedLocal/findings. This is the ONLY way landing state changes — agents cannot assert it.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string", "description": "Task id (prefix ok). Omit to verify all tasks." },
+                    "fetch": { "type": "boolean", "description": "git fetch the upstream's remote first (default false)." }
+                }
+            }
+        },
+        {
+            "name": "task_inbox",
+            "description": "What needs `who`: tasks assigned to them, tasks they claimed, revisions awaiting their review, and their reviewed-but-unlanded work.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "who": { "type": "string", "description": "Endpoint to compute the inbox for." }
+                },
+                "required": ["who"]
+            }
+        },
+        {
+            "name": "task_debt",
+            "description": "The honest debt view: reviewed-but-unlanded work grouped by repo, oldest first, with recorded findings. If it's not empty, something finished isn't on main yet.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "repo": { "type": "string", "description": "Only this repo path." }
+                }
+            }
+        }
+    ])
+}
+
+fn base_tool_list() -> Value {
     json!([
         {
             "name": "list_sessions",
@@ -535,6 +732,20 @@ fn call_tool(name: &str, args: &Value) -> anyhow::Result<String> {
         "board_who" => board_who(args),
         "board_heartbeat" => board_heartbeat(args),
         "board_ack" => board_ack(args),
+        "task_open" => task_open(args),
+        "task_list" => task_list(args),
+        "task_show" => task_show(args),
+        "task_claim" => task_simple(args, |from| cv_core::task::TaskEventKind::Claimed { assignee: from }),
+        "task_release" => task_simple(args, |_| cv_core::task::TaskEventKind::Released {}),
+        "task_note" => task_note(args),
+        "task_done" => task_done(args),
+        "task_abandon" => task_abandon(args),
+        "task_propose" => task_propose(args),
+        "task_pass" => task_pass(args),
+        "task_refute" => task_refute(args),
+        "task_verify" => task_verify(args),
+        "task_inbox" => task_inbox(args),
+        "task_debt" => task_debt(args),
         "prune_session" => prune_session(args),
         "prune_retrieve" => prune_retrieve(args),
         "doctor" => doctor(args),
@@ -808,6 +1019,280 @@ fn board_ack(args: &Value) -> anyhow::Result<String> {
     let message_id = arg_str(args, "message_id").context("`message_id` is required")?;
     let msg = cv_core::board::ack(channel, from, message_id)?;
     Ok(serde_json::to_string_pretty(&msg)?)
+}
+
+// ---------------------------------------------------------------------------
+// task_* tools — thin wrappers over cv_core::task. Law 1 note: there is NO tool
+// that appends MergedLocal/Landed; task_verify runs the git verifier, whose
+// events go through the store's verifier-only path.
+// ---------------------------------------------------------------------------
+
+/// Replay the default task store; error on unreadable log, surface warnings inline.
+fn task_replay() -> anyhow::Result<(cv_core::task::ReplayOutcome, Vec<String>)> {
+    let outcome = cv_core::task::replay()?;
+    let warnings = outcome.warnings.clone();
+    Ok((outcome, warnings))
+}
+
+/// Resolve an id prefix against the replayed model.
+fn task_resolve(outcome: &cv_core::task::ReplayOutcome, prefix: &str) -> anyhow::Result<String> {
+    cv_core::task::resolve_id(&outcome.model, prefix)
+        .map(String::from)
+        .map_err(|e| anyhow::anyhow!(e))
+}
+
+/// Append an agent event + board notification; return a JSON report of the event and new state.
+fn task_append(
+    task_id: Option<&str>,
+    from: &str,
+    kind: cv_core::task::TaskEventKind,
+    mut warnings: Vec<String>,
+) -> anyhow::Result<String> {
+    let store = cv_core::task::TaskStore::default_store();
+    let event = store.append_agent_event(cv_core::task::new_event(task_id, from, kind))?;
+    let outcome = store.replay()?;
+    let proj = outcome.model.tasks.get(&event.task_id);
+    let channel = proj.map(|t| t.channel.clone()).unwrap_or_else(|| "tasks".into());
+    if let Err(e) = cv_core::task::notify_board(&event, &channel) {
+        warnings.push(format!("board notification failed (task state is durable): {e}"));
+    }
+    Ok(serde_json::to_string_pretty(&json!({
+        "event": event,
+        "effective_state": proj.map(cv_core::task::effective_display),
+        "warnings": warnings,
+    }))?)
+}
+
+fn task_open(args: &Value) -> anyhow::Result<String> {
+    let title = arg_str(args, "title").context("`title` is required")?.to_string();
+    let repo = match arg_str(args, "repo") {
+        Some(r) => Some(
+            std::path::Path::new(r)
+                .canonicalize()
+                .with_context(|| format!("repo {r} not found"))?,
+        ),
+        None => None,
+    };
+    task_append(
+        None,
+        arg_str(args, "from").unwrap_or("agent"),
+        cv_core::task::TaskEventKind::Opened {
+            title,
+            body: arg_str(args, "body").unwrap_or("").to_string(),
+            repo,
+            issue: arg_str(args, "issue").map(String::from),
+            channel: arg_str(args, "channel").unwrap_or("tasks").to_string(),
+            assignee: arg_str(args, "assignee").map(String::from),
+        },
+        Vec::new(),
+    )
+}
+
+fn task_list(args: &Value) -> anyhow::Result<String> {
+    let (outcome, warnings) = task_replay()?;
+    let filter = cv_core::task::TaskFilter {
+        state: arg_str(args, "state").map(String::from),
+        assignee: arg_str(args, "assignee").map(String::from),
+        repo: arg_str(args, "repo").map(std::path::PathBuf::from),
+        include_terminal: args.get("all").and_then(Value::as_bool).unwrap_or(false),
+    };
+    let tasks: Vec<Value> = cv_core::task::list(&outcome.model, &filter)
+        .into_iter()
+        .map(|t| {
+            json!({
+                "id": t.task_id,
+                "title": t.title,
+                "effective_state": cv_core::task::effective_display(t),
+                "assignee": t.assignee,
+                "repo": t.repo,
+                "channel": t.channel,
+            })
+        })
+        .collect();
+    Ok(serde_json::to_string_pretty(&json!({ "tasks": tasks, "warnings": warnings }))?)
+}
+
+fn task_show(args: &Value) -> anyhow::Result<String> {
+    let (outcome, warnings) = task_replay()?;
+    let id = task_resolve(&outcome, arg_str(args, "id").context("`id` is required")?)?;
+    Ok(serde_json::to_string_pretty(&json!({
+        "task": outcome.model.tasks[&id],
+        "effective_state": cv_core::task::effective_display(&outcome.model.tasks[&id]),
+        "warnings": warnings,
+    }))?)
+}
+
+/// Shared shape for claim/release: resolve id, build the kind from `from`, append.
+fn task_simple(
+    args: &Value,
+    kind: impl FnOnce(String) -> cv_core::task::TaskEventKind,
+) -> anyhow::Result<String> {
+    let (outcome, warnings) = task_replay()?;
+    let id = task_resolve(&outcome, arg_str(args, "id").context("`id` is required")?)?;
+    let from = arg_str(args, "from").unwrap_or("agent").to_string();
+    task_append(Some(&id), &from.clone(), kind(from), warnings)
+}
+
+fn task_note(args: &Value) -> anyhow::Result<String> {
+    let (outcome, warnings) = task_replay()?;
+    let id = task_resolve(&outcome, arg_str(args, "id").context("`id` is required")?)?;
+    task_append(
+        Some(&id),
+        arg_str(args, "from").unwrap_or("agent"),
+        cv_core::task::TaskEventKind::Noted {
+            text: arg_str(args, "text").context("`text` is required")?.to_string(),
+            session_ref: arg_str(args, "session_ref").map(String::from),
+        },
+        warnings,
+    )
+}
+
+fn task_done(args: &Value) -> anyhow::Result<String> {
+    let (outcome, warnings) = task_replay()?;
+    let id = task_resolve(&outcome, arg_str(args, "id").context("`id` is required")?)?;
+    task_append(
+        Some(&id),
+        arg_str(args, "from").unwrap_or("agent"),
+        cv_core::task::TaskEventKind::Done { observed: arg_str(args, "observed").map(String::from) },
+        warnings,
+    )
+}
+
+fn task_abandon(args: &Value) -> anyhow::Result<String> {
+    let (outcome, warnings) = task_replay()?;
+    let id = task_resolve(&outcome, arg_str(args, "id").context("`id` is required")?)?;
+    task_append(
+        Some(&id),
+        arg_str(args, "from").unwrap_or("agent"),
+        cv_core::task::TaskEventKind::Abandoned {
+            reason: arg_str(args, "reason").unwrap_or("no reason given").to_string(),
+        },
+        warnings,
+    )
+}
+
+fn task_propose(args: &Value) -> anyhow::Result<String> {
+    let (outcome, warnings) = task_replay()?;
+    let id = task_resolve(&outcome, arg_str(args, "id").context("`id` is required")?)?;
+    let t = &outcome.model.tasks[&id];
+    let repo = t
+        .repo
+        .clone()
+        .context("task has no repo recorded; open it with `repo` to propose revisions")?;
+    let revision = cv_core::task::verify::observe_revision(
+        &repo,
+        arg_str(args, "branch").context("`branch` is required")?,
+        arg_str(args, "upstream").unwrap_or("origin/main"),
+        arg_str(args, "sha"),
+        t.revisions.len() as u32 + 1,
+        arg_str(args, "worktree").map(std::path::PathBuf::from),
+        arg_str(args, "reviewer").map(String::from),
+        arg_str(args, "session_ref").map(String::from),
+    )?;
+    task_append(
+        Some(&id),
+        arg_str(args, "from").unwrap_or("agent"),
+        cv_core::task::TaskEventKind::RevisionProposed { revision },
+        warnings,
+    )
+}
+
+fn task_pass(args: &Value) -> anyhow::Result<String> {
+    let (outcome, mut warnings) = task_replay()?;
+    let id = task_resolve(&outcome, arg_str(args, "id").context("`id` is required")?)?;
+    let session = arg_str(args, "session");
+    let independence = cv_core::task::independence_check(&outcome.model.tasks[&id], session);
+    if let Some(w) = cv_core::task::independence_warning(independence.as_ref()) {
+        warnings.push(w);
+    }
+    let from = arg_str(args, "from").unwrap_or("agent").to_string();
+    task_append(
+        Some(&id),
+        &from,
+        cv_core::task::TaskEventKind::ReviewPassed {
+            reviewer: from.clone(),
+            session_ref: session.map(String::from),
+            independence,
+        },
+        warnings,
+    )
+}
+
+fn task_refute(args: &Value) -> anyhow::Result<String> {
+    let (outcome, warnings) = task_replay()?;
+    let id = task_resolve(&outcome, arg_str(args, "id").context("`id` is required")?)?;
+    let from = arg_str(args, "from").unwrap_or("agent").to_string();
+    task_append(
+        Some(&id),
+        &from,
+        cv_core::task::TaskEventKind::ReviewRefuted {
+            reviewer: from.clone(),
+            session_ref: arg_str(args, "session").map(String::from),
+        },
+        warnings,
+    )
+}
+
+fn task_verify(args: &Value) -> anyhow::Result<String> {
+    let store = cv_core::task::TaskStore::default_store();
+    let ids: Option<Vec<String>> = match arg_str(args, "id") {
+        Some(prefix) => {
+            let (outcome, _) = task_replay()?;
+            Some(vec![task_resolve(&outcome, prefix)?])
+        }
+        None => None,
+    };
+    let fetch = args.get("fetch").and_then(Value::as_bool).unwrap_or(false);
+    let (appended, warnings) = cv_core::task::verify::run_verify(&store, ids.as_deref(), fetch)?;
+    Ok(serde_json::to_string_pretty(&json!({
+        "observed": appended,
+        "warnings": warnings,
+    }))?)
+}
+
+fn task_inbox(args: &Value) -> anyhow::Result<String> {
+    let (outcome, warnings) = task_replay()?;
+    let who = arg_str(args, "who").context("`who` is required")?;
+    let entries: Vec<Value> = cv_core::task::inbox(&outcome.model, who)
+        .into_iter()
+        .map(|e| {
+            json!({
+                "id": e.task.task_id,
+                "title": e.task.title,
+                "reason": e.reason,
+                "effective_state": cv_core::task::effective_display(e.task),
+            })
+        })
+        .collect();
+    Ok(serde_json::to_string_pretty(&json!({ "inbox": entries, "warnings": warnings }))?)
+}
+
+fn task_debt(args: &Value) -> anyhow::Result<String> {
+    let (outcome, warnings) = task_replay()?;
+    let want = arg_str(args, "repo").map(std::path::PathBuf::from);
+    let groups = cv_core::task::debt(&outcome.model);
+    let mut rows = Vec::new();
+    for (repo, entries) in &groups {
+        if let Some(want) = &want {
+            if repo.as_deref() != Some(want.as_path()) {
+                continue;
+            }
+        }
+        for e in entries {
+            rows.push(json!({
+                "id": e.task.task_id,
+                "title": e.task.title,
+                "repo": repo,
+                "revision": e.revision_n,
+                "branch": e.branch,
+                "upstream": e.upstream,
+                "state": e.state,
+                "since": e.since,
+                "issues": e.issues,
+            }));
+        }
+    }
+    Ok(serde_json::to_string_pretty(&json!({ "debt": rows, "warnings": warnings }))?)
 }
 
 /// Build a JSON view of a `Lease` from its public fields (the struct isn't directly Serialize).

@@ -402,21 +402,10 @@ pub(crate) fn cmd_task(action: TaskCmd) -> Result<()> {
         TaskCmd::Pass { id, session, from } => {
             let outcome = replay_loud()?;
             let id = resolve(&outcome.model, &id)?.to_string();
-            let independence = independence_check(&outcome.model.tasks[&id], session.as_deref());
-            if let Some(check) = &independence {
-                match check.independent {
-                    Some(true) => {}
-                    Some(false) => eprintln!(
-                        "⚠ SAME-FAMILY REVIEW: author and reviewer are both {} — this pass is not an independent verdict (recorded, not blocked)",
-                        check.reviewer_family.as_deref().unwrap_or("?")
-                    ),
-                    None => eprintln!(
-                        "⚠ independence undetermined (author {:?}, reviewer {:?}) — recorded, not blocked",
-                        check.author_family, check.reviewer_family
-                    ),
-                }
-            } else {
-                eprintln!("⚠ no --session given: reviewer independence not checked (recorded as unknown)");
+            let independence =
+                task::independence_check(&outcome.model.tasks[&id], session.as_deref());
+            if let Some(w) = task::independence_warning(independence.as_ref()) {
+                eprintln!("⚠ {w}");
             }
             append_and_report(
                 Some(&id),
@@ -501,53 +490,27 @@ pub(crate) fn cmd_task(action: TaskCmd) -> Result<()> {
     }
 }
 
-/// Advisory independence check (law 2): read harness families from cv's catalog. Never blocks.
-fn independence_check(
-    t: &TaskProjection,
-    reviewer_session: Option<&str>,
-) -> Option<cv_core::task::IndependenceCheck> {
-    let reviewer_session = reviewer_session?;
-    let family_of = |session_id: &str| -> Option<String> {
-        let (sref, _) = cv_core::find_cheap(session_id, None).ok()??;
-        cv_core::task::harness_family(sref.harness).map(String::from)
-    };
-    let reviewer_family = family_of(reviewer_session);
-    let author_family = t
-        .current_revision()
-        .and_then(|r| r.revision.session_ref.as_deref())
-        .and_then(family_of);
-    let independent = match (&author_family, &reviewer_family) {
-        (Some(a), Some(r)) => Some(a != r),
-        _ => None,
-    };
-    Some(cv_core::task::IndependenceCheck { author_family, reviewer_family, independent })
-}
-
-/// `cv task verify` — the observation pass. Filled in with the landed predicate; see verify.rs.
+/// `cv task verify` — the observation pass, shared with MCP/cvd via `verify::run_verify`.
 fn cmd_verify(id: Option<String>, all: bool, fetch: bool) -> Result<()> {
     if id.is_none() && !all {
         bail!("pass a task id or --all");
     }
-    let outcome = replay_loud()?;
-    let ids: Vec<String> = match &id {
-        Some(prefix) => vec![resolve(&outcome.model, prefix)?.to_string()],
-        None => outcome.model.tasks.keys().cloned().collect(),
-    };
     let store = TaskStore::default_store();
-    let mut observed = 0usize;
-    for tid in ids {
-        let t = &outcome.model.tasks[&tid];
-        let events = cv_core::task::verify::verify_task(t, fetch)?;
-        for kind in events {
-            let ev = store.append_verifier_event(task::new_event(Some(&tid), "cv-verify", kind))?;
-            if let Err(e) = task::notify_board(&ev, &t.channel) {
-                eprintln!("⚠ board notification failed: {e}");
-            }
-            println!("✦ observed {} on {}", ev.kind.tag(), short_id(&tid));
-            observed += 1;
+    let ids: Option<Vec<String>> = match &id {
+        Some(prefix) => {
+            let outcome = replay_loud()?;
+            Some(vec![resolve(&outcome.model, prefix)?.to_string()])
         }
+        None => None,
+    };
+    let (appended, warnings) = cv_core::task::verify::run_verify(&store, ids.as_deref(), fetch)?;
+    for w in &warnings {
+        eprintln!("⚠ {w}");
     }
-    if observed == 0 {
+    for ev in &appended {
+        println!("✦ observed {} on {}", ev.kind.tag(), short_id(&ev.task_id));
+    }
+    if appended.is_empty() {
         println!("(nothing new observed)");
     }
     Ok(())

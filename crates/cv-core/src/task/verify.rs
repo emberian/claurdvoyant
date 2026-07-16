@@ -308,6 +308,49 @@ pub fn verify_task(task: &TaskProjection, fetch: bool) -> Result<Vec<TaskEventKi
     Ok(Vec::new())
 }
 
+/// Run the verifier over `ids` (or every task when `ids` is `None`) against `store`: verify each
+/// task, append what was observed, post board notifications. Returns the appended events plus
+/// non-fatal warnings. The shared engine behind `cv task verify`, the MCP `task_verify` tool, and
+/// cvd's periodic pass.
+pub fn run_verify(
+    store: &super::store::TaskStore,
+    ids: Option<&[String]>,
+    fetch: bool,
+) -> Result<(Vec<super::model::TaskEvent>, Vec<String>)> {
+    let outcome = store.replay()?;
+    let mut warnings = outcome.warnings.clone();
+    let all_ids: Vec<String> = match ids {
+        Some(ids) => ids.to_vec(),
+        None => outcome.model.tasks.keys().cloned().collect(),
+    };
+    let mut appended = Vec::new();
+    for tid in all_ids {
+        let Some(task) = outcome.model.tasks.get(&tid) else {
+            warnings.push(format!("unknown task {tid}"));
+            continue;
+        };
+        let kinds = match verify_task(task, fetch) {
+            Ok(kinds) => kinds,
+            Err(e) => {
+                warnings.push(format!("verify {tid}: {e}"));
+                continue;
+            }
+        };
+        for kind in kinds {
+            let ev = store.append_verifier_event(super::store::new_event(
+                Some(&tid),
+                "cv-verify",
+                kind,
+            ))?;
+            if let Err(e) = super::notify_board(&ev, &task.channel) {
+                warnings.push(format!("board notification failed: {e}"));
+            }
+            appended.push(ev);
+        }
+    }
+    Ok((appended, warnings))
+}
+
 /// Route an anomaly to the state-legal issue kind: `MergeFailed`/`SourceUnavailable` only apply
 /// from `Ready`; from `MergedLocal` the grammar's issue kind is `ReconcileFailed`.
 fn merge_or_reconcile(state: RevisionState, detail: String) -> TaskEventKind {

@@ -42,6 +42,51 @@ pub use project::{
 };
 pub use store::{new_event, replay, ReplayOutcome, TaskStore};
 
+/// Advisory reviewer-independence check (law 2): read harness families from cv's catalog for the
+/// reviewer's session and the current revision's recorded author session. Never blocks anything —
+/// the result is recorded on the pass event and surfaced as a warning by the front-ends.
+pub fn independence_check(
+    t: &reduce::TaskProjection,
+    reviewer_session: Option<&str>,
+) -> Option<IndependenceCheck> {
+    let reviewer_session = reviewer_session?;
+    let family_of = |session_id: &str| -> Option<String> {
+        let (sref, _) = crate::find_cheap(session_id, None).ok()??;
+        harness_family(sref.harness).map(String::from)
+    };
+    let reviewer_family = family_of(reviewer_session);
+    let author_family = t
+        .current_revision()
+        .and_then(|r| r.revision.session_ref.as_deref())
+        .and_then(family_of);
+    let independent = match (&author_family, &reviewer_family) {
+        (Some(a), Some(r)) => Some(a != r),
+        _ => None,
+    };
+    Some(IndependenceCheck { author_family, reviewer_family, independent })
+}
+
+/// Human-readable advisory line for an independence result (shared CLI/MCP wording).
+pub fn independence_warning(check: Option<&IndependenceCheck>) -> Option<String> {
+    match check {
+        None => Some(
+            "no reviewer session given: reviewer independence not checked (recorded as unknown)"
+                .to_string(),
+        ),
+        Some(c) => match c.independent {
+            Some(true) => None,
+            Some(false) => Some(format!(
+                "SAME-FAMILY REVIEW: author and reviewer are both {} — this pass is not an independent verdict (recorded, not blocked)",
+                c.reviewer_family.as_deref().unwrap_or("?")
+            )),
+            None => Some(format!(
+                "independence undetermined (author {:?}, reviewer {:?}) — recorded, not blocked",
+                c.author_family, c.reviewer_family
+            )),
+        },
+    }
+}
+
 /// Best-effort board notification for an appended task event (never called while the store lock
 /// is held — the append has already returned). Failures are returned for the caller to warn
 /// about, never to fail the operation.
