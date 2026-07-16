@@ -36,9 +36,11 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
-#[cfg(not(target_family = "wasm"))]
-use fs4::fs_std::FileExt;
 use serde::{Deserialize, Serialize};
+
+/// Per-channel advisory lock: a [`crate::lockfile::FileLock`] on the `<channel>.lock` file. See
+/// that module for the crash-safety and never-unlink rationale.
+use crate::lockfile::FileLock as ChannelLock;
 
 /// Root dir for board channels: `$CLUSTERVISION_HOME/board` (or `~/.clustervision/board`).
 pub fn board_dir() -> PathBuf {
@@ -100,33 +102,6 @@ fn channel_path(dir: &Path, channel: &str) -> PathBuf {
 /// Path to a channel's lockfile inside `dir`.
 fn lock_path(dir: &Path, channel: &str) -> PathBuf {
     dir.join(format!("{}.lock", slug(channel)))
-}
-
-/// RAII guard for the per-channel advisory lock: an OS `flock`-style exclusive lock on the
-/// `<channel>.lock` file. Closing the file (drop) releases the lock, and the kernel releases it on
-/// process death too — so a crashed holder can never wedge the channel, and there is no stale-lock
-/// steal path (the old `remove_file` + re-create dance could crown two winners and cascade-steal a
-/// *live* holder's lock). The lockfile itself is never removed: unlinking it would let the next
-/// locker open a fresh inode and lock *that*, silently breaking mutual exclusion.
-struct ChannelLock {
-    _file: File,
-}
-
-impl ChannelLock {
-    /// Acquire the lock, blocking until the current holder (if any) releases it.
-    fn acquire(path: PathBuf) -> Result<ChannelLock> {
-        let file = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&path)
-            .with_context(|| format!("creating board lockfile {}", path.display()))?;
-        // wasm32 has no file locking (and no cross-process concurrency): the open alone suffices.
-        #[cfg(not(target_family = "wasm"))]
-        file.lock_exclusive()
-            .with_context(|| format!("locking board lockfile {}", path.display()))?;
-        Ok(ChannelLock { _file: file })
-    }
 }
 
 /// Post a message to `channel` (in the default [`board_dir`]). See [`post_to_dir`].

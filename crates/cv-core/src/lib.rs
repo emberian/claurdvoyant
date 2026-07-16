@@ -21,6 +21,7 @@ pub mod html;
 pub mod ingest;
 pub mod ir;
 pub mod lazy;
+pub(crate) mod lockfile;
 pub mod loom;
 pub mod offsets;
 pub mod prune;
