@@ -297,8 +297,9 @@ impl RevisionState {
 }
 
 /// Model family behind a harness, for the advisory independence check. Multi-model harnesses
-/// (IDE extensions, local runners) return `None` — undeterminable at harness granularity.
-/// Model-granular resolution (per-message `model` field) is a planned refinement.
+/// (IDE extensions, local runners) return `None` — undeterminable at harness granularity;
+/// `task::independence_check` then falls back to reading the session's per-message `model` ids
+/// and mapping them through [`model_family`].
 pub fn harness_family(harness: Harness) -> Option<&'static str> {
     match harness {
         Harness::Claude | Harness::ClaudeApp | Harness::ClaudeExport => Some("anthropic"),
@@ -319,6 +320,33 @@ pub fn harness_family(harness: Harness) -> Option<&'static str> {
         | Harness::Goose
         | Harness::Zed => None,
     }
+}
+
+/// Model family from a model **id** (the per-message `model` field), for sessions whose harness
+/// is multi-model. Dumb case-insensitive prefix match on the major providers' id conventions;
+/// unknown ids are `None` — recorded as undetermined, never guessed.
+pub fn model_family(model_id: &str) -> Option<&'static str> {
+    let m = model_id.trim().to_ascii_lowercase();
+    const PREFIXES: [(&str, &str); 8] = [
+        ("claude", "anthropic"),
+        ("gpt", "openai"),
+        ("gemini", "google"),
+        ("grok", "xai"),
+        ("qwen", "alibaba"),
+        ("kimi", "moonshot"),
+        ("deepseek", "deepseek"),
+        ("llama", "meta"),
+    ];
+    for (prefix, family) in PREFIXES {
+        if m.starts_with(prefix) {
+            return Some(family);
+        }
+    }
+    // OpenAI's o-series: "o1", "o3-mini", "o4" — an 'o' followed by a digit.
+    if m.starts_with('o') && m.as_bytes().get(1).is_some_and(u8::is_ascii_digit) {
+        return Some("openai");
+    }
+    None
 }
 
 #[cfg(test)]
@@ -471,5 +499,24 @@ mod tests {
         assert_eq!(harness_family(Harness::Gemini), Some("google"));
         assert_eq!(harness_family(Harness::Cursor), None);
         assert_eq!(harness_family(Harness::Goose), None);
+    }
+
+    #[test]
+    fn model_family_maps_id_prefixes_and_declines_unknowns() {
+        assert_eq!(model_family("claude-sonnet-4-5-20250929"), Some("anthropic"));
+        assert_eq!(model_family("Claude-Opus-4"), Some("anthropic"), "case-insensitive");
+        assert_eq!(model_family("  gpt-5.1-codex "), Some("openai"), "trimmed");
+        assert_eq!(model_family("o3-mini"), Some("openai"), "o-series");
+        assert_eq!(model_family("o1"), Some("openai"));
+        assert_eq!(model_family("gemini-2.5-pro"), Some("google"));
+        assert_eq!(model_family("grok-4"), Some("xai"));
+        assert_eq!(model_family("qwen3-coder-plus"), Some("alibaba"));
+        assert_eq!(model_family("kimi-k2"), Some("moonshot"));
+        assert_eq!(model_family("deepseek-v3"), Some("deepseek"));
+        assert_eq!(model_family("llama-3.3-70b"), Some("meta"));
+        // Not guessed: bare 'o' words, empty, unknown vendors.
+        assert_eq!(model_family("opus"), None, "'o' + non-digit is not o-series");
+        assert_eq!(model_family(""), None);
+        assert_eq!(model_family("mistral-large"), None);
     }
 }

@@ -2,7 +2,7 @@
 //! the worktree-debt view. Pure functions over the model — no I/O.
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -211,6 +211,53 @@ pub fn age_short(since: DateTime<Utc>, now: DateTime<Utc>) -> String {
         3_600..=86_399 => format!("{}h", secs / 3_600),
         _ => format!("{}d", secs / 86_400),
     }
+}
+
+/// Non-terminal tasks in `repo` whose CURRENT revision carries `branch` (or, when `worktree` is
+/// given, the same worktree path). Pure scan for the propose-time collision warning: two live
+/// tasks pointing at one branch usually means two agents about to trample each other.
+pub fn branch_carriers<'m>(
+    model: &'m TaskReadModel,
+    repo: &Path,
+    branch: &str,
+    worktree: Option<&Path>,
+) -> Vec<&'m TaskProjection> {
+    model
+        .tasks
+        .values()
+        .filter(|t| !t.state.is_terminal())
+        .filter(|t| t.repo.as_deref() == Some(repo))
+        .filter(|t| {
+            t.current_revision().is_some_and(|r| {
+                r.revision.branch == branch
+                    || (worktree.is_some() && r.revision.worktree.as_deref() == worktree)
+            })
+        })
+        .collect()
+}
+
+/// Advisory propose-time collision warnings (never a block): one line per OTHER non-terminal
+/// task whose current revision already carries this revision's branch or worktree in `repo`.
+/// Shared by the CLI and MCP propose paths; callers sanitize at render.
+pub fn propose_collision_warnings(
+    model: &TaskReadModel,
+    task_id: &str,
+    repo: &Path,
+    revision: &super::model::Revision,
+) -> Vec<String> {
+    branch_carriers(model, repo, &revision.branch, revision.worktree.as_deref())
+        .into_iter()
+        .filter(|t| t.task_id != task_id)
+        .map(|t| {
+            format!(
+                "branch {} is already carried by task {} ({}) — two tasks proposing one branch \
+                 usually means a collision",
+                revision.branch,
+                &t.task_id[..t.task_id.len().min(8)],
+                t.title
+            )
+        })
+        .collect()
 }
 
 /// Resolve a task-id prefix (short id) to the unique matching task id.
@@ -584,6 +631,62 @@ mod tests {
             "2026-07-15T00:00:00+00:00",
             "unlanded work ages from the pass, not the propose"
         );
+    }
+
+    #[test]
+    fn branch_carriers_flags_live_same_branch_same_repo_only() {
+        let mut log = Log::new();
+        let rev_on = |branch: &str, worktree: Option<&str>| Revision {
+            n: 1,
+            branch: branch.into(),
+            worktree: worktree.map(PathBuf::from),
+            upstream: "origin/main".into(),
+            base: sha('0'),
+            review_sha: sha('1'),
+            patch_id: sha('b'),
+            reviewer: None,
+            session_ref: None,
+        };
+        let propose = |log: &mut Log, task: &str, branch: &str, wt: Option<&str>| {
+            log.push(
+                task,
+                "agent:author",
+                TaskEventKind::RevisionProposed { revision: rev_on(branch, wt) },
+            );
+        };
+
+        let carrier = log.open("h", Some("/tmp/r"), None);
+        propose(&mut log, &carrier, "task/x", Some("/wt/x"));
+        // Same branch but a DIFFERENT repo: not a collision.
+        let other_repo = log.open("h", Some("/tmp/other"), None);
+        propose(&mut log, &other_repo, "task/x", None);
+        // Same repo, different branch, same WORKTREE: still a collision.
+        let wt_clash = log.open("h", Some("/tmp/r"), None);
+        propose(&mut log, &wt_clash, "task/y", Some("/wt/x"));
+        // Same branch, same repo, but the task is terminal: not a collision.
+        let dead = log.open("h", Some("/tmp/r"), None);
+        propose(&mut log, &dead, "task/x", None);
+        log.push(&dead, "h", TaskEventKind::Abandoned { reason: "gone".into() });
+
+        let model = log.model();
+        let repo = PathBuf::from("/tmp/r");
+        let by_branch = branch_carriers(&model, &repo, "task/x", None);
+        assert_eq!(by_branch.len(), 1);
+        assert_eq!(by_branch[0].task_id, carrier);
+
+        let by_worktree = branch_carriers(&model, &repo, "task/z", Some(Path::new("/wt/x")));
+        let ids: Vec<&str> = by_worktree.iter().map(|t| t.task_id.as_str()).collect();
+        assert!(ids.contains(&carrier.as_str()) && ids.contains(&wt_clash.as_str()), "{ids:?}");
+
+        // The warning builder excludes the proposing task itself and names the carrier.
+        let proposing = log.open("h", Some("/tmp/r"), None);
+        let model = log.model();
+        let w = propose_collision_warnings(&model, &proposing, &repo, &rev_on("task/x", None));
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(w[0].contains("task/x") && w[0].contains(&carrier[..8]), "{}", w[0]);
+        // The carrier proposing on ITS OWN branch again warns about nobody.
+        let w = propose_collision_warnings(&model, &carrier, &repo, &rev_on("task/x", None));
+        assert!(w.is_empty(), "{w:?}");
     }
 
     #[test]

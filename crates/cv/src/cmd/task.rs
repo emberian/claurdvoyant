@@ -448,6 +448,11 @@ pub(crate) fn cmd_task(action: TaskCmd) -> Result<()> {
                 &revision.review_sha[..12],
                 &revision.patch_id[..12]
             );
+            // Advisory collision scan (never a block): another live task already carrying this
+            // branch/worktree in the same repo is usually two agents about to trample each other.
+            for w in task::propose_collision_warnings(&outcome.model, &id, &repo, &revision) {
+                eprintln!("⚠ WARNING: {}", sanitize_line(&w));
+            }
             append_and_report(Some(&id), &from, TaskEventKind::RevisionProposed { revision })
         }
         TaskCmd::Reroute { id, to, from } => {

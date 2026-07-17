@@ -564,6 +564,18 @@ fn base_tool_list() -> Value {
             }
         },
         {
+            "name": "board_unanswered",
+            "description": "Requests on a channel with ZERO replies, oldest first, each with its age in seconds — the dropped-questions view. A request that got any board_reply is excluded.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "channel": { "type": "string", "description": "Channel/room name." },
+                    "within_secs": { "type": "number", "description": "Only requests posted within this window (default 86400 = 24h)." }
+                },
+                "required": ["channel"]
+            }
+        },
+        {
             "name": "board_claim",
             "description": "Try to CLAIM a task `key` on a channel — a soft distributed lock so two agents don't grab the same task. Returns {granted: bool, lease?}. If granted is false another agent holds it; branch on that to pick a different task. Renews your own claim if you already hold it. Release with board_release when done.",
             "inputSchema": {
@@ -726,6 +738,7 @@ fn call_tool(name: &str, args: &Value) -> anyhow::Result<String> {
         "board_request" => board_request(args),
         "board_reply" => board_reply(args),
         "board_replies" => board_replies(args),
+        "board_unanswered" => board_unanswered(args),
         "board_claim" => board_claim(args),
         "board_release" => board_release(args),
         "board_claims" => board_claims(args),
@@ -920,6 +933,18 @@ fn board_replies(args: &Value) -> anyhow::Result<String> {
     let request_id = arg_str(args, "request_id").context("`request_id` is required")?;
     let msgs = cv_core::board::replies(channel, request_id)?;
     Ok(serde_json::to_string_pretty(&msgs)?)
+}
+
+/// Requests with zero replies on a channel, oldest first, with age in seconds.
+fn board_unanswered(args: &Value) -> anyhow::Result<String> {
+    let channel = arg_str(args, "channel").context("`channel` is required")?;
+    let within = Duration::from_secs(arg_usize(args, "within_secs", 86_400)? as u64);
+    let rows = cv_core::board::unanswered_requests(channel, within)?;
+    let out: Vec<Value> = rows
+        .iter()
+        .map(|(m, age)| json!({ "message": m, "age_secs": age.num_seconds() }))
+        .collect();
+    Ok(serde_json::to_string_pretty(&json!(out))?)
 }
 
 /// Try to claim a task `key` (soft distributed lock). Returns `{granted, lease?}`.
@@ -1196,7 +1221,7 @@ fn task_abandon(args: &Value) -> anyhow::Result<String> {
 }
 
 fn task_propose(args: &Value) -> anyhow::Result<String> {
-    let (outcome, warnings) = task_replay()?;
+    let (outcome, mut warnings) = task_replay()?;
     let id = task_resolve(&outcome, arg_str(args, "id").context("`id` is required")?)?;
     let t = &outcome.model.tasks[&id];
     let repo = t
@@ -1213,6 +1238,14 @@ fn task_propose(args: &Value) -> anyhow::Result<String> {
         arg_str(args, "reviewer").map(String::from),
         arg_str(args, "session_ref").map(String::from),
     )?;
+    // Advisory collision scan (never a block): another live task already carrying this
+    // branch/worktree in the same repo is usually two agents about to trample each other.
+    warnings.extend(cv_core::task::propose_collision_warnings(
+        &outcome.model,
+        &id,
+        &repo,
+        &revision,
+    ));
     task_append(
         Some(&id),
         &require_task_from(args)?,

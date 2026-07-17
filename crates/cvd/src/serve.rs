@@ -236,6 +236,8 @@ fn route(segments: &[String], query: &str) -> (u16, Value) {
 
         ["api", "board", channel] => board(channel, query),
 
+        ["api", "board", channel, "unanswered"] => board_unanswered(channel, query),
+
         ["api", "claims", channel] => claims(channel),
 
         ["api", "who", channel] => who(channel, query),
@@ -892,6 +894,26 @@ fn board(channel: &str, query: &str) -> (u16, Value) {
     let limit = params.get("limit").and_then(|l| l.parse::<usize>().ok()).unwrap_or(0); // 0 == unlimited in cv_core::board::read.
     match cv_core::board::read(channel, since.as_deref(), limit) {
         Ok(msgs) => ok(json!(msgs)),
+        Err(e) => err(500, &e.to_string()),
+    }
+}
+
+/// `GET /api/board/{channel}/unanswered?within_secs=` — requests with zero replies, oldest
+/// first, each with its age in seconds (default window 24h).
+fn board_unanswered(channel: &str, query: &str) -> (u16, Value) {
+    let params = Query::parse(query);
+    let within = params
+        .get("within_secs")
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(86_400);
+    match cv_core::board::unanswered_requests(channel, Duration::from_secs(within)) {
+        Ok(rows) => {
+            let out: Vec<Value> = rows
+                .iter()
+                .map(|(m, age)| json!({ "message": m, "age_secs": age.num_seconds() }))
+                .collect();
+            ok(json!(out))
+        }
         Err(e) => err(500, &e.to_string()),
     }
 }

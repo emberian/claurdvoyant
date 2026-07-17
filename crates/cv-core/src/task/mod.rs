@@ -29,16 +29,17 @@ pub mod store;
 pub mod verify;
 
 pub use model::{
-    harness_family, IndependenceCheck, MergeFailure, Revision, RevisionState, TaskEvent,
-    TaskEventKind, TaskState, VERIFIER_BY,
+    harness_family, model_family, IndependenceCheck, MergeFailure, Revision, RevisionState,
+    TaskEvent, TaskEventKind, TaskState, VERIFIER_BY,
 };
 pub use reduce::{
     EffectiveState, Note, PassEvidence, ReduceError, RefuteEvidence, RerouteEvidence,
     RevisionProjection, TaskIssue, TaskProjection, TaskReadModel, TaskReducer,
 };
 pub use project::{
-    age_short, awaiting_review, debt, effective_display, inbox, list, resolve_id,
-    AwaitingReviewEntry, DebtEntry, InboxEntry, InboxReason, TaskFilter,
+    age_short, awaiting_review, branch_carriers, debt, effective_display, inbox, list,
+    propose_collision_warnings, resolve_id, AwaitingReviewEntry, DebtEntry, InboxEntry,
+    InboxReason, TaskFilter,
 };
 pub use store::{new_event, replay, ReplayOutcome, TaskStore};
 
@@ -51,8 +52,13 @@ pub fn independence_check(
 ) -> Option<IndependenceCheck> {
     let reviewer_session = reviewer_session?;
     let family_of = |session_id: &str| -> Option<String> {
-        let (sref, _) = crate::find_cheap(session_id, None).ok()??;
-        harness_family(sref.harness).map(String::from)
+        let (sref, adapter) = crate::find_cheap(session_id, None).ok()??;
+        if let Some(f) = harness_family(sref.harness) {
+            return Some(f.to_string());
+        }
+        // Multi-model harness (Cursor, OpenCode, …): the harness alone can't name the family,
+        // but the transcript's per-message `model` ids can. Read model-granular.
+        session_model(&*adapter, &sref).as_deref().and_then(model_family).map(String::from)
     };
     let reviewer_family = family_of(reviewer_session);
     let author_family = t
@@ -64,6 +70,25 @@ pub fn independence_check(
         _ => None,
     };
     Some(IndependenceCheck { author_family, reviewer_family, independent })
+}
+
+/// The model id that actually spoke in a session: the LAST assistant message's `model`, falling
+/// back to the session-level metadata model. Streamed under [`ParseOptions::lazy`] — large
+/// content arrives as unresolved spans, so the pass costs one forward read of record metadata,
+/// never a materialized transcript. (The adapter API has no tail read; this is the cheapest
+/// faithful path.) Any parse failure is `None` — advisory callers degrade to "undetermined".
+fn session_model(adapter: &dyn crate::harness::Adapter, sref: &crate::ir::SessionRef) -> Option<String> {
+    let mut last: Option<String> = None;
+    let mut sink = |m: crate::ir::Message| {
+        if m.role == crate::ir::Role::Assistant {
+            if let Some(model) = &m.model {
+                last = Some(model.clone());
+            }
+        }
+        crate::stream::Flow::Continue
+    };
+    let session = adapter.stream(sref, &crate::stream::ParseOptions::lazy(), &mut sink).ok()?;
+    last.or(session.model)
 }
 
 /// Human-readable advisory line for an independence result (shared CLI/MCP wording).

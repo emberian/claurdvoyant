@@ -526,8 +526,13 @@ fn merge_or_reconcile(state: RevisionState, detail: String) -> TaskEventKind {
     }
 }
 
-/// Anti-spam: drop a finding identical to the revision's most recent issue, and route
-/// `SourceUnavailable` from `MergedLocal` into `ReconcileFailed` (grammar legality).
+/// How far back [`finding`] looks for an identical issue. Last-1 let an alternating pair
+/// (NonFastForward / GitFailed flapping between passes) grow the log forever; a shallow window
+/// still re-records anything genuinely intermittent.
+const DEDUP_WINDOW: usize = 5;
+
+/// Anti-spam: drop a finding identical to any of the revision's last [`DEDUP_WINDOW`] issues, and
+/// route `SourceUnavailable` from `MergedLocal` into `ReconcileFailed` (grammar legality).
 fn finding(task: &TaskProjection, state: RevisionState, kind: TaskEventKind) -> Vec<TaskEventKind> {
     let kind = match kind {
         TaskEventKind::SourceUnavailable { detail } if state == RevisionState::MergedLocal => {
@@ -536,16 +541,14 @@ fn finding(task: &TaskProjection, state: RevisionState, kind: TaskEventKind) -> 
         other => other,
     };
     let Some(rev) = task.current_revision() else { return vec![kind] };
-    if let Some(last) = rev.issues.last() {
-        let same = match (&kind, last) {
-            (TaskEventKind::SourceUnavailable { detail }, TaskIssue::SourceUnavailable { detail: d, .. }) => detail == d,
-            (TaskEventKind::MergeFailed { reason }, TaskIssue::MergeFailed { reason: r, .. }) => reason == r,
-            (TaskEventKind::ReconcileFailed { detail }, TaskIssue::ReconcileFailed { detail: d, .. }) => detail == d,
-            _ => false,
-        };
-        if same {
-            return Vec::new();
-        }
+    let same = |issue: &TaskIssue| match (&kind, issue) {
+        (TaskEventKind::SourceUnavailable { detail }, TaskIssue::SourceUnavailable { detail: d, .. }) => detail == d,
+        (TaskEventKind::MergeFailed { reason }, TaskIssue::MergeFailed { reason: r, .. }) => reason == r,
+        (TaskEventKind::ReconcileFailed { detail }, TaskIssue::ReconcileFailed { detail: d, .. }) => detail == d,
+        _ => false,
+    };
+    if rev.issues.iter().rev().take(DEDUP_WINDOW).any(same) {
+        return Vec::new();
     }
     vec![kind]
 }
@@ -785,6 +788,34 @@ mod tests {
         });
         let again = verify_task(the_task(&model), false).unwrap();
         assert!(again.is_empty(), "identical finding must not spam the log: {again:?}");
+
+        // Alternation: an unrelated issue lands between two identical findings (the flapping
+        // NonFastForward/GitFailed pair). Last-1 dedup would re-record; the last-5 window doesn't.
+        let t = model.tasks.get_mut(&tid).unwrap();
+        t.revisions.last_mut().unwrap().issues.push(TaskIssue::MergeFailed {
+            reason: MergeFailure::NonFastForward {},
+            event_id: "y".into(),
+        });
+        let alternated = verify_task(the_task(&model), false).unwrap();
+        assert!(
+            alternated.is_empty(),
+            "a finding identical to a recent (non-last) issue must not spam the log: {alternated:?}"
+        );
+
+        // But once the identical issue has scrolled out of the window, it records again — the
+        // dedup is a spam guard, not amnesia about a still-broken world.
+        let t = model.tasks.get_mut(&tid).unwrap();
+        for i in 0..5 {
+            t.revisions.last_mut().unwrap().issues.push(TaskIssue::MergeFailed {
+                reason: MergeFailure::GitFailed { detail: format!("distinct {i}") },
+                event_id: format!("z{i}"),
+            });
+        }
+        let reemitted = verify_task(the_task(&model), false).unwrap();
+        assert!(
+            matches!(reemitted.as_slice(), [TaskEventKind::SourceUnavailable { .. }]),
+            "an issue older than the window records again: {reemitted:?}"
+        );
     }
 
     #[test]

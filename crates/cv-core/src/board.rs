@@ -302,6 +302,50 @@ pub fn replies_to_dir(dir: &Path, channel: &str, request_id: &str) -> Result<Vec
     Ok(msgs)
 }
 
+/// Requests on `channel` with zero replies, oldest first (default board dir). See
+/// [`unanswered_requests_in_dir`].
+pub fn unanswered_requests(
+    channel: &str,
+    within: Duration,
+) -> Result<Vec<(BoardMessage, chrono::Duration)>> {
+    unanswered_requests_in_dir(&board_dir(), channel, within)
+}
+
+/// Core of [`unanswered_requests`], parameterized on the board directory.
+///
+/// A dropped question is honest state nobody sees unless it ages on a surface someone reads:
+/// returns every `kind="request"` posted within the last `within` that has **zero** replies
+/// (correlated exactly as [`replies_to_dir`] does — `session_ref` or the `reply-to:` tag),
+/// oldest first, each with its age at read time. Pure projection: it renders age, never escalates.
+pub fn unanswered_requests_in_dir(
+    dir: &Path,
+    channel: &str,
+    within: Duration,
+) -> Result<Vec<(BoardMessage, chrono::Duration)>> {
+    let now = Utc::now();
+    let cutoff = now - chrono::Duration::from_std(within).unwrap_or_else(|_| chrono::Duration::zero());
+    let msgs = read_from_dir(dir, channel, None, 0)?;
+    let answered: Vec<&str> = msgs
+        .iter()
+        .filter(|m| m.kind == "reply")
+        .flat_map(|m| {
+            m.session_ref
+                .as_deref()
+                .into_iter()
+                .chain(m.tags.iter().filter_map(|t| t.strip_prefix(REPLY_TO_TAG)))
+        })
+        .collect();
+    let mut out: Vec<(BoardMessage, chrono::Duration)> = msgs
+        .iter()
+        .filter(|m| m.kind == "request" && m.ts >= cutoff && !answered.contains(&m.id.as_str()))
+        .map(|m| (m.clone(), now.signed_duration_since(m.ts)))
+        .collect();
+    // File order is append order; sort by post time so "oldest first" holds even for
+    // out-of-order appends (backfills, clock skew across writers).
+    out.sort_by_key(|(m, _)| m.ts);
+    Ok(out)
+}
+
 /// Acknowledge a message id with a tiny `kind="ack"` note. See [`ack_to_dir`].
 pub fn ack(channel: &str, from: &str, msg_id: &str) -> Result<BoardMessage> {
     ack_to_dir(&board_dir(), channel, from, msg_id)
@@ -813,6 +857,53 @@ mod tests {
         let got = replies_to_dir(&dir, "ch", &req.id).unwrap();
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].body, "tagged answer");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn unanswered_requests_excludes_answered_includes_aged_oldest_first() {
+        let dir = tmp_board();
+        let day = Duration::from_secs(86_400);
+
+        // An answered request is excluded; an unanswered one is included with a real age.
+        let answered = request_to_dir(&dir, "ch", "alice", "answered q").unwrap();
+        let open1 = request_to_dir(&dir, "ch", "bob", "open q one").unwrap();
+        let open2 = request_to_dir(&dir, "ch", "carol", "open q two").unwrap();
+        reply_to_dir(&dir, "ch", "dave", &answered.id, "here you go").unwrap();
+        // Non-reply chatter (an ack, a plain msg) does NOT count as an answer.
+        ack_to_dir(&dir, "ch", "dave", &open1.id).unwrap();
+        post_to_dir(&dir, "ch", "dave", "noise", None, vec![], None).unwrap();
+
+        let got = unanswered_requests_in_dir(&dir, "ch", day).unwrap();
+        let ids: Vec<&str> = got.iter().map(|(m, _)| m.id.as_str()).collect();
+        assert_eq!(ids, vec![open1.id.as_str(), open2.id.as_str()], "oldest first, answered gone");
+        assert!(got.iter().all(|(_, age)| age.num_seconds() >= 0), "ages are non-negative");
+
+        // A request older than the window is not surfaced (hand-crafted old ts, appended raw).
+        let old = BoardMessage {
+            id: "00000000-0000-7000-8000-00000000dead".into(),
+            channel: "ch".into(),
+            from: "eve".into(),
+            ts: Utc::now() - chrono::Duration::days(30),
+            kind: "request".into(),
+            body: "ancient q".into(),
+            tags: vec![],
+            session_ref: None,
+        };
+        let mut f = OpenOptions::new().append(true).open(channel_path(&dir, "ch")).unwrap();
+        writeln!(f, "{}", serde_json::to_string(&old).unwrap()).unwrap();
+        let got = unanswered_requests_in_dir(&dir, "ch", day).unwrap();
+        assert!(!got.iter().any(|(m, _)| m.id == old.id), "outside the window: {got:?}");
+        // Widen the window and it shows, first (oldest), with a ~30d age.
+        let got = unanswered_requests_in_dir(&dir, "ch", Duration::from_secs(90 * 86_400)).unwrap();
+        assert_eq!(got[0].0.id, old.id);
+        assert!(got[0].1.num_days() >= 29, "age reflects the old ts: {:?}", got[0].1);
+
+        // A tag-only reply (no session_ref) still answers it.
+        post_to_dir(&dir, "ch", "dave", "tagged", Some("reply"), vec![reply_to_tag(&open2.id)], None)
+            .unwrap();
+        let got = unanswered_requests_in_dir(&dir, "ch", day).unwrap();
+        assert!(!got.iter().any(|(m, _)| m.id == open2.id), "{got:?}");
         fs::remove_dir_all(&dir).ok();
     }
 

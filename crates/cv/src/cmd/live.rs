@@ -65,6 +65,15 @@ pub(crate) enum BoardCmd {
     },
     /// Collect all replies to a request id.
     Replies { channel: String, request_id: String },
+    /// Requests with zero replies, oldest first, with age — dropped questions made visible.
+    Unanswered {
+        channel: String,
+        /// Only requests posted within this window.
+        #[arg(long = "within-secs", default_value_t = 86_400)]
+        within_secs: u64,
+        #[arg(long)]
+        json: bool,
+    },
     /// Try to claim a task `key` (a soft lease). Exits non-zero on contention.
     Claim {
         channel: String,
@@ -226,6 +235,33 @@ pub(crate) fn cmd_board(action: BoardCmd) -> Result<()> {
             }
             if msgs.is_empty() {
                 println!("(no replies to {} on #{channel})", short_id(&request_id));
+            }
+        }
+        BoardCmd::Unanswered { channel, within_secs, json } => {
+            let rows = board::unanswered_requests(&channel, Duration::from_secs(within_secs))?;
+            if json {
+                let out: Vec<serde_json::Value> = rows
+                    .iter()
+                    .map(|(m, age)| {
+                        serde_json::json!({ "message": m, "age_secs": age.num_seconds() })
+                    })
+                    .collect();
+                println!("{}", serde_json::to_string_pretty(&out)?);
+            } else {
+                use cv_core::sanitize::sanitize_line;
+                let now = chrono::Utc::now();
+                for (m, _) in &rows {
+                    println!(
+                        "{:>4}  {}  {}  {}",
+                        cv_core::task::age_short(m.ts, now),
+                        short_id(&m.id),
+                        sanitize_line(&m.from),
+                        sanitize_line(&m.body)
+                    );
+                }
+                if rows.is_empty() {
+                    println!("(no unanswered requests on #{channel} in the last {within_secs}s)");
+                }
             }
         }
         BoardCmd::Claim {

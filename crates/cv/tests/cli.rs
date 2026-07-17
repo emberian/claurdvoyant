@@ -672,6 +672,56 @@ fn task_surfaces_sanitize_and_age() {
     assert!(!out.contains('\u{1b}'), "debt leaks ESC:\n{out:?}");
 }
 
+/// Branch collision at propose is a WARNING on stderr, never a block: two live tasks proposing
+/// one branch in one repo usually means two agents about to trample each other.
+#[test]
+fn task_propose_warns_on_branch_collision() {
+    let w = World::new("task-collide");
+    // A tiny real repo with one feature branch over main (propose observes git, so it's real).
+    let repo = w.base.join("repo");
+    fs::create_dir_all(&repo).unwrap();
+    let git = |args: &[&str]| {
+        let out = Command::new("git").arg("-C").arg(&repo).args(args).output().unwrap();
+        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    };
+    git(&["init", "-q", "-b", "main"]);
+    git(&["config", "user.email", "t@example.com"]);
+    git(&["config", "user.name", "t"]);
+    fs::write(repo.join("a.txt"), "a").unwrap();
+    git(&["add", "."]);
+    git(&["commit", "-q", "-m", "base"]);
+    git(&["checkout", "-q", "-b", "task/shared"]);
+    fs::write(repo.join("b.txt"), "b").unwrap();
+    git(&["add", "."]);
+    git(&["commit", "-q", "-m", "feat"]);
+
+    let repo_s = repo.to_str().unwrap();
+    let (out, _) = w.cv_ok(&["task", "open", "first", "--repo", repo_s]);
+    let t1 = opened_task_id(&out);
+    let (out, _) = w.cv_ok(&["task", "open", "second", "--repo", repo_s]);
+    let t2 = opened_task_id(&out);
+
+    // First propose: nobody else carries the branch, no warning.
+    let (ok, _, _, err) = w.cv_env(
+        &["task", "propose", &t1, "--branch", "task/shared", "--upstream", "main"],
+        &[("CV_ENDPOINT", "agent:a")],
+    );
+    assert!(ok, "{err}");
+    assert!(!err.contains("collision"), "first propose must not warn:\n{err}");
+
+    // Second task proposing the SAME branch: warned on stderr, exit still 0 (never a block).
+    let (ok, code, out, err) = w.cv_env(
+        &["task", "propose", &t2, "--branch", "task/shared", "--upstream", "main"],
+        &[("CV_ENDPOINT", "agent:b")],
+    );
+    assert!(ok, "collision is a warning, not a block: exit {code}\n{out}\n{err}");
+    assert!(
+        err.contains("WARNING") && err.contains("already carried by task") && err.contains(&t1[..8]),
+        "warning names the carrier:\n{err}"
+    );
+    assert!(err.contains("collision"), "{err}");
+}
+
 /// G5 on the board: message bodies and senders are stripped at `cv board read`.
 #[test]
 fn board_read_sanitizes_and_from_defaults_to_cv_endpoint() {
