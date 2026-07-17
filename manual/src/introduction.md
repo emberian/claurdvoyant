@@ -14,7 +14,7 @@ clustervision fixes all three. It parses **20 harnesses** into one unified repre
 - 🖥️ **Browse** your whole corpus in a desktop/web app — a Projects lens, an activity heatmap, side-by-side compare, stats, and **sub-agent trees**.
 - 🚀 **Convert** a session from one harness to another (N-way among 13 emit targets).
 - 🧳 **Port** a session out of its directory jail.
-- 🧠 **Let running agents read each other's minds** via an MCP server, and coordinate via a shared board.
+- 🧠 **Let running agents read each other's minds** via an MCP server, and coordinate via a shared board — plus a task substrate whose landings are *verified from git*, never taken on an agent's word.
 - 🧬 **Distill** a session into a durable `MEMORY.md` so your archive compounds instead of rotting.
 
 It's open source (MIT/Apache-2.0) and runs **entirely locally** — nothing is uploaded.
@@ -23,6 +23,6 @@ It's open source (MIT/Apache-2.0) and runs **entirely locally** — nothing is u
 
 - New here? Start with **[Install & quick start](getting-started.md)**.
 - Living in the terminal? **[The CLI](cli.md)** is your map.
-- Running a fleet of agents? See **[`cvd`](daemon.md)**, **[MCP](mcp.md)**, and **[the board](board.md)**.
+- Running a fleet of agents? See **[`cvd`](daemon.md)**, **[MCP](mcp.md)**, **[the board](board.md)**, and **[tasks](tasks.md)**.
 - Want the pretty pictures? **[The app](app.md)**.
 - Curious how it all works? **[Architecture](architecture.md)**.

@@ -133,6 +133,20 @@ done
 
 No agent ever does the same task twice, and a crashed agent's task frees itself after the TTL. That's the whole point. 🔮
 
+## Growth & retention
+
+Honesty section: board channels are **append-only and currently unbounded**. Every message
+ever posted to a channel — including the `presence` heartbeats and `claim` records the
+coordination primitives generate under the hood — stays in `board/<channel>.jsonl` forever,
+and reads scan the file. A busy fleet channel (or `#fleet` under a long-running `cvd watch`)
+therefore grows monotonically. Compaction is planned as **segment retirement**: presence
+beats and routine chatter age out of retired segments while durable records stay, but it is
+not implemented yet. Until then the mitigation is operational — channels are plain JSONL
+files, so rotating or archiving an oversized one by hand is safe (readers tolerate a fresh
+file; the claims map lives in its own sibling `*.claims.json` and stays small). The
+[task substrate](tasks.md)'s event log shares the append-only property, with its own plan
+(snapshot + tail) described in [that chapter](tasks.md#growth--retention).
+
 ## How it composes
 
 - **[MCP board tools](mcp.md)** — the same board, surfaced as MCP tools so running agents post/read/claim/heartbeat (and an *await-until-regex* loop built on top of `read`) directly, no shell-out. Same files, same locks, same channels: a claim made over MCP blocks a `cv board claim` on the CLI and vice-versa.

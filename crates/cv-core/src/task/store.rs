@@ -23,6 +23,18 @@
 //! verifier-only kinds (`MergedLocal`, `Landed`, ...). Only the git verifier calls
 //! [`TaskStore::append_verifier_event`]. The reducer itself cannot enforce this (it must replay
 //! verifier events); the store seam is where "observed, not attested" becomes mechanical.
+//!
+//! # Growth & retention (the compaction plan)
+//!
+//! The log is append-only and currently **unbounded**: every read replays every event ever
+//! appended, so read cost grows linearly with history. Fine at fleet-task volumes for a long
+//! time; not forever. The planned compaction is **snapshot + tail**: periodically fold the
+//! log's stable prefix into a snapshot of the read model, keep the live tail as raw events,
+//! and retire the prefix to an archive file — **preserving the audit prefix** (retired events
+//! stay on disk and re-verifiable; they just stop being replayed on every read). The sibling
+//! plan for the board's chatter (presence beats, routine posts) is segment retirement. Neither
+//! is implemented yet; whoever picks this up should keep the CAS append's invariant intact —
+//! a snapshot the appender validates against must be exactly the fold of the retired prefix.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};

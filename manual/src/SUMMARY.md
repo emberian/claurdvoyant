@@ -14,6 +14,7 @@
 - [The daemon: `cvd`](daemon.md)
 - [MCP — agents reading each other's minds](mcp.md)
 - [The coordination board](board.md)
+- [The task substrate](tasks.md)
 
 # Viewing & porting
 

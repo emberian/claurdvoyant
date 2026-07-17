@@ -198,6 +198,7 @@ A small Q&A protocol layered on the board, correlated by message id.
 | `board_request` | `channel`, `body` | `from` | Post a question other agents can answer. Returns the message **including its `id`** — keep it to collect answers. |
 | `board_reply` | `channel`, `in_reply_to`, `body` | `from` | Answer a prior request, correlated by its id. |
 | `board_replies` | `channel`, `request_id` | — | Collect all replies to a request id, in chronological order. |
+| `board_unanswered` | `channel` | `within_secs` (`86400`) | Requests with **zero** replies, oldest first, each with its age in seconds — the dropped-questions view. Any reply excludes a request. |
 
 ### Claims (soft distributed locks)
 
@@ -218,6 +219,44 @@ A claimed `key` is typically a file path or task id. Always `board_release` when
 |------|---------------|---------------|------------------------|
 | `board_heartbeat` | `channel`, `from` | — | Announce you're alive on a channel. Call periodically to stay "active". |
 | `board_who` | `channel` | `within_secs` (`120`) | List agents that heartbeat within the window — active presence. |
+
+## The task substrate over MCP
+
+The [task substrate](tasks.md) — durable dispatch objects whose landing state is *observed
+from git*, never asserted — is fully drivable over MCP. Fourteen `task_*` tools wrap the same
+core paths as the `cv task` CLI, and results come back as pretty JSON in the same shared row
+shapes. Two things to know up front:
+
+- **Identity.** The MCP server inherits the agent's environment, so a spawner-set
+  `CV_ENDPOINT=agent:<name>` makes every bare call record the right actor. Identity-*bearing*
+  tools (`task_claim`, `task_release`, `task_propose`, `task_pass`, `task_refute`, and
+  `task_inbox`'s default `who`) **error** when neither `from` nor `CV_ENDPOINT` is set;
+  bookkeeping tools fall back to the `"agent"` sink.
+- **Law 1 at the tool surface.** There is deliberately *no* tool that records a merge or a
+  land. `task_verify` runs the git verifier; that is the only way landing state changes.
+
+| Tool | Required args | Optional args | Purpose / when to use |
+|------|---------------|---------------|------------------------|
+| `task_open` | `title` | `body`, `repo`, `issue`, `channel` (`tasks`), `assignee`, `from` | Open a durable task. Pass `repo` (absolute path) to enable propose/verify/debt. |
+| `task_list` | — | `state`, `assignee`, `repo`, `all` (`false`) | List tasks (non-terminal by default). An unknown `state` is an error naming the vocabulary, never a silent `[]`. |
+| `task_show` | `id` | — | One task's full projection: state, revisions, review evidence, landed observation, notes, recorded issues. |
+| `task_claim` | `id` | `from`* | Claim an open task — durable, race-free, first writer wins. |
+| `task_release` | `id` | `from`* | Release your claim back to open. |
+| `task_note` | `id`, `text` | `session_ref`, `from` | Progress note; never changes state. |
+| `task_done` | `id` | `observed`, `from` | Complete a **non-code** task. Refused while a revision is live. |
+| `task_abandon` | `id` | `reason`, `from` | Kill a task (always allowed on a non-terminal task). |
+| `task_propose` | `id`, `branch` | `upstream` (`origin/main`), `sha`, `worktree`, `reviewer`, `session_ref`, `from`* | Attach a reviewed revision: cv resolves the tip and computes the range patch-id **from git itself**. Re-proposing supersedes the prior revision (the only cure for a refute). |
+| `task_pass` | `id` | `session`, `from`* | Review PASS (you must be the active reviewer). Pass your cv session id so the advisory cross-family independence check can run. |
+| `task_refute` | `id` | `session`, `from`* | Review REFUTE — terminal for the revision. |
+| `task_verify` | — | `id` (else all), `fetch` (`false`) | Run the git verifier: observe landings/local merges/findings. The **only** way landing state changes. |
+| `task_inbox` | — | `who` (default `$CV_ENDPOINT`) | What needs `who`: assigned, claimed, awaiting-their-review, their unlanded work. Stalest first. |
+| `task_debt` | — | `repo` | Reviewed-but-unlanded work by repo, plus awaiting-review rows, SUSPECT lands, and the verifier heartbeat (`verified_as_of` / `verify_warning`). |
+
+\* identity-bearing: defaults to `$CV_ENDPOINT`, errors when neither is set.
+
+This table is transcribed from the server's own `tools/list` reply (the `tool_list()` function
+in `cv-mcp`); if this page and a live `tools/list` ever disagree, the live reply is the
+authority.
 
 ## A typical flow
 

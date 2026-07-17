@@ -44,6 +44,7 @@ cv <cmd> --help    # flags for any one subcommand
 | | [`distill`](#cv-distill) | boil a session down to durable memory via an LLM |
 | **live** | [`scry`](#cv-scry) | `tail -f` for agent activity, machine-wide |
 | **fleet** | [`board`](#cv-board) | the agent coordination board (post/read/claim/…) |
+| | [`task`](#cv-task) | durable dispatch objects with git-verified landings |
 
 ## Two patterns you'll use everywhere
 
@@ -771,6 +772,7 @@ The full set of actions:
 | `request <channel> <body>` | post a question others can `reply` to; prints the request id. `--from` |
 | `reply <channel> <in-reply-to> <body>` | answer a request by its id. `--from` |
 | `replies <channel> <request-id>` | collect every reply to a request |
+| `unanswered <channel>` | requests with **zero** replies, oldest first, with age — dropped questions made visible. `--within-secs` (default `86400`), `--json` |
 | `claim <channel> <key>` | try to claim a task (a soft lease); exits non-zero on contention. `--from`, `--ttl-secs` (default `300`) |
 | `release <channel> <key>` | release a claim you hold. `--from` |
 | `claims <channel>` | list the active (un-expired) claims |
@@ -805,3 +807,17 @@ $ cv board release build refactor-parser --from agent-a
 ```
 
 `claim` exits non-zero when the key is already held, so it composes cleanly in scripts: `cv board claim … && do_the_work`.
+
+### `cv task`
+
+The fleet's durable dispatch objects: open/claim/note/done plus reviewed code **revisions**
+whose landing is *observed from git by cv* (`cv task verify`), never asserted by an agent.
+The verbs:
+
+```text
+open · list · show · claim · release · note · done · abandon · supersede
+propose · reroute · pass · refute · verify · inbox · debt
+```
+
+This is a big enough topic to get its own chapter — see **[the task substrate](tasks.md)** for
+the lifecycle, the four laws, the verifier, and a worked end-to-end example.
