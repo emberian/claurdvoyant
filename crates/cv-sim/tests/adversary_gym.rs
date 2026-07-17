@@ -1,0 +1,836 @@
+//! The adversary gym: an attack suite fired at the task substrate's sensors, in two honest
+//! categories.
+//!
+//! **Category 1 — DETECTED attacks.** Each stages an attack the substrate is supposed to catch
+//! and asserts the defense fires (a warning, a quarantine, a suspect row, a rejected append).
+//! Comment out the defense and the test goes red — that is the contract that keeps these from
+//! rotting into vacuous green.
+//!
+//! **Category 2 — KNOWN-HOLE PIN TESTS** (`pin_*`). Each stages an attack that currently
+//! SUCCEEDS and asserts the success. They document our admitted weaknesses so that *fixing* one
+//! is a measurable event: the fix flips the assertion, and the test is renamed into a Category-1
+//! defense. Each carries the hole's name, the red-team / self-audit source that found it, and
+//! the intended future fix direction.
+//!
+//! Fixtures: cv-sim's [`FleetScenario`] generator supplies real-shaped clean fleets for
+//! baselines; scratch git repos follow the `verify.rs` hermeticity convention
+//! (`GIT_CONFIG_GLOBAL=/dev/null`, per-repo user config, no commit signing).
+
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+use cv_core::task::verify::{
+    heartbeat_warning, observe_revision, read_heartbeat, run_verify, VerifyHeartbeat, VerifyOptions,
+};
+use cv_core::task::{
+    new_event, review_receipts, DebtReport, FleetStats, InboxReason, InboxRow, MergeFailure, Revision, RevisionState,
+    TaskEvent, TaskEventKind, TaskProjection, TaskReducer, TaskState, TaskStore,
+};
+use cv_sim::{FleetScenario, Pathology};
+
+// ── scratch git repos (verify.rs hermeticity convention) ─────────────────────
+
+fn tmp_dir(tag: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("cv-gym-{tag}-{}", uuid::Uuid::now_v7()));
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+/// Run git in `repo` with the machine's global/system config blanked out (no commit signing, no
+/// user config leakage) — the whole hermeticity trick from the verify.rs fixtures.
+fn git_run(repo: &Path, args: &[&str]) {
+    let out = Command::new("git")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "git {:?} failed: {}",
+        args,
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+fn git_out(repo: &Path, args: &[&str]) -> String {
+    let out = Command::new("git")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "git {:?} failed: {}",
+        args,
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+fn tmp_repo() -> PathBuf {
+    let dir = tmp_dir("git");
+    git_run(&dir, &["init", "-q", "-b", "main"]);
+    git_run(&dir, &["config", "user.email", "t@example.com"]);
+    git_run(&dir, &["config", "user.name", "t"]);
+    commit(&dir, "base.txt", "base", "base commit");
+    dir
+}
+
+fn commit(repo: &Path, file: &str, content: &str, msg: &str) {
+    std::fs::write(repo.join(file), content).unwrap();
+    git_run(repo, &["add", "."]);
+    git_run(repo, &["commit", "-q", "-m", msg]);
+}
+
+fn head(repo: &Path) -> String {
+    git_out(repo, &["rev-parse", "HEAD"])
+}
+
+// ── store plumbing ───────────────────────────────────────────────────────────
+
+fn quiet() -> VerifyOptions {
+    VerifyOptions {
+        quiet: true,
+        ..Default::default()
+    }
+}
+
+/// Append an `Opened` event and return the new task id.
+fn open_in(store: &TaskStore, repo: Option<&Path>, by: &str, assignee: Option<&str>, title: &str) -> String {
+    store
+        .append_agent_event(new_event(
+            None,
+            by,
+            TaskEventKind::Opened {
+                title: title.into(),
+                body: String::new(),
+                repo: repo.map(Path::to_path_buf),
+                issue: None,
+                channel: "tasks".into(),
+                assignee: assignee.map(String::from),
+            },
+        ))
+        .unwrap()
+        .task_id
+}
+
+/// Append a `RevisionProposed`.
+fn propose(store: &TaskStore, task: &str, by: &str, revision: Revision) {
+    store
+        .append_agent_event(new_event(Some(task), by, TaskEventKind::RevisionProposed { revision }))
+        .unwrap();
+}
+
+/// Append a `ReviewPassed` with the given receipts.
+fn pass(store: &TaskStore, task: &str, reviewer: &str, receipts: Option<cv_core::task::ReviewReceipts>) {
+    store
+        .append_agent_event(new_event(
+            Some(task),
+            reviewer,
+            TaskEventKind::ReviewPassed {
+                reviewer: reviewer.into(),
+                session_ref: None,
+                independence: None,
+                receipts,
+            },
+        ))
+        .unwrap();
+}
+
+/// A hand-built revision with opaque (non-git) identity fields — enough for the reducer, the
+/// stats projection, and the inbox view, none of which resolve the shas against a repo. The
+/// reviewer is who the reducer will require the pass verdict to come from (the active-reviewer
+/// gate).
+fn fake_revision(n: u32, reviewer: &str) -> Revision {
+    Revision {
+        n,
+        branch: format!("task/x{n}"),
+        worktree: None,
+        upstream: "origin/main".into(),
+        base: "0".repeat(40),
+        review_sha: "a".repeat(40),
+        patch_id: "b".repeat(40),
+        reviewer: Some(reviewer.into()),
+        session_ref: None,
+    }
+}
+
+/// Hand-append a raw JSONL line straight into the log — what any seat with Bash can do.
+fn raw_append(store: &TaskStore, ev: &TaskEvent) {
+    use std::io::Write as _;
+    let mut f = std::fs::OpenOptions::new()
+        .append(true)
+        .open(store.dir().join("events.jsonl"))
+        .unwrap();
+    writeln!(f, "{}", serde_json::to_string(ev).unwrap()).unwrap();
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Category 1 — DETECTED attacks (the defense must fire)
+// ══════════════════════════════════════════════════════════════════════════════
+
+/// A self-consistent forged `Landed` (patch_id copied from the revision) hand-appended by a
+/// non-verifier identity, against a branch that never merged. The provenance scan names the
+/// forger on replay; one verify pass re-observes the branch, finds the content is NOT on
+/// upstream, and records a suspect land that surfaces on the debt view.
+#[test]
+fn forged_landed_is_contradicted_within_one_verify_pass() {
+    let repo = tmp_repo();
+    let store = TaskStore::at(tmp_dir("store"));
+    git_run(&repo, &["checkout", "-q", "-b", "task/forge"]);
+    commit(&repo, "f.txt", "f", "feat f");
+    let rev = observe_revision(&repo, "task/forge", "main", None, 1, None, None, None).unwrap();
+    git_run(&repo, &["checkout", "-q", "main"]); // NOT merged — the land is a lie
+
+    let task = open_in(&store, Some(&repo), "agent:author", None, "forged land");
+    let patch_id = rev.patch_id.clone();
+    propose(&store, &task, "agent:author", rev);
+    pass(&store, &task, "agent:reviewer", None);
+
+    // The forgery: a Landed line copying the revision's own patch_id, by a sneaky identity.
+    let forged = new_event(
+        Some(&task),
+        "agent:sneaky",
+        TaskEventKind::Landed {
+            upstream_head: head(&repo),
+            observed_patch_id: patch_id,
+        },
+    );
+    raw_append(&store, &forged);
+
+    // Replay folds it (self-consistent) but the provenance scan is loud about attestation.
+    let outcome = store.replay().unwrap();
+    assert_eq!(
+        outcome.quarantined, 0,
+        "self-consistent, so not quarantined — the danger"
+    );
+    assert!(
+        outcome
+            .warnings
+            .iter()
+            .any(|w| w.contains("attested, not observed") && w.contains("agent:sneaky")),
+        "provenance warning must name the forger: {:?}",
+        outcome.warnings
+    );
+    assert_eq!(
+        outcome.model.tasks[&task].current_revision().unwrap().state,
+        RevisionState::Landed,
+        "the forged fold does move the revision to Landed — which is why re-observation matters"
+    );
+
+    // One verify pass re-observes Landed: content is NOT on upstream → suspect warning + row.
+    let (appended, warnings) = run_verify(&store, None, &quiet()).unwrap();
+    assert!(appended.is_empty(), "nothing legitimate to append: {appended:?}");
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.contains("possible forged or rolled-back land")),
+        "suspect warning must fire on the verify pass: {warnings:?}"
+    );
+
+    // Persisted to the heartbeat and surfaced as a debt suspect row.
+    let hb = read_heartbeat(store.dir()).unwrap();
+    assert_eq!(hb.suspect_landed.len(), 1);
+    assert_eq!(hb.suspect_landed[0].task_id, task);
+    let report = DebtReport::compute(&outcome.model, Some(&hb), None);
+    assert_eq!(report.suspects.len(), 1, "the debt view shows the suspect land");
+    assert_eq!(report.suspects[0].task_id, task);
+}
+
+/// A rubber-stamp pass — receipts show `saw_change: Some(false)` (the reviewer signed off with no
+/// observable contact with the change). The stats reviewer row must count it in
+/// `no_contact_passes`, and a real-shaped clean fleet must count zero (the counter is not
+/// trivially always-positive).
+#[test]
+fn rubber_stamp_pass_is_counted() {
+    // Baseline: a real-shaped fleet with rubber stamps dialed OFF reports zero no-contact passes.
+    let clean = FleetScenario {
+        endpoints: 4,
+        reviewers: 2,
+        tasks: 40,
+        seed: 7,
+        pathology: Pathology {
+            rubber_stamp_rate: 0.0,
+            ..Pathology::default()
+        },
+    };
+    let clean_stats = clean.stats().unwrap();
+    assert_eq!(
+        clean_stats.reviewers.iter().map(|r| r.no_contact_passes).sum::<usize>(),
+        0,
+        "a fleet with no rubber stamps has zero no-contact passes"
+    );
+
+    // The attack: one pass whose receipts record no observable contact.
+    let store = TaskStore::at(tmp_dir("store"));
+    let task = open_in(&store, None, "agent:author", Some("agent:author"), "rubber stamp");
+    propose(&store, &task, "agent:author", fake_revision(1, "agent:rubber"));
+    pass(
+        &store,
+        &task,
+        "agent:rubber",
+        Some(cv_core::task::ReviewReceipts {
+            saw_change: Some(false),
+            ran_checks: Some(false),
+            turns: Some(1),
+        }),
+    );
+
+    let model = store.replay().unwrap().model;
+    let stats = FleetStats::compute(&model, None, None);
+    let row = stats
+        .reviewers
+        .iter()
+        .find(|r| r.reviewer == "agent:rubber")
+        .expect("the rubber-stamp reviewer has a row");
+    assert_eq!(row.passes, 1);
+    assert_eq!(
+        row.no_contact_passes, 1,
+        "saw_change=Some(false) must increment no_contact_passes"
+    );
+}
+
+/// The verifier's liveness marker is loud in all three states: absent (NEVER verified), stale
+/// (older than 2x its recorded interval), and — as a no-false-alarm control — fresh (silent).
+/// The debt view surfaces the NEVER state directly.
+#[test]
+fn stale_verifier_is_visible() {
+    use chrono::{Duration, Utc};
+
+    // Absent heartbeat: landing state has NEVER been verified — the loudest case.
+    let never = heartbeat_warning(None).expect("absence must warn");
+    assert!(never.contains("NEVER"), "absent heartbeat warning: {never}");
+
+    // The debt view carries the same NEVER wording when no heartbeat exists.
+    let empty = TaskReducer::reduce(&[]).unwrap();
+    let report = DebtReport::compute(&empty, None, None);
+    assert!(
+        report.verify_warning.as_deref().unwrap_or("").contains("NEVER"),
+        "debt view must say NEVER when never verified: {:?}",
+        report.verify_warning
+    );
+
+    // A backdated heartbeat WITH a recorded interval, older than 2x that interval: STALE.
+    let stale = VerifyHeartbeat {
+        ts: Utc::now() - Duration::seconds(1000),
+        tasks_checked: 3,
+        events_appended: 0,
+        interval_secs: Some(300),
+        suspect_landed: Vec::new(),
+    };
+    let w = heartbeat_warning(Some(&stale)).expect("a stale heartbeat must warn");
+    assert!(
+        w.contains("STALE") && w.contains("periodic verifier may be dead"),
+        "stale heartbeat warning: {w}"
+    );
+
+    // A fresh heartbeat within its interval is silent — no false alarm.
+    let fresh = VerifyHeartbeat {
+        ts: Utc::now(),
+        ..stale.clone()
+    };
+    assert_eq!(heartbeat_warning(Some(&fresh)), None, "a fresh heartbeat must not warn");
+}
+
+/// Log tampering has three shapes with three responses: a reducer-refused interior line is
+/// quarantined (counted, warned, the rest of the log survives); a torn trailing line is tolerated
+/// silently (the one shape a crashed locked writer leaves); a future-version header refuses replay
+/// entirely (written by a newer cv).
+#[test]
+fn log_tampering_is_loud() {
+    use std::io::Write as _;
+
+    // (a) Interior reducer-refused line between valid events → quarantine + warning, log survives.
+    let store = TaskStore::at(tmp_dir("store"));
+    let task = open_in(&store, None, "agent:a", None, "t");
+    store
+        .append_agent_event(new_event(
+            Some(&task),
+            "agent:a",
+            TaskEventKind::Noted {
+                text: "hi".into(),
+                session_ref: None,
+            },
+        ))
+        .unwrap();
+    // A parseable event the reducer refuses (claim on an unknown task) + a valid trailer.
+    let refused = new_event(
+        Some("00000000-0000-7000-8000-00000000dead"),
+        "agent:evil",
+        TaskEventKind::Claimed {
+            assignee: "agent:evil".into(),
+        },
+    );
+    let good = new_event(
+        Some(&task),
+        "agent:a",
+        TaskEventKind::Noted {
+            text: "still here".into(),
+            session_ref: None,
+        },
+    );
+    raw_append(&store, &refused);
+    raw_append(&store, &good);
+    let outcome = store.replay().unwrap();
+    assert_eq!(
+        outcome.quarantined, 1,
+        "the reducer-refused interior line is quarantined"
+    );
+    assert!(
+        outcome.warnings.iter().any(|w| w.contains("quarantined")),
+        "quarantine must warn: {:?}",
+        outcome.warnings
+    );
+    assert_eq!(
+        outcome.model.tasks[&task].notes.len(),
+        2,
+        "the trailing valid event still folds — one poison line does not brick the log"
+    );
+
+    // (b) A torn trailing line (no newline) is tolerated silently.
+    let store2 = TaskStore::at(tmp_dir("store"));
+    open_in(&store2, None, "agent:a", None, "t");
+    {
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(store2.dir().join("events.jsonl"))
+            .unwrap();
+        f.write_all(b"{\"id\":\"trunc").unwrap();
+    }
+    let outcome = store2.replay().unwrap();
+    assert!(
+        outcome.warnings.is_empty(),
+        "a torn trailing line is tolerated: {:?}",
+        outcome.warnings
+    );
+    assert_eq!(outcome.quarantined, 0);
+    assert_eq!(outcome.events.len(), 1);
+
+    // (c) A future log-format header (v2) → replay refuses loudly.
+    let store3 = TaskStore::at(tmp_dir("store"));
+    std::fs::create_dir_all(store3.dir()).unwrap();
+    {
+        let mut f = std::fs::File::create(store3.dir().join("events.jsonl")).unwrap();
+        writeln!(f, "{{\"format\":\"cv-task-log\",\"v\":2}}").unwrap();
+    }
+    let err = store3.replay().unwrap_err();
+    assert!(
+        err.to_string().contains("newer cv"),
+        "a v2 header must refuse replay: {err}"
+    );
+}
+
+/// The locked compare-and-swap claim at scale: 32 threads race to claim each of 8 tasks through
+/// the real store. Exactly one claim wins per task; every loser gets a clean, named rejection —
+/// never a panic, never a corrupt append.
+#[test]
+fn claim_race_has_one_winner_at_scale() {
+    let store = TaskStore::at(tmp_dir("store"));
+    let tasks: Vec<String> = (0..8)
+        .map(|i| open_in(&store, None, "human:sim", None, &format!("task {i}")))
+        .collect();
+
+    let winners: Vec<Vec<String>> = std::thread::scope(|s| {
+        let handles: Vec<_> = (0..32)
+            .map(|w| {
+                let store = store.clone();
+                let tasks = tasks.clone();
+                s.spawn(move || {
+                    let who = format!("agent:w{w:02}");
+                    tasks
+                        .iter()
+                        .filter(|t| {
+                            store
+                                .append_agent_event(new_event(
+                                    Some(t),
+                                    &who,
+                                    TaskEventKind::Claimed { assignee: who.clone() },
+                                ))
+                                .is_ok()
+                        })
+                        .cloned()
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+
+    for t in &tasks {
+        let n = winners.iter().flatten().filter(|w| *w == t).count();
+        assert_eq!(n, 1, "task {t} must have exactly one winning claim, got {n}");
+    }
+    assert_eq!(
+        winners.iter().map(Vec::len).sum::<usize>(),
+        8,
+        "8 tasks → 8 winning claims total"
+    );
+
+    // The log agrees: every task is Claimed exactly once.
+    let model = store.replay().unwrap().model;
+    for t in &tasks {
+        assert_eq!(model.tasks[t].state, TaskState::Claimed);
+    }
+
+    // A late claim on an already-won task is a clean, named rejection — not a panic, not a corrupt
+    // append.
+    let err = store
+        .append_agent_event(new_event(
+            Some(&tasks[0]),
+            "agent:late",
+            TaskEventKind::Claimed {
+                assignee: "agent:late".into(),
+            },
+        ))
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("event rejected"),
+        "a loser sees a clean rejection: {err}"
+    );
+}
+
+/// The store seam holds law 1: every verifier-only kind pushed through the agent-facing append
+/// path is rejected, and nothing lands in the log.
+#[test]
+fn verifier_only_kinds_rejected_from_agent_paths() {
+    let store = TaskStore::at(tmp_dir("store"));
+    let task = open_in(&store, None, "agent:a", None, "t");
+
+    let verifier_only = [
+        TaskEventKind::SourceUnavailable { detail: "gone".into() },
+        TaskEventKind::MergeFailed {
+            reason: MergeFailure::NonFastForward {},
+        },
+        TaskEventKind::MergedLocal {
+            from_sha: "a".repeat(40),
+            to_sha: "b".repeat(40),
+        },
+        TaskEventKind::ReconcileFailed { detail: "boom".into() },
+        TaskEventKind::Landed {
+            upstream_head: "c".repeat(40),
+            observed_patch_id: "d".repeat(40),
+        },
+    ];
+    for kind in verifier_only {
+        assert!(
+            kind.is_verifier_only(),
+            "{} must be classified verifier-only",
+            kind.tag()
+        );
+        let tag = kind.tag();
+        let err = store
+            .append_agent_event(new_event(Some(&task), "agent:sneaky", kind))
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("verifier-only"),
+            "agent append of '{tag}' must be rejected at the store seam: {err}"
+        );
+    }
+    // The seam held: only the Opened event is in the log.
+    assert_eq!(store.replay().unwrap().events.len(), 1);
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Category 2 — KNOWN-HOLE PIN TESTS (the attack currently SUCCEEDS)
+// ══════════════════════════════════════════════════════════════════════════════
+
+/// Serializes the env-mutating pin tests: `find_cheap` resolves session ids through
+/// process-global `HOME`/`CLUSTERVISION_HOME`, so any test that plants a discoverable transcript
+/// holds this for its whole body (the freshness.rs convention).
+static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// A task with one proposed revision whose `review_sha` is the contact needle the reviewer scan
+/// looks for.
+fn task_with_revision(repo: &str, branch: &str, review_sha: &str) -> TaskProjection {
+    let ts: chrono::DateTime<chrono::Utc> = "2026-07-16T12:00:00Z".parse().unwrap();
+    let open = TaskEvent {
+        id: "00000000-0000-7000-8000-000000000001".into(),
+        task_id: "00000000-0000-7000-8000-000000000001".into(),
+        ts,
+        by: "h".into(),
+        kind: TaskEventKind::Opened {
+            title: "t".into(),
+            body: String::new(),
+            repo: Some(PathBuf::from(repo)),
+            issue: None,
+            channel: "tasks".into(),
+            assignee: None,
+        },
+    };
+    let propose = TaskEvent {
+        id: "00000000-0000-7000-8000-000000000002".into(),
+        task_id: open.task_id.clone(),
+        ts,
+        by: "agent:author".into(),
+        kind: TaskEventKind::RevisionProposed {
+            revision: Revision {
+                n: 1,
+                branch: branch.into(),
+                worktree: None,
+                upstream: "origin/main".into(),
+                base: "0".repeat(40),
+                review_sha: review_sha.into(),
+                patch_id: "b".repeat(40),
+                reviewer: Some("agent:r".into()),
+                session_ref: None,
+            },
+        },
+    };
+    let model = TaskReducer::reduce(&[open, propose]).unwrap();
+    model.tasks.values().next().unwrap().clone()
+}
+
+/// Plant a Claude-format reviewer transcript discoverable at `HOME/.claude/projects/<enc>/<sid>.jsonl`
+/// (the adapter walks depth 2) whose single assistant turn issues one Bash tool call.
+fn plant_claude_review_session(home: &Path, sid: &str, cwd: &str, tool_command: &str) {
+    let proj = home.join(".claude/projects/-repo-proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    let mut body = String::new();
+    body.push_str(
+        &serde_json::json!({
+            "type": "user", "uuid": "u1", "sessionId": sid,
+            "timestamp": "2026-07-16T12:00:00Z", "cwd": cwd,
+            "message": {"role": "user", "content": "please review"}
+        })
+        .to_string(),
+    );
+    body.push('\n');
+    body.push_str(
+        &serde_json::json!({
+            "type": "assistant", "uuid": "a0", "sessionId": sid,
+            "timestamp": "2026-07-16T12:01:00Z",
+            "message": {"role": "assistant", "model": "claude-test-1", "content": [
+                {"type": "tool_use", "id": "t0", "name": "Bash", "input": {"command": tool_command}}
+            ]}
+        })
+        .to_string(),
+    );
+    body.push('\n');
+    std::fs::write(proj.join(format!("{sid}.jsonl")), body).unwrap();
+}
+
+/// KNOWN HOLE (pinned). `saw_change` is a plain substring scan over reviewer tool-call inputs
+/// (`task/mod.rs::scan_session`): the revision's `review_sha` (or its 12-prefix), branch, repo
+/// path, or a `git diff/show/log` invocation appearing ANYWHERE in a tool input reads as
+/// "observable contact with the change." A reviewer that never opened the diff but merely
+/// `echo`s the review sha satisfies it — Goodhart on the contact metric.
+///
+/// Source: codex red-team + the substrate's own self-audit (the receipts doc-comment already
+/// names the heuristic as "named, documented, not semantic").
+///
+/// Future fix that FLIPS this into a defense: structural/semantic contact evidence — require an
+/// actual diff/file-read whose *target* is the reviewed range, not a token match — then rename to
+/// `goodhart_saw_change_is_refused` and assert `Some(false)`.
+#[test]
+fn pin_goodhart_saw_change_is_currently_gameable() {
+    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    let home = tmp_dir("home7");
+    std::env::set_var("HOME", &home);
+    std::env::set_var("CLUSTERVISION_HOME", tmp_dir("cvhome7"));
+    std::env::set_var("CLUSTERVISION_MAX_STALE_SECS", "0"); // force full discovery — deterministic
+    std::env::set_var("XDG_CACHE_HOME", home.join(".cache"));
+    std::env::set_var("XDG_CONFIG_HOME", home.join(".config"));
+    std::env::set_var("XDG_DATA_HOME", home.join(".local/share"));
+    std::env::remove_var("CURSOR_USER_DIR");
+
+    let review_sha = "a".repeat(40);
+    let t = task_with_revision("/repo/proj", "task/demo", &review_sha);
+
+    // The forgery: a single Bash call, `echo <review-sha>`. No diff, no file read under the repo —
+    // the reviewer demonstrably never looked at the change, only quoted its sha.
+    plant_claude_review_session(&home, "reviewsess", "/repo/proj", &format!("echo {review_sha}"));
+
+    let receipts = review_receipts(&t, Some("reviewsess")).expect("a session id was given");
+    assert_eq!(
+        receipts.saw_change,
+        Some(true),
+        "PINNED HOLE: echoing the review sha satisfies the substring contact heuristic — the \
+         attack currently SUCCEEDS. If this now reads Some(false)/None the hole was closed; flip \
+         this pin into a defense and rename it."
+    );
+}
+
+/// KNOWN HOLE (pinned). The `by` field on every event is a self-asserted string (`CV_ENDPOINT` or
+/// a `--sender` flag). Nothing binds it to the actor that actually wrote the line: a seat running
+/// as agent:attacker can append events stamped `by: "agent:victim"`; the store accepts them and
+/// replay raises no identity/impersonation warning.
+///
+/// Source: codex red-team ("env strings are not identities").
+///
+/// Future fix that FLIPS this: short-lived per-worker credentials the store verifies before
+/// accepting `by` — then an impersonated append is rejected and this becomes a defense test.
+#[test]
+fn pin_identity_impersonation_is_currently_undetected() {
+    let store = TaskStore::at(tmp_dir("store"));
+    // The victim owns a task; the attacker acts under the victim's endpoint string.
+    let task = open_in(&store, None, "agent:victim", Some("agent:victim"), "victim work");
+    let claimed = store
+        .append_agent_event(new_event(
+            Some(&task),
+            "agent:victim",
+            TaskEventKind::Claimed {
+                assignee: "agent:victim".into(),
+            },
+        ))
+        .unwrap();
+    assert_eq!(
+        claimed.by, "agent:victim",
+        "the store records the CLAIMED identity verbatim"
+    );
+
+    propose(&store, &task, "agent:victim", fake_revision(1, "agent:victim"));
+    pass(&store, &task, "agent:victim", None);
+
+    // Replay is clean: nothing flags that these events might be impersonated.
+    let outcome = store.replay().unwrap();
+    assert!(
+        outcome.warnings.is_empty(),
+        "PINNED HOLE: impersonation raises no warning — env strings are not identities. If a \
+         warning now appears the hole was closed; flip this pin. Got: {:?}",
+        outcome.warnings
+    );
+    assert!(
+        outcome.events.iter().all(|e| e.by == "agent:victim"),
+        "every event is on the record under the claimed identity, indistinguishable from genuine"
+    );
+}
+
+/// KNOWN HOLE (pinned). A non-code task's completion (`Done`) is taken on the agent's word: the
+/// `observed` field is free text and nothing verifies or contradicts it. This is the law-1
+/// carve-out — git observation only covers code revisions (`MergedLocal`/`Landed`), so a task with
+/// no revision has no observable completion predicate at all.
+///
+/// Source: codex red-team item 3.
+///
+/// Future fix that FLIPS this: per-task-type completion predicates (a checkable artifact per task
+/// kind) — then a bare "trust me" Done is refused/flagged and this becomes a defense.
+#[test]
+fn pin_done_completion_is_self_reported() {
+    let store = TaskStore::at(tmp_dir("store"));
+    let task = open_in(
+        &store,
+        None,
+        "agent:worker",
+        Some("agent:worker"),
+        "write the design doc",
+    );
+    store
+        .append_agent_event(new_event(
+            Some(&task),
+            "agent:worker",
+            TaskEventKind::Claimed {
+                assignee: "agent:worker".into(),
+            },
+        ))
+        .unwrap();
+    let done = store
+        .append_agent_event(new_event(
+            Some(&task),
+            "agent:worker",
+            TaskEventKind::Done {
+                observed: Some("trust me".into()),
+            },
+        ))
+        .unwrap();
+    assert_eq!(done.by, "agent:worker");
+
+    let outcome = store.replay().unwrap();
+    assert!(
+        outcome.warnings.is_empty(),
+        "no contradiction is raised on replay: {:?}",
+        outcome.warnings
+    );
+    assert_eq!(outcome.model.tasks[&task].state, TaskState::Done);
+
+    // A verify pass has nothing to observe for a revision-less task: it neither confirms nor
+    // contradicts the self-reported completion.
+    let (appended, warnings) = run_verify(&store, None, &quiet()).unwrap();
+    assert!(
+        appended.is_empty(),
+        "nothing to append for a revision-less task: {appended:?}"
+    );
+    assert!(
+        !warnings.iter().any(|w| w.contains(&task)),
+        "PINNED HOLE: the verifier says nothing about the Done task — completion is unverified. \
+         If a completion predicate now fires, flip this pin. Warnings: {warnings:?}"
+    );
+}
+
+/// KNOWN HOLE (pinned). When a verdict lands on a task, the assignee learns of it only by PULLING
+/// their inbox. There is no push: no event is appended to wake them, no file is written, nothing
+/// beyond an optional board post. Wake latency is bounded only by when the assignee next looks —
+/// unbounded in the worst case.
+///
+/// Source: codex red-team item 7 (session-start pull only).
+///
+/// Future fix that FLIPS this: an empty-to-nonempty wake — the substrate signals the assignee the
+/// instant their inbox gains an obligation — then assert the wake artifact exists and rename this
+/// into a defense.
+#[test]
+fn pin_wake_latency_is_unbounded() {
+    let store = TaskStore::at(tmp_dir("store"));
+    let task = open_in(&store, None, "human:pm", Some("agent:worker"), "ship it");
+    store
+        .append_agent_event(new_event(
+            Some(&task),
+            "agent:worker",
+            TaskEventKind::Claimed {
+                assignee: "agent:worker".into(),
+            },
+        ))
+        .unwrap();
+    propose(&store, &task, "agent:worker", fake_revision(1, "agent:reviewer"));
+
+    // Before the verdict: the worker owes no unlanded work yet.
+    let before_model = store.replay().unwrap();
+    let before_events = before_model.events.len();
+    let before = InboxRow::compute(&before_model.model, "agent:worker");
+    assert!(
+        !before.iter().any(|r| r.reason == InboxReason::YourUnlandedWork),
+        "no unlanded-work obligation before the verdict: {:?}",
+        before.iter().map(|r| r.reason).collect::<Vec<_>>()
+    );
+
+    // The reviewer's verdict lands on the task.
+    pass(&store, &task, "agent:reviewer", None);
+
+    // The verdict created an obligation — the worker's inbox level changed (unlanded work appeared).
+    let model = store.replay().unwrap().model;
+    let after = InboxRow::compute(&model, "agent:worker");
+    assert!(
+        after
+            .iter()
+            .any(|r| r.reason == InboxReason::YourUnlandedWork && r.id == task),
+        "the verdict put unlanded work in the worker's inbox: {:?}",
+        after.iter().map(|r| r.reason).collect::<Vec<_>>()
+    );
+
+    // But nothing WOKE the worker: the only new artifact is the verdict event itself — no extra
+    // notification event was appended to reach the assignee.
+    let after_events = store.replay().unwrap().events.len();
+    assert_eq!(
+        after_events,
+        before_events + 1,
+        "exactly one new event (the verdict) — PINNED HOLE: no wake/notification event exists"
+    );
+
+    // Re-reading the inbox any number of times returns the same obligation, unchanged: nothing
+    // consumes it, because nothing was ever pushed. Pull is the only mechanism.
+    let reread = InboxRow::compute(&store.replay().unwrap().model, "agent:worker");
+    assert_eq!(
+        reread.len(),
+        after.len(),
+        "PINNED HOLE: the obligation persists across reads with no consumer — wake is pull-only. \
+         A future empty-to-nonempty wake would flip this pin."
+    );
+    assert!(reread
+        .iter()
+        .any(|r| r.id == task && r.reason == InboxReason::YourUnlandedWork));
+}
