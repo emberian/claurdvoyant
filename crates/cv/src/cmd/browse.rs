@@ -31,9 +31,9 @@ pub(crate) fn cmd_ls(
     query: Option<String>,
     limit: usize,
     sort_by: &str,
-    fresh: bool,   // force a full re-discovery instead of trusting the probed catalog
-    json: bool,    // emit the rows as one JSON array (OpenSession-aligned fields) instead of the table
-    enrich: bool,  // --json only: add transcript-derived git + displayTitle (one parse per emitted row)
+    fresh: bool,  // force a full re-discovery instead of trusting the probed catalog
+    json: bool,   // emit the rows as one JSON array (OpenSession-aligned fields) instead of the table
+    enrich: bool, // --json only: add transcript-derived git + displayTitle (one parse per emitted row)
 ) -> Result<()> {
     let want = parse_harness(&harness)?;
     let query = crate::cmd::query::build(query)?;
@@ -96,9 +96,9 @@ pub(crate) fn cmd_ls(
                     // content on disk (memory-safe on the multi-MB "single-exchange giants" sesh
                     // warns about) while still carrying the session's git metadata and enough of the
                     // first user turn to synthesize a title.
-                    if let Some(session) = cv_core::harness::for_harness(r.harness).and_then(|a| {
-                        cv_core::stream::collect_with(a.as_ref(), r, &cv_core::ParseOptions::lazy()).ok()
-                    }) {
+                    if let Some(session) = cv_core::harness::for_harness(r.harness)
+                        .and_then(|a| cv_core::stream::collect_with(a.as_ref(), r, &cv_core::ParseOptions::lazy()).ok())
+                    {
                         let map = obj.as_object_mut().expect("json object");
                         // `git`: the same object `cv show --json` emits (branch/commit/remote,
                         // skip-none), omitted entirely when the transcript records no git context.

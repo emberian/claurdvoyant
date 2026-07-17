@@ -455,8 +455,12 @@ fn meaningful_prompt(text: &str) -> Option<String> {
     let mut s = text.trim_start();
     loop {
         s = s.trim_start();
-        let Some(rest) = s.strip_prefix("<system-reminder>") else { break };
-        let Some(end) = rest.find("</system-reminder>") else { break };
+        let Some(rest) = s.strip_prefix("<system-reminder>") else {
+            break;
+        };
+        let Some(end) = rest.find("</system-reminder>") else {
+            break;
+        };
         s = &rest[end + "</system-reminder>".len()..];
     }
     let s = s.trim();
@@ -520,12 +524,14 @@ mod tests {
         );
         // Multiple stacked reminders are all peeled.
         assert_eq!(
-            meaningful_prompt("<system-reminder>a</system-reminder><system-reminder>b</system-reminder> hi")
-                .as_deref(),
+            meaningful_prompt("<system-reminder>a</system-reminder><system-reminder>b</system-reminder> hi").as_deref(),
             Some("hi")
         );
         // Pure noise (no residual prose) yields None.
-        assert_eq!(meaningful_prompt("<system-reminder>only a reminder</system-reminder>"), None);
+        assert_eq!(
+            meaningful_prompt("<system-reminder>only a reminder</system-reminder>"),
+            None
+        );
         assert_eq!(meaningful_prompt("Caveat: The messages below were generated…"), None);
         assert_eq!(meaningful_prompt("<command-name>/foo</command-name>"), None);
         assert_eq!(meaningful_prompt("   \n  "), None);

@@ -255,7 +255,10 @@ fn ls_json_emits_the_same_rows_machine_readably() {
     assert_eq!(rows[0]["sizeBytes"].as_u64().unwrap(), real_size, "{out}");
     assert!(rows[0]["sizeBytes"].as_u64().unwrap() > 0, "{out}");
     assert!(rows[0].get("git").is_none(), "no --enrich ⇒ no git:\n{out}");
-    assert!(rows[0].get("displayTitle").is_none(), "no --enrich ⇒ no displayTitle:\n{out}");
+    assert!(
+        rows[0].get("displayTitle").is_none(),
+        "no --enrich ⇒ no displayTitle:\n{out}"
+    );
 
     // --limit bounds the array just like the table, with no "… N more" footer polluting stdout.
     let (out, _) = w.cv_ok(&["ls", "--json", "--limit", "1"]);
@@ -282,8 +285,11 @@ fn ls_json_enrich_adds_git_branch_and_synthesized_title() {
                 "message": {"role": "user", "content":
                     "<system-reminder>be nice</system-reminder>\n\nteach me about capybaras please"}
             }),
-            assistant_line("e2", "2026-05-01T10:01:00Z",
-                serde_json::json!([{"type": "text", "text": "capybaras are the largest rodents"}])),
+            assistant_line(
+                "e2",
+                "2026-05-01T10:01:00Z",
+                serde_json::json!([{"type": "text", "text": "capybaras are the largest rodents"}]),
+            ),
         ],
     );
 
