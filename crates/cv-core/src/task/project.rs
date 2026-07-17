@@ -405,7 +405,7 @@ mod tests {
         let open = log.open("h", None, None);
         let done = log.open("h", None, None);
         log.push(&done, "a", TaskEventKind::Claimed { assignee: "a".into() });
-        log.push(&done, "a", TaskEventKind::Done { observed: None });
+        log.push(&done, "a", TaskEventKind::Done { observed: None, check: None });
         let ready = log.open("h", Some("/tmp/repo"), None);
         log.push(
             &ready,

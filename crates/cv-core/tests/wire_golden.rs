@@ -129,7 +129,9 @@ fn golden_log_replays_identically_forever() {
 /// files is that the *repo history* then pins the bytes.
 fn regenerate(log_path: &std::path::Path, snap_path: &std::path::Path) {
     use chrono::{DateTime, Utc};
-    use cv_core::task::{IndependenceCheck, MergeFailure, ReviewReceipts, Revision, TaskEventKind};
+    use cv_core::task::{
+        DoneCheck, DoneCheckKind, IndependenceCheck, MergeFailure, ReviewReceipts, Revision, TaskEventKind,
+    };
 
     fn hex(c: char) -> String {
         std::iter::repeat_n(c, 40).collect()
@@ -295,6 +297,14 @@ fn regenerate(log_path: &std::path::Path, snap_path: &std::path::Path) {
         11,
         TaskEventKind::Done {
             observed: Some("observed on origin/main by cv-verify".into()),
+            // A checked completion: cv ran the predicate and recorded the observed pass (pins the
+            // DoneCheck wire shape into the golden log).
+            check: Some(DoneCheck {
+                kind: DoneCheckKind::Cmd {
+                    cmd: "cargo test -p demo".into(),
+                },
+                result: "exit 0".into(),
+            }),
         },
     );
 

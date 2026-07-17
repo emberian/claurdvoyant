@@ -527,6 +527,7 @@ impl<'a> Sim<'a> {
             &author,
             TaskEventKind::Done {
                 observed: Some("sim: revision landed".to_string()),
+                check: None,
             },
         );
     }

@@ -95,11 +95,25 @@ pub(crate) enum TaskCmd {
         from: Option<String>,
     },
     /// Complete a non-code task (refused while a code revision is live — land or kill it first).
+    ///
+    /// With a `--check-*`, cv RUNS the check and records the result: a pass makes the completion
+    /// OBSERVED (provenance `checked`), a failure REFUSES the done (the task stays open). At most
+    /// one check kind may be given; a checkless done is self-reported, the honest fallback.
     Done {
         id: String,
         /// Pointer to observable evidence (URL, path, session id).
         #[arg(long)]
         observed: Option<String>,
+        /// Run this shell command; exit 0 = pass, nonzero refuses the done (runs in the task's repo
+        /// dir if it has one, else cwd).
+        #[arg(long = "check-cmd", group = "check")]
+        check_cmd: Option<String>,
+        /// Require this path to exist and be non-empty (relative paths resolve in the task's repo).
+        #[arg(long = "check-file", group = "check")]
+        check_file: Option<PathBuf>,
+        /// GET this http:// url; a 2xx = pass. (https is not built in — use --check-cmd 'curl -fsS …'.)
+        #[arg(long = "check-http", group = "check")]
+        check_http: Option<String>,
         /// Acting endpoint recorded in `by`. Default: $CV_ENDPOINT.
         #[arg(long)]
         from: Option<String>,
@@ -351,13 +365,22 @@ pub(crate) fn cmd_task(action: TaskCmd) -> Result<()> {
                 let hb_interval = hb.as_ref().and_then(|h| h.interval_secs);
                 let show_now = Utc::now();
                 if t.state == cv_core::task::TaskState::Done {
-                    let prov = cv_core::task::Provenance::self_reported(Some(t.last_ts));
-                    let observed = t
-                        .done_observed
-                        .as_deref()
-                        .map(|o| format!(" ({})", sanitize_line(o)))
-                        .unwrap_or_default();
-                    println!("  done:     {}{}", freshness_phrase(&prov, show_now), observed);
+                    // A checked completion cv observed itself (provenance `checked`) renders
+                    // distinctly from a self-reported one — law 1 extended to non-code tasks.
+                    let (prov, detail) = match &t.done_check {
+                        Some(dc) => (
+                            cv_core::task::Provenance::checked(Some(t.last_ts)),
+                            format!(" ({})", sanitize_line(&describe_check(dc))),
+                        ),
+                        None => (
+                            cv_core::task::Provenance::self_reported(Some(t.last_ts)),
+                            t.done_observed
+                                .as_deref()
+                                .map(|o| format!(" ({})", sanitize_line(o)))
+                                .unwrap_or_default(),
+                        ),
+                    };
+                    println!("  done:     {}{}", freshness_phrase(&prov, show_now), detail);
                 }
                 println!("  title:    {}", sanitize_line(&t.title));
                 if !t.body.is_empty() {
@@ -459,10 +482,35 @@ pub(crate) fn cmd_task(action: TaskCmd) -> Result<()> {
             let id = resolve(&outcome.model, &id)?.to_string();
             append_and_report(Some(&id), &from_or_cv(from), TaskEventKind::Noted { text, session_ref })
         }
-        TaskCmd::Done { id, observed, from } => {
+        TaskCmd::Done {
+            id,
+            observed,
+            check_cmd,
+            check_file,
+            check_http,
+            from,
+        } => {
             let outcome = replay_loud()?;
             let id = resolve(&outcome.model, &id)?.to_string();
-            append_and_report(Some(&id), &from_or_cv(from), TaskEventKind::Done { observed })
+            let t = &outcome.model.tasks[&id];
+            // If a check was requested, cv RUNS it now. A pass records HOW the completion was
+            // observed; a failure refuses the done here (nothing is appended — the task stays open).
+            let spec = check_cmd
+                .map(cv_core::task::CheckSpec::Cmd)
+                .or_else(|| check_file.map(cv_core::task::CheckSpec::File))
+                .or_else(|| check_http.map(cv_core::task::CheckSpec::Http));
+            let (observed, check) = match spec {
+                Some(spec) => {
+                    let done_check = spec.run(t.repo.as_deref())?;
+                    // Default the human `observed` pointer to the check's own result when the caller
+                    // gave none, so `task show` always has something to print next to `checked`.
+                    let observed = observed.or_else(|| Some(done_check.result.clone()));
+                    println!("✓ completion check passed: {}", sanitize_line(&done_check.result));
+                    (observed, Some(done_check))
+                }
+                None => (observed, None),
+            };
+            append_and_report(Some(&id), &from_or_cv(from), TaskEventKind::Done { observed, check })
         }
         TaskCmd::Abandon { id, reason, from } => {
             let outcome = replay_loud()?;
@@ -749,6 +797,12 @@ fn freshness_phrase(p: &cv_core::task::Provenance, now: DateTime<Utc>) -> String
     match p.freshness {
         Freshness::Unknown if p.source == cv_core::task::provenance::SOURCE_SELF_REPORT => "self-reported".into(),
         Freshness::Unknown => "NEVER verified".into(),
+        // A checked completion: cv ran the predicate itself — say "checked" rather than the generic
+        // "observed", so the surface distinguishes it from a git-verified land at a glance.
+        Freshness::Fresh if p.source == cv_core::task::provenance::SOURCE_CHECKED => match p.observed_at {
+            Some(t) => format!("checked {} ago", task::age_short(t, now)),
+            None => "checked".into(),
+        },
         Freshness::Fresh => match p.observed_at {
             Some(t) => format!("observed {} ago", task::age_short(t, now)),
             None => "verified".into(),
@@ -758,6 +812,19 @@ fn freshness_phrase(p: &cv_core::task::Provenance, now: DateTime<Utc>) -> String
             None => "stale".into(),
         },
     }
+}
+
+/// A completion check as a human line: `cmd: cargo test → exit 0` / `file: design.md → exists, 42
+/// bytes` / `http: http://… → 200 OK`. The target itself is untrusted log content, sanitized by
+/// the caller.
+fn describe_check(dc: &cv_core::task::DoneCheck) -> String {
+    use cv_core::task::DoneCheckKind;
+    let (label, target) = match &dc.kind {
+        DoneCheckKind::Cmd { cmd } => ("cmd", cmd.clone()),
+        DoneCheckKind::File { path } => ("file", path.display().to_string()),
+        DoneCheckKind::Http { url } => ("http", url.clone()),
+    };
+    format!("{label}: {target} → {}", dc.result)
 }
 
 /// One receipts observation as a human line: `saw change ✓, ran checks ✗, 14 turns`
@@ -916,6 +983,7 @@ mod tests {
             superseded_by: None,
             abandoned_reason: None,
             done_observed: None,
+            done_check: None,
         }
     }
 

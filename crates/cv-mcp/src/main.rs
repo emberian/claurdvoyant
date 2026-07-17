@@ -278,12 +278,15 @@ fn task_tool_list() -> Value {
         },
         {
             "name": "task_done",
-            "description": "Complete a NON-CODE task, optionally pointing at observable evidence. Refused while a code revision is live — land it (task_verify observes that) or abandon the task.",
+            "description": "Complete a NON-CODE task, optionally pointing at observable evidence. Refused while a code revision is live — land it (task_verify observes that) or abandon the task. Attach a completion CHECK (at most one) and cv RUNS it: a pass makes the completion OBSERVED (provenance 'checked'), a failure REFUSES the done and leaves the task open. A checkless done is self-reported.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "id": { "type": "string", "description": "Task id (prefix ok)." },
                     "observed": { "type": "string", "description": "Pointer to observable evidence (URL, path, session id)." },
+                    "check_cmd": { "type": "string", "description": "Shell command cv runs; exit 0 = pass, nonzero refuses the done. Runs in the task's repo dir if it has one, else cwd." },
+                    "check_file": { "type": "string", "description": "Path that must exist and be non-empty (relative paths resolve in the task's repo dir)." },
+                    "check_http": { "type": "string", "description": "http:// url cv GETs; a 2xx = pass. https is not built in (use check_cmd with curl)." },
                     "from": { "type": "string", "description": "Your endpoint. Defaults to $CV_ENDPOINT, else 'agent'." }
                 },
                 "required": ["id"]
@@ -1212,12 +1215,38 @@ fn task_note(args: &Value) -> anyhow::Result<String> {
 fn task_done(args: &Value) -> anyhow::Result<String> {
     let (outcome, warnings) = task_replay()?;
     let id = task_resolve(&outcome, arg_str(args, "id").context("`id` is required")?)?;
+    let t = &outcome.model.tasks[&id];
+
+    // At most one check kind. cv RUNS it: a pass records how the completion was observed; a failure
+    // returns Err here, so nothing is appended and the task stays open.
+    let mut specs = Vec::new();
+    if let Some(c) = arg_str(args, "check_cmd") {
+        specs.push(cv_core::task::CheckSpec::Cmd(c.to_string()));
+    }
+    if let Some(f) = arg_str(args, "check_file") {
+        specs.push(cv_core::task::CheckSpec::File(std::path::PathBuf::from(f)));
+    }
+    if let Some(u) = arg_str(args, "check_http") {
+        specs.push(cv_core::task::CheckSpec::Http(u.to_string()));
+    }
+    if specs.len() > 1 {
+        anyhow::bail!("at most one of check_cmd / check_file / check_http may be given");
+    }
+
+    let mut observed = arg_str(args, "observed").map(String::from);
+    let check = match specs.into_iter().next() {
+        Some(spec) => {
+            let done_check = spec.run(t.repo.as_deref())?;
+            observed = observed.or_else(|| Some(done_check.result.clone()));
+            Some(done_check)
+        }
+        None => None,
+    };
+
     task_append(
         Some(&id),
         &task_from_or_agent(args),
-        cv_core::task::TaskEventKind::Done {
-            observed: arg_str(args, "observed").map(String::from),
-        },
+        cv_core::task::TaskEventKind::Done { observed, check },
         warnings,
     )
 }

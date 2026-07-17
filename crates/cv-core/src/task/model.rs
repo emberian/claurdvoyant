@@ -75,6 +75,12 @@ pub enum TaskEventKind {
     Done {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         observed: Option<String>,
+        /// How cv verified the completion, when a check was attached and it PASSED. Only a passing
+        /// check is ever recorded — a failing check refuses the `Done`, so the task stays open and
+        /// no event is written. `None` = self-report (the honest fallback), and the provenance
+        /// layer labels it as such. Additive optional: pre-check logs replay unchanged.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        check: Option<DoneCheck>,
     },
     Abandoned {
         reason: String,
@@ -169,6 +175,32 @@ impl TaskEventKind {
             TaskEventKind::Landed { .. } => "landed",
         }
     }
+}
+
+/// How a non-code completion was verified: the kind of check cv RAN at `done` time and the
+/// observed result. Recorded on a [`TaskEventKind::Done`] only when the check PASSED — this is the
+/// structural difference between a self-reported completion and one cv itself observed. Extends
+/// law 1 (observed, not attested) to revision-less tasks: the completion predicate is a check cv
+/// executes, not free text an agent types.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct DoneCheck {
+    /// What was checked, and against what target (the command, path, or url).
+    #[serde(flatten)]
+    pub kind: DoneCheckKind,
+    /// A short human summary of the observed pass (e.g. `exit 0`, `exists, 42 bytes`, `200 OK`).
+    pub result: String,
+}
+
+/// The kinds of completion check cv can run. Tagged on the wire by `check`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "check", rename_all = "snake_case")]
+pub enum DoneCheckKind {
+    /// A shell command cv ran (in the task's repo dir if it has one, else cwd); exit 0 = pass.
+    Cmd { cmd: String },
+    /// A filesystem path cv confirmed exists and is non-empty.
+    File { path: PathBuf },
+    /// A URL cv issued a GET against; a 2xx status = pass.
+    Http { url: String },
 }
 
 /// A reviewed code revision. Identity-bearing fields are `review_sha` and `patch_id` (the
@@ -427,7 +459,19 @@ mod tests {
                 text: "n".into(),
                 session_ref: Some("s".into()),
             },
-            TaskEventKind::Done { observed: None },
+            TaskEventKind::Done {
+                observed: None,
+                check: None,
+            },
+            TaskEventKind::Done {
+                observed: Some("exit 0".into()),
+                check: Some(DoneCheck {
+                    kind: DoneCheckKind::Cmd {
+                        cmd: "cargo test".into(),
+                    },
+                    result: "exit 0".into(),
+                }),
+            },
             TaskEventKind::Abandoned { reason: "r".into() },
             TaskEventKind::Superseded { by_task: "t2".into() },
             TaskEventKind::RevisionProposed { revision: revision() },
@@ -561,7 +605,10 @@ mod tests {
                 text: String::new(),
                 session_ref: None,
             },
-            TaskEventKind::Done { observed: None },
+            TaskEventKind::Done {
+                observed: None,
+                check: None,
+            },
             TaskEventKind::Abandoned { reason: String::new() },
             TaskEventKind::Superseded { by_task: String::new() },
             TaskEventKind::RevisionProposed { revision: revision() },
@@ -655,5 +702,42 @@ mod tests {
             v["receipts"].get("ran_checks").is_none(),
             "undetermined sub-observations stay off the wire: {json}"
         );
+    }
+
+    /// Wire additivity of the Done `check`: a pre-check `done` event (no `check` key) reads as
+    /// `check: None` and re-serializes to its own bytes (byte-stable replay of old logs), while a
+    /// checked `done` round-trips carrying its flattened `check` tag and result.
+    #[test]
+    fn done_check_field_is_wire_additive() {
+        // What a pre-check cv wrote for a self-reported completion.
+        let old = r#"{"id":"0198c0de-0000-7000-8000-000000000001","task_id":"0198c0de-0000-7000-8000-000000000000","ts":"2026-07-16T12:00:00Z","by":"agent:test","event":"done","observed":"trust me"}"#;
+        let ev: TaskEvent = serde_json::from_str(old).unwrap();
+        let TaskEventKind::Done { ref check, .. } = ev.kind else {
+            panic!("wrong kind: {ev:?}")
+        };
+        assert_eq!(check, &None, "absent key reads as None (still self-report)");
+        assert_eq!(
+            serde_json::to_string(&ev).unwrap(),
+            old,
+            "an old done must re-serialize to its own bytes — check is skip-when-none"
+        );
+
+        // A checked done round-trips; the flattened kind tag and result appear on the wire.
+        let ev = event(TaskEventKind::Done {
+            observed: Some("exists, 42 bytes".into()),
+            check: Some(DoneCheck {
+                kind: DoneCheckKind::File {
+                    path: PathBuf::from("/repo/design.md"),
+                },
+                result: "exists, 42 bytes".into(),
+            }),
+        });
+        let json = serde_json::to_string(&ev).unwrap();
+        let back: TaskEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(ev, back);
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["check"]["check"], "file", "kind is flattened under the outer check key");
+        assert_eq!(v["check"]["path"], "/repo/design.md");
+        assert_eq!(v["check"]["result"], "exists, 42 bytes");
     }
 }

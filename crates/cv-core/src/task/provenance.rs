@@ -28,6 +28,10 @@ pub const SOURCE_GIT_VERIFY: &str = "git-verify";
 /// lifecycle's `Done` carve-out, made structural: a self-reported completion is *marked* distinct
 /// from a verified land in the projection, not silently equal to one).
 pub const SOURCE_SELF_REPORT: &str = "self-report";
+/// A completion cv itself observed by RUNNING an attached check at `done` time (a command exiting
+/// 0, a file existing and non-empty, an HTTP 2xx). Extends law 1 to revision-less tasks: distinct
+/// from self-report because a machine executed the completion predicate, not an agent's say-so.
+pub const SOURCE_CHECKED: &str = "checked";
 
 /// How fresh an observed fact is, relative to the verifier's last pass. `Unknown` is first-class:
 /// a fact the verifier has never checked since it entered a verifiable state is *not* implicitly
@@ -142,6 +146,18 @@ impl Provenance {
             freshness: Freshness::Unknown,
         }
     }
+
+    /// A completion cv observed by running an attached check that PASSED. `observed_at` is when the
+    /// check ran (the `Done` event's timestamp). Freshness is `Fresh`: the check is a one-shot
+    /// observation with no re-check cadence to go stale against (same rule as a one-shot verifier
+    /// pass) — cv looked, at that moment, and the predicate held.
+    pub fn checked(observed_at: Option<DateTime<Utc>>) -> Provenance {
+        Provenance {
+            observed_at,
+            source: SOURCE_CHECKED,
+            freshness: Freshness::Fresh,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -232,6 +248,14 @@ mod tests {
         let done = Provenance::self_reported(Some(observed));
         assert_eq!(done.source, SOURCE_SELF_REPORT);
         assert!(done.freshness.is_unknown(), "a self-report is never git-verified");
+
+        // A checked completion: cv ran the predicate, so it is observed (not self-report) and fresh
+        // at the moment it ran — distinct source, distinct freshness from a bare Done.
+        let checked = Provenance::checked(Some(observed));
+        assert_eq!(checked.source, SOURCE_CHECKED);
+        assert_eq!(checked.observed_at, Some(observed));
+        assert_eq!(checked.freshness, Freshness::Fresh);
+        assert_ne!(checked.source, SOURCE_SELF_REPORT, "a checked done is not self-report");
     }
 
     #[test]

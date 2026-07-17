@@ -497,6 +497,7 @@ mod tests {
                 "a",
                 TaskEventKind::Done {
                     observed: Some("i finished it".into()),
+                    check: None,
                 },
             ),
         ])
