@@ -530,6 +530,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "cv-sim"
+version = "0.10.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "clustervision-core",
+ "serde_json",
+ "thiserror 2.0.18",
+ "uuid",
+]
+
+[[package]]
 name = "cv-tui"
 version = "0.10.0"
 dependencies = [

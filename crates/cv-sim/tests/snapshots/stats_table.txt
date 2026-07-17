@@ -1,0 +1,14 @@
+endpoints (as author/assignee):
+  endpoint         claimed proposed  landed refuted  live  aband land-rate  med-land
+  agent:sim-e00         14       16      10       2     0      4     10/12     1h16m
+  agent:sim-e02          9       11       9       2     0      0      9/11     1h51m
+  agent:sim-e01          9       11       8       2     0      1      8/10     1h40m
+  agent:sim-e03          8       10       6       2     0      2       6/8     1h33m
+reviewers:
+  reviewer         verdicts pass/refute  same-fam  no-rcpt no-contact med-latency
+  agent:sim-r00          25        20/5         4        2          2         50m
+  agent:sim-r01          16        13/3         2        2          1         48m
+family google: 13 reviews (10 cross-family, 3 same-family, 0 undetermined)
+family anthropic: 7 reviews (5 cross-family, 2 same-family, 0 undetermined)
+family openai: 7 reviews (6 cross-family, 1 same-family, 0 undetermined)
+family xai: 6 reviews (6 cross-family, 0 same-family, 0 undetermined)
