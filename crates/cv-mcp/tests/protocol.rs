@@ -310,6 +310,59 @@ fn tool_calls_against_fixture_corpus() {
     assert!(text.contains("recall failed"), "{text}");
 }
 
+/// `read_session` resolves workflow sub-agent ids (`agent-…`) through cv_core::find's sub-agent
+/// fallback — no MCP-side special-casing. Full id, unique prefix, and the ambiguous-prefix error.
+#[test]
+fn read_session_resolves_workflow_subagent_ids() {
+    let mut s = Server::spawn("agentid");
+
+    // A workflow sub-agent transcript in the standard sidecar layout:
+    // <projects>/<encoded>/<sid>/subagents/workflows/<runId>/agent-<id>.jsonl
+    let proj = s.base.join("home/.claude/projects/-work-proj");
+    let run_dir = proj.join("alphasess/subagents/workflows/wf_run1");
+    fs::create_dir_all(&run_dir).unwrap();
+    let lines = [
+        json!({"type": "user", "uuid": "w1", "timestamp": "2026-01-01T11:00:00Z",
+               "cwd": "/work/proj",
+               "message": {"role": "user", "content": "count the wombats"}}),
+        json!({"type": "assistant", "uuid": "w2", "timestamp": "2026-01-01T11:05:00Z",
+               "message": {"role": "assistant", "content": [
+                   {"type": "text", "text": "WOMBAT_COUNT is forty-two"}]}}),
+    ];
+    let body: String = lines.iter().map(|l| format!("{l}\n")).collect();
+    fs::write(run_dir.join("agent-zeta97cafe.jsonl"), body).unwrap();
+
+    s.request(1, "initialize", json!({}));
+
+    // The full agent id reads the sub-agent's transcript.
+    let (text, is_err) = s.call_tool(2, "read_session", json!({"id": "agent-zeta97cafe"}));
+    assert!(!is_err, "{text}");
+    assert!(text.contains("WOMBAT_COUNT is forty-two"), "{text}");
+
+    // A unique prefix resolves too; JSON format carries the full agent id.
+    let (text, is_err) = s.call_tool(3, "read_session", json!({"id": "agent-zeta9", "format": "json"}));
+    assert!(!is_err, "{text}");
+    let v: Value = serde_json::from_str(&text).expect("json format parses");
+    assert_eq!(v["id"], "agent-zeta97cafe", "{text}");
+
+    // A second parent session carrying a matching agent makes the prefix ambiguous: a tool error
+    // naming the candidate parents, never a silent "first one wins".
+    let direct = proj.join("betasess/subagents");
+    fs::create_dir_all(&direct).unwrap();
+    fs::write(direct.join("agent-zeta97beef.jsonl"), "").unwrap();
+    let (text, is_err) = s.call_tool(4, "read_session", json!({"id": "agent-zeta97"}));
+    assert!(is_err, "ambiguous agent prefix must be an error: {text}");
+    assert!(
+        text.contains("alphasess") && text.contains("betasess"),
+        "the error must name both parents: {text}"
+    );
+
+    // A non-existent agent id still reports a clean miss.
+    let (text, is_err) = s.call_tool(5, "read_session", json!({"id": "agent-nope"}));
+    assert!(is_err, "{text}");
+    assert!(text.contains("no session found"), "{text}");
+}
+
 #[test]
 fn protocol_error_handling() {
     let mut s = Server::spawn("errors");

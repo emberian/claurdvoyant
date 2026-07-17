@@ -578,7 +578,17 @@ mod tests {
     }
 
     fn run(repo: &Path, args: &[&str]) {
-        let out = Command::new("git").arg("-C").arg(repo).args(args).output().unwrap();
+        // Hermetic git: blank out the machine's global/system config so commits never pick up
+        // commit-signing (1Password prompts = machine-wide flake + per-commit latency) or other
+        // user config. Production code only *reads* repos, so this lives on the fixture helper.
+        let out = Command::new("git")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .output()
+            .unwrap();
         assert!(
             out.status.success(),
             "git {:?} failed: {}",

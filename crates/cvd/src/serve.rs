@@ -36,6 +36,10 @@ struct Ctx {
 /// and the browser dashboard.
 pub fn run(host: &str, port: u16, web_root: Option<PathBuf>, token: Option<String>) -> Result<()> {
     let server = Server::http((host, port)).map_err(|e| anyhow::anyhow!("failed to bind {host}:{port}: {e}"))?;
+    // `--port 0` binds an ephemeral port; the banner below must carry the REAL bound port so
+    // callers (test harnesses, scripts) can parse the address instead of racing to guess a free
+    // one. For a fixed port this is the same number.
+    let port = server.server_addr().to_ip().map_or(port, |a| a.port());
     // Canonicalize the web root once so per-request path-traversal checks are cheap and robust.
     let web_root = web_root.and_then(|d| match d.canonicalize() {
         Ok(c) => Some(c),

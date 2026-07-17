@@ -349,8 +349,12 @@ pub fn find(id: &str, harness: Option<Harness>) -> Result<Option<(SessionRef, Bo
         (Some(hit), _) => Ok(Some(hit)),
         // A probe-path miss escalates to the full scan (a session in one of the probe's documented
         // blind spots) — unless the probe path already was one (cold catalog): a miss is a miss.
-        (None, true) => Ok(None),
-        (None, false) => resolve_id(discover_all(), id, harness),
+        // Either way, an `agent-…` shaped id gets one last reading as a sub-agent transcript.
+        (None, true) => find_subagent_session(id, harness),
+        (None, false) => match resolve_id(discover_all(), id, harness)? {
+            Some(hit) => Ok(Some(hit)),
+            None => find_subagent_session(id, harness),
+        },
     }
 }
 
@@ -360,7 +364,62 @@ pub fn find(id: &str, harness: Option<Harness>) -> Result<Option<(SessionRef, Bo
 /// multi-second full scan on every such miss. Escalate yourself via [`find`] once every cheaper
 /// interpretation has failed.
 pub fn find_cheap(id: &str, harness: Option<Harness>) -> Result<Option<(SessionRef, Box<dyn Adapter>)>> {
-    Ok(find_inner(id, harness)?.0)
+    match find_inner(id, harness)?.0 {
+        Some(hit) => Ok(Some(hit)),
+        None => find_subagent_session(id, harness),
+    }
+}
+
+/// The sub-agent fallback behind [`find`]/[`find_cheap`]: an `agent-…` id no pool/catalog session
+/// carries is resolved as a workflow/`Task` sub-agent transcript (those live in `subagents/`
+/// sidecars, never the main pool), so every front-end that resolves session ids — MCP
+/// `read_session`, cvd routes, exports — can drill into an agent id directly.
+///
+/// Cost discipline: gated on the literal `agent-` prefix (and a non-Claude harness constraint),
+/// so a normal session-id miss pays **zero** extra work; only agent-shaped ids pay the same
+/// parallel filename scan `cv show <agent-id>` already does. Multiple parent sessions — or
+/// several agents matching a prefix under the one parent — are an error listing the candidates,
+/// mirroring `cv show`'s ambiguity handling rather than a silent "first one wins".
+fn find_subagent_session(id: &str, harness: Option<Harness>) -> Result<Option<FoundSession>> {
+    if !id.starts_with("agent-") || harness.is_some_and(|h| h != Harness::Claude) {
+        return Ok(None);
+    }
+    let parents = find_subagent_parents(id);
+    let parent = match parents.as_slice() {
+        [] => return Ok(None),
+        [one] => one,
+        many => {
+            let mut names: Vec<String> = many
+                .iter()
+                .map(|p| format!("{} ({})", p.id, p.title.as_deref().unwrap_or("untitled")))
+                .collect();
+            names.sort();
+            anyhow::bail!(
+                "{} sessions have a sub-agent matching {id:?}: {} — pass a longer agent id",
+                names.len(),
+                names.join(", ")
+            );
+        }
+    };
+    // Within the one parent, mirror `resolve_id`'s contract: exact match wins, a unique prefix
+    // resolves, several distinct prefix hits are an ambiguity error.
+    let mut hits: Vec<SessionRef> = Vec::new();
+    for s in subagent_tree_of(parent) {
+        if s.session.id == id {
+            return Ok(harness::for_harness(s.session.harness).map(|a| (s.session, a)));
+        }
+        if s.session.id.starts_with(id) {
+            hits.push(s.session);
+        }
+    }
+    match hits.len() {
+        0 => Ok(None),
+        1 => {
+            let r = hits.pop().unwrap();
+            Ok(harness::for_harness(r.harness).map(|a| (r, a)))
+        }
+        _ => Err(ambiguous(id, hits.iter())),
+    }
 }
 
 /// A resolved session: its catalog ref plus the harness adapter that reads it.

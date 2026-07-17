@@ -192,10 +192,14 @@ impl Workflow {
 
     /// Enrich every agent with its **full** journaled return value from the run's
     /// `subagents/workflows/<runId>/journal.jsonl` (the state file only keeps a ~400-char
-    /// `resultPreview`). No-op when the journal is absent (e.g. a crashed run).
+    /// `resultPreview`). When the journal is absent or empty (e.g. a crashed run), falls back to
+    /// each agent's own transcript: the final assistant text of
+    /// `subagents/workflows/<runId>/agent-<id>.jsonl` is the return the orchestrator never got to
+    /// journal — the harvestable work.
     pub fn attach_journal(&mut self, parent_path: &Path) {
         let results = journal_results(parent_path, &self.run_id);
         if results.is_empty() {
+            self.attach_transcript_returns(parent_path);
             return;
         }
         for a in self
@@ -206,6 +210,36 @@ impl Workflow {
         {
             if let Some(id) = &a.agent_id {
                 a.journal_result = results.get(id).cloned();
+            }
+        }
+    }
+
+    /// The journal-less fallback for [`Self::attach_journal`]: read each agent's return straight
+    /// from its transcript in the run's debris dir. Only fills agents whose transcript exists and
+    /// ends in assistant text; the rest stay `None` (honest: no return was recorded anywhere).
+    fn attach_transcript_returns(&mut self, parent_path: &Path) {
+        let Some(stem) = parent_path.file_stem().and_then(|s| s.to_str()) else {
+            return;
+        };
+        let Some(dir) = parent_path
+            .parent()
+            .map(|d| d.join(stem).join("subagents").join("workflows").join(&self.run_id))
+        else {
+            return;
+        };
+        if !dir.is_dir() {
+            return;
+        }
+        for a in self
+            .phases
+            .iter_mut()
+            .flat_map(|p| &mut p.agents)
+            .chain(&mut self.orphan_agents)
+        {
+            if let Some(id) = &a.agent_id {
+                if let Some(ret) = super::claude::subagent_return(&dir.join(format!("agent-{id}.jsonl"))) {
+                    a.journal_result = Some(Value::String(ret));
+                }
             }
         }
     }
@@ -1083,6 +1117,46 @@ mod tests {
         assert_eq!(jr["try"], 2);
         assert_eq!(jr["detail"].as_str().unwrap().len(), 600); // FULL, beyond any preview cap
         assert!(w.phases[0].agents[1].journal_result.is_none()); // no journal entry → stays absent
+    }
+
+    #[test]
+    fn attach_journal_falls_back_to_agent_transcripts_when_journal_absent() {
+        // A crashed run: the debris dir has agent transcripts but journal.jsonl was never written.
+        let dir = std::env::temp_dir().join(format!("cv-wf-nojournal-test-{}", std::process::id()));
+        let run_dir = dir.join("sess").join("subagents").join("workflows").join("wf_c-1");
+        std::fs::create_dir_all(&run_dir).unwrap();
+        let sess = dir.join("sess.jsonl");
+        std::fs::write(&sess, "").unwrap();
+        let transcript = [
+            json!({"type":"user","message":{"role":"user","content":"do the thing"}}).to_string(),
+            json!({"type":"assistant","message":{"role":"assistant","content":[
+                {"type":"text","text":"intermediate progress note"}]}})
+            .to_string(),
+            json!({"type":"assistant","message":{"role":"assistant","content":[
+                {"type":"text","text":"FINAL: proved 3 lemmas, all green"}]}})
+            .to_string(),
+        ];
+        std::fs::write(run_dir.join("agent-a1.jsonl"), transcript.join("\n")).unwrap();
+        // a2 has no transcript at all — it must stay None, never a fabricated return.
+
+        let mut w = parse_state(&json!({
+            "runId": "wf_c-1",
+            "phases": [{"title": "P"}],
+            "workflowProgress": [
+                {"type": "workflow_agent", "index": 1, "phaseIndex": 1, "agentId": "a1", "state": "done"},
+                {"type": "workflow_agent", "index": 2, "phaseIndex": 1, "agentId": "a2", "state": "progress"}
+            ]
+        }));
+        w.attach_journal(&sess);
+        std::fs::remove_dir_all(&dir).ok();
+
+        let a1 = &w.phases[0].agents[0];
+        assert_eq!(
+            a1.journal_result.as_ref().unwrap().as_str().unwrap(),
+            "FINAL: proved 3 lemmas, all green",
+            "the LAST assistant text is the agent's return"
+        );
+        assert!(w.phases[0].agents[1].journal_result.is_none());
     }
 
     #[test]

@@ -17,6 +17,15 @@ pub(crate) fn cmd_show(
     pre_compaction: Option<usize>,
 ) -> Result<()> {
     let want = parse_harness(&harness)?;
+    // An `agent-…` shaped id goes straight to the sub-agent view: cv_core::find_cheap can now
+    // resolve these too (its fleet-wide fallback), but this path keeps the provenance banner and
+    // lists candidates on an ambiguous prefix instead of erroring.
+    if id.starts_with("agent-") {
+        let parsed_range = range.as_deref().map(parse_msg_range).transpose()?;
+        if show_agent_fleetwide(id, json, parsed_range)? {
+            return Ok(());
+        }
+    }
     // find_cheap first: don't pay a full fleet re-discovery before trying the id as a sub-agent
     // id — sub-agents aren't in the main pool, but `cv show <agent-id>` should still just work
     // (harvest reports hand out bare agent ids all the time). Only when the id is neither a

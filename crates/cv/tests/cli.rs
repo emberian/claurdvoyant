@@ -681,7 +681,15 @@ fn task_propose_warns_on_branch_collision() {
     let repo = w.base.join("repo");
     fs::create_dir_all(&repo).unwrap();
     let git = |args: &[&str]| {
-        let out = Command::new("git").arg("-C").arg(&repo).args(args).output().unwrap();
+        // Hermetic git: no global/system config, so no 1Password commit-signing prompts/latency.
+        let out = Command::new("git")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .arg("-C")
+            .arg(&repo)
+            .args(args)
+            .output()
+            .unwrap();
         assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
     };
     git(&["init", "-q", "-b", "main"]);

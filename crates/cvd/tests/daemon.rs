@@ -5,7 +5,7 @@
 use serde_json::{json, Value};
 use std::fs;
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -305,30 +305,90 @@ fn spawn_serve_with(w: &World, extra: &[&str]) -> (u16, Reaper) {
 }
 
 /// Like [`spawn_serve_with`] but also with extra child env vars (e.g. `CVD_TOKEN`).
+///
+/// Binds `--port 0` (the OS assigns a genuinely free ephemeral port — no bind/release/rebind race
+/// under parallel tests) and parses the REAL port out of the startup banner on stderr. The child
+/// is `try_wait()`ed inside the wait loop so a server that dies at startup fails the test with its
+/// exit status immediately instead of as connection-reset noise later.
 fn spawn_serve_cfg(w: &World, extra: &[&str], envs: &[(&str, &str)]) -> (u16, Reaper) {
-    // A free port: bind 0, note the assignment, release it for cvd (tiny race, fine for tests).
-    let port = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
-
-    let mut args: Vec<String> = vec!["serve".into(), "--port".into(), port.to_string()];
+    let mut args: Vec<String> = vec!["serve".into(), "--port".into(), "0".into()];
     args.extend(extra.iter().map(|s| s.to_string()));
-    let child = w
+    let mut child = w
         .cvd_cmd()
         .args(&args)
         .envs(envs.iter().copied())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .spawn()
         .expect("cvd serve should spawn");
-    let reaper = Reaper(child);
 
-    // Wait for the listener.
+    // Read the banner (`cvd serve on http://host:PORT — …`) off stderr on a side thread; keep
+    // draining afterwards so the child never blocks on a full pipe.
+    let stderr = child.stderr.take().unwrap();
+    let stdout = child.stdout.take().unwrap();
+    std::thread::spawn(move || {
+        let mut sink = Vec::new();
+        let mut stdout = stdout;
+        let _ = stdout.read_to_end(&mut sink);
+    });
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    std::thread::spawn(move || {
+        use std::io::BufRead;
+        for line in std::io::BufReader::new(stderr).lines().map_while(Result::ok) {
+            if tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+
+    let banner_port = |line: &str| -> Option<u16> {
+        // "cvd serve on http://127.0.0.1:PORT — …": take the port from the URL.
+        let rest = line.split("http://").nth(1)?;
+        let hostport = rest.split_whitespace().next()?;
+        hostport.rsplit(':').next()?.parse().ok()
+    };
+
+    let mut reaper = Reaper(child);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut seen = Vec::new();
+    let port = loop {
+        if let Some(status) = reaper.0.try_wait().expect("try_wait cvd serve") {
+            panic!("cvd serve exited at startup ({status}); stderr so far: {seen:?}");
+        }
+        match rx.recv_timeout(Duration::from_millis(50)) {
+            Ok(line) => {
+                if line.starts_with("cvd serve on ") {
+                    if let Some(p) = banner_port(&line) {
+                        break p;
+                    }
+                }
+                seen.push(line);
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                // Stream closed without a banner — the exit branch above will report the status.
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "cvd serve never printed its banner; stderr so far: {seen:?}"
+        );
+    };
+    // Keep draining stderr so the server never blocks writing logs.
+    std::thread::spawn(move || while rx.recv().is_ok() {});
+
+    // The banner prints after the bind, so the listener is up — probe once to be sure, still
+    // failing fast if the process dies between banner and accept loop.
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         if TcpStream::connect(("127.0.0.1", port)).is_ok() {
             break;
         }
-        assert!(Instant::now() < deadline, "cvd serve never came up on :{port}");
-        std::thread::sleep(Duration::from_millis(50));
+        if let Some(status) = reaper.0.try_wait().expect("try_wait cvd serve") {
+            panic!("cvd serve died after its banner ({status})");
+        }
+        assert!(Instant::now() < deadline, "cvd serve banner printed :{port} but it never accepts");
+        std::thread::sleep(Duration::from_millis(20));
     }
     (port, reaper)
 }
