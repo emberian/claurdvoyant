@@ -236,14 +236,16 @@ pub(crate) fn cmd_board(action: BoardCmd) -> Result<()> {
                 println!("(no replies to {} on #{channel})", short_id(&request_id));
             }
         }
-        BoardCmd::Unanswered { channel, within_secs, json } => {
+        BoardCmd::Unanswered {
+            channel,
+            within_secs,
+            json,
+        } => {
             let rows = board::unanswered_requests(&channel, Duration::from_secs(within_secs))?;
             if json {
                 let out: Vec<serde_json::Value> = rows
                     .iter()
-                    .map(|(m, age)| {
-                        serde_json::json!({ "message": m, "age_secs": age.num_seconds() })
-                    })
+                    .map(|(m, age)| serde_json::json!({ "message": m, "age_secs": age.num_seconds() }))
                     .collect();
                 println!("{}", serde_json::to_string_pretty(&out)?);
             } else {
@@ -285,7 +287,10 @@ pub(crate) fn cmd_board(action: BoardCmd) -> Result<()> {
                         .find(|(k, _, _)| *k == key)
                         .map(|(_, owner, _)| owner)
                         .unwrap_or_else(|| "someone".into());
-                    println!("CONTENDED  {key} is held by {}", cv_core::sanitize::sanitize_line(&holder));
+                    println!(
+                        "CONTENDED  {key} is held by {}",
+                        cv_core::sanitize::sanitize_line(&holder)
+                    );
                     std::process::exit(1);
                 }
             }

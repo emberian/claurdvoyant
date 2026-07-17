@@ -228,7 +228,12 @@ fn append_and_report(task_id: Option<&str>, from: &str, kind: TaskEventKind) -> 
         eprintln!("⚠ {}", sanitize_line(w));
     }
     let state = report.effective_state.unwrap_or_else(|| "?".into());
-    println!("✦ {} {} → {}", report.event.kind.tag(), short_id(&report.event.task_id), state);
+    println!(
+        "✦ {} {} → {}",
+        report.event.kind.tag(),
+        short_id(&report.event.task_id),
+        state
+    );
     if matches!(report.event.kind, TaskEventKind::Opened { .. }) {
         println!("{}", report.event.task_id);
     }
@@ -289,10 +294,23 @@ pub(crate) fn cmd_task(action: TaskCmd) -> Result<()> {
             append_and_report(
                 None,
                 &from_or_cv(from),
-                TaskEventKind::Opened { title, body, repo, issue, channel, assignee },
+                TaskEventKind::Opened {
+                    title,
+                    body,
+                    repo,
+                    issue,
+                    channel,
+                    assignee,
+                },
             )
         }
-        TaskCmd::List { state, assignee, repo, all, json } => {
+        TaskCmd::List {
+            state,
+            assignee,
+            repo,
+            all,
+            json,
+        } => {
             let outcome = replay_loud()?;
             let filter = task::TaskFilter {
                 state,
@@ -379,11 +397,7 @@ pub(crate) fn cmd_task(action: TaskCmd) -> Result<()> {
                 }
             }
             if events {
-                let history: Vec<_> = outcome
-                    .events
-                    .iter()
-                    .filter(|e| e.task_id == id)
-                    .collect();
+                let history: Vec<_> = outcome.events.iter().filter(|e| e.task_id == id).collect();
                 println!("{}", serde_json::to_string_pretty(&history)?);
             }
             Ok(())
@@ -400,7 +414,12 @@ pub(crate) fn cmd_task(action: TaskCmd) -> Result<()> {
             let id = resolve(&outcome.model, &id)?.to_string();
             append_and_report(Some(&id), &from, TaskEventKind::Released {})
         }
-        TaskCmd::Note { id, text, session_ref, from } => {
+        TaskCmd::Note {
+            id,
+            text,
+            session_ref,
+            from,
+        } => {
             let outcome = replay_loud()?;
             let id = resolve(&outcome.model, &id)?.to_string();
             append_and_report(Some(&id), &from_or_cv(from), TaskEventKind::Noted { text, session_ref })
@@ -511,10 +530,19 @@ pub(crate) fn cmd_task(action: TaskCmd) -> Result<()> {
             append_and_report(
                 Some(&id),
                 &from,
-                TaskEventKind::ReviewRefuted { reviewer: from.clone(), session_ref: session, receipts },
+                TaskEventKind::ReviewRefuted {
+                    reviewer: from.clone(),
+                    session_ref: session,
+                    receipts,
+                },
             )
         }
-        TaskCmd::Verify { id, all, fetch, skip_landed } => cmd_verify(id, all, fetch, skip_landed),
+        TaskCmd::Verify {
+            id,
+            all,
+            fetch,
+            skip_landed,
+        } => cmd_verify(id, all, fetch, skip_landed),
         TaskCmd::Inbox { who, json } => {
             // Bare `cv task inbox` means "my inbox": the spawner-set CV_ENDPOINT, else "cv".
             let who = from_or_cv(who);
@@ -570,8 +598,7 @@ pub(crate) fn cmd_task(action: TaskCmd) -> Result<()> {
                 );
                 return Ok(());
             }
-            let report =
-                task::DebtReport::compute(&outcome.model, hb.as_ref(), repo.as_deref());
+            let report = task::DebtReport::compute(&outcome.model, hb.as_ref(), repo.as_deref());
             // Rows arrive repo-ascending (no-repo first), oldest first within a repo: render a
             // group header at each repo transition.
             let mut current: Option<&Option<std::path::PathBuf>> = None;
@@ -630,9 +657,7 @@ pub(crate) fn cmd_task(action: TaskCmd) -> Result<()> {
                 println!(
                     "verified as of {}{}",
                     fmt_local(hb.ts, "%Y-%m-%d %H:%M:%S"),
-                    hb.interval_secs
-                        .map(|i| format!(" (every {i}s)"))
-                        .unwrap_or_default()
+                    hb.interval_secs.map(|i| format!(" (every {i}s)")).unwrap_or_default()
                 );
             }
             if let Some(w) = &report.verify_warning {
@@ -662,8 +687,16 @@ fn receipts_line(r: &cv_core::task::ReviewReceipts) -> String {
         Some(false) => "✗",
         None => "?",
     };
-    let turns = r.turns.map(|t| format!("{t} turns")).unwrap_or_else(|| "? turns".into());
-    format!("saw change {}, ran checks {}, {}", mark(r.saw_change), mark(r.ran_checks), turns)
+    let turns = r
+        .turns
+        .map(|t| format!("{t} turns"))
+        .unwrap_or_else(|| "? turns".into());
+    format!(
+        "saw change {}, ran checks {}, {}",
+        mark(r.saw_change),
+        mark(r.ran_checks),
+        turns
+    )
 }
 
 /// A median duration cell: `-` when there is no sample (never a fake `0s`).
@@ -689,7 +722,11 @@ fn render_stats(stats: &cv_core::task::FleetStats) {
         );
         for e in &stats.endpoints {
             let terminal = e.landed + e.refuted + e.superseded;
-            let rate = if terminal == 0 { "-".into() } else { format!("{}/{terminal}", e.landed) };
+            let rate = if terminal == 0 {
+                "-".into()
+            } else {
+                format!("{}/{terminal}", e.landed)
+            };
             println!(
                 "  {:24} {:>7} {:>8} {:>7} {:>7} {:>5} {:>6}  {:>9} {:>9}",
                 sanitize_line(&e.endpoint),
@@ -756,7 +793,11 @@ fn cmd_verify(id: Option<String>, all: bool, fetch: bool, skip_landed: bool) -> 
         }
         None => None,
     };
-    let opts = cv_core::task::verify::VerifyOptions { fetch, skip_landed, ..Default::default() };
+    let opts = cv_core::task::verify::VerifyOptions {
+        fetch,
+        skip_landed,
+        ..Default::default()
+    };
     let (appended, warnings) = cv_core::task::verify::run_verify(&store, ids.as_deref(), &opts)?;
     for w in &warnings {
         eprintln!("⚠ {}", sanitize_line(w));
