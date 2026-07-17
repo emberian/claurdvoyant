@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.10.0 (unreleased)
+## 0.10.0 (2026-07-17)
 
 - **`cv ls --json` closes the consumer gaps (#15).** Every row now carries
   `sizeBytes` (the transcript file's length — free from the same `stat` that
@@ -64,14 +64,35 @@
   and suspects persist across partial verifies, so a targeted re-verify
   cannot launder one away. `cv`/`cvd --version` and the cvd startup log embed
   the build commit.
-- **Docs say exactly what the sensors deliver.** Review **receipts are a
-  heuristic signal, not proof** — substring/pattern scans of the reviewer's
-  transcript that show effort, never guarantee the diff was read (echoing the
-  review sha alone satisfies `saw_change`, pinned in
-  `crates/cv-sim/tests/adversary_gym.rs`). And law 1 is spelled out as covering
-  **landing, not completion**: a non-code `done` is self-reported unless a
-  completion check is attached to verify it. Doc-comments and the manual now
-  state both plainly instead of implying more.
+- **The adversary gym, and three closed holes.** `crates/cv-sim` ships a
+  deterministic synthetic-fleet generator, a replay-cost bench (the O(n²) append
+  curve *measured*, not hand-waved), and an **adversary gym**: attack tests that
+  assert each defense fires, alongside honest `pin_*` tests that named the
+  sensors' known weaknesses so closing one is a measurable git event. This
+  release closes three of them:
+  - **Review receipts require engagement, not a quoted sha.** `saw_change` now
+    demands structural evidence the reviewer opened the change — a repo
+    file-read, or a real `git diff`/`show`/`log` in *command position* — so
+    `echo <sha>` no longer passes (it reads `undetermined`). Still a heuristic
+    (a pointless repo read passes), but the trivial forgery is dead.
+  - **Verifiable completion.** `cv task done --check-cmd/--check-file/--check-http`
+    makes cv RUN a completion predicate: a passing check records the `Done` as
+    *observed* (provenance `checked`), a failing one refuses it and leaves the
+    task open. Law 1 now reaches non-code tasks; a check-less `Done` stays
+    self-reported (and is labeled as such).
+  - **Per-endpoint identity (TOFU).** An endpoint binds a token on first use
+    (`--token` / `$CV_TOKEN`); thereafter an identity-bearing event
+    (claim/release/propose/pass/refute) stamped as that endpoint must present
+    the matching token or the CAS append is rejected. Unbound endpoints stay
+    trusted (the solo/human case) — authentication of the `by` claim, not
+    authorization; no seats, no roles, and only the token's hash is stored.
+
+  Receipts and independence remain **advisory, never a gate**; the sensors
+  inform judgment, they do not control it. Review **receipts are a heuristic
+  signal, not proof**, and law 1 is spelled out as covering **landing** — and
+  now, via `--check-*`, verifiable **completion** — with a check-less `Done`
+  honestly labeled self-reported. Doc-comments and the manual state all of this
+  plainly instead of implying more.
 - **Task identity comes from the environment.** `CV_ENDPOINT` is the identity
   convention (the spawner sets it; `--from` overrides); identity-bearing verbs
   (claim/release/propose/pass/refute) refuse to act with neither present
