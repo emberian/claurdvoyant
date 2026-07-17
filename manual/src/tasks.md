@@ -254,9 +254,12 @@ Error: set CV_ENDPOINT or pass --from; identity-bearing events must record who a
 Review independence (law 2) rides on identity plus transcripts: pass `--session <your-cv-session-id>`
 when reviewing and cv reads the author's and reviewer's harness families from its catalog.
 Same-family review is **recorded and warned about, never blocked** — and cross-family review
-is the value the warning protects. Receipts are a **heuristic signal, not proof**: a substring
-scan of the reviewer's transcript that shows effort, never guarantees the diff was read (pinned by
-`adversary_gym.rs::pin_goodhart_saw_change_is_currently_gameable`).
+is the value the warning protects. Receipts are a **heuristic signal, not proof**: `saw_change`
+requires structural engagement (a content read of a path under the repo, or a real
+`git diff`/`git show`/`git log`), so quoting the sha alone (`echo <sha>`) is undetermined, not a
+pass — but a reviewer who pointlessly opens a repo file still passes (`adversary_gym.rs::
+saw_change_rejects_bare_sha_echo` and `receipts_remain_a_heuristic_by_design`). The bar is raised
+past the trivial forgery, never made a guarantee.
 
 ## A worked example
 

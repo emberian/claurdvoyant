@@ -111,6 +111,69 @@ pub const CHECK_COMMAND_PATTERNS: &[&str] = &[
     "go test",
 ];
 
+/// Shell commands that read file CONTENT (not merely list/stat a path). A tool call invoking one of
+/// these against a path under the reviewed repo is engagement evidence for
+/// [`ReviewReceipts::saw_change`] — the reviewer opened a file in the change's tree, not just quoted
+/// its sha. Deliberately narrow; grow it like [`CHECK_COMMAND_PATTERNS`].
+const READ_COMMANDS: &[&str] = &[
+    "cat", "less", "more", "head", "tail", "bat", "nl", "od", "xxd", "hexdump", "grep", "egrep",
+    "fgrep", "rg", "ag", "sed", "awk", "view",
+];
+
+/// Structured tool NAMES (Claude Code / harness read-and-search tools) that carry a file/path in
+/// their input. Same engagement weight as [`READ_COMMANDS`] when that path targets the repo.
+const READ_TOOL_NAMES: &[&str] = &["Read", "Grep", "Glob", "NotebookRead"];
+
+/// Split a shell command into the pipeline/sequence segments a real invocation is built from
+/// (`;`, `|`, `&`, newline), each trimmed and non-empty. Classification then looks at each
+/// segment's COMMAND POSITION (its leading token), never a bare substring — this is what defeats
+/// `echo "git diff"` / `echo <sha>`: the segment's first token is `echo`, not `git`/`cat`.
+fn command_segments(command: &str) -> impl Iterator<Item = &str> {
+    command.split(['\n', ';', '|', '&']).map(str::trim).filter(|s| !s.is_empty())
+}
+
+/// A command segment with leading `NAME=value` env-assignments stripped, so `RUST_LOG=x cargo test`
+/// and `GIT_PAGER=cat git diff` classify by their real leading command. Only whitespace-free
+/// assignment tokens are stripped (the common shell case); anything else stops the strip.
+fn command_head(segment: &str) -> &str {
+    let mut rest = segment.trim_start();
+    while let Some((head, tail)) = rest.split_once(char::is_whitespace) {
+        let is_env = head
+            .split_once('=')
+            .is_some_and(|(k, _)| !k.is_empty() && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'));
+        if is_env {
+            rest = tail.trim_start();
+        } else {
+            break;
+        }
+    }
+    rest
+}
+
+/// Is `segment` a real `git diff` / `git show` / `git log` invocation? The leading token (after any
+/// env prefix) must be `git`, and the first non-flag token after it must be diff/show/log — so
+/// `git --no-pager show <sha>` counts while `echo "git diff"` (leading token `echo`) does not.
+fn is_git_inspection(segment: &str) -> bool {
+    let mut toks = command_head(segment).split_whitespace();
+    if toks.next() != Some("git") {
+        return false;
+    }
+    toks.find(|t| !t.starts_with('-'))
+        .is_some_and(|sub| matches!(sub, "diff" | "show" | "log"))
+}
+
+/// Does `segment` run a content-reading command ([`READ_COMMANDS`]) against a path under `repo`?
+/// The leading token (after any env prefix, and after stripping any binary path prefix) must be a
+/// read command, AND the repo path must appear as an argument. `echo /repo/x` is not a read; `cat
+/// /repo/x` is.
+fn reads_under_repo(segment: &str, repo: Option<&str>) -> bool {
+    let Some(repo) = repo else { return false };
+    let head = command_head(segment);
+    let Some(first) = head.split_whitespace().next() else { return false };
+    let cmd = first.rsplit('/').next().unwrap_or(first);
+    READ_COMMANDS.contains(&cmd) && segment.contains(repo)
+}
+
 /// What one pass over the reviewer's transcript observed: the model that spoke (for the
 /// independence family) plus the receipts. Internal — the public results are
 /// [`ReviewObservation`] and [`review_receipts`].
@@ -171,37 +234,105 @@ fn scan_reviewer_session(session_id: &str, t: &reduce::TaskProjection) -> Option
     Some((sref.harness, scan))
 }
 
+/// How strongly one tool call ties the reviewer to the change under review — the `saw_change`
+/// evidence hierarchy, weakest to strongest. Ordered so `max` over a session keeps the best signal.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Engagement {
+    /// Nothing ties this call to the change.
+    None,
+    /// The change's IDENTITY (review sha, its 12-prefix, the branch, or the repo path) appears as a
+    /// bare substring only — the `echo <sha>` case. Suggestive, but NOT proof the reviewer opened
+    /// the change. Downgraded on purpose: this alone leaves `saw_change` undetermined, not `true`.
+    Mention,
+    /// STRUCTURAL evidence the reviewer actually engaged the change: a content read
+    /// ([`READ_COMMANDS`]/[`READ_TOOL_NAMES`]) against a path under the repo, or a real
+    /// `git diff`/`git show`/`git log` invocation. This — and only this — satisfies `saw_change`.
+    Engaged,
+}
+
+/// Classify one tool call against the change's identity ([`Engagement`]). `repo` is the reviewed
+/// repo's display path (the read-target anchor); `needles` are the identity strings for the bare
+/// [`Engagement::Mention`] fallback. Shell invocations (`command`/`cmd`) are read segment-by-
+/// segment in command position; structured read/search tools ([`READ_TOOL_NAMES`]) engage when
+/// their rendered path targets the repo.
+fn classify_engagement(name: &str, input: &serde_json::Value, needles: &[String], repo: Option<&str>) -> Engagement {
+    if let Some(command) = input.get("command").or_else(|| input.get("cmd")).and_then(|v| v.as_str()) {
+        if command_segments(command).any(|seg| is_git_inspection(seg) || reads_under_repo(seg, repo)) {
+            return Engagement::Engaged;
+        }
+    }
+    let rendered = format!("{name} {input}");
+    if READ_TOOL_NAMES.contains(&name) {
+        if let Some(repo) = repo {
+            if rendered.contains(repo) {
+                return Engagement::Engaged;
+            }
+        }
+    }
+    if needles.iter().any(|n| rendered.contains(n.as_str())) {
+        return Engagement::Mention;
+    }
+    Engagement::None
+}
+
+/// Did this tool call RUN a check (test/build) command — in command position, not merely quoting
+/// one? Same segment/env-prefix discipline as the engagement signals, so `echo "cargo test"` does
+/// not count.
+fn ran_check_command(input: &serde_json::Value) -> bool {
+    input
+        .get("command")
+        .or_else(|| input.get("cmd"))
+        .and_then(|v| v.as_str())
+        .is_some_and(|command| {
+            command_segments(command)
+                .any(|seg| CHECK_COMMAND_PATTERNS.iter().any(|p| command_head(seg).starts_with(p)))
+        })
+}
+
 /// One forward pass over a transcript, observing everything the review-time advisories need:
 /// the last assistant `model` (independence family fallback), the assistant turn count, and the
 /// contact/checks heuristics over tool inputs. Streamed under [`ParseOptions::lazy`] — tool
 /// inputs are always inline; giant text/tool-result content stays unresolved on disk.
 ///
 /// Honesty rules: `None` means undetermined. `saw_change` is only judged when the task has a
-/// current revision to name needles from (branch, review sha + 12-prefix, repo path, or a
-/// `git diff`/`git show`/`git log` invocation); `ran_checks` uses [`CHECK_COMMAND_PATTERNS`].
-/// Both look at **tool-call inputs** only — that is where commands and file reads live; claims
-/// in prose are exactly what this observation refuses to take at face value. The match is still a
-/// plain substring test, so it is gameable at the tool-input level too (echoing the sha satisfies
-/// `saw_change`): pinned by `adversary_gym.rs::pin_goodhart_saw_change_is_currently_gameable`.
+/// current revision (branch, review sha + 12-prefix, repo path). It is a HEURISTIC, not proof, and
+/// runs an evidence hierarchy over tool-call **inputs** ([`Engagement`], strongest wins):
+/// - [`Engagement::Engaged`] → `Some(true)`: a content read under the repo, or a real
+///   `git diff`/`git show`/`git log` invocation. The reviewer opened the change, not just its name.
+/// - [`Engagement::Mention`] → `None`: the change's identity (sha/branch/repo path) appears only as
+///   a bare argument (`echo <sha>`). Suggestive but unproven — undetermined, deliberately NOT
+///   `true`. This is the echo downgrade that narrows the old Goodhart hole.
+/// - [`Engagement::None`] with revision context → `Some(false)`: we scanned and saw no contact at
+///   all (a genuine rubber stamp).
+///
+/// It remains gameable by a determined adversary who pointlessly opens a file in the repo — the bar
+/// is raised past the trivial echo, not made a guarantee. `ran_checks` uses the same command-
+/// position discipline over [`CHECK_COMMAND_PATTERNS`]. Both look at tool inputs only; prose claims
+/// are exactly what this observation refuses to take at face value.
 fn scan_session(
     adapter: &dyn crate::harness::Adapter,
     sref: &crate::ir::SessionRef,
     t: &reduce::TaskProjection,
 ) -> Option<ReviewerScan> {
-    let mut contact_needles: Vec<String> = Vec::new();
+    // Identity strings for the bare-mention tier; `repo` anchors the read-target signal. Structural
+    // contact (git inspection / repo-path reads) is detected in command position, not via needles.
+    let mut needles: Vec<String> = Vec::new();
+    let mut repo: Option<String> = None;
+    let has_revision = t.current_revision().is_some();
     if let Some(rev) = t.current_revision() {
-        contact_needles.push(rev.revision.branch.clone());
-        contact_needles.push(rev.revision.review_sha.clone());
-        contact_needles.push(rev.revision.review_sha.chars().take(12).collect());
-        if let Some(repo) = &t.repo {
-            contact_needles.push(repo.display().to_string());
+        needles.push(rev.revision.branch.clone());
+        needles.push(rev.revision.review_sha.clone());
+        needles.push(rev.revision.review_sha.chars().take(12).collect());
+        if let Some(r) = &t.repo {
+            let r = r.display().to_string();
+            needles.push(r.clone());
+            repo = Some(r);
         }
-        contact_needles.extend(["git diff", "git show", "git log"].map(String::from));
     }
 
     let mut last_model: Option<String> = None;
     let mut turns: u32 = 0;
-    let mut saw_change = false;
+    let mut best = Engagement::None;
     let mut ran_checks = false;
     let mut sink = |m: crate::ir::Message| {
         if m.role == crate::ir::Role::Assistant {
@@ -212,9 +343,8 @@ fn scan_session(
         }
         for b in &m.content {
             if let crate::ir::Block::ToolUse { name, input, .. } = b {
-                let text = format!("{name} {input}");
-                saw_change = saw_change || contact_needles.iter().any(|n| text.contains(n.as_str()));
-                ran_checks = ran_checks || CHECK_COMMAND_PATTERNS.iter().any(|p| text.contains(p));
+                best = best.max(classify_engagement(name, input, &needles, repo.as_deref()));
+                ran_checks = ran_checks || ran_check_command(input);
             }
         }
         crate::stream::Flow::Continue
@@ -222,11 +352,22 @@ fn scan_session(
     adapter
         .stream(sref, &crate::stream::ParseOptions::lazy(), &mut sink)
         .ok()?;
+    // No revision context → contact undeterminable (None). Otherwise: structural engagement is the
+    // only thing that reads `true`; a bare mention stays undetermined (the echo downgrade); nothing
+    // at all is an honest observed `false`.
+    let saw_change = if !has_revision {
+        None
+    } else {
+        match best {
+            Engagement::Engaged => Some(true),
+            Engagement::Mention => None,
+            Engagement::None => Some(false),
+        }
+    };
     Some(ReviewerScan {
         last_model,
         receipts: ReviewReceipts {
-            // No revision context → no needles → contact is undeterminable, not "false".
-            saw_change: (!contact_needles.is_empty()).then_some(saw_change),
+            saw_change,
             ran_checks: Some(ran_checks),
             turns: Some(turns),
         },
