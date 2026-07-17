@@ -50,8 +50,14 @@ impl World {
 
     /// Run `cv` with this world's env; returns (status_ok, exit_code, stdout, stderr).
     fn cv(&self, args: &[&str]) -> (bool, i32, String, String) {
-        let out = Command::new(env!("CARGO_BIN_EXE_cv"))
-            .args(args)
+        self.cv_env(args, &[])
+    }
+
+    /// Like [`World::cv`] with extra env vars. The ambient `CV_ENDPOINT` is always cleared
+    /// first so identity-resolution tests see exactly the environment they set.
+    fn cv_env(&self, args: &[&str], extra: &[(&str, &str)]) -> (bool, i32, String, String) {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_cv"));
+        cmd.args(args)
             .current_dir(&self.base)
             .env("HOME", &self.home)
             .env("CLUSTERVISION_HOME", &self.cv_home)
@@ -59,8 +65,11 @@ impl World {
             .env("XDG_CACHE_HOME", self.home.join(".cache"))
             .env("XDG_CONFIG_HOME", self.home.join(".config"))
             .env("XDG_DATA_HOME", self.home.join(".local/share"))
-            .output()
-            .expect("cv should run");
+            .env_remove("CV_ENDPOINT");
+        for (k, v) in extra {
+            cmd.env(k, v);
+        }
+        let out = cmd.output().expect("cv should run");
         (
             out.status.success(),
             out.status.code().unwrap_or(-1),
@@ -579,4 +588,102 @@ fn id_prefix_resolution() {
 
     let (out, _) = w.cv_ok(&["show", "beta", "--harness", "claude"]);
     assert!(out.contains("quokkas"), "{out}");
+}
+
+// ───────────────────────────── task substrate: identity + sanitizing ─────────────────────────────
+
+/// Extract the task id `cv task open` prints on its own line (the uuid-shaped one).
+fn opened_task_id(stdout: &str) -> String {
+    stdout
+        .lines()
+        .map(str::trim)
+        .find(|l| l.len() == 36 && l.chars().filter(|c| *c == '-').count() == 4)
+        .unwrap_or_else(|| panic!("no task id in open output:\n{stdout}"))
+        .to_string()
+}
+
+/// G4: identity is environment, not assertion — CV_ENDPOINT is the default `--from`, an explicit
+/// flag still wins, and an identity-bearing verb with no resolvable identity is a hard error.
+#[test]
+fn task_identity_resolution_order() {
+    let w = World::new("task-ident");
+
+    // Open needs no ceremony: bare command records "cv".
+    let (out, _) = w.cv_ok(&["task", "open", "first task"]);
+    let id = opened_task_id(&out);
+    let (json, _) = w.cv_ok(&["task", "show", &id, "--json"]);
+    assert!(json.contains(r#""opened_by": "cv""#), "{json}");
+
+    // Identity-bearing verb without CV_ENDPOINT or --from: refuse, name the cure.
+    let (ok, _, _, err) = w.cv_env(&["task", "claim", &id], &[]);
+    assert!(!ok, "claim without identity must fail");
+    assert!(
+        err.contains("set CV_ENDPOINT or pass --from"),
+        "error names the cure:\n{err}"
+    );
+
+    // CV_ENDPOINT alone resolves it.
+    let (ok, code, out, err) = w.cv_env(&["task", "claim", &id], &[("CV_ENDPOINT", "agent:demo")]);
+    assert!(ok, "claim with CV_ENDPOINT: exit {code}\n{out}\n{err}");
+    let (json, _) = w.cv_ok(&["task", "show", &id, "--json"]);
+    assert!(json.contains(r#""assignee": "agent:demo""#), "{json}");
+
+    // Explicit --from beats the env var.
+    let (ok, ..) = w.cv_env(
+        &["task", "release", &id, "--from", "agent:explicit"],
+        &[("CV_ENDPOINT", "agent:demo")],
+    );
+    assert!(ok);
+    let (json, _) = w.cv_ok(&["task", "show", &id, "--json", "--events"]);
+    assert!(json.contains(r#""by": "agent:explicit""#), "explicit --from wins:\n{json}");
+
+    // Whitespace-only CV_ENDPOINT is no identity.
+    let (ok, _, _, err) = w.cv_env(&["task", "claim", &id], &[("CV_ENDPOINT", "   ")]);
+    assert!(!ok && err.contains("CV_ENDPOINT"), "{err}");
+}
+
+/// G5 + G8: an ANSI-bomb title renders stripped on every task surface, and list/inbox rows carry
+/// an age column (inbox marks >24h rows with a leading marker — not testable with a fresh log,
+/// covered in unit tests; here we prove the column exists).
+#[test]
+fn task_surfaces_sanitize_and_age() {
+    let w = World::new("task-ansi");
+
+    let bomb = "evil\u{1b}]0;pwned\u{7}title \u{1b}[31mred\nline";
+    let (out, _) = w.cv_ok(&["task", "open", bomb]);
+    let id = opened_task_id(&out);
+
+    let (out, _) = w.cv_ok(&["task", "list"]);
+    assert!(!out.contains('\u{1b}'), "list leaks ESC:\n{out:?}");
+    assert!(out.contains("eviltitle red line"), "stripped title renders:\n{out}");
+    assert!(out.contains("0s") || out.contains("1s"), "age column present:\n{out}");
+
+    let (out, _) = w.cv_ok(&["task", "show", &id]);
+    assert!(!out.contains('\u{1b}'), "show leaks ESC:\n{out:?}");
+
+    // Assign it so the inbox has a row, then check the inbox strips too.
+    let (ok, ..) = w.cv_env(&["task", "claim", &id], &[("CV_ENDPOINT", "agent:demo")]);
+    assert!(ok);
+    let (out, _) = w.cv_ok(&["task", "inbox", "agent:demo"]);
+    assert!(!out.contains('\u{1b}'), "inbox leaks ESC:\n{out:?}");
+    assert!(out.contains("ClaimedByYou"), "{out}");
+
+    let (out, _) = w.cv_ok(&["task", "debt"]);
+    assert!(!out.contains('\u{1b}'), "debt leaks ESC:\n{out:?}");
+}
+
+/// G5 on the board: message bodies and senders are stripped at `cv board read`.
+#[test]
+fn board_read_sanitizes_and_from_defaults_to_cv_endpoint() {
+    let w = World::new("board-ansi");
+
+    let (ok, ..) = w.cv_env(
+        &["board", "post", "general", "hi \u{1b}[31mthere\u{1b}]0;x\u{7}!"],
+        &[("CV_ENDPOINT", "agent:board\u{1b}[0m")],
+    );
+    assert!(ok);
+    let (out, _) = w.cv_ok(&["board", "read", "general"]);
+    assert!(!out.contains('\u{1b}'), "board read leaks ESC:\n{out:?}");
+    assert!(out.contains("hi there!"), "{out}");
+    assert!(out.contains("agent:board"), "CV_ENDPOINT is the default sender:\n{out}");
 }

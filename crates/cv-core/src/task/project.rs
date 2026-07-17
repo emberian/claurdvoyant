@@ -68,47 +68,56 @@ pub enum InboxReason {
 pub struct InboxEntry<'m> {
     pub task: &'m TaskProjection,
     pub reason: InboxReason,
+    /// When this entry started waiting — the aging anchor (G8): propose time for a review,
+    /// pass time for unlanded work, the task's last event otherwise.
+    pub since: DateTime<Utc>,
 }
 
-/// The per-agent "what needs me" view.
+/// The per-agent "what needs me" view, **oldest first** (stalest at the top — age is the
+/// escalation mechanism, so the longest-waiting obligation is the first line an agent reads).
 pub fn inbox<'m>(model: &'m TaskReadModel, endpoint: &str) -> Vec<InboxEntry<'m>> {
     let mut entries = Vec::new();
     for task in model.tasks.values() {
         if task.state.is_terminal() {
             continue;
         }
-        let reason = if let Some(rev) = task.current_revision() {
+        let reason_since = if let Some(rev) = task.current_revision() {
             match rev.state {
                 RevisionState::AwaitingReview
                     if rev.active_reviewer.as_deref() == Some(endpoint) =>
                 {
-                    Some(InboxReason::AwaitingYourReview)
+                    Some((InboxReason::AwaitingYourReview, rev.proposed_at))
                 }
                 RevisionState::Ready | RevisionState::MergedLocal
                     if task.assignee.as_deref() == Some(endpoint)
                         || task.opened_by == endpoint =>
                 {
-                    Some(InboxReason::YourUnlandedWork)
+                    let since = rev.pass.as_ref().map(|p| p.ts).unwrap_or(task.last_ts);
+                    Some((InboxReason::YourUnlandedWork, since))
                 }
                 _ => base_inbox_reason(task, endpoint),
             }
         } else {
             base_inbox_reason(task, endpoint)
         };
-        if let Some(reason) = reason {
-            entries.push(InboxEntry { task, reason });
+        if let Some((reason, since)) = reason_since {
+            entries.push(InboxEntry { task, reason, since });
         }
     }
+    entries.sort_by_key(|e| e.since);
     entries
 }
 
-fn base_inbox_reason(task: &TaskProjection, endpoint: &str) -> Option<InboxReason> {
+fn base_inbox_reason(
+    task: &TaskProjection,
+    endpoint: &str,
+) -> Option<(InboxReason, DateTime<Utc>)> {
     match task.state {
         TaskState::Open if task.assignee.as_deref() == Some(endpoint) => {
-            Some(InboxReason::AssignedOpen)
+            Some((InboxReason::AssignedOpen, task.last_ts))
         }
         TaskState::Claimed if task.assignee.as_deref() == Some(endpoint) => {
-            Some(InboxReason::ClaimedByYou)
+            Some((InboxReason::ClaimedByYou, task.last_ts))
         }
         _ => None,
     }
@@ -154,6 +163,54 @@ pub fn debt(model: &TaskReadModel) -> BTreeMap<Option<PathBuf>, Vec<DebtEntry<'_
         entries.sort_by_key(|e| e.since);
     }
     groups
+}
+
+/// One aged awaiting-review row: a proposed revision whose reviewer has not spoken. The sibling
+/// of the debt view (G8) — a dead reviewer is honest state that nobody sees unless it ages on a
+/// surface the owner reads.
+#[derive(Clone, Debug, Serialize)]
+pub struct AwaitingReviewEntry<'m> {
+    pub task: &'m TaskProjection,
+    pub revision_n: u32,
+    pub branch: String,
+    /// The only endpoint whose verdict can advance the revision (None until a verdict binds).
+    pub reviewer: Option<String>,
+    /// Propose time — age since the review was requested.
+    pub since: DateTime<Utc>,
+}
+
+/// Revisions currently awaiting review, oldest first. Pure projection: it renders age, it never
+/// escalates.
+pub fn awaiting_review(model: &TaskReadModel) -> Vec<AwaitingReviewEntry<'_>> {
+    let mut rows: Vec<AwaitingReviewEntry<'_>> = model
+        .tasks
+        .values()
+        .filter(|t| !t.state.is_terminal())
+        .filter_map(|task| {
+            let rev = task.current_revision()?;
+            (rev.state == RevisionState::AwaitingReview).then(|| AwaitingReviewEntry {
+                task,
+                revision_n: rev.revision.n,
+                branch: rev.revision.branch.clone(),
+                reviewer: rev.active_reviewer.clone(),
+                since: rev.proposed_at,
+            })
+        })
+        .collect();
+    rows.sort_by_key(|e| e.since);
+    rows
+}
+
+/// Compact human age for terminal rows: `42s`, `12m`, `5h`, `3d`. Truncating division at each
+/// unit boundary; future timestamps (clock skew) saturate to `0s`, never a negative.
+pub fn age_short(since: DateTime<Utc>, now: DateTime<Utc>) -> String {
+    let secs = now.signed_duration_since(since).num_seconds().max(0);
+    match secs {
+        0..=59 => format!("{secs}s"),
+        60..=3_599 => format!("{}m", secs / 60),
+        3_600..=86_399 => format!("{}h", secs / 3_600),
+        _ => format!("{}d", secs / 86_400),
+    }
 }
 
 /// Resolve a task-id prefix (short id) to the unique matching task id.
@@ -207,11 +264,14 @@ mod tests {
             format!("00000000-0000-7000-8000-{:012}", self.n)
         }
         fn push(&mut self, task_id: &str, by: &str, kind: TaskEventKind) {
+            self.push_at(task_id, by, "2026-07-16T12:00:00Z", kind);
+        }
+        fn push_at(&mut self, task_id: &str, by: &str, ts: &str, kind: TaskEventKind) {
             let id = self.next_id();
             self.events.push(TaskEvent {
                 id,
                 task_id: task_id.to_string(),
-                ts: "2026-07-16T12:00:00Z".parse().unwrap(),
+                ts: ts.parse().unwrap(),
                 by: by.to_string(),
                 kind,
             });
@@ -376,6 +436,154 @@ mod tests {
         assert_eq!(r1[0].state, RevisionState::Ready);
         let r2 = &groups[&Some(PathBuf::from("/tmp/r2"))];
         assert_eq!(r2[0].state, RevisionState::MergedLocal);
+    }
+
+    fn revision(n: u32, reviewer: Option<&str>) -> Revision {
+        Revision {
+            n,
+            branch: format!("task/x{n}"),
+            worktree: None,
+            upstream: "origin/main".into(),
+            base: sha('0'),
+            review_sha: sha('1'),
+            patch_id: sha('b'),
+            reviewer: reviewer.map(String::from),
+            session_ref: None,
+        }
+    }
+
+    #[test]
+    fn age_short_boundaries() {
+        let t0: chrono::DateTime<chrono::Utc> = "2026-07-16T00:00:00Z".parse().unwrap();
+        let at = |secs: i64| t0 + chrono::Duration::seconds(secs);
+        assert_eq!(age_short(t0, t0), "0s");
+        assert_eq!(age_short(t0, at(59)), "59s");
+        assert_eq!(age_short(t0, at(60)), "1m");
+        assert_eq!(age_short(t0, at(3_599)), "59m");
+        assert_eq!(age_short(t0, at(3_600)), "1h");
+        assert_eq!(age_short(t0, at(86_399)), "23h");
+        assert_eq!(age_short(t0, at(86_400)), "1d");
+        assert_eq!(age_short(t0, at(3 * 86_400 + 7_200)), "3d");
+        // Future timestamp (clock skew) saturates, never renders a negative.
+        assert_eq!(age_short(at(60), t0), "0s");
+    }
+
+    #[test]
+    fn awaiting_review_ages_since_propose_and_clears_on_verdict() {
+        let mut log = Log::new();
+        let old = log.open("h", Some("/tmp/r"), None);
+        log.push_at(
+            &old,
+            "agent:author",
+            "2026-07-13T12:00:00Z",
+            TaskEventKind::RevisionProposed { revision: revision(1, Some("agent:reviewer")) },
+        );
+        let newer = log.open("h", Some("/tmp/r"), None);
+        log.push_at(
+            &newer,
+            "agent:author",
+            "2026-07-16T09:00:00Z",
+            TaskEventKind::RevisionProposed { revision: revision(1, None) },
+        );
+
+        let model = log.model();
+        let rows = awaiting_review(&model);
+        assert_eq!(rows.len(), 2);
+        // Oldest first, propose time is the anchor, reviewer endpoint rides along.
+        assert_eq!(rows[0].task.task_id, old);
+        assert_eq!(rows[0].since.to_rfc3339(), "2026-07-13T12:00:00+00:00");
+        assert_eq!(rows[0].reviewer.as_deref(), Some("agent:reviewer"));
+        assert_eq!(rows[1].task.task_id, newer);
+        assert_eq!(rows[1].reviewer, None);
+
+        // A pass clears the entry (it moves to the debt view instead) ...
+        log.push(
+            &old,
+            "agent:reviewer",
+            TaskEventKind::ReviewPassed {
+                reviewer: "agent:reviewer".into(),
+                session_ref: None,
+                independence: None,
+            },
+        );
+        // ... a refute clears the other.
+        log.push(
+            &newer,
+            "agent:b",
+            TaskEventKind::ReviewRefuted { reviewer: "agent:b".into(), session_ref: None },
+        );
+        let model = log.model();
+        assert!(awaiting_review(&model).is_empty());
+    }
+
+    #[test]
+    fn awaiting_review_follows_supersede() {
+        let mut log = Log::new();
+        let t = log.open("h", Some("/tmp/r"), None);
+        log.push_at(
+            &t,
+            "agent:author",
+            "2026-07-10T00:00:00Z",
+            TaskEventKind::RevisionProposed { revision: revision(1, Some("agent:reviewer")) },
+        );
+        // Re-propose: rev1 is auto-superseded, only rev2 should age.
+        log.push_at(
+            &t,
+            "agent:author",
+            "2026-07-15T00:00:00Z",
+            TaskEventKind::RevisionProposed { revision: revision(2, Some("agent:reviewer")) },
+        );
+        let model = log.model();
+        let rows = awaiting_review(&model);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].revision_n, 2);
+        assert_eq!(rows[0].since.to_rfc3339(), "2026-07-15T00:00:00+00:00");
+    }
+
+    #[test]
+    fn inbox_is_oldest_first_with_waiting_anchors() {
+        let mut log = Log::new();
+        // Reviewed-unlanded work: `since` must be the PASS time, not the propose time.
+        let unlanded = log.open("h", Some("/tmp/r"), None);
+        log.push(&unlanded, "agent:a", TaskEventKind::Claimed { assignee: "agent:a".into() });
+        log.push_at(
+            &unlanded,
+            "agent:a",
+            "2026-07-14T00:00:00Z",
+            TaskEventKind::RevisionProposed { revision: revision(1, Some("agent:r")) },
+        );
+        log.push_at(
+            &unlanded,
+            "agent:r",
+            "2026-07-15T00:00:00Z",
+            TaskEventKind::ReviewPassed {
+                reviewer: "agent:r".into(),
+                session_ref: None,
+                independence: None,
+            },
+        );
+        // A review awaiting agent:a, proposed EARLIER than the pass above — sorts first.
+        let review = log.open("h", Some("/tmp/r"), None);
+        log.push_at(
+            &review,
+            "agent:b",
+            "2026-07-12T00:00:00Z",
+            TaskEventKind::RevisionProposed { revision: revision(1, Some("agent:a")) },
+        );
+
+        let model = log.model();
+        let entries = inbox(&model, "agent:a");
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].task.task_id, review, "stalest at top");
+        assert_eq!(entries[0].reason, InboxReason::AwaitingYourReview);
+        assert_eq!(entries[0].since.to_rfc3339(), "2026-07-12T00:00:00+00:00");
+        assert_eq!(entries[1].task.task_id, unlanded);
+        assert_eq!(entries[1].reason, InboxReason::YourUnlandedWork);
+        assert_eq!(
+            entries[1].since.to_rfc3339(),
+            "2026-07-15T00:00:00+00:00",
+            "unlanded work ages from the pass, not the propose"
+        );
     }
 
     #[test]

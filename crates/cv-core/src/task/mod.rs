@@ -37,8 +37,8 @@ pub use reduce::{
     RevisionProjection, TaskIssue, TaskProjection, TaskReadModel, TaskReducer,
 };
 pub use project::{
-    debt, effective_display, inbox, list, resolve_id, DebtEntry, InboxEntry, InboxReason,
-    TaskFilter,
+    age_short, awaiting_review, debt, effective_display, inbox, list, resolve_id,
+    AwaitingReviewEntry, DebtEntry, InboxEntry, InboxReason, TaskFilter,
 };
 pub use store::{new_event, replay, ReplayOutcome, TaskStore};
 
@@ -107,6 +107,17 @@ pub fn notify_board(event: &TaskEvent, channel: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The fleet identity convention (audit G4): the spawner sets `CV_ENDPOINT=agent:<pane>` in each
+/// agent's environment, and cv front-ends derive their default `--from` here — the *bare*
+/// command records the right actor. This is environment, not assertion: nothing verifies the
+/// string (law 3, no authority machinery); it only stops a forgotten flag from silently
+/// detaching an agent from its own inbox and misattributing the durable record forever.
+pub fn default_endpoint() -> Option<String> {
+    let v = std::env::var("CV_ENDPOINT").ok()?;
+    let v = v.trim();
+    (!v.is_empty()).then(|| v.to_string())
+}
+
 use std::path::PathBuf;
 
 /// Root dir for the task log: `$CLUSTERVISION_HOME/tasks` (or `~/.clustervision/tasks`).
@@ -116,4 +127,31 @@ pub fn tasks_dir() -> PathBuf {
         .or_else(|| dirs::home_dir().map(|h| h.join(".clustervision")))
         .unwrap_or_else(|| PathBuf::from("."))
         .join("tasks")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::default_endpoint;
+
+    /// All env cases live in ONE test: `set_var` is process-global and lib tests run in
+    /// parallel threads, so sequencing inside a single test is the serialization.
+    #[test]
+    fn default_endpoint_reads_cv_endpoint_trimmed_nonempty() {
+        std::env::remove_var("CV_ENDPOINT");
+        assert_eq!(default_endpoint(), None, "unset → no identity");
+
+        std::env::set_var("CV_ENDPOINT", "agent:demo");
+        assert_eq!(default_endpoint().as_deref(), Some("agent:demo"));
+
+        std::env::set_var("CV_ENDPOINT", "  agent:padded \n");
+        assert_eq!(default_endpoint().as_deref(), Some("agent:padded"), "trimmed");
+
+        std::env::set_var("CV_ENDPOINT", "   ");
+        assert_eq!(default_endpoint(), None, "whitespace-only → no identity");
+
+        std::env::set_var("CV_ENDPOINT", "");
+        assert_eq!(default_endpoint(), None, "empty → no identity");
+
+        std::env::remove_var("CV_ENDPOINT");
+    }
 }

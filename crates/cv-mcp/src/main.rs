@@ -211,7 +211,7 @@ fn task_tool_list() -> Value {
                     "issue": { "type": "string", "description": "External issue/work handle, free-form." },
                     "channel": { "type": "string", "description": "Board channel for task notifications (default 'tasks')." },
                     "assignee": { "type": "string", "description": "Endpoint this task is assigned to, if pre-assigned." },
-                    "from": { "type": "string", "description": "Who's opening. Default 'agent'." }
+                    "from": { "type": "string", "description": "Who's opening. Defaults to $CV_ENDPOINT, else 'agent'." }
                 },
                 "required": ["title"]
             }
@@ -247,9 +247,9 @@ fn task_tool_list() -> Value {
                 "type": "object",
                 "properties": {
                     "id": { "type": "string", "description": "Task id (prefix ok)." },
-                    "from": { "type": "string", "description": "Your endpoint. Default 'agent'." }
+                    "from": { "type": "string", "description": "Your endpoint. Defaults to $CV_ENDPOINT; ERROR when neither is set (identity-bearing events must record who acted)." }
                 },
-                "required": ["id", "from"]
+                "required": ["id"]
             }
         },
         {
@@ -259,9 +259,9 @@ fn task_tool_list() -> Value {
                 "type": "object",
                 "properties": {
                     "id": { "type": "string", "description": "Task id (prefix ok)." },
-                    "from": { "type": "string", "description": "Your endpoint. Default 'agent'." }
+                    "from": { "type": "string", "description": "Your endpoint. Defaults to $CV_ENDPOINT; ERROR when neither is set (identity-bearing events must record who acted)." }
                 },
-                "required": ["id", "from"]
+                "required": ["id"]
             }
         },
         {
@@ -273,7 +273,7 @@ fn task_tool_list() -> Value {
                     "id": { "type": "string", "description": "Task id (prefix ok)." },
                     "text": { "type": "string", "description": "The note." },
                     "session_ref": { "type": "string", "description": "Your cv session id, for provenance." },
-                    "from": { "type": "string", "description": "Your endpoint. Default 'agent'." }
+                    "from": { "type": "string", "description": "Your endpoint. Defaults to $CV_ENDPOINT, else 'agent'." }
                 },
                 "required": ["id", "text"]
             }
@@ -286,7 +286,7 @@ fn task_tool_list() -> Value {
                 "properties": {
                     "id": { "type": "string", "description": "Task id (prefix ok)." },
                     "observed": { "type": "string", "description": "Pointer to observable evidence (URL, path, session id)." },
-                    "from": { "type": "string", "description": "Your endpoint. Default 'agent'." }
+                    "from": { "type": "string", "description": "Your endpoint. Defaults to $CV_ENDPOINT, else 'agent'." }
                 },
                 "required": ["id"]
             }
@@ -299,7 +299,7 @@ fn task_tool_list() -> Value {
                 "properties": {
                     "id": { "type": "string", "description": "Task id (prefix ok)." },
                     "reason": { "type": "string", "description": "Why." },
-                    "from": { "type": "string", "description": "Your endpoint. Default 'agent'." }
+                    "from": { "type": "string", "description": "Your endpoint. Defaults to $CV_ENDPOINT, else 'agent'." }
                 },
                 "required": ["id"]
             }
@@ -317,7 +317,7 @@ fn task_tool_list() -> Value {
                     "worktree": { "type": "string", "description": "Worktree path, if the branch lives in one." },
                     "reviewer": { "type": "string", "description": "Reviewer endpoint bound to this revision (else the first verdict binds)." },
                     "session_ref": { "type": "string", "description": "YOUR cv session id — the author side of the reviewer-independence check." },
-                    "from": { "type": "string", "description": "Your endpoint. Default 'agent'." }
+                    "from": { "type": "string", "description": "Your endpoint. Defaults to $CV_ENDPOINT; ERROR when neither is set (identity-bearing events must record who acted)." }
                 },
                 "required": ["id", "branch"]
             }
@@ -330,9 +330,9 @@ fn task_tool_list() -> Value {
                 "properties": {
                     "id": { "type": "string", "description": "Task id (prefix ok)." },
                     "session": { "type": "string", "description": "Your cv session id (reviewer side of the independence check)." },
-                    "from": { "type": "string", "description": "Your reviewer endpoint. Default 'agent'." }
+                    "from": { "type": "string", "description": "Your reviewer endpoint. Defaults to $CV_ENDPOINT; ERROR when neither is set (identity-bearing events must record who acted)." }
                 },
-                "required": ["id", "from"]
+                "required": ["id"]
             }
         },
         {
@@ -343,9 +343,9 @@ fn task_tool_list() -> Value {
                 "properties": {
                     "id": { "type": "string", "description": "Task id (prefix ok)." },
                     "session": { "type": "string", "description": "Your cv session id." },
-                    "from": { "type": "string", "description": "Your reviewer endpoint. Default 'agent'." }
+                    "from": { "type": "string", "description": "Your reviewer endpoint. Defaults to $CV_ENDPOINT; ERROR when neither is set (identity-bearing events must record who acted)." }
                 },
-                "required": ["id", "from"]
+                "required": ["id"]
             }
         },
         {
@@ -1027,6 +1027,30 @@ fn board_ack(args: &Value) -> anyhow::Result<String> {
 // events go through the store's verifier-only path.
 // ---------------------------------------------------------------------------
 
+/// Identity resolution (G4): explicit `from` param wins, else the spawner-set `CV_ENDPOINT`
+/// (the MCP server inherits the agent's environment). Used by verbs where the actor is
+/// bookkeeping, not semantics — those fall back to the literal "agent" as before.
+fn task_from(args: &Value) -> Option<String> {
+    arg_str(args, "from")
+        .map(String::from)
+        .or_else(cv_core::task::default_endpoint)
+}
+
+/// [`task_from`] with the legacy "agent" sink for the non-identity-bearing verbs
+/// (open/note/done/abandon).
+fn task_from_or_agent(args: &Value) -> String {
+    task_from(args).unwrap_or_else(|| "agent".into())
+}
+
+/// Identity for identity-BEARING tools (task_claim/release/propose/pass/refute), whose endpoint
+/// string keys inbox and reviewer semantics: unresolvable identity is a hard error, never a
+/// silent fall-through to the shared "agent" sink.
+fn require_task_from(args: &Value) -> anyhow::Result<String> {
+    task_from(args).context(
+        "set CV_ENDPOINT or pass `from`; identity-bearing events must record who acted",
+    )
+}
+
 /// Replay the default task store; error on unreadable log, surface warnings inline.
 fn task_replay() -> anyhow::Result<(cv_core::task::ReplayOutcome, Vec<String>)> {
     let outcome = cv_core::task::replay()?;
@@ -1075,7 +1099,7 @@ fn task_open(args: &Value) -> anyhow::Result<String> {
     };
     task_append(
         None,
-        arg_str(args, "from").unwrap_or("agent"),
+        &task_from_or_agent(args),
         cv_core::task::TaskEventKind::Opened {
             title,
             body: arg_str(args, "body").unwrap_or("").to_string(),
@@ -1129,7 +1153,7 @@ fn task_simple(
 ) -> anyhow::Result<String> {
     let (outcome, warnings) = task_replay()?;
     let id = task_resolve(&outcome, arg_str(args, "id").context("`id` is required")?)?;
-    let from = arg_str(args, "from").unwrap_or("agent").to_string();
+    let from = require_task_from(args)?;
     task_append(Some(&id), &from.clone(), kind(from), warnings)
 }
 
@@ -1138,7 +1162,7 @@ fn task_note(args: &Value) -> anyhow::Result<String> {
     let id = task_resolve(&outcome, arg_str(args, "id").context("`id` is required")?)?;
     task_append(
         Some(&id),
-        arg_str(args, "from").unwrap_or("agent"),
+        &task_from_or_agent(args),
         cv_core::task::TaskEventKind::Noted {
             text: arg_str(args, "text").context("`text` is required")?.to_string(),
             session_ref: arg_str(args, "session_ref").map(String::from),
@@ -1152,7 +1176,7 @@ fn task_done(args: &Value) -> anyhow::Result<String> {
     let id = task_resolve(&outcome, arg_str(args, "id").context("`id` is required")?)?;
     task_append(
         Some(&id),
-        arg_str(args, "from").unwrap_or("agent"),
+        &task_from_or_agent(args),
         cv_core::task::TaskEventKind::Done { observed: arg_str(args, "observed").map(String::from) },
         warnings,
     )
@@ -1163,7 +1187,7 @@ fn task_abandon(args: &Value) -> anyhow::Result<String> {
     let id = task_resolve(&outcome, arg_str(args, "id").context("`id` is required")?)?;
     task_append(
         Some(&id),
-        arg_str(args, "from").unwrap_or("agent"),
+        &task_from_or_agent(args),
         cv_core::task::TaskEventKind::Abandoned {
             reason: arg_str(args, "reason").unwrap_or("no reason given").to_string(),
         },
@@ -1191,7 +1215,7 @@ fn task_propose(args: &Value) -> anyhow::Result<String> {
     )?;
     task_append(
         Some(&id),
-        arg_str(args, "from").unwrap_or("agent"),
+        &require_task_from(args)?,
         cv_core::task::TaskEventKind::RevisionProposed { revision },
         warnings,
     )
@@ -1205,7 +1229,7 @@ fn task_pass(args: &Value) -> anyhow::Result<String> {
     if let Some(w) = cv_core::task::independence_warning(independence.as_ref()) {
         warnings.push(w);
     }
-    let from = arg_str(args, "from").unwrap_or("agent").to_string();
+    let from = require_task_from(args)?;
     task_append(
         Some(&id),
         &from,
@@ -1221,7 +1245,7 @@ fn task_pass(args: &Value) -> anyhow::Result<String> {
 fn task_refute(args: &Value) -> anyhow::Result<String> {
     let (outcome, warnings) = task_replay()?;
     let id = task_resolve(&outcome, arg_str(args, "id").context("`id` is required")?)?;
-    let from = arg_str(args, "from").unwrap_or("agent").to_string();
+    let from = require_task_from(args)?;
     task_append(
         Some(&id),
         &from,
@@ -1293,11 +1317,31 @@ fn task_debt(args: &Value) -> anyhow::Result<String> {
             }));
         }
     }
+    // Aged awaiting-review revisions (G8): reviewer + propose time, oldest first.
+    let awaiting: Vec<Value> = cv_core::task::awaiting_review(&outcome.model)
+        .into_iter()
+        .filter(|e| match &want {
+            Some(w) => e.task.repo.as_deref() == Some(w.as_path()),
+            None => true,
+        })
+        .map(|e| {
+            json!({
+                "id": e.task.task_id,
+                "title": e.task.title,
+                "repo": e.task.repo,
+                "revision": e.revision_n,
+                "branch": e.branch,
+                "reviewer": e.reviewer,
+                "since": e.since,
+            })
+        })
+        .collect();
     // The debt view is only as honest as the verifier is alive: attach the heartbeat and any
     // suspect lands (recorded Landed, content no longer observed on upstream).
     let hb = cv_core::task::verify::read_heartbeat(&cv_core::task::tasks_dir());
     Ok(serde_json::to_string_pretty(&json!({
         "debt": rows,
+        "awaiting_review": awaiting,
         "suspects": hb.as_ref().map(|h| h.suspect_landed.clone()).unwrap_or_default(),
         "verified_as_of": hb.as_ref().map(|h| h.ts),
         "verify_warning": cv_core::task::verify::heartbeat_warning(hb.as_ref()),

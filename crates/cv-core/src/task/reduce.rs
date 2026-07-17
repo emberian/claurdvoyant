@@ -121,6 +121,9 @@ pub struct Note {
 pub struct RevisionProjection {
     pub revision: Revision,
     pub state: RevisionState,
+    /// When the revision was proposed (the propose event's timestamp) — the anchor for aging
+    /// AwaitingReview work: a dead reviewer is honest state nobody sees unless it ages visibly.
+    pub proposed_at: DateTime<Utc>,
     /// The only endpoint whose verdict can advance this revision. Bound at propose time (if the
     /// revision named a reviewer) or by the first verdict; reroute is the only reassignment.
     pub active_reviewer: Option<String>,
@@ -396,6 +399,7 @@ impl TaskReducer {
                     active_reviewer: revision.reviewer.clone(),
                     revision: revision.clone(),
                     state: RevisionState::AwaitingReview,
+                    proposed_at: event.ts,
                     pass: None,
                     refute: None,
                     reroutes: Vec::new(),

@@ -349,6 +349,26 @@ fn tasks_debt(query: &str) -> (u16, Value) {
                 }));
             }
         }
+        // Aged awaiting-review revisions (G8): reviewer endpoint + propose time, oldest first —
+        // a dead reviewer is honest state that must age somewhere the owner reads.
+        let awaiting: Vec<Value> = cv_core::task::awaiting_review(&outcome.model)
+            .into_iter()
+            .filter(|e| match &want {
+                Some(w) => e.task.repo.as_deref() == Some(w.as_path()),
+                None => true,
+            })
+            .map(|e| {
+                json!({
+                    "id": e.task.task_id,
+                    "title": e.task.title,
+                    "repo": e.task.repo,
+                    "revision": e.revision_n,
+                    "branch": e.branch,
+                    "reviewer": e.reviewer,
+                    "since": e.since,
+                })
+            })
+            .collect();
         let hb = cv_core::task::verify::read_heartbeat(&cv_core::task::tasks_dir());
         let suspects: Vec<Value> = hb
             .as_ref()
@@ -370,6 +390,7 @@ fn tasks_debt(query: &str) -> (u16, Value) {
             .unwrap_or_default();
         ok(json!({
             "debt": rows,
+            "awaiting_review": awaiting,
             "suspects": suspects,
             "verified_as_of": hb.as_ref().map(|h| h.ts),
             "verify_warning": cv_core::task::verify::heartbeat_warning(hb.as_ref()),

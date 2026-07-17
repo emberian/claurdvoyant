@@ -13,8 +13,9 @@ pub(crate) enum BoardCmd {
     Post {
         channel: String,
         body: String,
-        #[arg(long, default_value = "cv")]
-        from: String,
+        /// Sender endpoint. Default: $CV_ENDPOINT, else "cv".
+        #[arg(long)]
+        from: Option<String>,
         #[arg(long)]
         kind: Option<String>,
         #[arg(long = "tag")]
@@ -48,8 +49,9 @@ pub(crate) enum BoardCmd {
     Request {
         channel: String,
         body: String,
-        #[arg(long, default_value = "cv")]
-        from: String,
+        /// Sender endpoint. Default: $CV_ENDPOINT, else "cv".
+        #[arg(long)]
+        from: Option<String>,
     },
     /// Answer a request by its id.
     Reply {
@@ -57,8 +59,9 @@ pub(crate) enum BoardCmd {
         /// The request (or message) id this answers.
         in_reply_to: String,
         body: String,
-        #[arg(long, default_value = "cv")]
-        from: String,
+        /// Sender endpoint. Default: $CV_ENDPOINT, else "cv".
+        #[arg(long)]
+        from: Option<String>,
     },
     /// Collect all replies to a request id.
     Replies { channel: String, request_id: String },
@@ -66,8 +69,9 @@ pub(crate) enum BoardCmd {
     Claim {
         channel: String,
         key: String,
-        #[arg(long, default_value = "cv")]
-        from: String,
+        /// Sender endpoint. Default: $CV_ENDPOINT, else "cv".
+        #[arg(long)]
+        from: Option<String>,
         /// Lease duration in seconds.
         #[arg(long = "ttl-secs", default_value_t = 300)]
         ttl_secs: u64,
@@ -76,8 +80,9 @@ pub(crate) enum BoardCmd {
     Release {
         channel: String,
         key: String,
-        #[arg(long, default_value = "cv")]
-        from: String,
+        /// Sender endpoint. Default: $CV_ENDPOINT, else "cv".
+        #[arg(long)]
+        from: Option<String>,
     },
     /// List the currently-active (un-expired) claims on a channel.
     Claims { channel: String },
@@ -91,8 +96,9 @@ pub(crate) enum BoardCmd {
     Ack {
         channel: String,
         message_id: String,
-        #[arg(long, default_value = "cv")]
-        from: String,
+        /// Sender endpoint. Default: $CV_ENDPOINT, else "cv".
+        #[arg(long)]
+        from: Option<String>,
     },
 }
 
@@ -125,6 +131,15 @@ pub(crate) fn cmd_scry(harness: Option<String>, cwd: Option<String>, interval: f
     });
 }
 
+/// Board identity (G4): explicit `--from`, else the spawner-set `CV_ENDPOINT`, else `"cv"`. The
+/// board is chat, so unlike identity-bearing task verbs an unresolvable identity is never an
+/// error — the env var just makes the bare command attribute correctly.
+fn board_from(explicit: Option<String>) -> String {
+    explicit
+        .or_else(cv_core::task::default_endpoint)
+        .unwrap_or_else(|| "cv".into())
+}
+
 pub(crate) fn cmd_board(action: BoardCmd) -> Result<()> {
     use cv_core::board;
     match action {
@@ -136,6 +151,7 @@ pub(crate) fn cmd_board(action: BoardCmd) -> Result<()> {
             tags,
             session_ref,
         } => {
+            let from = board_from(from);
             let m = board::post(&channel, &from, &body, kind.as_deref(), tags, session_ref)?;
             println!("✦ posted {} to #{}", short_id(&m.id), channel);
         }
@@ -185,7 +201,7 @@ pub(crate) fn cmd_board(action: BoardCmd) -> Result<()> {
             }
         }
         BoardCmd::Request { channel, body, from } => {
-            let m = board::request(&channel, &from, &body)?;
+            let m = board::request(&channel, &board_from(from), &body)?;
             println!("✦ requested {} on #{}", short_id(&m.id), channel);
             println!("  ↳ reply with: cv board reply {channel} {} <body>", m.id);
         }
@@ -195,7 +211,7 @@ pub(crate) fn cmd_board(action: BoardCmd) -> Result<()> {
             body,
             from,
         } => {
-            let m = board::reply(&channel, &from, &in_reply_to, &body)?;
+            let m = board::reply(&channel, &board_from(from), &in_reply_to, &body)?;
             println!(
                 "✦ replied {} to {} on #{}",
                 short_id(&m.id),
@@ -218,12 +234,13 @@ pub(crate) fn cmd_board(action: BoardCmd) -> Result<()> {
             from,
             ttl_secs,
         } => {
+            let from = board_from(from);
             let lease = board::claim(&channel, &from, &key, Duration::from_secs(ttl_secs))?;
             match lease {
                 Some(l) => {
                     println!(
                         "GRANTED  {key} → {} (expires {})",
-                        l.owner,
+                        cv_core::sanitize::sanitize_line(&l.owner),
                         crate::util::fmt_local(l.expires_at, "%Y-%m-%d %H:%M:%S")
                     );
                 }
@@ -233,12 +250,13 @@ pub(crate) fn cmd_board(action: BoardCmd) -> Result<()> {
                         .find(|(k, _, _)| *k == key)
                         .map(|(_, owner, _)| owner)
                         .unwrap_or_else(|| "someone".into());
-                    println!("CONTENDED  {key} is held by {holder}");
+                    println!("CONTENDED  {key} is held by {}", cv_core::sanitize::sanitize_line(&holder));
                     std::process::exit(1);
                 }
             }
         }
         BoardCmd::Release { channel, key, from } => {
+            let from = board_from(from);
             // We can only `release` a real `Lease` (its dir/channel fields are private). But we must
             // not *acquire* a free key just to drop it — that would print "released" for something we
             // never held. So first confirm `from` actually owns a live claim on `key`; only then
@@ -264,7 +282,9 @@ pub(crate) fn cmd_board(action: BoardCmd) -> Result<()> {
             let claims = board::active_claims(&channel)?;
             for (key, owner, expires) in &claims {
                 println!(
-                    "{key:30}  {owner:16}  expires {}",
+                    "{:30}  {:16}  expires {}",
+                    cv_core::sanitize::sanitize_line(key),
+                    cv_core::sanitize::sanitize_line(owner),
                     crate::util::fmt_local(*expires, "%Y-%m-%d %H:%M:%S")
                 );
             }
@@ -273,11 +293,11 @@ pub(crate) fn cmd_board(action: BoardCmd) -> Result<()> {
             }
         }
         BoardCmd::Who { channel, within_secs } => {
-            // Record our own presence first, then list recent heartbeaters.
-            board::heartbeat(&channel, "cv")?;
+            // Record our own presence first (as CV_ENDPOINT when set), then list heartbeaters.
+            board::heartbeat(&channel, &board_from(None))?;
             let agents = board::who(&channel, Duration::from_secs(within_secs))?;
             for a in &agents {
-                println!("{a}");
+                println!("{}", cv_core::sanitize::sanitize_line(a));
             }
             if agents.is_empty() {
                 println!("(nobody seen on #{channel} in the last {within_secs}s)");
@@ -288,7 +308,7 @@ pub(crate) fn cmd_board(action: BoardCmd) -> Result<()> {
             message_id,
             from,
         } => {
-            let m = board::ack(&channel, &from, &message_id)?;
+            let m = board::ack(&channel, &board_from(from), &message_id)?;
             println!("✦ acked {} on #{channel}", short_id(&message_id));
             let _ = m;
         }
@@ -296,12 +316,15 @@ pub(crate) fn cmd_board(action: BoardCmd) -> Result<()> {
     Ok(())
 }
 
+/// Board messages are untrusted, forever-replayed text — sanitize every field at the terminal
+/// seam (G5). `--json` output stays raw: serde_json escapes control chars for that transport.
 fn print_board_msg(m: &cv_core::board::BoardMessage) {
+    use cv_core::sanitize::sanitize_line;
     println!(
         "{}  {}  ({}) {}",
         crate::util::fmt_local(m.ts, "%H:%M:%S"),
-        m.from,
-        m.kind,
-        m.body
+        sanitize_line(&m.from),
+        sanitize_line(&m.kind),
+        sanitize_line(&m.body)
     );
 }

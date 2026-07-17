@@ -28,6 +28,7 @@ pub mod prune;
 pub mod query;
 pub mod redact;
 pub mod render;
+pub mod sanitize;
 pub mod stream;
 pub mod task;
 pub mod tools;
