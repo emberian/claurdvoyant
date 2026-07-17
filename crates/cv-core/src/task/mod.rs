@@ -18,14 +18,18 @@
 //! 4. **Small.** This substrate stays a few thousand lines. Complexity requests go to the
 //!    design-notes graveyard, next to the 200k-line system this replaced.
 //!
-//! Law 1 governs the **land facet** — `MergedLocal`/`Landed` on code revisions. Base-lifecycle
-//! `Done { observed }` is **self-reported** unless a completion check is attached to verify it;
-//! `observed` on a check-less non-code task is free text nothing confirms (pinned by
-//! `crates/cv-sim/tests/adversary_gym.rs::pin_done_completion_is_self_reported`).
+//! Law 1 governs the **land facet** — `MergedLocal`/`Landed` on code revisions — and now extends
+//! to base-lifecycle completion: `cv task done --check-*` makes cv RUN a completion predicate, so a
+//! non-code `Done` can be OBSERVED (provenance `checked`, [`check::CheckSpec`]) rather than taken
+//! on the agent's word. A check-less `Done { observed }` stays **self-reported** — the honest
+//! fallback for tasks with no runnable predicate, LABELED as such (defended by
+//! `crates/cv-sim/tests/adversary_gym.rs::done_with_a_check_is_verified_not_attested`).
 //!
 //! Storage is a single append-only event log (`$CLUSTERVISION_HOME/tasks/events.jsonl`) with the
 //! same crash-safe flock recipe as the board.
 
+#[cfg(not(target_family = "wasm"))]
+pub mod check;
 pub mod model;
 pub mod project;
 pub mod provenance;
@@ -38,13 +42,15 @@ pub mod verify;
 pub mod views;
 
 pub use model::{
-    harness_family, model_family, IndependenceCheck, MergeFailure, ReviewReceipts, Revision, RevisionState, TaskEvent,
-    TaskEventKind, TaskState, VERIFIER_BY,
+    harness_family, model_family, DoneCheck, DoneCheckKind, IndependenceCheck, MergeFailure, ReviewReceipts, Revision,
+    RevisionState, TaskEvent, TaskEventKind, TaskState, VERIFIER_BY,
 };
 pub use project::{
     age_short, awaiting_review, branch_carriers, debt, effective_display, inbox, list, propose_collision_warnings,
     resolve_id, AwaitingReviewEntry, DebtEntry, InboxEntry, InboxReason, TaskFilter, STATE_VOCABULARY,
 };
+#[cfg(not(target_family = "wasm"))]
+pub use check::CheckSpec;
 pub use provenance::{freshness_from_heartbeat, Freshness, Provenance};
 pub use reduce::{
     EffectiveState, Note, PassEvidence, ReduceError, RefuteEvidence, RerouteEvidence, RevisionProjection, TaskIssue,

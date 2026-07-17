@@ -28,7 +28,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use super::model::{
-    IndependenceCheck, MergeFailure, ReviewReceipts, Revision, RevisionState, TaskEvent, TaskEventKind, TaskState,
+    DoneCheck, IndependenceCheck, MergeFailure, ReviewReceipts, Revision, RevisionState, TaskEvent, TaskEventKind,
+    TaskState,
 };
 
 /// Errors from applying an event. During a CAS append these reject the candidate event; during
@@ -216,6 +217,9 @@ pub struct TaskProjection {
     pub superseded_by: Option<String>,
     pub abandoned_reason: Option<String>,
     pub done_observed: Option<String>,
+    /// How the completion was verified, when a passing check was attached to the `Done`. `None` =
+    /// self-reported (the view/provenance layer labels the two distinctly).
+    pub done_check: Option<DoneCheck>,
 }
 
 impl TaskProjection {
@@ -249,6 +253,7 @@ impl TaskProjection {
             superseded_by: None,
             abandoned_reason: None,
             done_observed: None,
+            done_check: None,
         }
     }
 
@@ -379,7 +384,7 @@ impl TaskReducer {
                     session_ref: session_ref.clone(),
                 });
             }
-            TaskEventKind::Done { observed } => {
+            TaskEventKind::Done { observed, check } => {
                 require_base(task, kind, &[TaskState::Open, TaskState::Claimed])?;
                 if let Some(rev) = task.current_revision() {
                     if !rev.state.is_terminal() {
@@ -391,6 +396,7 @@ impl TaskReducer {
                     }
                 }
                 task.done_observed = observed.clone();
+                task.done_check = check.clone();
                 task.state = TaskState::Done;
             }
             TaskEventKind::Abandoned { reason } => {
@@ -1168,6 +1174,7 @@ mod tests {
             OTHER,
             TaskEventKind::Done {
                 observed: Some("screenshot.png".into()),
+                check: None,
             },
         );
         let m = log.reduce().unwrap();
@@ -1207,7 +1214,7 @@ mod tests {
         propose(&mut log, &task, 1);
         pass(&mut log, &task, REVIEWER);
 
-        log.push(&task, AUTHOR, TaskEventKind::Done { observed: None });
+        log.push(&task, AUTHOR, TaskEventKind::Done { observed: None, check: None });
         assert!(matches!(
             log.reduce().unwrap_err(),
             ReduceError::DoneWithLiveRevision { .. }
@@ -1234,7 +1241,7 @@ mod tests {
                 observed_patch_id: sha('b'),
             },
         );
-        log.push(&task, AUTHOR, TaskEventKind::Done { observed: None });
+        log.push(&task, AUTHOR, TaskEventKind::Done { observed: None, check: None });
         let m = log.reduce().unwrap();
         assert_eq!(m.tasks[&task].state, TaskState::Done);
     }

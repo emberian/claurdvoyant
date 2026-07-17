@@ -768,17 +768,21 @@ fn pin_identity_impersonation_is_currently_undetected() {
     );
 }
 
-/// KNOWN HOLE (pinned). A non-code task's completion (`Done`) is taken on the agent's word: the
-/// `observed` field is free text and nothing verifies or contradicts it. This is the law-1
-/// carve-out — git observation only covers code revisions (`MergedLocal`/`Landed`), so a task with
-/// no revision has no observable completion predicate at all.
+/// DEFENSE (formerly `pin_done_completion_is_self_reported`, codex red-team item 3). A non-code
+/// task's completion can now be OBSERVED, not just attested: `cv task done --check-cmd/-file/-http`
+/// makes cv RUN a completion predicate. A failing check REFUSES the done (the task stays open); a
+/// passing check records HOW it was verified ([`DoneCheck`]) and the completion carries provenance
+/// `checked`, not self-report. This extends law 1 (observed, not attested) from code revisions to
+/// revision-less tasks.
 ///
-/// Source: codex red-team item 3.
-///
-/// Future fix that FLIPS this: per-task-type completion predicates (a checkable artifact per task
-/// kind) — then a bare "trust me" Done is refused/flagged and this becomes a defense.
+/// The honest fallback is KEPT DELIBERATELY: a checkless done is still self-report — some tasks
+/// have no runnable completion predicate, and pretending otherwise would be the real hole. What
+/// changed is that self-report is now a *choice with an alternative*, and it is LABELED as such,
+/// never silently equal to an observed completion.
 #[test]
-fn pin_done_completion_is_self_reported() {
+fn done_with_a_check_is_verified_not_attested() {
+    use cv_core::task::{provenance, CheckSpec, Provenance};
+
     let store = TaskStore::at(tmp_dir("store"));
     let task = open_in(
         &store,
@@ -796,36 +800,76 @@ fn pin_done_completion_is_self_reported() {
             },
         ))
         .unwrap();
-    let done = store
+
+    // A FAILING check refuses the done. The surface (CLI/MCP) runs the check FIRST and appends only
+    // on pass; a nonzero exit errors, so nothing is written and the task stays open. Hermetic: the
+    // `false` builtin, no repo dir.
+    let refused = CheckSpec::Cmd("false".into()).run(None);
+    assert!(refused.is_err(), "a nonzero --check-cmd must refuse the done");
+    assert_eq!(
+        store.replay().unwrap().model.tasks[&task].state,
+        TaskState::Claimed,
+        "the refused done left the task open — completion was NOT taken on the agent's word"
+    );
+
+    // A PASSING check makes the completion observed. cv ran `true`, records the DoneCheck, and the
+    // projection carries it; the provenance is `checked`, distinct from self-report.
+    let check = CheckSpec::Cmd("true".into()).run(None).unwrap();
+    assert_eq!(check.result, "exit 0");
+    store
         .append_agent_event(new_event(
             Some(&task),
             "agent:worker",
             TaskEventKind::Done {
-                observed: Some("trust me".into()),
+                observed: Some(check.result.clone()),
+                check: Some(check.clone()),
             },
         ))
         .unwrap();
-    assert_eq!(done.by, "agent:worker");
-
     let outcome = store.replay().unwrap();
-    assert!(
-        outcome.warnings.is_empty(),
-        "no contradiction is raised on replay: {:?}",
-        outcome.warnings
+    let t = &outcome.model.tasks[&task];
+    assert_eq!(t.state, TaskState::Done);
+    assert_eq!(
+        t.done_check.as_ref(),
+        Some(&check),
+        "the observed check is recorded on the projection"
     );
-    assert_eq!(outcome.model.tasks[&task].state, TaskState::Done);
+    let prov = Provenance::checked(Some(t.last_ts));
+    assert_eq!(prov.source, provenance::SOURCE_CHECKED);
+    assert_ne!(
+        prov.source,
+        provenance::SOURCE_SELF_REPORT,
+        "a checked completion is observed, not self-reported"
+    );
 
-    // A verify pass has nothing to observe for a revision-less task: it neither confirms nor
-    // contradicts the self-reported completion.
-    let (appended, warnings) = run_verify(&store, None, &quiet()).unwrap();
-    assert!(
-        appended.is_empty(),
-        "nothing to append for a revision-less task: {appended:?}"
+    // DESIGN CHOICE, kept deliberately (not a hole): a CHECKLESS done is still self-report — the
+    // honest fallback for a task with no runnable completion predicate. It is LABELED self-report,
+    // never silently equal to an observed completion.
+    let task2 = open_in(
+        &store,
+        None,
+        "agent:worker",
+        Some("agent:worker"),
+        "think hard about the problem",
     );
-    assert!(
-        !warnings.iter().any(|w| w.contains(&task)),
-        "PINNED HOLE: the verifier says nothing about the Done task — completion is unverified. \
-         If a completion predicate now fires, flip this pin. Warnings: {warnings:?}"
+    store
+        .append_agent_event(new_event(
+            Some(&task2),
+            "agent:worker",
+            TaskEventKind::Done {
+                observed: Some("trust me".into()),
+                check: None,
+            },
+        ))
+        .unwrap();
+    let outcome = store.replay().unwrap();
+    let t2 = &outcome.model.tasks[&task2];
+    assert_eq!(t2.state, TaskState::Done);
+    assert!(t2.done_check.is_none(), "a checkless done carries no observed check");
+    assert_eq!(
+        Provenance::self_reported(Some(t2.last_ts)).source,
+        provenance::SOURCE_SELF_REPORT,
+        "the honest fallback stays LABELED self-report"
     );
 }
 

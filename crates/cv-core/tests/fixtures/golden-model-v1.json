@@ -98,7 +98,12 @@
       ],
       "superseded_by": null,
       "abandoned_reason": null,
-      "done_observed": "observed on origin/main by cv-verify"
+      "done_observed": "observed on origin/main by cv-verify",
+      "done_check": {
+        "check": "cmd",
+        "cmd": "cargo test -p demo",
+        "result": "exit 0"
+      }
     },
     "00000000-0000-7000-8000-000000000013": {
       "task_id": "00000000-0000-7000-8000-000000000013",
@@ -149,7 +154,8 @@
       "notes": [],
       "superseded_by": null,
       "abandoned_reason": "refuted; superseding approach chosen",
-      "done_observed": null
+      "done_observed": null,
+      "done_check": null
     },
     "00000000-0000-7000-8000-000000000020": {
       "task_id": "00000000-0000-7000-8000-000000000020",
@@ -168,7 +174,8 @@
       "notes": [],
       "superseded_by": "00000000-0000-7000-8000-000000000001",
       "abandoned_reason": null,
-      "done_observed": null
+      "done_observed": null,
+      "done_check": null
     }
   }
 }
