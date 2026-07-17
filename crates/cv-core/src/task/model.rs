@@ -242,6 +242,10 @@ pub struct IndependenceCheck {
 /// (law 2's posture: observed and recorded, never a gate). Every field is `Option` because every
 /// field is an honest observation: `None` means "could not determine", never a guess.
 ///
+/// These are a **heuristic signal, not proof**: substring/pattern observations over tool inputs
+/// that show *effort*, never guarantee *review* — echoing the review sha alone satisfies
+/// `saw_change` (pinned by `crates/cv-sim/tests/adversary_gym.rs::pin_goodhart_saw_change_is_currently_gameable`).
+///
 /// Semantics when recorded (a reviewer session id was provided):
 /// - all fields `None`: the session was named but could not be found/read — undetermined.
 /// - `saw_change`: whether the transcript shows observable contact with the reviewed change

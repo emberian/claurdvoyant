@@ -32,6 +32,14 @@
   and suspects persist across partial verifies, so a targeted re-verify
   cannot launder one away. `cv`/`cvd --version` and the cvd startup log embed
   the build commit.
+- **Docs say exactly what the sensors deliver.** Review **receipts are a
+  heuristic signal, not proof** — substring/pattern scans of the reviewer's
+  transcript that show effort, never guarantee the diff was read (echoing the
+  review sha alone satisfies `saw_change`, pinned in
+  `crates/cv-sim/tests/adversary_gym.rs`). And law 1 is spelled out as covering
+  **landing, not completion**: a non-code `done` is self-reported unless a
+  completion check is attached to verify it. Doc-comments and the manual now
+  state both plainly instead of implying more.
 - **Task identity comes from the environment.** `CV_ENDPOINT` is the identity
   convention (the spawner sets it; `--from` overrides); identity-bearing verbs
   (claim/release/propose/pass/refute) refuse to act with neither present
