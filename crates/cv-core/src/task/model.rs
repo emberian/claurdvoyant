@@ -690,7 +690,7 @@ mod tests {
                 text: String::new(),
                 session_ref: None,
             },
-            TaskEventKind::Done { observed: None },
+            TaskEventKind::Done { observed: None, check: None },
             TaskEventKind::Abandoned { reason: String::new() },
             TaskEventKind::Superseded { by_task: String::new() },
             TaskEventKind::ReviewRerouted {
