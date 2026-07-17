@@ -24,14 +24,16 @@ fn apply_query(refs: &mut Vec<SessionRef>, query: &Option<cv_core::SessionQuery>
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn cmd_ls(
     harness: Option<String>,
     cwd: Option<String>,
     query: Option<String>,
     limit: usize,
     sort_by: &str,
-    fresh: bool, // force a full re-discovery instead of trusting the probed catalog
-    json: bool,  // emit the rows as one JSON array (OpenSession-aligned fields) instead of the table
+    fresh: bool,   // force a full re-discovery instead of trusting the probed catalog
+    json: bool,    // emit the rows as one JSON array (OpenSession-aligned fields) instead of the table
+    enrich: bool,  // --json only: add transcript-derived git + displayTitle (one parse per emitted row)
 ) -> Result<()> {
     let want = parse_harness(&harness)?;
     let query = crate::cmd::query::build(query)?;
@@ -63,14 +65,22 @@ pub(crate) fn cmd_ls(
         // Machine-readable listing: the SAME rows the table below would print (same filters, sort,
         // exists() guard, and limit), as one JSON array on stdout — no header/footer, so it pipes
         // cleanly. Field names are camelCase, aligned with docs/OPENSESSION.md where it names the
-        // concept (harness/id/cwd/title/createdAt/updatedAt); the catalog doesn't store the model
-        // or file size, so those aren't emitted.
+        // concept (harness/id/cwd/title/createdAt/updatedAt).
+        //
+        // `sizeBytes` is always emitted: it comes free from the metadata() call that already serves
+        // as the exists() guard (a row whose file has vanished since the probe is skipped, its Err
+        // standing in for the old `path.exists()` == false). Transcript-derived text (title) stays
+        // raw here — sanitizing is the terminal seam's job (G5); JSON is the machine contract.
+        //
+        // `--enrich` (git + displayTitle) is opt-in because it costs one transcript parse per
+        // emitted row — O(limit), not O(fleet), but not the catalog-cheap default `ls --json`
+        // promises. See the perf note in the flag's help.
         let rows: Vec<serde_json::Value> = refs
             .iter()
-            .filter(|r| r.path.exists())
+            .filter_map(|r| std::fs::metadata(&r.path).ok().map(|m| (r, m.len())))
             .take(limit)
-            .map(|r| {
-                serde_json::json!({
+            .map(|(r, size)| {
+                let mut obj = serde_json::json!({
                     "harness": r.harness.as_str(),
                     "id": r.id,
                     "cwd": r.cwd.as_ref().map(|p| p.to_string_lossy()),
@@ -79,7 +89,31 @@ pub(crate) fn cmd_ls(
                     "createdAt": r.created_at.map(|t| t.to_rfc3339()),
                     "updatedAt": r.updated_at.map(|t| t.to_rfc3339()),
                     "path": r.path.to_string_lossy(),
-                })
+                    "sizeBytes": size,
+                });
+                if enrich {
+                    // Same transcript source `cv show --json` reads. A lazy parse leaves giant
+                    // content on disk (memory-safe on the multi-MB "single-exchange giants" sesh
+                    // warns about) while still carrying the session's git metadata and enough of the
+                    // first user turn to synthesize a title.
+                    if let Some(session) = cv_core::harness::for_harness(r.harness).and_then(|a| {
+                        cv_core::stream::collect_with(a.as_ref(), r, &cv_core::ParseOptions::lazy()).ok()
+                    }) {
+                        let map = obj.as_object_mut().expect("json object");
+                        // `git`: the same object `cv show --json` emits (branch/commit/remote,
+                        // skip-none), omitted entirely when the transcript records no git context.
+                        if let Some(git) = &session.git {
+                            if let Ok(g) = serde_json::to_value(git) {
+                                map.insert("git".into(), g);
+                            }
+                        }
+                        // `displayTitle`: `title` with a first-real-user-text fallback. Explicit
+                        // null (not absent) when a session has neither, so consumers can tell "no
+                        // title anywhere" from "not enriched" (the key is absent without --enrich).
+                        map.insert("displayTitle".into(), serde_json::json!(session.synth_title()));
+                    }
+                }
+                obj
             })
             .collect();
         println!("{}", serde_json::to_string_pretty(&rows)?);

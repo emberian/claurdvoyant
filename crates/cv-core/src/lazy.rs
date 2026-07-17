@@ -78,6 +78,17 @@ impl Text {
         }
     }
 
+    /// Resolve at most the first `max_raw` raw bytes — the head of the content. Cheap and bounded:
+    /// a giant paste never materializes past the cap. Inline text borrows in full (already in
+    /// memory); a span reads only its prefix. Used to synthesize a short title without paying for a
+    /// multi-megabyte first message.
+    pub fn resolve_prefix<'a>(&'a self, resolver: &'a Resolver, max_raw: u64) -> Cow<'a, str> {
+        match self {
+            Text::Inline(s) => Cow::Borrowed(s),
+            Text::Span(sp) => resolver.resolve_prefix(sp, max_raw),
+        }
+    }
+
     /// Length in bytes without resolving (a span's raw length — an upper bound on the unescaped len).
     pub fn len(&self) -> usize {
         match self {

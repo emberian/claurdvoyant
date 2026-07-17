@@ -102,7 +102,46 @@ When a session has no title, `cv` falls back to a dimmed cwd so the row still te
 - `--limit <n>` — rows to show (default `40`).
 - `--json` — emit the same rows as one JSON array on stdout (nothing else), for downstream
   tools. Fields are camelCase and OpenSession-aligned: `harness`, `id`, `cwd`, `title`,
-  `messageCount`, `createdAt`/`updatedAt` (ISO-8601 UTC), plus the on-disk `path`.
+  `messageCount`, `createdAt`/`updatedAt` (ISO-8601 UTC), the on-disk `path`, and `sizeBytes`
+  (the transcript file's length — free from the same `stat` that guards a since-deleted row, so
+  it is always present). Transcript-derived text (`title`) is emitted **raw** — the machine
+  contract, not the sanitized terminal view.
+- `--enrich` (with `--json`) — add two transcript-derived fields to each row:
+  - `git` — the same object `cv show --json` emits (`branch`/`commit`/`remote`, each omitted when
+    absent), read from the transcript's recorded git context. This is the branch the session *ran
+    on*, a historical fact stored in the transcript — **not** the cwd's current branch (which a
+    `git` shell-out would give and which may since have changed).
+  - `displayTitle` — the row's `title` with a fallback synthesized from the first real user turn
+    (peeling a leading `<system-reminder>` block and skipping the `Caveat:` command preamble, bare
+    command wrappers, and tool-result turns). Explicit `null` only when a session carries neither
+    an explicit title nor any user prose. `title` itself is left untouched (still `null` when the
+    catalog has none), so a consumer can tell "no title anywhere" from "not enriched".
+
+  Enrichment costs **one lazy transcript parse per emitted row** — O(`--limit`), not the whole
+  fleet (the giants' content stays on disk; only metadata and the first user turn's head are
+  read). Plain `cv ls --json` stays a catalog-only, milliseconds-warm read; opt into `--enrich`
+  when you need `git`/`displayTitle` and are listing a bounded window.
+
+#### Freshness — what `ls` guarantees
+
+`cv ls` reads the **probed catalog**, not a full fleet scan: warm, it answers in milliseconds. The
+catalog's freshness rests on a staleness probe plus a time backstop
+(`CLUSTERVISION_MAX_STALE_SECS`, default **900s**):
+
+- **A brand-new session is always seen.** Creating a session writes a new file, which bumps its
+  directory's mtime; the probe re-stats the watched directories and re-discovers that harness before
+  reading. Worst-case lag for a *just-created* session is effectively none (one probe cycle on the
+  next `cv ls`), not the backstop window.
+- **The bounded blind spot is an in-place append** to an *existing, older* session (one outside the
+  50 most-recently-updated files the probe re-stats): its `updatedAt`/`messageCount` can lag until
+  the backstop forces a full re-discovery — at most `CLUSTERVISION_MAX_STALE_SECS` (default 900s).
+  New sessions and new files are never in this blind spot.
+- **`--fresh` forces a full re-discovery** (`discover_all`) instead of trusting the probe — the
+  escape hatch when you need the absolute latest and cannot accept even the bounded append lag.
+  `CLUSTERVISION_MAX_STALE_SECS=0` has the same effect for every read.
+
+A row whose file was deleted since the probe is dropped at read time (the `stat` that also yields
+`sizeBytes`), so a stale row never survives into the output.
 
 ### `cv timeline`
 
