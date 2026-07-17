@@ -150,6 +150,43 @@ impl Session {
         label_from(self.title.as_deref(), self.first_user_text().as_deref())
     }
 
+    /// The best title for a machine listing: the explicit [`title`](Session::title) when present,
+    /// otherwise one synthesized from the first user message that reads as a real prompt — skipping
+    /// the `Caveat:` command preamble, bare `<system-reminder>`/command-wrapper turns, and peeling a
+    /// leading `<system-reminder>` block off an otherwise-real turn (tool results are [`Role::Tool`],
+    /// already excluded). `None` only when a session carries no explicit title and no user prose.
+    ///
+    /// Resolver-aware and bounded (reads at most a few KB of any one message via
+    /// [`Text::resolve_prefix`](crate::lazy::Text::resolve_prefix)), so it never panics on a lazy
+    /// [`Span`](crate::lazy::Span) and never materializes a giant paste — safe to call on a
+    /// [`ParseOptions::lazy`](crate::ParseOptions::lazy) parse. The result is transcript-derived text
+    /// (untrusted): JSON consumers get it raw; a terminal seam must sanitize it.
+    pub fn synth_title(&self) -> Option<String> {
+        if let Some(t) = &self.title {
+            return Some(t.clone());
+        }
+        // A title is short; reading the head of each candidate is plenty and keeps a multi-megabyte
+        // first message from being materialized in full.
+        const HEAD: u64 = 8 * 1024;
+        let resolver = self.resolver();
+        self.messages
+            .iter()
+            .filter(|m| m.role == Role::User)
+            .find_map(|m| {
+                let mut s = String::new();
+                for b in &m.content {
+                    if let Block::Text { text } = b {
+                        if !s.is_empty() {
+                            s.push('\n');
+                        }
+                        s.push_str(&text.resolve_prefix(&resolver, HEAD));
+                    }
+                }
+                meaningful_prompt(&s)
+            })
+            .map(|t| truncate(&t, 80))
+    }
+
     /// All textual content concatenated — used to build a search index.
     ///
     /// The per-message projection lives in [`Message::append_searchable`]; this just prepends the
@@ -410,6 +447,30 @@ pub fn label_from(title: Option<&str>, first_user_text: Option<&str>) -> String 
         .unwrap_or_else(|| "(untitled)".into())
 }
 
+/// A user turn's text as a real prompt, or `None` when it's only harness noise. Peels any leading
+/// `<system-reminder>…</system-reminder>` blocks and surrounding whitespace, then rejects the
+/// residual if it's empty, the `Caveat:` local-command preamble, or a bare command wrapper
+/// (`<command-name>`/`<command-message>`/`<local-command-stdout>`). Used by [`Session::synth_title`].
+fn meaningful_prompt(text: &str) -> Option<String> {
+    let mut s = text.trim_start();
+    loop {
+        s = s.trim_start();
+        let Some(rest) = s.strip_prefix("<system-reminder>") else { break };
+        let Some(end) = rest.find("</system-reminder>") else { break };
+        s = &rest[end + "</system-reminder>".len()..];
+    }
+    let s = s.trim();
+    if s.is_empty()
+        || s.starts_with("Caveat:")
+        || s.starts_with("<command-name>")
+        || s.starts_with("<command-message>")
+        || s.starts_with("<local-command-stdout>")
+    {
+        return None;
+    }
+    Some(s.to_string())
+}
+
 /// Flatten newlines to spaces and truncate to at most `max` chars, ending with `…` when cut.
 /// The one canonical truncation used by labels, renderers, and listings.
 ///
@@ -446,6 +507,65 @@ mod tests {
             assert_eq!(Harness::parse(h.as_str()), Some(h), "parse arm missing for {h:?}");
         }
         assert_eq!(Harness::ALL.len(), Harness::COUNT);
+    }
+
+    /// `meaningful_prompt` peels system-reminder blocks and rejects pure harness noise, so
+    /// `synth_title` never surfaces a caveat/command wrapper as a title.
+    #[test]
+    fn meaningful_prompt_skips_noise_and_peels_reminders() {
+        // A leading reminder block is peeled off an otherwise-real prompt.
+        assert_eq!(
+            meaningful_prompt("<system-reminder>x</system-reminder>\n\nreal question").as_deref(),
+            Some("real question")
+        );
+        // Multiple stacked reminders are all peeled.
+        assert_eq!(
+            meaningful_prompt("<system-reminder>a</system-reminder><system-reminder>b</system-reminder> hi")
+                .as_deref(),
+            Some("hi")
+        );
+        // Pure noise (no residual prose) yields None.
+        assert_eq!(meaningful_prompt("<system-reminder>only a reminder</system-reminder>"), None);
+        assert_eq!(meaningful_prompt("Caveat: The messages below were generated…"), None);
+        assert_eq!(meaningful_prompt("<command-name>/foo</command-name>"), None);
+        assert_eq!(meaningful_prompt("   \n  "), None);
+        // A plain prompt passes through unchanged.
+        assert_eq!(meaningful_prompt("just a prompt").as_deref(), Some("just a prompt"));
+    }
+
+    /// `synth_title` prefers the explicit title, falls back to the first meaningful user turn, and
+    /// stays `None` when a session carries neither (the documented residual).
+    #[test]
+    fn synth_title_prefers_title_then_falls_back_then_none() {
+        let user = |t: &str| {
+            let mut m = Message::new(Role::User);
+            m.content.push(Block::Text { text: t.into() });
+            m
+        };
+        let mut s = Session {
+            id: "s".into(),
+            harness: Harness::Claude,
+            cwd: None,
+            title: Some("explicit".into()),
+            created_at: None,
+            updated_at: None,
+            model: None,
+            git: None,
+            messages: vec![user("<system-reminder>noise</system-reminder>\n\nask about otters")],
+            source_path: None,
+            extra: Default::default(),
+        };
+        // Explicit title wins.
+        assert_eq!(s.synth_title().as_deref(), Some("explicit"));
+        // Without one, the first meaningful user turn is synthesized (reminder peeled).
+        s.title = None;
+        assert_eq!(s.synth_title().as_deref(), Some("ask about otters"));
+        // A session with no user prose stays None.
+        s.messages = vec![user("<system-reminder>only noise</system-reminder>")];
+        assert_eq!(s.synth_title(), None);
+        // And truly no user turns at all is None too.
+        s.messages = vec![];
+        assert_eq!(s.synth_title(), None);
     }
 
     /// The streaming `truncate` must behave exactly like the old flatten-whole-string version.

@@ -249,6 +249,13 @@ fn ls_json_emits_the_same_rows_machine_readably() {
     assert!(rows[0]["path"].as_str().unwrap().ends_with("alphasess.jsonl"), "{out}");
     // betasess has no title: present as an explicit null, not absent.
     assert!(rows[1]["title"].is_null(), "{out}");
+    // sizeBytes is always emitted (it comes free from the exists() guard's metadata call) and
+    // matches the file's real length; the enrichment fields stay absent without --enrich.
+    let real_size = std::fs::metadata(rows[0]["path"].as_str().unwrap()).unwrap().len();
+    assert_eq!(rows[0]["sizeBytes"].as_u64().unwrap(), real_size, "{out}");
+    assert!(rows[0]["sizeBytes"].as_u64().unwrap() > 0, "{out}");
+    assert!(rows[0].get("git").is_none(), "no --enrich ⇒ no git:\n{out}");
+    assert!(rows[0].get("displayTitle").is_none(), "no --enrich ⇒ no displayTitle:\n{out}");
 
     // --limit bounds the array just like the table, with no "… N more" footer polluting stdout.
     let (out, _) = w.cv_ok(&["ls", "--json", "--limit", "1"]);
@@ -259,6 +266,38 @@ fn ls_json_emits_the_same_rows_machine_readably() {
     let (out, _) = w.cv_ok(&["ls", "--json", "--harness", "codex"]);
     let rows: Vec<serde_json::Value> = serde_json::from_str(out.trim()).unwrap();
     assert!(rows.is_empty(), "{out}");
+}
+
+#[test]
+fn ls_json_enrich_adds_git_branch_and_synthesized_title() {
+    let w = World::new("lsjsonenrich");
+    // A session with a recorded git branch and NO explicit title — so displayTitle must be
+    // synthesized from the first real user turn, and a leading <system-reminder> block is peeled.
+    w.write_session(
+        "enrichsess",
+        &[
+            serde_json::json!({
+                "type": "user", "uuid": "e1", "sessionId": "s",
+                "timestamp": "2026-05-01T10:00:00Z", "cwd": "/work/proj", "gitBranch": "feature/enrich",
+                "message": {"role": "user", "content":
+                    "<system-reminder>be nice</system-reminder>\n\nteach me about capybaras please"}
+            }),
+            assistant_line("e2", "2026-05-01T10:01:00Z",
+                serde_json::json!([{"type": "text", "text": "capybaras are the largest rodents"}])),
+        ],
+    );
+
+    let (out, _) = w.cv_ok(&["ls", "--json", "--enrich"]);
+    let rows: Vec<serde_json::Value> = serde_json::from_str(out.trim()).expect("pure JSON");
+    assert_eq!(rows.len(), 1, "{out}");
+    // The raw catalog title stays null; displayTitle carries the synthesized fallback with the
+    // system-reminder noise stripped.
+    assert!(rows[0]["title"].is_null(), "{out}");
+    assert_eq!(rows[0]["displayTitle"], "teach me about capybaras please", "{out}");
+    // git object matches `cv show --json`'s shape (branch present).
+    assert_eq!(rows[0]["git"]["branch"], "feature/enrich", "{out}");
+    // sizeBytes still present alongside the enrichment.
+    assert!(rows[0]["sizeBytes"].as_u64().unwrap() > 0, "{out}");
 }
 
 // ───────────────────────────── search ─────────────────────────────

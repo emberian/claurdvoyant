@@ -2,6 +2,25 @@
 
 ## 0.10.0 (unreleased)
 
+- **`cv ls --json` closes the consumer gaps (#15).** Every row now carries
+  `sizeBytes` (the transcript file's length — free from the same `stat` that
+  already guards a since-deleted row, so it is always present and needs no extra
+  I/O). A new `--enrich` flag (with `--json`) adds two transcript-derived fields:
+  `git` — the same `branch`/`commit`/`remote` object `cv show --json` emits, read
+  from the transcript's recorded git context (the branch the session *ran on*, a
+  historical fact — not the cwd's current branch) — and `displayTitle`, the row's
+  `title` with a fallback synthesized from the first real user turn (peeling a
+  leading `<system-reminder>` block and skipping the `Caveat:` preamble, bare
+  command wrappers, and tool-result turns; explicit `null` only when a session
+  has neither an explicit title nor any user prose). `title` itself is left
+  untouched, so existing consumers see byte-identical keys. Enrichment costs one
+  lazy transcript parse per emitted row — O(`--limit`), not the whole fleet — so
+  plain `cv ls --json` stays a catalog-only, milliseconds-warm read. The `ls`
+  freshness contract is now documented (manual `cli.md`): brand-new sessions are
+  always seen on the next read (a new file bumps a watched dir mtime); the only
+  bounded blind spot is an in-place append to an older session outside the
+  top-50, which lags at most `CLUSTERVISION_MAX_STALE_SECS` (default 900s); and
+  `--fresh` forces a full re-discovery.
 - **Every observed fact now carries its source and freshness — `Unknown` is
   first-class.** A land is no longer a bare boolean; it is "observed landed,
   git-verified, as of a pass 4m ago". A new pure `Provenance { observed_at,

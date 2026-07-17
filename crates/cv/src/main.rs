@@ -115,6 +115,12 @@ enum Cmd {
         /// fields. Nothing else goes to stdout, so the output pipes cleanly.
         #[arg(long)]
         json: bool,
+        /// (--json only) Enrich each row with transcript-derived `git` (branch/commit/remote, as
+        /// `cv show --json` emits it) and `displayTitle` (the title with a first-real-user-text
+        /// fallback). Costs one lazy transcript parse per emitted row — O(--limit), not the whole
+        /// fleet — so plain `ls --json` stays catalog-cheap; opt in when you need these fields.
+        #[arg(long)]
+        enrich: bool,
     },
     /// Full-text search across all session content.
     Search {
@@ -711,7 +717,8 @@ fn main() -> Result<()> {
             sort_by,
             fresh,
             json,
-        } => browse::cmd_ls(harness, cwd, query, limit, &sort_by, fresh, json),
+            enrich,
+        } => browse::cmd_ls(harness, cwd, query, limit, &sort_by, fresh, json, enrich),
         Cmd::Search {
             query,
             harness,
