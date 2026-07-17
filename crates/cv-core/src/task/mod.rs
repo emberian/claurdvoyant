@@ -18,6 +18,11 @@
 //! 4. **Small.** This substrate stays a few thousand lines. Complexity requests go to the
 //!    design-notes graveyard, next to the 200k-line system this replaced.
 //!
+//! Law 1 governs the **land facet** — `MergedLocal`/`Landed` on code revisions. Base-lifecycle
+//! `Done { observed }` is **self-reported** unless a completion check is attached to verify it;
+//! `observed` on a check-less non-code task is free text nothing confirms (pinned by
+//! `crates/cv-sim/tests/adversary_gym.rs::pin_done_completion_is_self_reported`).
+//!
 //! Storage is a single append-only event log (`$CLUSTERVISION_HOME/tasks/events.jsonl`) with the
 //! same crash-safe flock recipe as the board.
 
@@ -175,7 +180,9 @@ fn scan_reviewer_session(session_id: &str, t: &reduce::TaskProjection) -> Option
 /// current revision to name needles from (branch, review sha + 12-prefix, repo path, or a
 /// `git diff`/`git show`/`git log` invocation); `ran_checks` uses [`CHECK_COMMAND_PATTERNS`].
 /// Both look at **tool-call inputs** only — that is where commands and file reads live; claims
-/// in prose are exactly what this observation refuses to take at face value.
+/// in prose are exactly what this observation refuses to take at face value. The match is still a
+/// plain substring test, so it is gameable at the tool-input level too (echoing the sha satisfies
+/// `saw_change`): pinned by `adversary_gym.rs::pin_goodhart_saw_change_is_currently_gameable`.
 fn scan_session(
     adapter: &dyn crate::harness::Adapter,
     sref: &crate::ir::SessionRef,
@@ -269,7 +276,9 @@ pub fn independence_warning(check: Option<&IndependenceCheck>) -> Option<String>
 }
 
 /// Human-readable advisory line for a receipts observation (shared CLI/MCP wording). `None`
-/// receipts means no reviewer session was given; observed contact produces no warning at all.
+/// receipts means no reviewer session was given; observed contact produces no warning at all —
+/// but note "observed contact" is the gameable substring heuristic (see [`ReviewReceipts`]), so
+/// the *absence* of a warning is a pre-Goodhart signal, not proof the reviewer read the change.
 /// Always advisory: recorded, never a gate.
 pub fn receipts_warning(receipts: Option<&ReviewReceipts>) -> Option<String> {
     match receipts {

@@ -31,6 +31,11 @@ The substrate is built on four laws (quoted from the module doc, which is the ca
 4. **Small.** This substrate stays a few thousand lines. Complexity requests go to the
    design-notes graveyard, next to the 200k-line system this replaced.
 
+> Law 1 is about the **land facet** — `merged_local`/`landed` on code revisions, which git
+> observes. Base-lifecycle `done` is **self-reported unless a completion check is attached** to
+> verify it; `--observed` on a check-less non-code task is free text (pinned by
+> `adversary_gym.rs::pin_done_completion_is_self_reported`).
+
 ## The base lifecycle
 
 Every task has a base lifecycle, whether or not code is involved:
@@ -50,7 +55,9 @@ open ──claim──► claimed ──done──► done
 - **`note`** — progress notes; never change state.
 - **`done`** — completes a task, optionally pointing at observable evidence
   (`--observed <url-or-path>`). **Refused while a code revision is live** — you can always
-  *kill* a task, but you can never silently complete one that has unlanded reviewed code.
+  *kill* a task, but you can never silently complete one that has unlanded reviewed code. On a
+  non-code task `done` is **self-reported unless a completion check is attached** to verify it —
+  `--observed` alone is free text (law 1 covers landing, not completion; see the note above).
 - **`abandon` / `supersede`** — the terminals. Abandon is always available on a non-terminal
   task, live revision or not.
 
@@ -247,7 +254,9 @@ Error: set CV_ENDPOINT or pass --from; identity-bearing events must record who a
 Review independence (law 2) rides on identity plus transcripts: pass `--session <your-cv-session-id>`
 when reviewing and cv reads the author's and reviewer's harness families from its catalog.
 Same-family review is **recorded and warned about, never blocked** — and cross-family review
-is the value the warning protects.
+is the value the warning protects. Receipts are a **heuristic signal, not proof**: a substring
+scan of the reviewer's transcript that shows effort, never guarantees the diff was read (pinned by
+`adversary_gym.rs::pin_goodhart_saw_change_is_currently_gameable`).
 
 ## A worked example
 
