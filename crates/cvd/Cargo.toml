@@ -1,6 +1,9 @@
 [package]
 name = "cvd"
 description = "clustervision daemon — watches harness storage roots and archives agent sessions (incl. cloud-fleet logs) into a central store."
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
 version.workspace = true
 edition.workspace = true
 license.workspace = true

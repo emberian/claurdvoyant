@@ -1,6 +1,9 @@
 [package]
 name = "cv-mcp"
 description = "MCP server exposing clustervision — lets a running agent search and read other agents' sessions (this project, across time, across harnesses)."
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
 version.workspace = true
 edition.workspace = true
 license.workspace = true

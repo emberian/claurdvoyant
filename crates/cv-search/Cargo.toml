@@ -1,6 +1,9 @@
 [package]
 name = "cv-search"
 description = "Pure-Rust full-text (tantivy) + semantic (embeddings) search over clustervision sessions."
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
 version.workspace = true
 edition.workspace = true
 license.workspace = true

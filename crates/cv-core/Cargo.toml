@@ -1,6 +1,9 @@
 [package]
 name = "clustervision-core"
 description = "Unified parser and intermediate representation for AI coding-agent session transcripts across harnesses (Claude Code, Codex, Grok, OpenCode, Gemini)."
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
 version.workspace = true
 edition.workspace = true
 license.workspace = true
