@@ -26,6 +26,7 @@
 //! Storage is a single append-only event log (`$CLUSTERVISION_HOME/tasks/events.jsonl`) with the
 //! same crash-safe flock recipe as the board.
 
+pub(crate) mod identity;
 pub mod model;
 pub mod project;
 pub mod provenance;
@@ -333,6 +334,19 @@ pub fn actor(explicit: Option<String>, default_sink: &str) -> String {
     explicit
         .or_else(default_endpoint)
         .unwrap_or_else(|| default_sink.to_string())
+}
+
+/// The TOFU per-worker credential (audit: identity impersonation): the spawner mints a
+/// `CV_TOKEN` per worker beside `CV_ENDPOINT`, and identity-bearing front-ends resolve it here —
+/// explicit `--token`/`token` param wins, else the environment. `None` means "no token presented"
+/// (the solo/human path); an endpoint that has bound a token must present the matching one, an
+/// endpoint that never bound stays trusted. This is authentication of the `by` claim, not
+/// authority — see [`identity`].
+pub fn token(explicit: Option<String>) -> Option<String> {
+    explicit
+        .or_else(|| std::env::var("CV_TOKEN").ok())
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty())
 }
 
 /// Identity resolution for identity-BEARING verbs (claim/release/propose/pass/refute), whose

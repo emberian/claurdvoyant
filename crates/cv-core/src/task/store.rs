@@ -77,22 +77,38 @@ pub struct ReplayOutcome {
 }
 
 /// Handle on a task log directory. Cheap to construct; every operation opens files fresh.
+///
+/// The optional `token` is the TOFU per-endpoint credential the handle presents on writes: the
+/// store's append seam authenticates identity-bearing events against the endpoint bindings
+/// ([`super::identity`]) using it. `None` is the solo/human path (unbound endpoints stay trusted).
 #[derive(Clone, Debug)]
 pub struct TaskStore {
     dir: PathBuf,
+    token: Option<String>,
 }
 
 impl TaskStore {
-    /// The default store at [`super::tasks_dir`].
+    /// The default store at [`super::tasks_dir`], presenting no token.
     pub fn default_store() -> TaskStore {
         TaskStore {
             dir: super::tasks_dir(),
+            token: None,
         }
     }
 
-    /// A store rooted at `dir` (testing and embedding).
+    /// A store rooted at `dir` (testing and embedding), presenting no token.
     pub fn at(dir: impl Into<PathBuf>) -> TaskStore {
-        TaskStore { dir: dir.into() }
+        TaskStore {
+            dir: dir.into(),
+            token: None,
+        }
+    }
+
+    /// This handle, but presenting `token` on identity-bearing appends (the TOFU credential). The
+    /// front-ends build the store with the resolved [`super::token`] before appending.
+    pub fn with_token(mut self, token: Option<String>) -> TaskStore {
+        self.token = token;
+        self
     }
 
     pub fn dir(&self) -> &Path {
@@ -203,6 +219,20 @@ impl TaskStore {
         reducer
             .apply(&event)
             .map_err(|e| anyhow::anyhow!("event rejected: {e}"))?;
+
+        // Identity gate (TOFU): after the event is validated but before it is written, authenticate
+        // the `by` claim against the endpoint bindings. Runs under the same lock as the append and
+        // binding write, so load-decide-bind-append is atomic. Non-identity events proceed
+        // untouched; a bound endpoint without the matching token is rejected here.
+        let decision = super::identity::authorize(
+            &self.dir,
+            &event.by,
+            event.kind.is_identity_bearing(),
+            self.token.as_deref(),
+        )?;
+        if let super::identity::Decision::Bind { endpoint, hash } = &decision {
+            super::identity::commit(&self.dir, endpoint, hash)?;
+        }
 
         // First append to a fresh log stamps the format header (older, header-less logs stay
         // valid: readers treat them as implicit v1).

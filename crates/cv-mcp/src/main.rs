@@ -245,7 +245,8 @@ fn task_tool_list() -> Value {
                 "type": "object",
                 "properties": {
                     "id": { "type": "string", "description": "Task id (prefix ok)." },
-                    "from": { "type": "string", "description": "Your endpoint. Defaults to $CV_ENDPOINT; ERROR when neither is set (identity-bearing events must record who acted)." }
+                    "from": { "type": "string", "description": "Your endpoint. Defaults to $CV_ENDPOINT; ERROR when neither is set (identity-bearing events must record who acted)." },
+                    "token": { "type": "string", "description": "TOFU per-endpoint token authenticating the `from` claim. Defaults to $CV_TOKEN. First use binds the endpoint to this token; thereafter a bound endpoint must present it or the append is rejected as impersonation. Optional — an endpoint that never bound stays trusted." }
                 },
                 "required": ["id"]
             }
@@ -257,7 +258,8 @@ fn task_tool_list() -> Value {
                 "type": "object",
                 "properties": {
                     "id": { "type": "string", "description": "Task id (prefix ok)." },
-                    "from": { "type": "string", "description": "Your endpoint. Defaults to $CV_ENDPOINT; ERROR when neither is set (identity-bearing events must record who acted)." }
+                    "from": { "type": "string", "description": "Your endpoint. Defaults to $CV_ENDPOINT; ERROR when neither is set (identity-bearing events must record who acted)." },
+                    "token": { "type": "string", "description": "TOFU per-endpoint token authenticating the `from` claim. Defaults to $CV_TOKEN. First use binds the endpoint to this token; thereafter a bound endpoint must present it or the append is rejected as impersonation. Optional — an endpoint that never bound stays trusted." }
                 },
                 "required": ["id"]
             }
@@ -315,7 +317,8 @@ fn task_tool_list() -> Value {
                     "worktree": { "type": "string", "description": "Worktree path, if the branch lives in one." },
                     "reviewer": { "type": "string", "description": "Reviewer endpoint bound to this revision (else the first verdict binds)." },
                     "session_ref": { "type": "string", "description": "YOUR cv session id — the author side of the reviewer-independence check." },
-                    "from": { "type": "string", "description": "Your endpoint. Defaults to $CV_ENDPOINT; ERROR when neither is set (identity-bearing events must record who acted)." }
+                    "from": { "type": "string", "description": "Your endpoint. Defaults to $CV_ENDPOINT; ERROR when neither is set (identity-bearing events must record who acted)." },
+                    "token": { "type": "string", "description": "TOFU per-endpoint token authenticating the `from` claim. Defaults to $CV_TOKEN. First use binds the endpoint to this token; thereafter a bound endpoint must present it or the append is rejected as impersonation. Optional — an endpoint that never bound stays trusted." }
                 },
                 "required": ["id", "branch"]
             }
@@ -328,7 +331,8 @@ fn task_tool_list() -> Value {
                 "properties": {
                     "id": { "type": "string", "description": "Task id (prefix ok)." },
                     "session": { "type": "string", "description": "Your cv session id (reviewer side of the independence check + review receipts)." },
-                    "from": { "type": "string", "description": "Your reviewer endpoint. Defaults to $CV_ENDPOINT; ERROR when neither is set (identity-bearing events must record who acted)." }
+                    "from": { "type": "string", "description": "Your reviewer endpoint. Defaults to $CV_ENDPOINT; ERROR when neither is set (identity-bearing events must record who acted)." },
+                    "token": { "type": "string", "description": "TOFU per-endpoint token authenticating the `from` claim. Defaults to $CV_TOKEN. First use binds the endpoint to this token; thereafter a bound endpoint must present it or the append is rejected as impersonation. Optional — an endpoint that never bound stays trusted." }
                 },
                 "required": ["id"]
             }
@@ -341,7 +345,8 @@ fn task_tool_list() -> Value {
                 "properties": {
                     "id": { "type": "string", "description": "Task id (prefix ok)." },
                     "session": { "type": "string", "description": "Your cv session id (recorded review receipts)." },
-                    "from": { "type": "string", "description": "Your reviewer endpoint. Defaults to $CV_ENDPOINT; ERROR when neither is set (identity-bearing events must record who acted)." }
+                    "from": { "type": "string", "description": "Your reviewer endpoint. Defaults to $CV_ENDPOINT; ERROR when neither is set (identity-bearing events must record who acted)." },
+                    "token": { "type": "string", "description": "TOFU per-endpoint token authenticating the `from` claim. Defaults to $CV_TOKEN. First use binds the endpoint to this token; thereafter a bound endpoint must present it or the append is rejected as impersonation. Optional — an endpoint that never bound stays trusted." }
                 },
                 "required": ["id"]
             }
@@ -1103,6 +1108,12 @@ fn require_task_from(args: &Value) -> anyhow::Result<String> {
     cv_core::task::require_actor(arg_str(args, "from").map(String::from), "`from`")
 }
 
+/// The TOFU token an identity-bearing tool presents: explicit `token` arg, else `$CV_TOKEN`
+/// (resolved in [`cv_core::task::token`]). `None` is the not-yet-opted-in / solo path.
+fn task_token(args: &Value) -> Option<String> {
+    arg_str(args, "token").map(String::from)
+}
+
 /// Replay the default task store; error on unreadable log, surface warnings inline.
 fn task_replay() -> anyhow::Result<(cv_core::task::ReplayOutcome, Vec<String>)> {
     let outcome = cv_core::task::replay()?;
@@ -1118,14 +1129,16 @@ fn task_resolve(outcome: &cv_core::task::ReplayOutcome, prefix: &str) -> anyhow:
 }
 
 /// Append an agent event + board notification through the shared core path; return a JSON
-/// report of the event and new state.
+/// report of the event and new state. `token` is the TOFU credential presented on identity-bearing
+/// appends (`token` arg, else `$CV_TOKEN`); inert for bookkeeping verbs and unbound endpoints.
 fn task_append(
     task_id: Option<&str>,
     from: &str,
     kind: cv_core::task::TaskEventKind,
     warnings: Vec<String>,
+    token: Option<String>,
 ) -> anyhow::Result<String> {
-    let store = cv_core::task::TaskStore::default_store();
+    let store = cv_core::task::TaskStore::default_store().with_token(cv_core::task::token(token));
     let report = cv_core::task::append_and_notify(&store, task_id, from, kind, warnings)?;
     Ok(serde_json::to_string_pretty(&json!({
         "event": report.event,
@@ -1156,6 +1169,7 @@ fn task_open(args: &Value) -> anyhow::Result<String> {
             assignee: arg_str(args, "assignee").map(String::from),
         },
         Vec::new(),
+        None,
     )
 }
 
@@ -1192,7 +1206,7 @@ fn task_simple(args: &Value, kind: impl FnOnce(String) -> cv_core::task::TaskEve
     let (outcome, warnings) = task_replay()?;
     let id = task_resolve(&outcome, arg_str(args, "id").context("`id` is required")?)?;
     let from = require_task_from(args)?;
-    task_append(Some(&id), &from.clone(), kind(from), warnings)
+    task_append(Some(&id), &from.clone(), kind(from), warnings, task_token(args))
 }
 
 fn task_note(args: &Value) -> anyhow::Result<String> {
@@ -1206,6 +1220,7 @@ fn task_note(args: &Value) -> anyhow::Result<String> {
             session_ref: arg_str(args, "session_ref").map(String::from),
         },
         warnings,
+        None,
     )
 }
 
@@ -1219,6 +1234,7 @@ fn task_done(args: &Value) -> anyhow::Result<String> {
             observed: arg_str(args, "observed").map(String::from),
         },
         warnings,
+        None,
     )
 }
 
@@ -1232,6 +1248,7 @@ fn task_abandon(args: &Value) -> anyhow::Result<String> {
             reason: arg_str(args, "reason").unwrap_or("no reason given").to_string(),
         },
         warnings,
+        None,
     )
 }
 
@@ -1266,6 +1283,7 @@ fn task_propose(args: &Value) -> anyhow::Result<String> {
         &require_task_from(args)?,
         cv_core::task::TaskEventKind::RevisionProposed { revision },
         warnings,
+        task_token(args),
     )
 }
 
@@ -1293,6 +1311,7 @@ fn task_pass(args: &Value) -> anyhow::Result<String> {
             receipts: obs.receipts,
         },
         warnings,
+        task_token(args),
     )
 }
 
@@ -1314,6 +1333,7 @@ fn task_refute(args: &Value) -> anyhow::Result<String> {
             receipts,
         },
         warnings,
+        task_token(args),
     )
 }
 
