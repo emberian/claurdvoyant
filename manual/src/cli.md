@@ -188,7 +188,9 @@ By default `cv` uses the tantivy full-text index if you've built one (real token
 - `--json` — emit the same hits as one JSON array on stdout (nothing else), for downstream
   tools. Fields are camelCase: `harness`, `id` (the FULL session id — the table truncates to
   8 chars), `cwd`, `title`, `score` (BM25, cosine for `--semantic`, `null` on a live scan),
-  `snippet` (untruncated), `createdAt`/`updatedAt` (ISO-8601 UTC).
+  `snippet` (untruncated), `createdAt`/`updatedAt` (ISO-8601 UTC), and the sub-agent provenance
+  trio `agentId`/`parentId`/`workflow` (from an index built with `cv index --subagents`; all
+  `null` for a top-level hit — the keys are always present).
 
 ### `cv recall`
 

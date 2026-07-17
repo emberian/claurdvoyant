@@ -157,6 +157,13 @@ fn hit_json(h: &cv_search::Hit) -> serde_json::Value {
         "snippet": h.snippet,
         "createdAt": h.created_at.and_then(|t| chrono::DateTime::from_timestamp(t, 0)).map(|d| d.to_rfc3339()),
         "updatedAt": h.updated_at.and_then(|t| chrono::DateTime::from_timestamp(t, 0)).map(|d| d.to_rfc3339()),
+        // Sub-agent provenance (an index built with `cv index --subagents` folds lane transcripts
+        // in): the lane's own agent id (`cv show <agentId>` resolves it), the top-level session
+        // that spawned it, and the workflow run it belonged to. All null for a top-level hit —
+        // the keys are always present so consumers can branch on them without probing.
+        "agentId": h.agent_id,
+        "parentId": h.parent_id,
+        "workflow": h.workflow,
     })
 }
 
@@ -215,6 +222,11 @@ fn cmd_search_live(query: &str, want: Option<Harness>, limit: usize, json: bool)
                         "snippet": snip,
                         "createdAt": r.created_at.map(|t| t.to_rfc3339()),
                         "updatedAt": r.updated_at.map(|t| t.to_rfc3339()),
+                        // A live scan only walks top-level sessions, so provenance is always
+                        // null here — the keys ride along for shape parity with indexed hits.
+                        "agentId": serde_json::Value::Null,
+                        "parentId": serde_json::Value::Null,
+                        "workflow": serde_json::Value::Null,
                     }));
                 } else {
                     println!(

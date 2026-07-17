@@ -321,6 +321,13 @@ fn search_json_emits_machine_readable_hits() {
     assert_eq!(rows[0]["title"], "alpha adventures");
     assert!(rows[0]["snippet"].as_str().unwrap().contains("zebrafish"), "{out}");
     assert!(rows[0]["score"].is_null(), "{out}");
+    // Sub-agent provenance keys are always present — null for a top-level hit — so consumers
+    // can branch on them without probing for the keys.
+    for key in ["agentId", "parentId", "workflow"] {
+        let obj = rows[0].as_object().unwrap();
+        assert!(obj.contains_key(key), "provenance key {key} must be present:\n{out}");
+        assert!(obj[key].is_null(), "top-level hit must have null {key}:\n{out}");
+    }
     assert!(
         rows[0]["updatedAt"].as_str().unwrap().starts_with("2026-06-01"),
         "{out}"
@@ -347,6 +354,11 @@ fn search_json_emits_machine_readable_hits() {
     assert_eq!(rows.len(), 1, "{out}");
     assert_eq!(rows[0]["id"], "alphasess", "{out}");
     assert!(rows[0]["score"].as_f64().unwrap() > 0.0, "{out}");
+    // Provenance keys ride on indexed hits too (null: the fixture has no sub-agent lanes).
+    let obj = rows[0].as_object().unwrap();
+    for key in ["agentId", "parentId", "workflow"] {
+        assert!(obj.contains_key(key) && obj[key].is_null(), "{key} present+null:\n{out}");
+    }
     assert!(
         rows[0]["updatedAt"].as_str().unwrap().starts_with("2026-06-01"),
         "{out}"
