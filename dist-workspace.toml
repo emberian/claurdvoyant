@@ -7,6 +7,9 @@ members = ["cargo:."]
 cargo-dist-version = "0.31.0"
 # CI backends to support
 ci = "github"
+# Publish to crates.io as part of the release (in addition to the GitHub release artifacts).
+# Without this, crates.io lagged the tag: v0.9.22 shipped binaries while crates.io sat at 0.9.21.
+publish-jobs = ["cargo"]
 # The installers to generate for each app
 installers = ["shell", "powershell"]
 # Target platforms to build apps for (Rust target-triple syntax)

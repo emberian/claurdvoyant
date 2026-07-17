@@ -43,6 +43,10 @@ const LOG_FORMAT: &str = "cv-task-log";
 const LOG_VERSION: u64 = 1;
 const HEADER_LINE: &str = r#"{"format":"cv-task-log","v":1}"#;
 
+/// Events paired with their 1-based line number in the log file — the raw material of a replay,
+/// where the line number keys quarantine warnings back to the physical file.
+type NumberedEvents = Vec<(usize, TaskEvent)>;
+
 /// A parsed replay of the whole log: the read model plus any loud warnings about interior
 /// garbage. Every read surface must show `warnings` to its caller — a corrupted coordination log
 /// is a finding, not a detail.
@@ -208,7 +212,7 @@ impl TaskStore {
     /// collected as warnings; a trailing partial line (no terminating newline, fails to parse) is
     /// tolerated silently. A format header is skipped when current, and refused loudly when it
     /// declares a version this cv does not read (a log written by a newer cv).
-    fn read_events(&self) -> Result<(Vec<(usize, TaskEvent)>, Vec<String>)> {
+    fn read_events(&self) -> Result<(NumberedEvents, Vec<String>)> {
         let path = self.events_path();
         let file = match File::open(&path) {
             Ok(f) => f,
@@ -317,7 +321,6 @@ pub fn replay() -> Result<ReplayOutcome> {
 mod tests {
     use super::*;
     use crate::task::model::TaskState;
-    use std::io::Write as _;
 
     /// A throwaway task dir under the system temp dir, unique per test (board.rs idiom).
     fn tmp_tasks() -> PathBuf {

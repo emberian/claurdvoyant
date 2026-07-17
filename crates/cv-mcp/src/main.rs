@@ -39,7 +39,6 @@ use anyhow::Context as _;
 use cv_core::watch::{Filter, Watcher};
 use cv_core::{Block, Harness, Session, SessionRef};
 use serde_json::{json, Value};
-use std::io::Write as _;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
@@ -1972,10 +1971,4 @@ fn extract_span(id: &str, harness: &str, query: &str, budget: usize) -> Option<S
     } else {
         Some(trimmed.to_string())
     }
-}
-
-// Ensure stderr logging is line-buffered-ish on panic paths; not strictly required.
-#[allow(dead_code)]
-fn flush_stderr() {
-    let _ = std::io::stderr().flush();
 }

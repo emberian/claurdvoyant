@@ -707,7 +707,7 @@ mod tests {
     const OTHER: &str = "agent:other";
 
     fn sha(c: char) -> String {
-        std::iter::repeat(c).take(40).collect()
+        std::iter::repeat_n(c, 40).collect()
     }
 
     struct Log {
@@ -878,7 +878,7 @@ mod tests {
         pass(&mut log, &task, REVIEWER);
         let err = log.reduce().unwrap_err();
         assert!(
-            matches!(err, ReduceError::InvalidTransition { ref event, .. } if *event == "review_passed"),
+            matches!(err, ReduceError::InvalidTransition { event, .. } if event == "review_passed"),
             "{err:?}"
         );
     }

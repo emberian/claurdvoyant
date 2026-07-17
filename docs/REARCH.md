@@ -174,7 +174,7 @@ when that session changes (incremental). All `cv show`/`export`/search output ve
 to the pre-change binary across sampled sessions (codex differs only by dropping spurious empty
 `token_count` carrier turns — an intended cleanup). Full workspace builds; all tests pass.
 
-## The lazy-content IR (the "never considerable memory" endgame) — designed, not yet landed
+## The lazy-content IR (the "never considerable memory" endgame) — foundation landed (Steps 1–2); Phases 2–4 open
 
 The deepest remaining inefficiency: a fully-parsed `Session` **owns every byte** of its content
 (`Block::Text { text: String }`, `Thinking`, `ToolResult { content: String }`, plus `extra`/`input`

@@ -61,7 +61,7 @@ pub enum Block {
 
 A few supporting types complete the picture:
 
-- **`Harness`** — a `Copy` enum naming the source harness (`Claude`, `Codex`, `Grok`, `OpenCode`, `Gemini`, `Cursor`, `ClaudeApp`, `Goose`, …). It carries the canonical string forms: `Harness::ALL` lists all 17, `as_str()` gives the lowercase name, and `parse()` accepts aliases (`cc` → `Claude`, `oc` → `OpenCode`, `antigravity` → `Gemini`, …).
+- **`Harness`** — a `Copy` enum naming the source harness (`Claude`, `Codex`, `Grok`, `OpenCode`, `Gemini`, `Cursor`, `ClaudeApp`, `Goose`, …). It carries the canonical string forms: `Harness::ALL` lists all 20, `as_str()` gives the lowercase name, and `parse()` accepts aliases (`cc` → `Claude`, `oc` → `OpenCode`, `antigravity` → `Gemini`, …).
 - **`Role`** — `System | User | Assistant | Tool`. We keep `Tool` distinct even though some harnesses model a tool result as a `user` turn, so conversions can re-encode it correctly.
 - **`Usage`** — optional token counts: `input_tokens`, `output_tokens`, `cache_read_tokens`, `cache_creation_tokens`.
 - **`GitInfo`** — the `branch` / `commit` / `remote` a session ran against, when the harness records it.

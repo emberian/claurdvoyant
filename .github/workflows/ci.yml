@@ -56,5 +56,9 @@ jobs:
         # Official prebuilt-binary installer (Node-free) — replaces jetli/wasm-pack-action, which
         # ran on the now-deprecated Node 20.
         run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+      - name: Check cv-core on wasm32 (standalone)
+        # cv-web enables uuid/js for the whole graph, which can mask a cv-core that doesn't
+        # compile for wasm32 on its own (the uuid randomness backend regression class).
+        run: cargo check -p clustervision-core --no-default-features --target wasm32-unknown-unknown
       - name: Build cv-web to wasm
         run: wasm-pack build --target web --out-dir /tmp/pkg crates/cv-web -- --no-default-features

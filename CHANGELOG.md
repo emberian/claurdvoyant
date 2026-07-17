@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.10.0 (unreleased)
 
 - **The task substrate (`cv task`, `task_*` MCP tools, `/api/tasks*`).** Durable,
   replayable dispatch objects for agent fleets, designed against the failure mode
@@ -22,6 +22,69 @@
   per-agent `inbox`, and `debt` — reviewed-but-unlanded work, the honest number.
   `cvd watch --verify-interval N` runs the verifier as a daemon; board channels
   carry the notification trail.
+- **The trust layer watches itself.** `run_verify` writes a heartbeat
+  (`tasks/last_verify.json`); every debt surface renders verified-as-of and
+  warns NEVER/STALE, and `cvd`'s verify interval defaults on (300s). Replay
+  **quarantines** reducer-refused events loudly instead of bricking every
+  consumer at once (appends fail closed on degraded reads; log format header
+  v1). Landed revisions are **re-observed every pass**: a forged `Landed`
+  contradicts observation within one tick and becomes a SUSPECT debt row —
+  and suspects persist across partial verifies, so a targeted re-verify
+  cannot launder one away. `cv`/`cvd --version` and the cvd startup log embed
+  the build commit.
+- **Task identity comes from the environment.** `CV_ENDPOINT` is the identity
+  convention (the spawner sets it; `--from` overrides); identity-bearing verbs
+  (claim/release/propose/pass/refute) refuse to act with neither present
+  rather than silently recording a shared sink. Age is the escalation
+  mechanism: list/inbox gain age columns (oldest first, ⏰ past 24h) and the
+  debt view gains an awaiting-review section anchored on the new
+  `proposed_at` — a dead reviewer is now visible, aging state on the owner
+  surface. `cv_core::sanitize` strips ESC/OSC/control characters at every
+  terminal render seam (tasks, plus `ls`/`timeline`/`search`/`recall`/`show
+  --subagents`; JSON transports stay raw — escaping is the transport's job).
+- **Below-the-line audit followups.** `propose` warns when another live task
+  carries the same branch or worktree (observation, never a block). Verifier
+  issue dedup widens to the last 5, so alternating findings stop growing the
+  log forever. `cv board unanswered` / `board_unanswered` / `GET
+  …/unanswered` surface requests nobody answered, oldest first with age.
+  Reviewer-independence checks read the *last assistant model* from
+  multi-model harness transcripts and map model-id prefixes to families —
+  Cursor-style harnesses no longer force `undetermined`.
+- **One shape, one identity across CLI/MCP/HTTP.** `task/views.rs` owns the
+  row types (`TaskRow`/`InboxRow`/`DebtRow`/`AwaitingRow`) and
+  `DebtReport::compute`; all three front-ends consume them, so the surfaces
+  cannot drift. `--state` now rejects unknown vocabulary naming the valid set
+  on every surface (was a silent empty result). MCP board identity routes
+  through `CV_ENDPOINT` (one-release legacy-owner transition on
+  `board_release`). New coverage: MCP task-tool race smoke + `cvd`
+  `/api/tasks*` route tests.
+- **Agent-id drill-down everywhere.** `find`/`find_cheap` fall back to
+  workflow sub-agent resolution after normal lookups miss, so MCP
+  `read_session` and every front-end inherit `cv show <agent-id>` behavior.
+  `cv workflow --results` falls back to per-agent transcript returns when
+  `journal.jsonl` is absent — crashed runs still harvest fully. Test-suite
+  flake classes killed: cvd tests bind port 0 and parse the real port; git
+  fixtures neutralize global/system gitconfig (and the verify suite runs 5x
+  faster).
+- **`cv search` shows sub-agent hits as lanes.** A folded-in sub-agent hit
+  renders its bare `agentId` (what `cv show <id>` resolves) with a
+  `⤷ sub-agent of <parent>` tag (+ `⟐<workflow>` when it belongs to one); the
+  empty-result path nudges toward `cv index --subagents` only when the index
+  genuinely holds no forest.
+- **`cv` dies quietly on closed pipes.** SIGPIPE resets to `SIG_DFL` on unix,
+  so `cv task list | head` behaves like every other pipeline citizen instead
+  of panicking on broken-pipe writes.
+- **`cv ls --json`** — the listing as one JSON array on stdout (same rows,
+  filters, sort, and `--limit` as the table; camelCase, OpenSession-aligned
+  fields), so downstream tools can consume the catalog instead of scraping
+  the table or re-scanning transcript files. (@akapug)
+- **Release mechanics.** `clustervision-core` compiles for
+  `wasm32-unknown-unknown` standalone again (target-gated `uuid` `js`
+  feature; CI checks it). Internal dependency pins track `0.10` so a
+  crates.io build can never silently resolve an old core. `cv-tui` and
+  `cv-web` are explicitly unpublished (`cv-tui` still ships as a release
+  binary); releases now publish to crates.io via cargo-dist `publish-jobs`,
+  so crates.io stops lagging the tag.
 
 ## v0.9.22 (2026-07-08)
 
@@ -97,10 +160,6 @@ now closed:
   `workflow_launches`/`ghost_launches` + `WorkflowLaunch`. The list form's
   `--json` output is now `{"runs": […], "ghost_launches": […]}` (was a bare
   array).
-- **`cv ls --json`** — the listing as one JSON array on stdout (same rows,
-  filters, sort, and `--limit` as the table; camelCase, OpenSession-aligned
-  fields), so downstream tools can consume the catalog instead of scraping
-  the table or re-scanning transcript files. (@akapug)
 
 ## v0.9.21 (2026-07-02)
 

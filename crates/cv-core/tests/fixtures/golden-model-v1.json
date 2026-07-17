@@ -1,0 +1,161 @@
+{
+  "tasks": {
+    "00000000-0000-7000-8000-000000000001": {
+      "task_id": "00000000-0000-7000-8000-000000000001",
+      "title": "land the range patch-id gate",
+      "body": "port the gate onto multi-commit review debts",
+      "repo": "/repo/alpha",
+      "issue": "#42",
+      "channel": "tasks",
+      "state": "done",
+      "assignee": "agent:author",
+      "opened_by": "agent:owner",
+      "opened_at": "2026-07-16T12:00:00Z",
+      "last_event_id": "00000000-0000-7000-8000-000000000012",
+      "last_ts": "2026-07-16T12:11:00Z",
+      "revisions": [
+        {
+          "revision": {
+            "n": 1,
+            "branch": "issue/42-gate",
+            "worktree": "/wt/alpha",
+            "upstream": "origin/main",
+            "base": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "review_sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "patch_id": "cccccccccccccccccccccccccccccccccccccccc",
+            "reviewer": "agent:reviewer",
+            "session_ref": "sess-alpha-001"
+          },
+          "state": "landed",
+          "proposed_at": "2026-07-16T12:03:00Z",
+          "active_reviewer": "agent:other",
+          "pass": {
+            "reviewer": "agent:other",
+            "event_id": "00000000-0000-7000-8000-000000000006",
+            "ts": "2026-07-16T12:05:00Z",
+            "session_ref": "sess-review-002",
+            "independence": {
+              "author_family": "anthropic",
+              "reviewer_family": "openai",
+              "independent": true
+            }
+          },
+          "refute": null,
+          "reroutes": [
+            {
+              "from": "agent:reviewer",
+              "to": "agent:other",
+              "event_id": "00000000-0000-7000-8000-000000000005"
+            }
+          ],
+          "local_merge": [
+            "dddddddddddddddddddddddddddddddddddddddd",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+          ],
+          "landed": [
+            "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            "cccccccccccccccccccccccccccccccccccccccc"
+          ],
+          "issues": [
+            {
+              "SourceUnavailable": {
+                "detail": "worktree /wt/alpha vanished",
+                "event_id": "00000000-0000-7000-8000-000000000007"
+              }
+            },
+            {
+              "MergeFailed": {
+                "reason": {
+                  "kind": "non_fast_forward"
+                },
+                "event_id": "00000000-0000-7000-8000-000000000008"
+              }
+            },
+            {
+              "ReconcileFailed": {
+                "detail": "post-merge fetch of origin failed",
+                "event_id": "00000000-0000-7000-8000-000000000010"
+              }
+            }
+          ]
+        }
+      ],
+      "notes": [
+        {
+          "event_id": "00000000-0000-7000-8000-000000000003",
+          "by": "agent:author",
+          "ts": "2026-07-16T12:02:00Z",
+          "text": "gate wired; tests running",
+          "session_ref": "sess-alpha-001"
+        }
+      ],
+      "superseded_by": null,
+      "abandoned_reason": null,
+      "done_observed": "observed on origin/main by cv-verify"
+    },
+    "00000000-0000-7000-8000-000000000013": {
+      "task_id": "00000000-0000-7000-8000-000000000013",
+      "title": "refuted lane",
+      "body": "",
+      "repo": null,
+      "issue": null,
+      "channel": "tasks",
+      "state": "abandoned",
+      "assignee": "agent:other",
+      "opened_by": "agent:owner",
+      "opened_at": "2026-07-16T12:12:00Z",
+      "last_event_id": "00000000-0000-7000-8000-000000000019",
+      "last_ts": "2026-07-16T12:18:00Z",
+      "revisions": [
+        {
+          "revision": {
+            "n": 1,
+            "branch": "issue/7-fix",
+            "upstream": "origin/main",
+            "base": "1111111111111111111111111111111111111111",
+            "review_sha": "2222222222222222222222222222222222222222",
+            "patch_id": "3333333333333333333333333333333333333333",
+            "reviewer": "agent:reviewer"
+          },
+          "state": "refuted",
+          "proposed_at": "2026-07-16T12:16:00Z",
+          "active_reviewer": "agent:reviewer",
+          "pass": null,
+          "refute": {
+            "reviewer": "agent:reviewer",
+            "event_id": "00000000-0000-7000-8000-000000000018",
+            "ts": "2026-07-16T12:17:00Z",
+            "session_ref": "sess-review-003"
+          },
+          "reroutes": [],
+          "local_merge": null,
+          "landed": null,
+          "issues": []
+        }
+      ],
+      "notes": [],
+      "superseded_by": null,
+      "abandoned_reason": "refuted; superseding approach chosen",
+      "done_observed": null
+    },
+    "00000000-0000-7000-8000-000000000020": {
+      "task_id": "00000000-0000-7000-8000-000000000020",
+      "title": "duplicate of the gate task",
+      "body": "",
+      "repo": null,
+      "issue": null,
+      "channel": "tasks",
+      "state": "superseded",
+      "assignee": null,
+      "opened_by": "agent:owner",
+      "opened_at": "2026-07-16T12:19:00Z",
+      "last_event_id": "00000000-0000-7000-8000-000000000021",
+      "last_ts": "2026-07-16T12:20:00Z",
+      "revisions": [],
+      "notes": [],
+      "superseded_by": "00000000-0000-7000-8000-000000000001",
+      "abandoned_reason": null,
+      "done_observed": null
+    }
+  }
+}

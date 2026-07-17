@@ -6,14 +6,22 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
+# Distributed as a prebuilt binary via cargo-dist releases; not published to crates.io
+# (young surface, no library API — revisit once the TUI stabilizes).
+publish = false
+
+# dist's default heuristic drops publish = false packages from releases; cv-tui still ships
+# as a prebuilt release binary, so opt it back in explicitly.
+[package.metadata.dist]
+dist = true
 
 [[bin]]
 name = "cv-tui"
 path = "src/main.rs"
 
 [dependencies]
-cv-core = { path = "../cv-core", version = "0.9.21", package = "clustervision-core" }
-cv-search = { path = "../cv-search", version = "0.9.21" }
+cv-core = { path = "../cv-core", version = "0.10", package = "clustervision-core" }
+cv-search = { path = "../cv-search", version = "0.10" }
 anyhow.workspace = true
 chrono.workspace = true
 dirs.workspace = true

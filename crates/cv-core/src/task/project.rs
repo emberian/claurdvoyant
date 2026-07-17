@@ -304,7 +304,7 @@ pub fn resolve_id<'m>(model: &'m TaskReadModel, prefix: &str) -> Result<&'m str,
         many => Err(format!(
             "'{prefix}' is ambiguous ({} matches: {} ...)",
             many.len(),
-            &many[..many.len().min(3)].join(", ")
+            many[..many.len().min(3)].join(", ")
         )),
     }
 }
@@ -324,7 +324,7 @@ mod tests {
     use crate::task::reduce::TaskReducer;
 
     fn sha(c: char) -> String {
-        std::iter::repeat(c).take(40).collect()
+        std::iter::repeat_n(c, 40).collect()
     }
 
     struct Log {

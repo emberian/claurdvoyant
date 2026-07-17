@@ -38,6 +38,13 @@ memmap2 = { version = ">=0.9.11, <0.10", optional = true }
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
 fs4 = { version = "0.13", default-features = false, features = ["sync"] }
 
+# uuid v4 generation needs a randomness source; on wasm32-unknown-unknown that means the JS
+# crypto API via getrandom's `js` backend. Feature-gating it here (features unify per-target)
+# makes `cargo check -p clustervision-core --no-default-features --target wasm32-unknown-unknown`
+# work standalone instead of relying on cv-web to enable `uuid/js` for the whole graph.
+[target.'cfg(target_family = "wasm")'.dependencies]
+uuid = { workspace = true, features = ["js"] }
+
 [features]
 default = ["sqlite", "parallel", "mmap"]
 # `mmap` resolves lazy content spans by memory-mapping the source file (only touched pages page in).

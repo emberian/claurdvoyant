@@ -279,8 +279,8 @@ fn tasks(query: &str) -> (u16, Value) {
     let params = Query::parse(query);
     with_tasks(|outcome| {
         let filter = cv_core::task::TaskFilter {
-            state: params.get("state").map(String::from),
-            assignee: params.get("assignee").map(String::from),
+            state: params.get("state"),
+            assignee: params.get("assignee"),
             repo: params.get("repo").map(std::path::PathBuf::from),
             include_terminal: params.get("all").is_some_and(|v| v == "1" || v == "true"),
         };

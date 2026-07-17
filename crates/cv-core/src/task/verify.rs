@@ -496,7 +496,7 @@ pub fn run_verify(
     // re-observed their task (a partial or --skip-landed pass must not launder a suspect away).
     if let Some(prev) = read_heartbeat(store.dir()) {
         for s in prev.suspect_landed {
-            let reobserved_now = !opts.skip_landed && checked.iter().any(|id| *id == s.task_id);
+            let reobserved_now = !opts.skip_landed && checked.contains(&s.task_id);
             if !reobserved_now && !suspects.iter().any(|n| n.task_id == s.task_id) {
                 suspects.push(s);
             }

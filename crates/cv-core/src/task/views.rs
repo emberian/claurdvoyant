@@ -243,7 +243,7 @@ mod tests {
     use crate::task::reduce::TaskReducer;
 
     fn sha(c: char) -> String {
-        std::iter::repeat(c).take(40).collect()
+        std::iter::repeat_n(c, 40).collect()
     }
 
     fn model_with_ready_revision() -> (TaskReadModel, String) {
