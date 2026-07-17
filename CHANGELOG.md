@@ -78,6 +78,19 @@
   filters, sort, and `--limit` as the table; camelCase, OpenSession-aligned
   fields), so downstream tools can consume the catalog instead of scraping
   the table or re-scanning transcript files. (@akapug)
+- **`cv search --json`** — the hits as one JSON array on stdout (same hits,
+  order, and `--harness`/`--limit`/`--semantic` handling as the table), with
+  camelCase fields, FULL session ids (the table truncates to 8 chars), the
+  untruncated snippet, the relevance score, and the sub-agent provenance trio
+  `agentId`/`parentId`/`workflow` — so downstream tools can consume hits
+  instead of regex-scraping the table. (@akapug)
+- **`cv prune --json`** — the prune report as one JSON object on stdout
+  (camelCase; FULL `sourceId`/`newId`, before/after bytes, snipped-payload
+  and freed-token counts, revive detail, `newPath`/`sidecarPath`), for
+  downstream resume-optimizers that today regex-scrape the human report off
+  stderr. Dry-run honest: nothing is written, so paths — and `newId`, unless
+  `--to` pinned it — are explicit nulls plus a `note`. The human report stays
+  on stderr (compose-family convention), so stdout is pure JSON. (@akapug)
 - **Release mechanics.** `clustervision-core` compiles for
   `wasm32-unknown-unknown` standalone again (target-gated `uuid` `js`
   feature; CI checks it). Internal dependency pins track `0.10` so a
@@ -160,11 +173,6 @@ now closed:
   `workflow_launches`/`ghost_launches` + `WorkflowLaunch`. The list form's
   `--json` output is now `{"runs": […], "ghost_launches": […]}` (was a bare
   array).
-- **`cv search --json`** — the hits as one JSON array on stdout (same hits,
-  order, and `--harness`/`--limit`/`--semantic` handling as the table), with
-  camelCase fields, FULL session ids (the table truncates to 8 chars), the
-  untruncated snippet, and the relevance score — so downstream tools can
-  consume hits instead of regex-scraping the table. (@akapug)
 
 ## v0.9.21 (2026-07-02)
 

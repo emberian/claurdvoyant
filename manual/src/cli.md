@@ -304,6 +304,7 @@ cv prune 3b829648 --dry-run                        # report the savings without 
 cv prune 3b829648 --to my-tidy-session             # choose the new id
 cv prune 3b829648 --drop                           # hard-drop payloads (no sidecar, irreversible)
 cv prune 3b829648 --thinking --revive              # the resurrection: flatten + correct the stale size in one go
+cv prune 3b829648 --json                           # + the report as one JSON object on stdout (for tools/scripts)
 
 cv prune <new-id> --retrieve toolu_abc123          # fetch a stashed original back out
 ```
@@ -316,6 +317,13 @@ cv prune <new-id> --retrieve toolu_abc123          # fetch a stashed original ba
 - `--copy-resources` — also copy the session's `subagents/`/`workflows/` dir under the new id (off by default; can be hundreds of MB for big sessions). `claude --resume` doesn't need it — only cv's forest features (`cv workflow`/`cv tools`) on the pruned session do.
 - `--revive` — **resurrect an already-maxed session.** Claude Code's resume gate reads the last turn's *recorded* `usage` (input + cache tokens) as the session's current size — and checks it *before* re-sending anything, so a session sitting at the wall refuses to resume even after pruning has made the real content fit. `--revive` recomputes the honest size of the loaded window (everything after the last compaction boundary — what Claude actually re-sends) and rewrites the stale `usage` records to that figure, so the gate lets you back in. Pair with `--thinking` to flatten *and* revive in one command. Real example: a session stuck at "979.7k / context limit reached" → recorded 149k, resumes clean. (Edits recorded metadata, not just content; the source is still never touched — new id only.)
 - `--dry-run` — compute and report without writing.
+- `--json` — also emit the report as **one JSON object on stdout** (the human report stays on
+  stderr, so stdout is pure JSON). camelCase fields: `sourceId`/`newId` (FULL ids), `harness`,
+  `beforeBytes`/`afterBytes`, `snippedPayloads`, `imageBlocks`, `tokensFreed` (estimated context
+  tokens freed), `droppedTurns`/`windowRealTokens` (`--window`/`--range`), `revived` (`false`, or
+  the stale → honest usage-rewrite detail), `warnings`, `newPath`/`sidecarPath`/`copiedResources`,
+  `dryRun`, `note`. Dry-run honest: nothing is written, so the paths — and `newId`, unless `--to`
+  pinned it — are explicit nulls, with a `note` saying so.
 - `--retrieve <tool_use_id>` — instead of pruning, print the stashed original for that id from `<id>.flat.jsonl`.
 
 Claude Code only for now (it operates on the raw JSONL to stay byte-faithful). The source session is never modified — prune only ever *writes a new one*. Also available as the `prune_session` / `prune_retrieve` MCP tools.
