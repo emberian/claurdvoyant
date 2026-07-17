@@ -104,7 +104,7 @@ pub(crate) fn cmd_prune(
             serde_json::to_string_pretty(&serde_json::json!({
                 "sourceId": res.source_id,
                 "newId": report_id,
-                "harness": "claude",
+                "harness": r.harness.as_str(),
                 "beforeBytes": res.original_size,
                 "afterBytes": res.new_size,
                 "snippedPayloads": res.pruned_count,
