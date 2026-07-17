@@ -100,11 +100,18 @@ pub enum TaskEventKind {
         /// Advisory reviewer-independence observation (recorded, never a gate).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         independence: Option<IndependenceCheck>,
+        /// Advisory reviewer-receipts observation (recorded, never a gate). Additive optional:
+        /// events appended before this field existed replay unchanged.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        receipts: Option<ReviewReceipts>,
     },
     ReviewRefuted {
         reviewer: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         session_ref: Option<String>,
+        /// Advisory reviewer-receipts observation (recorded, never a gate). Additive optional.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        receipts: Option<ReviewReceipts>,
     },
 
     // ── verifier-only (law 1: observed, not attested) ───────────────────────
@@ -229,6 +236,28 @@ pub struct IndependenceCheck {
     pub reviewer_family: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub independent: Option<bool>,
+}
+
+/// Advisory reviewer-receipts observation, read from the reviewer's transcript at verdict time
+/// (law 2's posture: observed and recorded, never a gate). Every field is `Option` because every
+/// field is an honest observation: `None` means "could not determine", never a guess.
+///
+/// Semantics when recorded (a reviewer session id was provided):
+/// - all fields `None`: the session was named but could not be found/read — undetermined.
+/// - `saw_change`: whether the transcript shows observable contact with the reviewed change
+///   (tool inputs mentioning the branch, the review sha or its 12-prefix, the repo path, or a
+///   `git diff`/`git show`/`git log` invocation). Heuristic, text-level, advisory.
+/// - `ran_checks`: whether any tool input matches a known test/build command pattern
+///   ([`crate::task::CHECK_COMMAND_PATTERNS`]). Heuristic and deliberately narrow.
+/// - `turns`: the number of assistant messages in the session — a cheap effort signal.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct ReviewReceipts {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub saw_change: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ran_checks: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turns: Option<u32>,
 }
 
 /// Base lifecycle state of a task.
@@ -404,8 +433,17 @@ mod tests {
                     reviewer_family: Some("openai".into()),
                     independent: Some(true),
                 }),
+                receipts: Some(ReviewReceipts {
+                    saw_change: Some(true),
+                    ran_checks: Some(false),
+                    turns: Some(14),
+                }),
             },
-            TaskEventKind::ReviewRefuted { reviewer: "b".into(), session_ref: None },
+            TaskEventKind::ReviewRefuted {
+                reviewer: "b".into(),
+                session_ref: None,
+                receipts: Some(ReviewReceipts { saw_change: None, ran_checks: None, turns: Some(2) }),
+            },
             TaskEventKind::SourceUnavailable { detail: "gone".into() },
             TaskEventKind::MergeFailed { reason: MergeFailure::GitFailed { detail: "boom".into() } },
             TaskEventKind::MergeFailed { reason: MergeFailure::NonFastForward {} },
@@ -481,8 +519,13 @@ mod tests {
             TaskEventKind::Superseded { by_task: String::new() },
             TaskEventKind::RevisionProposed { revision: revision() },
             TaskEventKind::ReviewRerouted { from: String::new(), to: String::new() },
-            TaskEventKind::ReviewPassed { reviewer: String::new(), session_ref: None, independence: None },
-            TaskEventKind::ReviewRefuted { reviewer: String::new(), session_ref: None },
+            TaskEventKind::ReviewPassed {
+                reviewer: String::new(),
+                session_ref: None,
+                independence: None,
+                receipts: None,
+            },
+            TaskEventKind::ReviewRefuted { reviewer: String::new(), session_ref: None, receipts: None },
         ];
         for k in &verifier_only {
             assert!(k.is_verifier_only(), "{} should be verifier-only", k.tag());
@@ -518,5 +561,45 @@ mod tests {
         assert_eq!(model_family("opus"), None, "'o' + non-digit is not o-series");
         assert_eq!(model_family(""), None);
         assert_eq!(model_family("mistral-large"), None);
+    }
+
+    /// Wire additivity of `receipts`: a pre-receipts pass/refute event (no `receipts` key)
+    /// deserializes to `receipts: None` AND re-serializes without the key (byte-stable replay of
+    /// old logs), while a receipts-bearing event round-trips with the key.
+    #[test]
+    fn receipts_field_is_wire_additive() {
+        // The exact shape old logs carry (also what a pre-receipts cv wrote).
+        let old = r#"{"id":"0198c0de-0000-7000-8000-000000000001","task_id":"0198c0de-0000-7000-8000-000000000000","ts":"2026-07-16T12:00:00Z","by":"agent:test","event":"review_passed","reviewer":"b"}"#;
+        let ev: TaskEvent = serde_json::from_str(old).unwrap();
+        let TaskEventKind::ReviewPassed { ref receipts, .. } = ev.kind else {
+            panic!("wrong kind: {ev:?}")
+        };
+        assert_eq!(receipts, &None, "absent key reads as None");
+        assert_eq!(
+            serde_json::to_string(&ev).unwrap(),
+            old,
+            "an old event must re-serialize to its own bytes — receipts is skip-when-none"
+        );
+
+        // A new event with receipts round-trips, and the key appears only when present.
+        let ev = event(TaskEventKind::ReviewRefuted {
+            reviewer: "b".into(),
+            session_ref: None,
+            receipts: Some(ReviewReceipts {
+                saw_change: Some(false),
+                ran_checks: None,
+                turns: Some(3),
+            }),
+        });
+        let json = serde_json::to_string(&ev).unwrap();
+        let back: TaskEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(ev, back);
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["receipts"]["saw_change"], false);
+        assert_eq!(v["receipts"]["turns"], 3);
+        assert!(
+            v["receipts"].get("ran_checks").is_none(),
+            "undetermined sub-observations stay off the wire: {json}"
+        );
     }
 }

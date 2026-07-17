@@ -28,7 +28,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use super::model::{
-    IndependenceCheck, MergeFailure, Revision, RevisionState, TaskEvent, TaskEventKind, TaskState,
+    IndependenceCheck, MergeFailure, ReviewReceipts, Revision, RevisionState, TaskEvent,
+    TaskEventKind, TaskState,
 };
 
 /// Errors from applying an event. During a CAS append these reject the candidate event; during
@@ -124,6 +125,11 @@ pub struct RevisionProjection {
     /// When the revision was proposed (the propose event's timestamp) — the anchor for aging
     /// AwaitingReview work: a dead reviewer is honest state nobody sees unless it ages visibly.
     pub proposed_at: DateTime<Utc>,
+    /// Who appended the propose event (`by`) — the revision's author endpoint (the batting-average
+    /// attribution for the stats projection). `default` so projections serialized before the
+    /// field existed still deserialize (as `""`).
+    #[serde(default)]
+    pub proposed_by: String,
     /// The only endpoint whose verdict can advance this revision. Bound at propose time (if the
     /// revision named a reviewer) or by the first verdict; reroute is the only reassignment.
     pub active_reviewer: Option<String>,
@@ -134,6 +140,11 @@ pub struct RevisionProjection {
     pub local_merge: Option<(String, String)>,
     /// `(upstream_head, observed_patch_id)` observed by the verifier.
     pub landed: Option<(String, String)>,
+    /// When the verifier observed the land (the `Landed` event's timestamp) — the end anchor for
+    /// time-to-land in the stats projection. `None` until landed. `default` so projections
+    /// serialized before the field existed still deserialize.
+    #[serde(default)]
+    pub landed_at: Option<DateTime<Utc>>,
     pub issues: Vec<TaskIssue>,
 }
 
@@ -144,6 +155,10 @@ pub struct PassEvidence {
     pub ts: DateTime<Utc>,
     pub session_ref: Option<String>,
     pub independence: Option<IndependenceCheck>,
+    /// Advisory reviewer receipts; `None` on verdicts recorded without a reviewer session (and on
+    /// events appended before the field existed — `default` keeps those deserializing).
+    #[serde(default)]
+    pub receipts: Option<ReviewReceipts>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -152,6 +167,9 @@ pub struct RefuteEvidence {
     pub event_id: String,
     pub ts: DateTime<Utc>,
     pub session_ref: Option<String>,
+    /// Advisory reviewer receipts, as on [`PassEvidence`].
+    #[serde(default)]
+    pub receipts: Option<ReviewReceipts>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -400,6 +418,8 @@ impl TaskReducer {
                     revision: revision.clone(),
                     state: RevisionState::AwaitingReview,
                     proposed_at: event.ts,
+                    proposed_by: event.by.clone(),
+                    landed_at: None,
                     pass: None,
                     refute: None,
                     reroutes: Vec::new(),
@@ -430,6 +450,7 @@ impl TaskReducer {
                 reviewer,
                 session_ref,
                 independence,
+                receipts,
             } => {
                 let task_id = task.task_id.clone();
                 let rev = require_revision(task, kind)?;
@@ -442,10 +463,11 @@ impl TaskReducer {
                     ts: event.ts,
                     session_ref: session_ref.clone(),
                     independence: independence.clone(),
+                    receipts: receipts.clone(),
                 });
                 rev.state = RevisionState::Ready;
             }
-            TaskEventKind::ReviewRefuted { reviewer, session_ref } => {
+            TaskEventKind::ReviewRefuted { reviewer, session_ref, receipts } => {
                 let task_id = task.task_id.clone();
                 let rev = require_revision(task, kind)?;
                 require_revision_state(
@@ -461,6 +483,7 @@ impl TaskReducer {
                     event_id: event.id.clone(),
                     ts: event.ts,
                     session_ref: session_ref.clone(),
+                    receipts: receipts.clone(),
                 });
                 rev.state = RevisionState::Refuted;
             }
@@ -528,6 +551,7 @@ impl TaskReducer {
                     });
                 }
                 rev.landed = Some((upstream_head.clone(), observed_patch_id.clone()));
+                rev.landed_at = Some(event.ts);
                 rev.state = RevisionState::Landed;
             }
         }
@@ -793,6 +817,7 @@ mod tests {
                 reviewer: reviewer.to_string(),
                 session_ref: None,
                 independence: None,
+                receipts: None,
             },
         )
     }
@@ -869,7 +894,7 @@ mod tests {
         log.push(
             &task,
             REVIEWER,
-            TaskEventKind::ReviewRefuted { reviewer: REVIEWER.into(), session_ref: None },
+            TaskEventKind::ReviewRefuted { reviewer: REVIEWER.into(), session_ref: None, receipts: None },
         );
         let m = log.reduce().unwrap();
         assert_eq!(m.tasks[&task].current_revision().unwrap().state, RevisionState::Refuted);
@@ -1087,7 +1112,7 @@ mod tests {
         log.push(
             &task,
             REVIEWER,
-            TaskEventKind::ReviewRefuted { reviewer: REVIEWER.into(), session_ref: None },
+            TaskEventKind::ReviewRefuted { reviewer: REVIEWER.into(), session_ref: None, receipts: None },
         );
         propose(&mut log, &task, 2);
         pass(&mut log, &task, REVIEWER);

@@ -3,12 +3,11 @@
 //! variant. This test replays it through the reducer and asserts the reduced model matches the
 //! committed snapshot `tests/fixtures/golden-model-v1.json`, byte for byte.
 //!
-//! If this test fails: **you changed the wire format or the reducer semantics — this log must
-//! replay identically forever.** Logs like this one exist on real machines; a cv that reduces
-//! them differently rewrites history. Additive changes (new variants, new optional fields) keep
-//! this green; if the change really is additive, extend the fixture with new specimen events
-//! (`GOLDEN_REGEN=1 cargo test -p clustervision-core --test wire_golden` rewrites both files —
-//! then read the diff like a wire-contract review, because it is one).
+//! If this test fails: the wire format or the reducer semantics changed. If that was intentional,
+//! regenerate the fixtures (`GOLDEN_REGEN=1 cargo test -p clustervision-core --test wire_golden`),
+//! read the diff like the wire-contract review it is, and say so in the commit. This tripwire
+//! becomes a hard freeze ("existing logs must replay identically") at the first published
+//! release; until then it exists to make format changes deliberate, not accidental.
 
 use std::fs;
 use std::path::PathBuf;
@@ -66,7 +65,8 @@ fn golden_log_replays_identically_forever() {
             serde_json::from_str(line).unwrap_or_else(|e| {
                 panic!(
                     "golden log line {} no longer parses as a TaskEvent ({e}).\n\
-                     You changed the wire format — this log must replay identically forever.",
+                     The wire format changed — if intentional, regenerate with GOLDEN_REGEN=1 \
+                     and note it in the commit.",
                     i + 2
                 )
             })
@@ -92,7 +92,8 @@ fn golden_log_replays_identically_forever() {
     let model = TaskReducer::reduce(&events).unwrap_or_else(|e| {
         panic!(
             "the reducer refused the golden log ({e}).\n\
-             You changed reducer semantics — this log must replay identically forever."
+             Reducer semantics changed — if intentional, regenerate with GOLDEN_REGEN=1 and \
+             note it in the commit."
         )
     });
     let mut rendered = serde_json::to_string_pretty(&model).expect("serializing reduced model");
@@ -102,9 +103,9 @@ fn golden_log_replays_identically_forever() {
     assert_eq!(
         rendered, expected,
         "reduced model diverged from the committed snapshot.\n\
-         You changed the wire format or reducer semantics — this log must replay identically \
-         forever. If the change is deliberately additive, regenerate with GOLDEN_REGEN=1 and \
-         review the snapshot diff as the wire-contract change it is."
+         The wire format or reducer semantics changed — if intentional, regenerate with \
+         GOLDEN_REGEN=1, review the snapshot diff as the wire-contract change it is, and note \
+         it in the commit. This becomes a hard freeze at the first published release."
     );
 
     // And the events themselves round-trip byte-stably under the same serde settings the store
@@ -116,7 +117,8 @@ fn golden_log_replays_identically_forever() {
             re,
             line,
             "golden log line {} does not re-serialize to itself — field order, names, or \
-             skip-serializing rules changed (a wire-format change).",
+             skip-serializing rules changed (a wire-format change; if intentional, regenerate \
+             with GOLDEN_REGEN=1 and note it in the commit).",
             i + 2
         );
     }
@@ -127,7 +129,7 @@ fn golden_log_replays_identically_forever() {
 /// files is that the *repo history* then pins the bytes.
 fn regenerate(log_path: &std::path::Path, snap_path: &std::path::Path) {
     use chrono::{DateTime, Utc};
-    use cv_core::task::{IndependenceCheck, MergeFailure, Revision, TaskEventKind};
+    use cv_core::task::{IndependenceCheck, MergeFailure, Revision, ReviewReceipts, TaskEventKind};
 
     fn hex(c: char) -> String {
         std::iter::repeat_n(c, 40).collect()
@@ -231,6 +233,11 @@ fn regenerate(log_path: &std::path::Path, snap_path: &std::path::Path) {
                 author_family: Some("anthropic".into()),
                 reviewer_family: Some("openai".into()),
                 independent: Some(true),
+            }),
+            receipts: Some(ReviewReceipts {
+                saw_change: Some(true),
+                ran_checks: Some(true),
+                turns: Some(14),
             }),
         },
     );
@@ -352,6 +359,12 @@ fn regenerate(log_path: &std::path::Path, snap_path: &std::path::Path) {
         TaskEventKind::ReviewRefuted {
             reviewer: "agent:reviewer".into(),
             session_ref: Some("sess-review-003".into()),
+            // A no-contact refute: pins that undetermined sub-observations stay off the wire.
+            receipts: Some(ReviewReceipts {
+                saw_change: Some(false),
+                ran_checks: None,
+                turns: Some(2),
+            }),
         },
     );
     push(

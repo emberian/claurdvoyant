@@ -401,6 +401,7 @@ mod tests {
                 reviewer: "agent:reviewer".into(),
                 session_ref: None,
                 independence: None,
+                receipts: None,
             },
         );
     }
@@ -583,13 +584,14 @@ mod tests {
                 reviewer: "agent:reviewer".into(),
                 session_ref: None,
                 independence: None,
+                receipts: None,
             },
         );
         // ... a refute clears the other.
         log.push(
             &newer,
             "agent:b",
-            TaskEventKind::ReviewRefuted { reviewer: "agent:b".into(), session_ref: None },
+            TaskEventKind::ReviewRefuted { reviewer: "agent:b".into(), session_ref: None, receipts: None },
         );
         let model = log.model();
         assert!(awaiting_review(&model).is_empty());
@@ -639,6 +641,7 @@ mod tests {
                 reviewer: "agent:r".into(),
                 session_ref: None,
                 independence: None,
+                receipts: None,
             },
         );
         // A review awaiting agent:a, proposed EARLIER than the pass above — sorts first.

@@ -323,12 +323,12 @@ fn task_tool_list() -> Value {
         },
         {
             "name": "task_pass",
-            "description": "Record a review PASS on the current revision (you must be its active reviewer). Pass your cv session id so the advisory cross-family independence check can read your harness — same-family review is recorded and warned about, never blocked.",
+            "description": "Record a review PASS on the current revision (you must be its active reviewer). Pass your cv session id so the advisory checks can read your transcript: cross-family independence AND review receipts (did the session touch the change, run checks, how many turns). Same-family or no-contact review is recorded and warned about, never blocked.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "id": { "type": "string", "description": "Task id (prefix ok)." },
-                    "session": { "type": "string", "description": "Your cv session id (reviewer side of the independence check)." },
+                    "session": { "type": "string", "description": "Your cv session id (reviewer side of the independence check + review receipts)." },
                     "from": { "type": "string", "description": "Your reviewer endpoint. Defaults to $CV_ENDPOINT; ERROR when neither is set (identity-bearing events must record who acted)." }
                 },
                 "required": ["id"]
@@ -336,12 +336,12 @@ fn task_tool_list() -> Value {
         },
         {
             "name": "task_refute",
-            "description": "Record a review REFUTE on the current revision — terminal for that revision; the author must propose a new revision to continue. A refute cannot be cured by a later pass.",
+            "description": "Record a review REFUTE on the current revision — terminal for that revision; the author must propose a new revision to continue. A refute cannot be cured by a later pass. Pass your cv session id so advisory review receipts are recorded.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "id": { "type": "string", "description": "Task id (prefix ok)." },
-                    "session": { "type": "string", "description": "Your cv session id." },
+                    "session": { "type": "string", "description": "Your cv session id (recorded review receipts)." },
                     "from": { "type": "string", "description": "Your reviewer endpoint. Defaults to $CV_ENDPOINT; ERROR when neither is set (identity-bearing events must record who acted)." }
                 },
                 "required": ["id"]
@@ -375,6 +375,16 @@ fn task_tool_list() -> Value {
                 "type": "object",
                 "properties": {
                     "repo": { "type": "string", "description": "Only this repo path." }
+                }
+            }
+        },
+        {
+            "name": "task_stats",
+            "description": "Fleet batting averages, computed from observed events only (landed = git-verified, never an agent claim): per-endpoint claim/propose/land/refute counts with median time-to-land, per-reviewer verdict counts with rubber-stamp signals (same-family, no-receipts, no-contact passes) and median review latency, per-family independence aggregates, plus verifier freshness. Informational — never a gate.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "repo": { "type": "string", "description": "Only tasks recorded against this repo path." }
                 }
             }
         }
@@ -757,6 +767,7 @@ fn call_tool(name: &str, args: &Value) -> anyhow::Result<String> {
         "task_verify" => task_verify(args),
         "task_inbox" => task_inbox(args),
         "task_debt" => task_debt(args),
+        "task_stats" => task_stats(args),
         "prune_session" => prune_session(args),
         "prune_retrieve" => prune_retrieve(args),
         "doctor" => doctor(args),
@@ -1248,8 +1259,13 @@ fn task_pass(args: &Value) -> anyhow::Result<String> {
     let (outcome, mut warnings) = task_replay()?;
     let id = task_resolve(&outcome, arg_str(args, "id").context("`id` is required")?)?;
     let session = arg_str(args, "session");
-    let independence = cv_core::task::independence_check(&outcome.model.tasks[&id], session);
-    if let Some(w) = cv_core::task::independence_warning(independence.as_ref()) {
+    // Both advisory observations from one parse of the reviewer's session (law 2: read,
+    // record, warn — never gate).
+    let obs = cv_core::task::review_observation(&outcome.model.tasks[&id], session);
+    if let Some(w) = cv_core::task::independence_warning(obs.independence.as_ref()) {
+        warnings.push(w);
+    }
+    if let Some(w) = cv_core::task::receipts_warning(obs.receipts.as_ref()) {
         warnings.push(w);
     }
     let from = require_task_from(args)?;
@@ -1259,25 +1275,45 @@ fn task_pass(args: &Value) -> anyhow::Result<String> {
         cv_core::task::TaskEventKind::ReviewPassed {
             reviewer: from.clone(),
             session_ref: session.map(String::from),
-            independence,
+            independence: obs.independence,
+            receipts: obs.receipts,
         },
         warnings,
     )
 }
 
 fn task_refute(args: &Value) -> anyhow::Result<String> {
-    let (outcome, warnings) = task_replay()?;
+    let (outcome, mut warnings) = task_replay()?;
     let id = task_resolve(&outcome, arg_str(args, "id").context("`id` is required")?)?;
+    let session = arg_str(args, "session");
+    let receipts = cv_core::task::review_receipts(&outcome.model.tasks[&id], session);
+    if let Some(w) = cv_core::task::receipts_warning(receipts.as_ref()) {
+        warnings.push(w);
+    }
     let from = require_task_from(args)?;
     task_append(
         Some(&id),
         &from,
         cv_core::task::TaskEventKind::ReviewRefuted {
             reviewer: from.clone(),
-            session_ref: arg_str(args, "session").map(String::from),
+            session_ref: session.map(String::from),
+            receipts,
         },
         warnings,
     )
+}
+
+/// `task_stats` — the fleet batting averages (pure projection over the replayed model, annotated
+/// with the verifier heartbeat). Informational only.
+fn task_stats(args: &Value) -> anyhow::Result<String> {
+    let (outcome, warnings) = task_replay()?;
+    let repo = arg_str(args, "repo").map(std::path::PathBuf::from);
+    let hb = cv_core::task::verify::read_heartbeat(&cv_core::task::tasks_dir());
+    let stats =
+        cv_core::task::FleetStats::compute(&outcome.model, hb.as_ref(), repo.as_deref());
+    let mut v = serde_json::to_value(&stats)?;
+    v["warnings"] = json!(warnings);
+    Ok(serde_json::to_string_pretty(&v)?)
 }
 
 fn task_verify(args: &Value) -> anyhow::Result<String> {

@@ -28,6 +28,7 @@
           },
           "state": "landed",
           "proposed_at": "2026-07-16T12:03:00Z",
+          "proposed_by": "agent:author",
           "active_reviewer": "agent:other",
           "pass": {
             "reviewer": "agent:other",
@@ -38,6 +39,11 @@
               "author_family": "anthropic",
               "reviewer_family": "openai",
               "independent": true
+            },
+            "receipts": {
+              "saw_change": true,
+              "ran_checks": true,
+              "turns": 14
             }
           },
           "refute": null,
@@ -56,6 +62,7 @@
             "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
             "cccccccccccccccccccccccccccccccccccccccc"
           ],
+          "landed_at": "2026-07-16T12:10:00Z",
           "issues": [
             {
               "SourceUnavailable": {
@@ -119,17 +126,23 @@
           },
           "state": "refuted",
           "proposed_at": "2026-07-16T12:16:00Z",
+          "proposed_by": "agent:other",
           "active_reviewer": "agent:reviewer",
           "pass": null,
           "refute": {
             "reviewer": "agent:reviewer",
             "event_id": "00000000-0000-7000-8000-000000000018",
             "ts": "2026-07-16T12:17:00Z",
-            "session_ref": "sess-review-003"
+            "session_ref": "sess-review-003",
+            "receipts": {
+              "saw_change": false,
+              "turns": 2
+            }
           },
           "reroutes": [],
           "local_merge": null,
           "landed": null,
+          "landed_at": null,
           "issues": []
         }
       ],

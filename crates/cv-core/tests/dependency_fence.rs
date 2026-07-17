@@ -9,9 +9,10 @@
 //! 1. **The dependency allowlist.** Every crate named in cv-core's `Cargo.toml` dependency
 //!    sections must appear in the literal allowlist below. Adding a dependency is allowed —
 //!    by editing the allowlist in the same diff, where a reviewer sees it.
-//! 2. **The purity fence.** `src/task/reduce.rs`, `src/task/model.rs`, and `src/sanitize.rs`
-//!    must not touch `std::process`, `std::net`, or `std::fs`. Reduction, wire types, and
-//!    render sanitization are pure; I/O belongs in `task/store.rs` and the verifier.
+//! 2. **The purity fence.** `src/task/reduce.rs`, `src/task/model.rs`, `src/task/stats.rs`,
+//!    and `src/sanitize.rs` must not touch `std::process`, `std::net`, or `std::fs`. Reduction,
+//!    wire types, the stats projection, and render sanitization are pure; I/O belongs in
+//!    `task/store.rs` and the verifier.
 
 use std::collections::BTreeSet;
 use std::fs;
@@ -81,7 +82,12 @@ fn dependencies_stay_within_the_allowlist() {
 }
 
 /// Modules that must stay pure: no process spawning, no network, no filesystem.
-const PURE_MODULES: &[&str] = &["src/task/reduce.rs", "src/task/model.rs", "src/sanitize.rs"];
+const PURE_MODULES: &[&str] = &[
+    "src/task/reduce.rs",
+    "src/task/model.rs",
+    "src/task/stats.rs",
+    "src/sanitize.rs",
+];
 const FORBIDDEN: &[&str] = &["std::process", "std::net", "std::fs"];
 
 #[test]

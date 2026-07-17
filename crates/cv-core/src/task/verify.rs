@@ -642,6 +642,7 @@ mod tests {
                     reviewer: "t".into(),
                     session_ref: None,
                     independence: None,
+                    receipts: None,
                 },
             ),
         ];
@@ -905,7 +906,7 @@ mod tests {
         )
         .unwrap();
         apply(
-            TaskEventKind::ReviewPassed { reviewer: "t".into(), session_ref: None, independence: None },
+            TaskEventKind::ReviewPassed { reviewer: "t".into(), session_ref: None, independence: None, receipts: None },
             &tid,
         )
         .unwrap();
@@ -1004,6 +1005,7 @@ mod tests {
                     reviewer: "agent:reviewer".into(),
                     session_ref: None,
                     independence: None,
+                    receipts: None,
                 },
             ))
             .unwrap();

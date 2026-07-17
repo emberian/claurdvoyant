@@ -730,6 +730,123 @@ fn task_propose_warns_on_branch_collision() {
     assert!(err.contains("collision"), "{err}");
 }
 
+/// Reviewer receipts + fleet stats end-to-end: a pass with a reviewer session whose transcript
+/// touched the change records receipts (rendered in `show`), a session-less pass warns and
+/// records none, and `cv task stats` renders both endpoints' counts with the trust footer.
+#[test]
+fn task_receipts_and_stats_end_to_end() {
+    let w = World::new("task-receipts");
+    // A tiny real repo (propose observes git).
+    let repo = w.base.join("repo");
+    fs::create_dir_all(&repo).unwrap();
+    let git = |args: &[&str]| {
+        let out = Command::new("git")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .arg("-C")
+            .arg(&repo)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    };
+    git(&["init", "-q", "-b", "main"]);
+    git(&["config", "user.email", "t@example.com"]);
+    git(&["config", "user.name", "t"]);
+    fs::write(repo.join("a.txt"), "a").unwrap();
+    git(&["add", "."]);
+    git(&["commit", "-q", "-m", "base"]);
+    git(&["checkout", "-q", "-b", "task/receipts"]);
+    fs::write(repo.join("b.txt"), "b").unwrap();
+    git(&["add", "."]);
+    git(&["commit", "-q", "-m", "feat"]);
+    let repo_s = repo.to_str().unwrap();
+
+    // The reviewer's transcript: diffed the branch and ran the tests.
+    w.write_session(
+        "reviewsess",
+        &[
+            user_line("u1", "2026-07-16T10:00:00Z", "review task/receipts please"),
+            assistant_line(
+                "a1",
+                "2026-07-16T10:01:00Z",
+                serde_json::json!([
+                    {"type": "tool_use", "id": "t1", "name": "Bash",
+                     "input": {"command": "git diff main...task/receipts"}},
+                    {"type": "tool_use", "id": "t2", "name": "Bash",
+                     "input": {"command": "cargo test --workspace"}},
+                ]),
+            ),
+        ],
+    );
+
+    // Task 1: propose + pass WITH the reviewer session — receipts observed.
+    let (out, _) = w.cv_ok(&["task", "open", "with receipts", "--repo", repo_s]);
+    let t1 = opened_task_id(&out);
+    let (ok, ..) = w.cv_env(&["task", "claim", &t1], &[("CV_ENDPOINT", "agent:author")]);
+    assert!(ok);
+    let (ok, _, _, err) = w.cv_env(
+        &["task", "propose", &t1, "--branch", "task/receipts", "--upstream", "main"],
+        &[("CV_ENDPOINT", "agent:author")],
+    );
+    assert!(ok, "{err}");
+    let (ok, code, out, err) = w.cv_env(
+        &["task", "pass", &t1, "--session", "reviewsess", "--from", "agent:reviewer"],
+        &[],
+    );
+    assert!(ok, "pass with session exited {code}\n{out}\n{err}");
+    assert!(
+        !err.contains("no observable contact") && !err.contains("receipts not observed"),
+        "contact was in the transcript, no receipts warning expected:\n{err}"
+    );
+
+    // The receipts render on `show`.
+    let (out, _) = w.cv_ok(&["task", "show", &t1]);
+    assert!(
+        out.contains("receipts (pass): saw change ✓, ran checks ✓, 1 turns"),
+        "receipts line missing:\n{out}"
+    );
+
+    // Task 2: pass WITHOUT a session — warned, recorded as none, still never blocked.
+    let (out, _) = w.cv_ok(&["task", "open", "no receipts", "--repo", repo_s]);
+    let t2 = opened_task_id(&out);
+    let (ok, ..) = w.cv_env(&["task", "claim", &t2], &[("CV_ENDPOINT", "agent:author")]);
+    assert!(ok);
+    let (ok, _, _, err) = w.cv_env(
+        &["task", "propose", &t2, "--branch", "task/receipts", "--upstream", "main"],
+        &[("CV_ENDPOINT", "agent:author")],
+    );
+    assert!(ok, "{err}");
+    let (ok, code, _, err) = w.cv_env(&["task", "pass", &t2, "--from", "agent:reviewer"], &[]);
+    assert!(ok, "session-less pass must not be blocked: exit {code}\n{err}");
+    assert!(
+        err.contains("no reviewer session given: review receipts not observed"),
+        "missing receipts warning:\n{err}"
+    );
+    let (out, _) = w.cv_ok(&["task", "show", &t2]);
+    assert!(!out.contains("receipts (pass)"), "no receipts recorded → no line:\n{out}");
+
+    // Fleet stats: both endpoints appear with honest counts and the trust footer.
+    let (out, err) = w.cv_ok(&["task", "stats"]);
+    assert!(out.contains("agent:author"), "{out}");
+    assert!(out.contains("agent:reviewer"), "{out}");
+    assert!(out.contains("computed from observed events only; landed = git-verified"), "{out}");
+    assert!(out.contains("verified: NEVER"), "no verify pass ran in this world:\n{out}");
+    assert!(err.contains("NEVER been verified"), "freshness warning on stderr:\n{err}");
+    // The reviewer row counts the session-less pass as a no-receipts pass (rubber-stamp signal).
+    let reviewer_row = out.lines().find(|l| l.contains("agent:reviewer")).unwrap();
+    assert!(reviewer_row.contains("2/0"), "two passes, zero refutes: {reviewer_row}");
+
+    // And the JSON surface carries the same rows machine-readably.
+    let (json, _) = w.cv_ok(&["task", "stats", "--json"]);
+    let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+    let reviewers = v["reviewers"].as_array().unwrap();
+    assert_eq!(reviewers.len(), 1);
+    assert_eq!(reviewers[0]["no_receipts_passes"], 1);
+    assert_eq!(reviewers[0]["no_contact_passes"], 0);
+    assert_eq!(reviewers[0]["passes"], 2);
+}
+
 /// G5 on the board: message bodies and senders are stripped at `cv board read`.
 #[test]
 fn board_read_sanitizes_and_from_defaults_to_cv_endpoint() {

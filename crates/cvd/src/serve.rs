@@ -255,6 +255,8 @@ fn route(segments: &[String], query: &str) -> (u16, Value) {
 
         ["api", "tasks", "debt"] => tasks_debt(query),
 
+        ["api", "tasks", "stats"] => tasks_stats(query),
+
         ["api", "tasks", "inbox", who] => tasks_inbox(who),
 
         ["api", "task", id] => task_one(id, false),
@@ -344,6 +346,25 @@ fn tasks_debt(query: &str) -> (u16, Value) {
             "verify_warning": report.verify_warning,
             "warnings": outcome.warnings,
         }))
+    })
+}
+
+/// `GET /api/tasks/stats?repo=` — fleet batting averages: per-endpoint and per-reviewer outcome
+/// counts over the replayed model, annotated with verifier freshness. Computed from observed
+/// events only (landed = git-verified); informational, never a gate.
+fn tasks_stats(query: &str) -> (u16, Value) {
+    let params = Query::parse(query);
+    with_tasks(|outcome| {
+        let want = params.get("repo").map(std::path::PathBuf::from);
+        let hb = cv_core::task::verify::read_heartbeat(&cv_core::task::tasks_dir());
+        let stats =
+            cv_core::task::FleetStats::compute(&outcome.model, hb.as_ref(), want.as_deref());
+        let mut v = match serde_json::to_value(&stats) {
+            Ok(v) => v,
+            Err(e) => return err(500, &e.to_string()),
+        };
+        v["warnings"] = json!(outcome.warnings);
+        ok(v)
     })
 }
 

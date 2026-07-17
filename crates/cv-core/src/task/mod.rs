@@ -24,15 +24,19 @@
 pub mod model;
 pub mod project;
 pub mod reduce;
+#[cfg(not(target_family = "wasm"))]
+pub mod stats;
 pub mod store;
 #[cfg(not(target_family = "wasm"))]
 pub mod verify;
 pub mod views;
 
 pub use model::{
-    harness_family, model_family, IndependenceCheck, MergeFailure, Revision, RevisionState,
-    TaskEvent, TaskEventKind, TaskState, VERIFIER_BY,
+    harness_family, model_family, IndependenceCheck, MergeFailure, ReviewReceipts, Revision,
+    RevisionState, TaskEvent, TaskEventKind, TaskState, VERIFIER_BY,
 };
+#[cfg(not(target_family = "wasm"))]
+pub use stats::{EndpointRow, FamilyRow, FleetStats, ReviewerRow};
 pub use reduce::{
     EffectiveState, Note, PassEvidence, ReduceError, RefuteEvidence, RerouteEvidence,
     RevisionProjection, TaskIssue, TaskProjection, TaskReadModel, TaskReducer,
@@ -55,25 +59,169 @@ pub fn independence_check(
     reviewer_session: Option<&str>,
 ) -> Option<IndependenceCheck> {
     let reviewer_session = reviewer_session?;
-    let family_of = |session_id: &str| -> Option<String> {
-        let (sref, adapter) = crate::find_cheap(session_id, None).ok()??;
-        if let Some(f) = harness_family(sref.harness) {
-            return Some(f.to_string());
-        }
-        // Multi-model harness (Cursor, OpenCode, …): the harness alone can't name the family,
-        // but the transcript's per-message `model` ids can. Read model-granular.
-        session_model(&*adapter, &sref).as_deref().and_then(model_family).map(String::from)
-    };
-    let reviewer_family = family_of(reviewer_session);
+    let reviewer_family = session_family(reviewer_session);
+    Some(independence_from(t, reviewer_family))
+}
+
+/// The model family a session id resolves to: harness family when the harness is single-vendor,
+/// else the transcript's per-message `model` ids (multi-model harnesses like Cursor/OpenCode).
+/// `None` when the session can't be found/read or the family can't be named — never guessed.
+fn session_family(session_id: &str) -> Option<String> {
+    let (sref, adapter) = crate::find_cheap(session_id, None).ok()??;
+    if let Some(f) = harness_family(sref.harness) {
+        return Some(f.to_string());
+    }
+    session_model(&*adapter, &sref).as_deref().and_then(model_family).map(String::from)
+}
+
+/// Assemble the recorded independence observation from the author side of `t` and an
+/// already-determined reviewer family (shared by [`independence_check`] and
+/// [`review_observation`], whose reviewer family comes out of the single receipts scan).
+fn independence_from(
+    t: &reduce::TaskProjection,
+    reviewer_family: Option<String>,
+) -> IndependenceCheck {
     let author_family = t
         .current_revision()
         .and_then(|r| r.revision.session_ref.as_deref())
-        .and_then(family_of);
+        .and_then(session_family);
     let independent = match (&author_family, &reviewer_family) {
         (Some(a), Some(r)) => Some(a != r),
         _ => None,
     };
-    Some(IndependenceCheck { author_family, reviewer_family, independent })
+    IndependenceCheck { author_family, reviewer_family, independent }
+}
+
+/// Command substrings that count as "ran checks" for [`ReviewReceipts::ran_checks`]. A **named,
+/// documented heuristic**, not a semantic analysis: a tool input containing one of these looks
+/// like a test/build run. Grow it deliberately; matching is plain case-sensitive substring.
+pub const CHECK_COMMAND_PATTERNS: &[&str] = &[
+    "cargo test",
+    "cargo nextest",
+    "pytest",
+    "npm test",
+    "make test",
+    "go test",
+];
+
+/// What one pass over the reviewer's transcript observed: the model that spoke (for the
+/// independence family) plus the receipts. Internal — the public results are
+/// [`ReviewObservation`] and [`review_receipts`].
+struct ReviewerScan {
+    last_model: Option<String>,
+    receipts: ReviewReceipts,
+}
+
+/// Both advisory review-time observations, computed from ONE parse of the reviewer's transcript
+/// (law 2's posture for each: read, record, warn — never gate).
+#[derive(Debug)]
+pub struct ReviewObservation {
+    pub independence: Option<IndependenceCheck>,
+    pub receipts: Option<ReviewReceipts>,
+}
+
+/// Observe reviewer independence AND reviewer receipts for a verdict on `t`'s current revision,
+/// parsing the reviewer's session once. With no session id, both observations are `None`
+/// (recorded as unknown, warned about by the shared wording helpers).
+pub fn review_observation(
+    t: &reduce::TaskProjection,
+    reviewer_session: Option<&str>,
+) -> ReviewObservation {
+    let Some(sid) = reviewer_session else {
+        return ReviewObservation { independence: None, receipts: None };
+    };
+    let scanned = scan_reviewer_session(sid, t);
+    let reviewer_family = scanned.as_ref().and_then(|(harness, scan)| {
+        harness_family(*harness)
+            .map(str::to_string)
+            .or_else(|| scan.last_model.as_deref().and_then(model_family).map(String::from))
+    });
+    // Session named but unreadable: all-None receipts — "we looked, undetermined", distinct on
+    // the record from "no session given" (receipts absent entirely).
+    let receipts = Some(scanned.map(|(_, scan)| scan.receipts).unwrap_or_default());
+    ReviewObservation {
+        independence: Some(independence_from(t, reviewer_family)),
+        receipts,
+    }
+}
+
+/// Receipts-only observation (the refute path, which records no independence check). Same
+/// single-parse scan as [`review_observation`]; `None` only when no session id was given.
+pub fn review_receipts(
+    t: &reduce::TaskProjection,
+    reviewer_session: Option<&str>,
+) -> Option<ReviewReceipts> {
+    let sid = reviewer_session?;
+    Some(scan_reviewer_session(sid, t).map(|(_, scan)| scan.receipts).unwrap_or_default())
+}
+
+/// Resolve the reviewer's session and scan it. `None` when the session can't be found — the
+/// caller records all-None receipts for that.
+fn scan_reviewer_session(
+    session_id: &str,
+    t: &reduce::TaskProjection,
+) -> Option<(crate::ir::Harness, ReviewerScan)> {
+    let (sref, adapter) = crate::find_cheap(session_id, None).ok()??;
+    let scan = scan_session(&*adapter, &sref, t)?;
+    Some((sref.harness, scan))
+}
+
+/// One forward pass over a transcript, observing everything the review-time advisories need:
+/// the last assistant `model` (independence family fallback), the assistant turn count, and the
+/// contact/checks heuristics over tool inputs. Streamed under [`ParseOptions::lazy`] — tool
+/// inputs are always inline; giant text/tool-result content stays unresolved on disk.
+///
+/// Honesty rules: `None` means undetermined. `saw_change` is only judged when the task has a
+/// current revision to name needles from (branch, review sha + 12-prefix, repo path, or a
+/// `git diff`/`git show`/`git log` invocation); `ran_checks` uses [`CHECK_COMMAND_PATTERNS`].
+/// Both look at **tool-call inputs** only — that is where commands and file reads live; claims
+/// in prose are exactly what this observation refuses to take at face value.
+fn scan_session(
+    adapter: &dyn crate::harness::Adapter,
+    sref: &crate::ir::SessionRef,
+    t: &reduce::TaskProjection,
+) -> Option<ReviewerScan> {
+    let mut contact_needles: Vec<String> = Vec::new();
+    if let Some(rev) = t.current_revision() {
+        contact_needles.push(rev.revision.branch.clone());
+        contact_needles.push(rev.revision.review_sha.clone());
+        contact_needles.push(rev.revision.review_sha.chars().take(12).collect());
+        if let Some(repo) = &t.repo {
+            contact_needles.push(repo.display().to_string());
+        }
+        contact_needles.extend(["git diff", "git show", "git log"].map(String::from));
+    }
+
+    let mut last_model: Option<String> = None;
+    let mut turns: u32 = 0;
+    let mut saw_change = false;
+    let mut ran_checks = false;
+    let mut sink = |m: crate::ir::Message| {
+        if m.role == crate::ir::Role::Assistant {
+            turns += 1;
+            if let Some(model) = &m.model {
+                last_model = Some(model.clone());
+            }
+        }
+        for b in &m.content {
+            if let crate::ir::Block::ToolUse { name, input, .. } = b {
+                let text = format!("{name} {input}");
+                saw_change = saw_change || contact_needles.iter().any(|n| text.contains(n.as_str()));
+                ran_checks = ran_checks || CHECK_COMMAND_PATTERNS.iter().any(|p| text.contains(p));
+            }
+        }
+        crate::stream::Flow::Continue
+    };
+    adapter.stream(sref, &crate::stream::ParseOptions::lazy(), &mut sink).ok()?;
+    Some(ReviewerScan {
+        last_model,
+        receipts: ReviewReceipts {
+            // No revision context → no needles → contact is undeterminable, not "false".
+            saw_change: (!contact_needles.is_empty()).then_some(saw_change),
+            ran_checks: Some(ran_checks),
+            turns: Some(turns),
+        },
+    })
 }
 
 /// The model id that actually spoke in a session: the LAST assistant message's `model`, falling
@@ -112,6 +260,27 @@ pub fn independence_warning(check: Option<&IndependenceCheck>) -> Option<String>
                 "independence undetermined (author {:?}, reviewer {:?}) — recorded, not blocked",
                 c.author_family, c.reviewer_family
             )),
+        },
+    }
+}
+
+/// Human-readable advisory line for a receipts observation (shared CLI/MCP wording). `None`
+/// receipts means no reviewer session was given; observed contact produces no warning at all.
+/// Always advisory: recorded, never a gate.
+pub fn receipts_warning(receipts: Option<&ReviewReceipts>) -> Option<String> {
+    match receipts {
+        None => Some("no reviewer session given: review receipts not observed".to_string()),
+        Some(r) => match r.saw_change {
+            Some(true) => None,
+            Some(false) => Some(
+                "reviewer session shows no observable contact with the change — recorded, not blocked"
+                    .to_string(),
+            ),
+            None => Some(
+                "review receipts undetermined (reviewer session unreadable or revision context \
+                 missing) — recorded, not blocked"
+                    .to_string(),
+            ),
         },
     }
 }
@@ -223,6 +392,7 @@ pub fn tasks_dir() -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use super::default_endpoint;
 
     /// All env cases live in ONE test: `set_var` is process-global and lib tests run in
@@ -245,5 +415,167 @@ mod tests {
         assert_eq!(default_endpoint(), None, "empty → no identity");
 
         std::env::remove_var("CV_ENDPOINT");
+    }
+
+    // ── reviewer receipts: observation over a constructed fake transcript ────────────────────
+
+    /// A task with one proposed revision (branch `task/demo`, review sha `aaaa…`, repo
+    /// `/repo/proj`) — the contact needles for the scan.
+    fn task_with_revision() -> reduce::TaskProjection {
+        let ts: chrono::DateTime<chrono::Utc> = "2026-07-16T12:00:00Z".parse().unwrap();
+        let open = TaskEvent {
+            id: "00000000-0000-7000-8000-000000000001".into(),
+            task_id: "00000000-0000-7000-8000-000000000001".into(),
+            ts,
+            by: "h".into(),
+            kind: TaskEventKind::Opened {
+                title: "t".into(),
+                body: String::new(),
+                repo: Some(std::path::PathBuf::from("/repo/proj")),
+                issue: None,
+                channel: "tasks".into(),
+                assignee: None,
+            },
+        };
+        let propose = TaskEvent {
+            id: "00000000-0000-7000-8000-000000000002".into(),
+            task_id: open.task_id.clone(),
+            ts,
+            by: "agent:author".into(),
+            kind: TaskEventKind::RevisionProposed {
+                revision: Revision {
+                    n: 1,
+                    branch: "task/demo".into(),
+                    worktree: None,
+                    upstream: "origin/main".into(),
+                    base: "0".repeat(40),
+                    review_sha: "a".repeat(40),
+                    patch_id: "b".repeat(40),
+                    reviewer: Some("agent:r".into()),
+                    session_ref: None,
+                },
+            },
+        };
+        let model = reduce::TaskReducer::reduce(&[open, propose]).unwrap();
+        model.tasks.values().next().unwrap().clone()
+    }
+
+    /// A task with no revision at all — contact is undeterminable.
+    fn task_without_revision() -> reduce::TaskProjection {
+        let mut t = task_with_revision();
+        t.revisions.clear();
+        t
+    }
+
+    /// Write a claude-format transcript whose assistant turns carry the given tool inputs;
+    /// return a SessionRef pointing straight at it (no catalog/discovery involved).
+    fn fake_session(tag: &str, tool_commands: &[&str]) -> crate::ir::SessionRef {
+        let dir = std::env::temp_dir().join(format!("cv-receipts-{tag}-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("reviewsess.jsonl");
+        let mut body = String::new();
+        body.push_str(
+            &serde_json::json!({
+                "type": "user", "uuid": "u1", "sessionId": "reviewsess",
+                "timestamp": "2026-07-16T12:00:00Z", "cwd": "/repo/proj",
+                "message": {"role": "user", "content": "please review the change"}
+            })
+            .to_string(),
+        );
+        body.push('\n');
+        for (i, cmd) in tool_commands.iter().enumerate() {
+            body.push_str(
+                &serde_json::json!({
+                    "type": "assistant", "uuid": format!("a{i}"), "sessionId": "reviewsess",
+                    "timestamp": "2026-07-16T12:01:00Z",
+                    "message": {"role": "assistant", "model": "claude-test-1", "content": [
+                        {"type": "tool_use", "id": format!("t{i}"), "name": "Bash",
+                         "input": {"command": cmd}},
+                    ]}
+                })
+                .to_string(),
+            );
+            body.push('\n');
+        }
+        std::fs::write(&path, body).unwrap();
+        crate::ir::SessionRef {
+            id: "reviewsess".into(),
+            harness: crate::ir::Harness::Claude,
+            path,
+            cwd: Some(std::path::PathBuf::from("/repo/proj")),
+            title: None,
+            created_at: None,
+            updated_at: None,
+            message_count: 1 + tool_commands.len(),
+        }
+    }
+
+    fn scan(sref: &crate::ir::SessionRef, t: &reduce::TaskProjection) -> ReviewerScan {
+        let adapter = crate::harness::for_harness(crate::ir::Harness::Claude).unwrap();
+        scan_session(&*adapter, sref, t).expect("fixture session should parse")
+    }
+
+    #[test]
+    fn receipts_observe_contact_and_checks() {
+        let t = task_with_revision();
+
+        // Contact via branch name + a test run: both observed true.
+        let sref = fake_session("contact", &["git diff main...task/demo", "cargo test -p demo"]);
+        let s = scan(&sref, &t);
+        assert_eq!(
+            s.receipts,
+            ReviewReceipts { saw_change: Some(true), ran_checks: Some(true), turns: Some(2) }
+        );
+        assert_eq!(s.last_model.as_deref(), Some("claude-test-1"));
+
+        // Contact via the review sha's 12-prefix alone.
+        let sref = fake_session("sha", &[&format!("git show {}", "a".repeat(12))]);
+        assert_eq!(scan(&sref, &t).receipts.saw_change, Some(true));
+
+        // Contact via the repo path alone (a file read under the repo).
+        let sref = fake_session("repo", &["cat /repo/proj/src/lib.rs"]);
+        assert_eq!(scan(&sref, &t).receipts.saw_change, Some(true));
+
+        // No contact, no checks: observed FALSE (we looked, it isn't there) — never a guess.
+        let sref = fake_session("nocontact", &["ls -la /somewhere/else"]);
+        let s = scan(&sref, &t);
+        assert_eq!(
+            s.receipts,
+            ReviewReceipts { saw_change: Some(false), ran_checks: Some(false), turns: Some(1) }
+        );
+    }
+
+    #[test]
+    fn receipts_undetermined_cases_are_none_not_false() {
+        // No revision on the task → no needles → contact undeterminable (None), while checks
+        // and turns are still honest observations.
+        let sref = fake_session("norev", &["cargo test"]);
+        let s = scan(&sref, &task_without_revision());
+        assert_eq!(
+            s.receipts,
+            ReviewReceipts { saw_change: None, ran_checks: Some(true), turns: Some(1) }
+        );
+
+        // Unreadable transcript → no scan at all; callers record all-None receipts.
+        let mut sref = fake_session("gone", &[]);
+        sref.path = std::path::PathBuf::from("/nonexistent/reviewsess.jsonl");
+        let adapter = crate::harness::for_harness(crate::ir::Harness::Claude).unwrap();
+        assert!(scan_session(&*adapter, &sref, &task_with_revision()).is_none());
+    }
+
+    #[test]
+    fn receipts_warning_wording() {
+        assert_eq!(
+            receipts_warning(None).as_deref(),
+            Some("no reviewer session given: review receipts not observed")
+        );
+        let contact = ReviewReceipts { saw_change: Some(true), ran_checks: Some(false), turns: Some(3) };
+        assert_eq!(receipts_warning(Some(&contact)), None, "contact observed → no warning");
+        let no_contact = ReviewReceipts { saw_change: Some(false), ran_checks: None, turns: Some(1) };
+        let w = receipts_warning(Some(&no_contact)).unwrap();
+        assert!(w.contains("no observable contact") && w.contains("not blocked"), "{w}");
+        let unknown = ReviewReceipts::default();
+        let w = receipts_warning(Some(&unknown)).unwrap();
+        assert!(w.contains("undetermined") && w.contains("not blocked"), "{w}");
     }
 }

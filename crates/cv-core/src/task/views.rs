@@ -291,6 +291,7 @@ mod tests {
                 reviewer: "agent:r".into(),
                 session_ref: None,
                 independence: None,
+                receipts: None,
             },
         };
         (TaskReducer::reduce(&[open, propose, pass]).unwrap(), id)

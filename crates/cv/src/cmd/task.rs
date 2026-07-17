@@ -201,6 +201,14 @@ pub(crate) enum TaskCmd {
         #[arg(long)]
         json: bool,
     },
+    /// Fleet batting averages: per-endpoint and per-reviewer outcome counts, computed from
+    /// observed events only. Informational — never a gate.
+    Stats {
+        #[arg(long)]
+        repo: Option<PathBuf>,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 /// Replay the default store, print any log warnings loudly, return the outcome.
@@ -346,6 +354,14 @@ pub(crate) fn cmd_task(action: TaskCmd) -> Result<()> {
                     if let Some(reviewer) = &rev.active_reviewer {
                         println!("         reviewer: {}", sanitize_line(reviewer));
                     }
+                    for (verdict, receipts) in [
+                        ("pass", rev.pass.as_ref().and_then(|p| p.receipts.as_ref())),
+                        ("refute", rev.refute.as_ref().and_then(|r| r.receipts.as_ref())),
+                    ] {
+                        if let Some(r) = receipts {
+                            println!("         receipts ({verdict}): {}", sanitize_line(&receipts_line(r)));
+                        }
+                    }
                     if let Some((head, pid)) = &rev.landed {
                         println!("         landed: upstream {} (patch-id {})", &head[..12], &pid[..12]);
                     }
@@ -464,25 +480,38 @@ pub(crate) fn cmd_task(action: TaskCmd) -> Result<()> {
             let from = require_from(from)?;
             let outcome = replay_loud()?;
             let id = resolve(&outcome.model, &id)?.to_string();
-            let independence =
-                task::independence_check(&outcome.model.tasks[&id], session.as_deref());
-            if let Some(w) = task::independence_warning(independence.as_ref()) {
+            // Both advisory observations from one parse of the reviewer's session (law 2:
+            // read, record, warn — never gate).
+            let obs = task::review_observation(&outcome.model.tasks[&id], session.as_deref());
+            if let Some(w) = task::independence_warning(obs.independence.as_ref()) {
+                eprintln!("⚠ {w}");
+            }
+            if let Some(w) = task::receipts_warning(obs.receipts.as_ref()) {
                 eprintln!("⚠ {w}");
             }
             append_and_report(
                 Some(&id),
                 &from,
-                TaskEventKind::ReviewPassed { reviewer: from.clone(), session_ref: session, independence },
+                TaskEventKind::ReviewPassed {
+                    reviewer: from.clone(),
+                    session_ref: session,
+                    independence: obs.independence,
+                    receipts: obs.receipts,
+                },
             )
         }
         TaskCmd::Refute { id, session, from } => {
             let from = require_from(from)?;
             let outcome = replay_loud()?;
             let id = resolve(&outcome.model, &id)?.to_string();
+            let receipts = task::review_receipts(&outcome.model.tasks[&id], session.as_deref());
+            if let Some(w) = task::receipts_warning(receipts.as_ref()) {
+                eprintln!("⚠ {w}");
+            }
             append_and_report(
                 Some(&id),
                 &from,
-                TaskEventKind::ReviewRefuted { reviewer: from.clone(), session_ref: session },
+                TaskEventKind::ReviewRefuted { reviewer: from.clone(), session_ref: session, receipts },
             )
         }
         TaskCmd::Verify { id, all, fetch, skip_landed } => cmd_verify(id, all, fetch, skip_landed),
@@ -611,7 +640,107 @@ pub(crate) fn cmd_task(action: TaskCmd) -> Result<()> {
             }
             Ok(())
         }
+        TaskCmd::Stats { repo, json } => {
+            let outcome = replay_loud()?;
+            let hb = cv_core::task::verify::read_heartbeat(&task::tasks_dir());
+            let stats = task::FleetStats::compute(&outcome.model, hb.as_ref(), repo.as_deref());
+            if json {
+                println!("{}", serde_json::to_string_pretty(&stats)?);
+            } else {
+                render_stats(&stats);
+            }
+            Ok(())
+        }
     }
+}
+
+/// One receipts observation as a human line: `saw change ✓, ran checks ✗, 14 turns`
+/// (`?` = undetermined — observed as unknown, never guessed).
+fn receipts_line(r: &cv_core::task::ReviewReceipts) -> String {
+    let mark = |o: Option<bool>| match o {
+        Some(true) => "✓",
+        Some(false) => "✗",
+        None => "?",
+    };
+    let turns = r.turns.map(|t| format!("{t} turns")).unwrap_or_else(|| "? turns".into());
+    format!("saw change {}, ran checks {}, {}", mark(r.saw_change), mark(r.ran_checks), turns)
+}
+
+/// A median duration cell: `-` when there is no sample (never a fake `0s`).
+fn median_cell(secs: Option<i64>) -> String {
+    let now = Utc::now();
+    match secs {
+        None => "-".into(),
+        Some(s) => task::age_short(now - chrono::Duration::seconds(s.max(0)), now),
+    }
+}
+
+/// `cv task stats` human rendering. Small-n honesty: rates print as the counts they came from
+/// (`2/3`), never a bare percentage.
+fn render_stats(stats: &cv_core::task::FleetStats) {
+    if stats.endpoints.is_empty() && stats.reviewers.is_empty() {
+        println!("(no task history yet)");
+    }
+    if !stats.endpoints.is_empty() {
+        println!("endpoints (as author/assignee):");
+        println!(
+            "  {:24} {:>7} {:>8} {:>7} {:>7} {:>5} {:>6}  {:>9} {:>9}",
+            "endpoint", "claimed", "proposed", "landed", "refuted", "live", "aband", "land-rate", "med-land"
+        );
+        for e in &stats.endpoints {
+            let terminal = e.landed + e.refuted + e.superseded;
+            let rate = if terminal == 0 { "-".into() } else { format!("{}/{terminal}", e.landed) };
+            println!(
+                "  {:24} {:>7} {:>8} {:>7} {:>7} {:>5} {:>6}  {:>9} {:>9}",
+                sanitize_line(&e.endpoint),
+                e.claimed,
+                e.proposed,
+                e.landed,
+                e.refuted,
+                e.unlanded,
+                e.abandoned_live,
+                rate,
+                median_cell(e.median_secs_to_land),
+            );
+        }
+    }
+    if !stats.reviewers.is_empty() {
+        println!("reviewers:");
+        println!(
+            "  {:24} {:>8} {:>11} {:>9} {:>8} {:>10}  {:>11}",
+            "reviewer", "verdicts", "pass/refute", "same-fam", "no-rcpt", "no-contact", "med-latency"
+        );
+        for r in &stats.reviewers {
+            println!(
+                "  {:24} {:>8} {:>11} {:>9} {:>8} {:>10}  {:>11}",
+                sanitize_line(&r.reviewer),
+                r.verdicts,
+                format!("{}/{}", r.passes, r.refutes),
+                r.same_family_passes,
+                r.no_receipts_passes,
+                r.no_contact_passes,
+                median_cell(r.median_review_latency_secs),
+            );
+        }
+    }
+    for f in &stats.families {
+        println!(
+            "family {}: {} reviews ({} cross-family, {} same-family, {} undetermined)",
+            sanitize_line(&f.family),
+            f.reviews_given,
+            f.cross_family,
+            f.same_family,
+            f.undetermined
+        );
+    }
+    match &stats.verified_as_of {
+        Some(ts) => println!("verified as of {}", fmt_local(*ts, "%Y-%m-%d %H:%M:%S")),
+        None => println!("verified: NEVER"),
+    }
+    if let Some(w) = &stats.verify_warning {
+        eprintln!("⚠ {}", sanitize_line(w));
+    }
+    println!("computed from observed events only; landed = git-verified");
 }
 
 /// `cv task verify` — the observation pass, shared with MCP/cvd via `verify::run_verify`.
