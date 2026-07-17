@@ -91,6 +91,16 @@
   stderr. Dry-run honest: nothing is written, so paths — and `newId`, unless
   `--to` pinned it — are explicit nulls plus a `note`. The human report stays
   on stderr (compose-family convention), so stdout is pure JSON. (@akapug)
+- **`cv prune --declassify`** — snip conversational message *prose* (user
+  prompts + assistant text blocks) whose density of caller-supplied terms is
+  high, into the sidecar with a `[PRUNED …]` marker — lossless and
+  `--retrieve`-able, like every other prune pass. A message is snipped iff it
+  holds ≥ 2 distinct terms; unlike the tool/`--thinking` passes it ignores
+  `keep_last` (recency is no shield when the whole loaded context is scored).
+  The terms are **always external** — `--declassify-tokens` (CSV) and/or
+  `--declassify-tokens-file` (one per line, `#` comments) — cv ships no
+  built-in list, so `--declassify` without terms is a warned no-op. Also on
+  the `prune_session` MCP tool (`declassify`/`declassify_tokens`). (@akapug)
 - **Release mechanics.** `clustervision-core` compiles for
   `wasm32-unknown-unknown` standalone again (target-gated `uuid` `js`
   feature; CI checks it). Internal dependency pins track `0.10` so a

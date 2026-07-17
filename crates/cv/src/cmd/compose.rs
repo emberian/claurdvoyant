@@ -75,6 +75,7 @@ pub(crate) fn cmd_prune(
         keep_range,
         declassify,
         declassify_tokens, // caller-supplied (external); cv ships no built-in list. min_hits from Default (2).
+        dry_run,
         ..Default::default()
     };
     let res = cv_core::prune::prune_session(&r.path, &opts)?;

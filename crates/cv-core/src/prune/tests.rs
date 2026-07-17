@@ -714,8 +714,14 @@ fn declassify_snips_all_security_prose_keeps_benign() {
     let opts = PruneOptions {
         declassify: true,
         declassify_tokens: [
-            "security", "exploit", "vulnerability", "cross-tenant", "auth bypass", "credential",
-            "exfil", "attacker",
+            "security",
+            "exploit",
+            "vulnerability",
+            "cross-tenant",
+            "auth bypass",
+            "credential",
+            "exfil",
+            "attacker",
         ]
         .iter()
         .map(|s| s.to_string())

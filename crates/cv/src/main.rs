@@ -16,7 +16,9 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use cmd::live::BoardCmd;
 use cmd::task::TaskCmd;
-use cmd::{browse, compose, config, convert, doctor, live, pack, provenance, query, search, share, task, view, workflow};
+use cmd::{
+    browse, compose, config, convert, doctor, live, pack, provenance, query, search, share, task, view, workflow,
+};
 use std::path::PathBuf;
 
 /// Parse a `cv prune --range` spec. Same grammar as `cv show --range` (`650-`, `650-900`,
@@ -28,10 +30,7 @@ fn parse_keep_range(s: &str) -> Result<(usize, Option<usize>)> {
 /// Resolve the caller-supplied `--declassify` term list from a CSV flag and/or a file (one term per
 /// line, `#` comments + blanks ignored). Terms are lowercased + de-duplicated. cv ships NO built-in
 /// list — the terms are always external (config/data), so cv's own source carries no domain shitlist.
-fn resolve_declassify_tokens(
-    csv: Option<String>,
-    file: Option<PathBuf>,
-) -> Result<Vec<String>> {
+fn resolve_declassify_tokens(csv: Option<String>, file: Option<PathBuf>) -> Result<Vec<String>> {
     let mut seen = std::collections::BTreeSet::new();
     let mut out = Vec::new();
     let mut push = |t: &str| {
@@ -918,5 +917,35 @@ fn main() -> Result<()> {
             generate,
             gen_model,
         } => compose::cmd_loom(&base, at, &graft, from, to, out, export, cwd, generate, gen_model),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_declassify_tokens;
+
+    #[test]
+    fn declassify_tokens_resolve_from_csv_and_file() {
+        // CSV alone: trimmed, lowercased, de-duplicated, order-preserving.
+        let got = resolve_declassify_tokens(Some("Exploit, credential ,exploit,".into()), None).unwrap();
+        assert_eq!(got, vec!["exploit", "credential"]);
+
+        // File alone: one term per line, `#` comments (inline too) and blanks ignored.
+        let dir = std::env::temp_dir().join(format!("cv-declass-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("terms.txt");
+        std::fs::write(&path, "# a comment\nExfil\n\nauth bypass  # trailing note\n exfil \n").unwrap();
+        let got = resolve_declassify_tokens(None, Some(path.clone())).unwrap();
+        assert_eq!(got, vec!["exfil", "auth bypass"]);
+
+        // CSV + file compose; duplicates across sources collapse; neither source is required.
+        let got = resolve_declassify_tokens(Some("exfil,Attacker".into()), Some(path)).unwrap();
+        assert_eq!(got, vec!["exfil", "attacker", "auth bypass"]);
+        assert!(resolve_declassify_tokens(None, None).unwrap().is_empty());
+
+        // A missing file is a real error naming the path, not a silent empty list.
+        let err = resolve_declassify_tokens(None, Some(dir.join("nope.txt"))).unwrap_err();
+        assert!(err.to_string().contains("declassify-tokens-file"), "{err}");
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

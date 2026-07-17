@@ -305,6 +305,7 @@ cv prune 3b829648 --to my-tidy-session             # choose the new id
 cv prune 3b829648 --drop                           # hard-drop payloads (no sidecar, irreversible)
 cv prune 3b829648 --thinking --revive              # the resurrection: flatten + correct the stale size in one go
 cv prune 3b829648 --json                           # + the report as one JSON object on stdout (for tools/scripts)
+cv prune 3b829648 --declassify --declassify-tokens-file terms.txt   # snip term-dense prose (terms are yours; none built in)
 
 cv prune <new-id> --retrieve toolu_abc123          # fetch a stashed original back out
 ```
@@ -316,6 +317,15 @@ cv prune <new-id> --retrieve toolu_abc123          # fetch a stashed original ba
 - `--drop` — discard payloads entirely instead of stashing them (smallest output, irreversible; the source session is never touched regardless).
 - `--copy-resources` — also copy the session's `subagents/`/`workflows/` dir under the new id (off by default; can be hundreds of MB for big sessions). `claude --resume` doesn't need it — only cv's forest features (`cv workflow`/`cv tools`) on the pruned session do.
 - `--revive` — **resurrect an already-maxed session.** Claude Code's resume gate reads the last turn's *recorded* `usage` (input + cache tokens) as the session's current size — and checks it *before* re-sending anything, so a session sitting at the wall refuses to resume even after pruning has made the real content fit. `--revive` recomputes the honest size of the loaded window (everything after the last compaction boundary — what Claude actually re-sends) and rewrites the stale `usage` records to that figure, so the gate lets you back in. Pair with `--thinking` to flatten *and* revive in one command. Real example: a session stuck at "979.7k / context limit reached" → recorded 149k, resumes clean. (Edits recorded metadata, not just content; the source is still never touched — new id only.)
+- `--declassify` — also snip conversational message *prose* (user prompts + assistant text
+  blocks) dense in caller-supplied terms, into the sidecar with a `[PRUNED …]` marker (lossless,
+  `--retrieve`-able). A message is snipped iff it holds ≥ 2 distinct terms, matched
+  case-insensitively as substrings. Unlike the tool/`--thinking` passes this ignores `keep_last` —
+  recent prose is snipped too, because the use case (a scorer reading the *whole* loaded context)
+  doesn't care about recency. cv ships **no built-in term list**: supply terms with
+  `--declassify-tokens t1,t2,…` and/or `--declassify-tokens-file <path>` (one per line, `#`
+  comments and blanks ignored; terms are lowercased and de-duplicated), else `--declassify` warns
+  and snips nothing. Also on the `prune_session` MCP tool as `declassify`/`declassify_tokens`.
 - `--dry-run` — compute and report without writing.
 - `--json` — also emit the report as **one JSON object on stdout** (the human report stays on
   stderr, so stdout is pure JSON). camelCase fields: `sourceId`/`newId` (FULL ids), `harness`,
