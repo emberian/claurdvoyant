@@ -365,9 +365,8 @@ fn task_tool_list() -> Value {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "who": { "type": "string", "description": "Endpoint to compute the inbox for." }
-                },
-                "required": ["who"]
+                    "who": { "type": "string", "description": "Endpoint to compute the inbox for. Defaults to $CV_ENDPOINT; ERROR when neither is given." }
+                }
             }
         },
         {
@@ -488,7 +487,7 @@ fn base_tool_list() -> Value {
                 "properties": {
                     "channel": { "type": "string", "description": "Channel/room name (often a project path or topic)." },
                     "body": { "type": "string", "description": "The message text." },
-                    "from": { "type": "string", "description": "Who's posting (agent/session name). Default 'agent'." },
+                    "from": { "type": "string", "description": "Who's posting (agent/session name). Defaults to $CV_ENDPOINT, else 'agent'." },
                     "kind": { "type": "string", "description": "msg | status | event (default msg)." },
                     "tags": { "type": "array", "items": { "type": "string" }, "description": "Optional tags." },
                     "session_ref": { "type": "string", "description": "Optional session id this message is about." }
@@ -532,7 +531,7 @@ fn base_tool_list() -> Value {
                 "properties": {
                     "channel": { "type": "string", "description": "Channel/room name." },
                     "body": { "type": "string", "description": "The question / ask." },
-                    "from": { "type": "string", "description": "Who's asking. Default 'agent'." }
+                    "from": { "type": "string", "description": "Who's asking. Defaults to $CV_ENDPOINT, else 'agent'." }
                 },
                 "required": ["channel", "body"]
             }
@@ -546,7 +545,7 @@ fn base_tool_list() -> Value {
                     "channel": { "type": "string", "description": "Channel/room name." },
                     "in_reply_to": { "type": "string", "description": "The id of the request message being answered." },
                     "body": { "type": "string", "description": "The answer text." },
-                    "from": { "type": "string", "description": "Who's replying. Default 'agent'." }
+                    "from": { "type": "string", "description": "Who's replying. Defaults to $CV_ENDPOINT, else 'agent'." }
                 },
                 "required": ["channel", "in_reply_to", "body"]
             }
@@ -583,7 +582,7 @@ fn base_tool_list() -> Value {
                 "properties": {
                     "channel": { "type": "string", "description": "Channel/room name." },
                     "key": { "type": "string", "description": "The task key to claim (e.g. a file path or task id)." },
-                    "from": { "type": "string", "description": "Who's claiming. Default 'agent'." },
+                    "from": { "type": "string", "description": "Who's claiming. Defaults to $CV_ENDPOINT, else 'agent'." },
                     "ttl_secs": { "type": "number", "description": "How long the claim is held before it can be stolen (default 300)." }
                 },
                 "required": ["channel", "key"]
@@ -597,7 +596,7 @@ fn base_tool_list() -> Value {
                 "properties": {
                     "channel": { "type": "string", "description": "Channel/room name." },
                     "key": { "type": "string", "description": "The claimed task key to release." },
-                    "from": { "type": "string", "description": "Who's releasing (must match the claimant). Default 'agent'." }
+                    "from": { "type": "string", "description": "Who's releasing (must match the claimant). Defaults to $CV_ENDPOINT, else 'agent'." }
                 },
                 "required": ["channel", "key"]
             }
@@ -615,12 +614,12 @@ fn base_tool_list() -> Value {
         },
         {
             "name": "board_who",
-            "description": "List agents that have recently sent a board_heartbeat on a channel (active presence) within the last `within_secs` seconds (default 120).",
+            "description": "List agents that have recently sent a board_heartbeat on a channel (active presence) within the last `within_secs` seconds (default 60).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "channel": { "type": "string", "description": "Channel/room name." },
-                    "within_secs": { "type": "number", "description": "Presence window in seconds (default 120)." }
+                    "within_secs": { "type": "number", "description": "Presence window in seconds (default 60)." }
                 },
                 "required": ["channel"]
             }
@@ -645,7 +644,7 @@ fn base_tool_list() -> Value {
                 "properties": {
                     "channel": { "type": "string", "description": "Channel/room name." },
                     "message_id": { "type": "string", "description": "The id of the message being acknowledged." },
-                    "from": { "type": "string", "description": "Who's acking. Default 'agent'." }
+                    "from": { "type": "string", "description": "Who's acking. Defaults to $CV_ENDPOINT, else 'agent'." }
                 },
                 "required": ["channel", "message_id"]
             }
@@ -841,10 +840,17 @@ fn prune_retrieve(args: &Value) -> anyhow::Result<String> {
     }
 }
 
+/// Board identity (G4), same resolution as the CLI: explicit `from`, else the spawner-set
+/// `CV_ENDPOINT`, else the legacy "agent" sink. The board is chat — an unresolvable identity is
+/// never an error; the env var just makes the bare call attribute correctly.
+fn board_from(args: &Value) -> String {
+    cv_core::task::actor(arg_str(args, "from").map(String::from), "agent")
+}
+
 /// Post a message to a coordination-board channel (so other agents can see it).
 fn board_post(args: &Value) -> anyhow::Result<String> {
     let channel = arg_str(args, "channel").context("`channel` is required")?;
-    let from = arg_str(args, "from").unwrap_or("agent");
+    let from = board_from(args);
     let body = arg_str(args, "body").context("`body` is required")?;
     let kind = arg_str(args, "kind");
     let tags = args
@@ -853,7 +859,7 @@ fn board_post(args: &Value) -> anyhow::Result<String> {
         .map(|a| a.iter().filter_map(|t| t.as_str().map(String::from)).collect())
         .unwrap_or_default();
     let session_ref = arg_str(args, "session_ref").map(String::from);
-    let msg = cv_core::board::post(channel, from, body, kind, tags, session_ref)?;
+    let msg = cv_core::board::post(channel, &from, body, kind, tags, session_ref)?;
     Ok(serde_json::to_string_pretty(&msg)?)
 }
 
@@ -911,19 +917,19 @@ fn board_await(args: &Value) -> anyhow::Result<String> {
 /// Post a request (a question others can `board_reply` to). Returns the message incl. its id.
 fn board_request(args: &Value) -> anyhow::Result<String> {
     let channel = arg_str(args, "channel").context("`channel` is required")?;
-    let from = arg_str(args, "from").unwrap_or("agent");
+    let from = board_from(args);
     let body = arg_str(args, "body").context("`body` is required")?;
-    let msg = cv_core::board::request(channel, from, body)?;
+    let msg = cv_core::board::request(channel, &from, body)?;
     Ok(serde_json::to_string_pretty(&msg)?)
 }
 
 /// Reply to a prior request, correlated by its message id.
 fn board_reply(args: &Value) -> anyhow::Result<String> {
     let channel = arg_str(args, "channel").context("`channel` is required")?;
-    let from = arg_str(args, "from").unwrap_or("agent");
+    let from = board_from(args);
     let in_reply_to = arg_str(args, "in_reply_to").context("`in_reply_to` is required")?;
     let body = arg_str(args, "body").context("`body` is required")?;
-    let msg = cv_core::board::reply(channel, from, in_reply_to, body)?;
+    let msg = cv_core::board::reply(channel, &from, in_reply_to, body)?;
     Ok(serde_json::to_string_pretty(&msg)?)
 }
 
@@ -950,10 +956,10 @@ fn board_unanswered(args: &Value) -> anyhow::Result<String> {
 /// Try to claim a task `key` (soft distributed lock). Returns `{granted, lease?}`.
 fn board_claim(args: &Value) -> anyhow::Result<String> {
     let channel = arg_str(args, "channel").context("`channel` is required")?;
-    let from = arg_str(args, "from").unwrap_or("agent");
+    let from = board_from(args);
     let key = arg_str(args, "key").context("`key` is required")?;
     let ttl = Duration::from_secs(arg_usize(args, "ttl_secs", 300)?.max(1) as u64);
-    match cv_core::board::claim(channel, from, key, ttl)? {
+    match cv_core::board::claim(channel, &from, key, ttl)? {
         Some(lease) => Ok(serde_json::to_string_pretty(&json!({
             "granted": true,
             "lease": lease_json(&lease),
@@ -972,28 +978,33 @@ fn board_claim(args: &Value) -> anyhow::Result<String> {
 /// returns None and we leave their claim untouched (a no-op, which is the correct semantics).
 fn board_release(args: &Value) -> anyhow::Result<String> {
     let channel = arg_str(args, "channel").context("`channel` is required")?;
-    let from = arg_str(args, "from").unwrap_or("agent");
+    let from = board_from(args);
     let key = arg_str(args, "key").context("`key` is required")?;
     // Guard before re-claiming: claiming a *free* key just to release it would falsely report
-    // `released: true` for a lock we never held. Only proceed if `from` already owns a live claim.
-    let owned = cv_core::board::active_claims(channel)?
+    // `released: true` for a lock we never held. Only proceed if the caller already owns a live
+    // claim. Transition note: before `from` routed through CV_ENDPOINT, every default-identity
+    // claim was owned by the literal "agent" — a defaulted release (no explicit `from`) still
+    // accepts that owner this release, so pre-upgrade claims stay releasable by their taker.
+    let defaulted = arg_str(args, "from").is_none();
+    let owner = cv_core::board::active_claims(channel)?
         .into_iter()
-        .any(|(k, owner, _)| k == key && owner == from);
-    if !owned {
+        .find(|(k, owner, _)| k == key && (*owner == from || (defaulted && owner == "agent")))
+        .map(|(_, owner, _)| owner);
+    let Some(owner) = owner else {
         return Ok(serde_json::to_string_pretty(&json!({
             "released": false,
             "key": key,
             "reason": "you don't hold this key; nothing released",
         }))?);
-    }
-    // Re-acquire (renews our own lease) then release it.
-    match cv_core::board::claim(channel, from, key, Duration::from_secs(1))? {
+    };
+    // Re-acquire under the owning identity (renews our own lease) then release it.
+    match cv_core::board::claim(channel, &owner, key, Duration::from_secs(1))? {
         Some(lease) => {
             cv_core::board::release(&lease)?;
             Ok(serde_json::to_string_pretty(&json!({
                 "released": true,
                 "key": key,
-                "owner": from,
+                "owner": owner,
             }))?)
         }
         None => Ok(serde_json::to_string_pretty(&json!({
@@ -1024,7 +1035,9 @@ fn board_claims(args: &Value) -> anyhow::Result<String> {
 /// List agents that heartbeat on a channel within the last `within_secs` (default 120).
 fn board_who(args: &Value) -> anyhow::Result<String> {
     let channel = arg_str(args, "channel").context("`channel` is required")?;
-    let within = Duration::from_secs(arg_usize(args, "within_secs", 120)? as u64);
+    let within = Duration::from_secs(
+        arg_usize(args, "within_secs", cv_core::board::WHO_WINDOW_SECS as usize)? as u64,
+    );
     let who = cv_core::board::who(channel, within)?;
     Ok(serde_json::to_string_pretty(&json!(who))?)
 }
@@ -1040,9 +1053,9 @@ fn board_heartbeat(args: &Value) -> anyhow::Result<String> {
 /// Acknowledge a message by id with a tiny ack note.
 fn board_ack(args: &Value) -> anyhow::Result<String> {
     let channel = arg_str(args, "channel").context("`channel` is required")?;
-    let from = arg_str(args, "from").unwrap_or("agent");
+    let from = board_from(args);
     let message_id = arg_str(args, "message_id").context("`message_id` is required")?;
-    let msg = cv_core::board::ack(channel, from, message_id)?;
+    let msg = cv_core::board::ack(channel, &from, message_id)?;
     Ok(serde_json::to_string_pretty(&msg)?)
 }
 
@@ -1052,28 +1065,19 @@ fn board_ack(args: &Value) -> anyhow::Result<String> {
 // events go through the store's verifier-only path.
 // ---------------------------------------------------------------------------
 
-/// Identity resolution (G4): explicit `from` param wins, else the spawner-set `CV_ENDPOINT`
-/// (the MCP server inherits the agent's environment). Used by verbs where the actor is
-/// bookkeeping, not semantics — those fall back to the literal "agent" as before.
-fn task_from(args: &Value) -> Option<String> {
-    arg_str(args, "from")
-        .map(String::from)
-        .or_else(cv_core::task::default_endpoint)
-}
-
-/// [`task_from`] with the legacy "agent" sink for the non-identity-bearing verbs
-/// (open/note/done/abandon).
+/// Identity resolution (G4) for verbs where the actor is bookkeeping, not semantics
+/// (open/note/done/abandon, board chat): explicit `from` param, else the spawner-set
+/// `CV_ENDPOINT` (the MCP server inherits the agent's environment), else the legacy "agent"
+/// sink. Shared logic lives in [`cv_core::task::actor`]; only MCP's default sink is chosen here.
 fn task_from_or_agent(args: &Value) -> String {
-    task_from(args).unwrap_or_else(|| "agent".into())
+    cv_core::task::actor(arg_str(args, "from").map(String::from), "agent")
 }
 
 /// Identity for identity-BEARING tools (task_claim/release/propose/pass/refute), whose endpoint
 /// string keys inbox and reviewer semantics: unresolvable identity is a hard error, never a
-/// silent fall-through to the shared "agent" sink.
+/// silent fall-through to the shared "agent" sink ([`cv_core::task::require_actor`]).
 fn require_task_from(args: &Value) -> anyhow::Result<String> {
-    task_from(args).context(
-        "set CV_ENDPOINT or pass `from`; identity-bearing events must record who acted",
-    )
+    cv_core::task::require_actor(arg_str(args, "from").map(String::from), "`from`")
 }
 
 /// Replay the default task store; error on unreadable log, surface warnings inline.
@@ -1090,25 +1094,20 @@ fn task_resolve(outcome: &cv_core::task::ReplayOutcome, prefix: &str) -> anyhow:
         .map_err(|e| anyhow::anyhow!(e))
 }
 
-/// Append an agent event + board notification; return a JSON report of the event and new state.
+/// Append an agent event + board notification through the shared core path; return a JSON
+/// report of the event and new state.
 fn task_append(
     task_id: Option<&str>,
     from: &str,
     kind: cv_core::task::TaskEventKind,
-    mut warnings: Vec<String>,
+    warnings: Vec<String>,
 ) -> anyhow::Result<String> {
     let store = cv_core::task::TaskStore::default_store();
-    let event = store.append_agent_event(cv_core::task::new_event(task_id, from, kind))?;
-    let outcome = store.replay()?;
-    let proj = outcome.model.tasks.get(&event.task_id);
-    let channel = proj.map(|t| t.channel.clone()).unwrap_or_else(|| "tasks".into());
-    if let Err(e) = cv_core::task::notify_board(&event, &channel) {
-        warnings.push(format!("board notification failed (task state is durable): {e}"));
-    }
+    let report = cv_core::task::append_and_notify(&store, task_id, from, kind, warnings)?;
     Ok(serde_json::to_string_pretty(&json!({
-        "event": event,
-        "effective_state": proj.map(cv_core::task::effective_display),
-        "warnings": warnings,
+        "event": report.event,
+        "effective_state": report.effective_state,
+        "warnings": report.warnings,
     }))?)
 }
 
@@ -1145,18 +1144,10 @@ fn task_list(args: &Value) -> anyhow::Result<String> {
         repo: arg_str(args, "repo").map(std::path::PathBuf::from),
         include_terminal: args.get("all").and_then(Value::as_bool).unwrap_or(false),
     };
-    let tasks: Vec<Value> = cv_core::task::list(&outcome.model, &filter)
+    let tasks: Vec<cv_core::task::TaskRow> = cv_core::task::list(&outcome.model, &filter)
+        .map_err(|e| anyhow::anyhow!(e))?
         .into_iter()
-        .map(|t| {
-            json!({
-                "id": t.task_id,
-                "title": t.title,
-                "effective_state": cv_core::task::effective_display(t),
-                "assignee": t.assignee,
-                "repo": t.repo,
-                "channel": t.channel,
-            })
-        })
+        .map(cv_core::task::TaskRow::brief)
         .collect();
     Ok(serde_json::to_string_pretty(&json!({ "tasks": tasks, "warnings": warnings }))?)
 }
@@ -1310,74 +1301,29 @@ fn task_verify(args: &Value) -> anyhow::Result<String> {
 
 fn task_inbox(args: &Value) -> anyhow::Result<String> {
     let (outcome, warnings) = task_replay()?;
-    let who = arg_str(args, "who").context("`who` is required")?;
-    let entries: Vec<Value> = cv_core::task::inbox(&outcome.model, who)
-        .into_iter()
-        .map(|e| {
-            json!({
-                "id": e.task.task_id,
-                "title": e.task.title,
-                "reason": e.reason,
-                "effective_state": cv_core::task::effective_display(e.task),
-            })
-        })
-        .collect();
+    // `who` still wins when given; a bare call means "my inbox" via the spawner-set CV_ENDPOINT.
+    let who = arg_str(args, "who")
+        .map(String::from)
+        .or_else(cv_core::task::default_endpoint)
+        .context("`who` is required (or set CV_ENDPOINT)")?;
+    let entries = cv_core::task::InboxRow::compute(&outcome.model, &who);
     Ok(serde_json::to_string_pretty(&json!({ "inbox": entries, "warnings": warnings }))?)
 }
 
 fn task_debt(args: &Value) -> anyhow::Result<String> {
     let (outcome, warnings) = task_replay()?;
     let want = arg_str(args, "repo").map(std::path::PathBuf::from);
-    let groups = cv_core::task::debt(&outcome.model);
-    let mut rows = Vec::new();
-    for (repo, entries) in &groups {
-        if let Some(want) = &want {
-            if repo.as_deref() != Some(want.as_path()) {
-                continue;
-            }
-        }
-        for e in entries {
-            rows.push(json!({
-                "id": e.task.task_id,
-                "title": e.task.title,
-                "repo": repo,
-                "revision": e.revision_n,
-                "branch": e.branch,
-                "upstream": e.upstream,
-                "state": e.state,
-                "since": e.since,
-                "issues": e.issues,
-            }));
-        }
-    }
-    // Aged awaiting-review revisions (G8): reviewer + propose time, oldest first.
-    let awaiting: Vec<Value> = cv_core::task::awaiting_review(&outcome.model)
-        .into_iter()
-        .filter(|e| match &want {
-            Some(w) => e.task.repo.as_deref() == Some(w.as_path()),
-            None => true,
-        })
-        .map(|e| {
-            json!({
-                "id": e.task.task_id,
-                "title": e.task.title,
-                "repo": e.task.repo,
-                "revision": e.revision_n,
-                "branch": e.branch,
-                "reviewer": e.reviewer,
-                "since": e.since,
-            })
-        })
-        .collect();
-    // The debt view is only as honest as the verifier is alive: attach the heartbeat and any
-    // suspect lands (recorded Landed, content no longer observed on upstream).
+    // The debt view is only as honest as the verifier is alive: the shared report attaches the
+    // heartbeat and any suspect lands (recorded Landed, content no longer observed on upstream).
     let hb = cv_core::task::verify::read_heartbeat(&cv_core::task::tasks_dir());
+    let report =
+        cv_core::task::DebtReport::compute(&outcome.model, hb.as_ref(), want.as_deref());
     Ok(serde_json::to_string_pretty(&json!({
-        "debt": rows,
-        "awaiting_review": awaiting,
-        "suspects": hb.as_ref().map(|h| h.suspect_landed.clone()).unwrap_or_default(),
-        "verified_as_of": hb.as_ref().map(|h| h.ts),
-        "verify_warning": cv_core::task::verify::heartbeat_warning(hb.as_ref()),
+        "debt": report.debt,
+        "awaiting_review": report.awaiting_review,
+        "suspects": report.suspects,
+        "verified_as_of": report.verified_as_of,
+        "verify_warning": report.verify_warning,
         "warnings": warnings,
     }))?)
 }

@@ -66,6 +66,7 @@ impl Server {
             .stderr(Stdio::null())
             .env("HOME", &home)
             .env("CLUSTERVISION_HOME", &cv_home)
+            .env_remove("CV_ENDPOINT") // hermetic: ambient identity must not leak into the tests
             .env("XDG_CACHE_HOME", home.join(".cache"))
             .env("XDG_CONFIG_HOME", home.join(".config"))
             .env("XDG_DATA_HOME", home.join(".local/share"))
@@ -361,6 +362,92 @@ fn read_session_resolves_workflow_subagent_ids() {
     let (text, is_err) = s.call_tool(5, "read_session", json!({"id": "agent-nope"}));
     assert!(is_err, "{text}");
     assert!(text.contains("no session found"), "{text}");
+}
+
+/// The task tools drive the durable store end-to-end over the protocol: open → two claimants
+/// race (first writer wins; the loser gets a rejection, not a duplicate) → done. Also pins the
+/// task row shapes (no timestamps on MCP rows), the inbox view, the identity-bearing-verb
+/// refusal, and the `--state` vocabulary rejection.
+#[test]
+fn task_tools_open_claim_race_done() {
+    let mut s = Server::spawn("tasks");
+    s.request(1, "initialize", json!({}));
+
+    // Open. The returned event carries the durable task id.
+    let (text, is_err) = s.call_tool(
+        2,
+        "task_open",
+        json!({"title": "carve the totem", "from": "agent:alpha"}),
+    );
+    assert!(!is_err, "{text}");
+    let v: Value = serde_json::from_str(&text).expect("task_open returns JSON");
+    let id = v["event"]["task_id"].as_str().expect("task id").to_string();
+    assert_eq!(v["effective_state"], "open", "{text}");
+
+    // First claimant wins…
+    let (text, is_err) = s.call_tool(3, "task_claim", json!({"id": id, "from": "agent:alpha"}));
+    assert!(!is_err, "{text}");
+    let v: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(v["effective_state"], "claimed", "{text}");
+
+    // …the second gets a rejection from the store's locked CAS, not a duplicate claim.
+    let (text, is_err) = s.call_tool(4, "task_claim", json!({"id": id, "from": "agent:beta"}));
+    assert!(is_err, "the second claimant must lose: {text}");
+    assert!(text.contains("rejected"), "{text}");
+
+    // Identity-bearing verbs refuse to act namelessly (no `from`, no CV_ENDPOINT in the env).
+    let (text, is_err) = s.call_tool(5, "task_release", json!({"id": id}));
+    assert!(is_err, "{text}");
+    assert!(text.contains("CV_ENDPOINT"), "the error must name the cure: {text}");
+
+    // The winner's inbox carries the claim (shared row shape); the loser's stays empty.
+    let (text, is_err) = s.call_tool(6, "task_inbox", json!({"who": "agent:alpha"}));
+    assert!(!is_err, "{text}");
+    let v: Value = serde_json::from_str(&text).unwrap();
+    let inbox = v["inbox"].as_array().expect("inbox array");
+    assert_eq!(inbox.len(), 1, "{text}");
+    assert_eq!(inbox[0]["id"], json!(id), "{text}");
+    assert_eq!(inbox[0]["reason"], "claimed_by_you", "{text}");
+    assert_eq!(inbox[0]["effective_state"], "claimed", "{text}");
+    assert!(inbox[0].get("since").is_none(), "since stays off the wire: {text}");
+    let (text, _) = s.call_tool(7, "task_inbox", json!({"who": "agent:beta"}));
+    let v: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(v["inbox"].as_array().unwrap().len(), 0, "{text}");
+
+    // An unknown state filter errors naming the vocabulary — never a silent empty list.
+    let (text, is_err) = s.call_tool(8, "task_list", json!({"state": "redy"}));
+    assert!(is_err, "{text}");
+    assert!(
+        text.contains("redy") && text.contains("awaiting_review"),
+        "the error names the typo and the vocabulary: {text}"
+    );
+
+    // Done closes it: hidden from the default list, visible with `all`.
+    let (text, is_err) = s.call_tool(9, "task_done", json!({"id": id, "from": "agent:alpha"}));
+    assert!(!is_err, "{text}");
+    let v: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(v["effective_state"], "done", "{text}");
+    let (text, _) = s.call_tool(10, "task_list", json!({}));
+    let v: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(v["tasks"].as_array().unwrap().len(), 0, "terminal task hidden: {text}");
+    let (text, _) = s.call_tool(11, "task_list", json!({"all": true}));
+    let v: Value = serde_json::from_str(&text).unwrap();
+    let rows = v["tasks"].as_array().unwrap();
+    assert_eq!(rows.len(), 1, "{text}");
+    assert_eq!(rows[0]["id"], json!(id), "{text}");
+    assert_eq!(rows[0]["effective_state"], "done", "{text}");
+    assert!(rows[0].get("opened_at").is_none(), "MCP rows ship no timestamps: {text}");
+
+    // Debt: the shared report envelope, loud about the never-run verifier.
+    let (text, is_err) = s.call_tool(12, "task_debt", json!({}));
+    assert!(!is_err, "{text}");
+    let v: Value = serde_json::from_str(&text).unwrap();
+    assert!(v["debt"].as_array().unwrap().is_empty(), "{text}");
+    assert!(v["suspects"].as_array().unwrap().is_empty(), "{text}");
+    assert!(
+        v["verify_warning"].as_str().unwrap_or_default().contains("NEVER"),
+        "{text}"
+    );
 }
 
 #[test]

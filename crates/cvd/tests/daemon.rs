@@ -772,6 +772,150 @@ fn serve_cors_allowlist() {
     );
 }
 
+// ───────────────────────────── tasks API ─────────────────────────────
+
+/// Seed the fixture task store directly through cv-core (the same store the daemon serves), then
+/// exercise every `/api/tasks*` route end-to-end: the shared row shapes (timestamps on this
+/// surface, `since` off the wire), state filtering, the 400 on an unknown state string (the
+/// silent-empty bug), the inbox rows, and the debt report envelope with an awaiting-review row.
+#[test]
+fn serve_tasks_routes() {
+    use cv_core::task::{model::Revision, new_event, TaskEventKind, TaskStore};
+
+    let w = World::new("tasks");
+    let store = TaskStore::at(w.cv_home.join("tasks"));
+    let opened = store
+        .append_agent_event(new_event(
+            None,
+            "human",
+            TaskEventKind::Opened {
+                title: "wire the flux capacitor".into(),
+                body: String::new(),
+                repo: None,
+                issue: None,
+                channel: "tasks".into(),
+                assignee: Some("agent:a".into()),
+            },
+        ))
+        .expect("seed open");
+    let id = opened.task_id.clone();
+    store
+        .append_agent_event(new_event(
+            Some(&id),
+            "agent:a",
+            TaskEventKind::Claimed { assignee: "agent:a".into() },
+        ))
+        .expect("seed claim");
+    // A code task with a proposed revision (fabricated shas — the event log is the fixture; no
+    // git needed to serve read views), so debt's awaiting_review section has a row.
+    let coded = store
+        .append_agent_event(new_event(
+            None,
+            "human",
+            TaskEventKind::Opened {
+                title: "review the pelican".into(),
+                body: String::new(),
+                repo: Some("/tmp/pelican-repo".into()),
+                issue: None,
+                channel: "tasks".into(),
+                assignee: None,
+            },
+        ))
+        .expect("seed code open");
+    store
+        .append_agent_event(new_event(
+            Some(&coded.task_id),
+            "agent:b",
+            TaskEventKind::RevisionProposed {
+                revision: Revision {
+                    n: 1,
+                    branch: "task/pelican".into(),
+                    worktree: None,
+                    upstream: "origin/main".into(),
+                    base: "0".repeat(40),
+                    review_sha: "1".repeat(40),
+                    patch_id: "b".repeat(40),
+                    reviewer: Some("agent:rev".into()),
+                    session_ref: None,
+                },
+            },
+        ))
+        .expect("seed propose");
+
+    let (port, _reaper) = spawn_serve(&w);
+
+    // /api/tasks: the shared TaskRow shape — this surface carries timestamps.
+    let (status, v) = get_json(port, "/api/tasks");
+    assert_eq!(status, 200, "{v}");
+    let rows = v["tasks"].as_array().expect("tasks array");
+    assert_eq!(rows.len(), 2, "{v}");
+    let row = rows.iter().find(|r| r["id"] == json!(id)).expect("claimed row");
+    assert_eq!(row["title"], "wire the flux capacitor", "{v}");
+    assert_eq!(row["effective_state"], "claimed", "{v}");
+    assert_eq!(row["assignee"], "agent:a", "{v}");
+    assert!(
+        row["opened_at"].is_string() && row["last_ts"].is_string(),
+        "HTTP rows carry timestamps: {v}"
+    );
+    assert!(v["warnings"].as_array().is_some_and(|w| w.is_empty()), "{v}");
+
+    // Effective-state filter hits and misses (the revision layer counts).
+    let (_, v) = get_json(port, "/api/tasks?state=claimed");
+    assert_eq!(v["tasks"].as_array().unwrap().len(), 1, "{v}");
+    let (_, v) = get_json(port, "/api/tasks?state=awaiting_review");
+    assert_eq!(v["tasks"].as_array().unwrap().len(), 1, "{v}");
+    let (_, v) = get_json(port, "/api/tasks?state=open");
+    assert_eq!(v["tasks"].as_array().unwrap().len(), 0, "{v}");
+
+    // An unknown state string is a 400 naming the typo and the vocabulary — never a silent [].
+    let (status, v) = get_json(port, "/api/tasks?state=redy");
+    assert_eq!(status, 400, "{v}");
+    let msg = v["error"].as_str().unwrap_or_default();
+    assert!(msg.contains("redy") && msg.contains("awaiting_review"), "{v}");
+
+    // /api/tasks/inbox/{who}: the claim shows for its owner; `since` stays off the wire.
+    let (status, v) = get_json(port, "/api/tasks/inbox/agent:a");
+    assert_eq!(status, 200, "{v}");
+    let inbox = v["inbox"].as_array().expect("inbox array");
+    assert_eq!(inbox.len(), 1, "{v}");
+    assert_eq!(inbox[0]["id"], json!(id), "{v}");
+    assert_eq!(inbox[0]["reason"], "claimed_by_you", "{v}");
+    assert_eq!(inbox[0]["effective_state"], "claimed", "{v}");
+    assert!(inbox[0].get("since").is_none(), "since stays off the wire: {v}");
+    // The bound reviewer sees the awaiting revision; a stranger sees nothing.
+    let (_, v) = get_json(port, "/api/tasks/inbox/agent:rev");
+    assert_eq!(v["inbox"][0]["reason"], "awaiting_your_review", "{v}");
+    let (_, v) = get_json(port, "/api/tasks/inbox/agent:nobody");
+    assert_eq!(v["inbox"].as_array().unwrap().len(), 0, "{v}");
+
+    // /api/tasks/debt: no reviewed-unlanded rows yet, one awaiting-review row, and the report is
+    // loud about the never-run verifier.
+    let (status, v) = get_json(port, "/api/tasks/debt");
+    assert_eq!(status, 200, "{v}");
+    assert_eq!(v["debt"].as_array().unwrap().len(), 0, "{v}");
+    let awaiting = v["awaiting_review"].as_array().expect("awaiting array");
+    assert_eq!(awaiting.len(), 1, "{v}");
+    assert_eq!(awaiting[0]["id"], json!(coded.task_id), "{v}");
+    assert_eq!(awaiting[0]["branch"], "task/pelican", "{v}");
+    assert_eq!(awaiting[0]["reviewer"], "agent:rev", "{v}");
+    assert_eq!(v["suspects"].as_array().unwrap().len(), 0, "{v}");
+    assert!(v["verified_as_of"].is_null(), "{v}");
+    assert!(
+        v["verify_warning"].as_str().unwrap_or_default().contains("NEVER"),
+        "{v}"
+    );
+    // Repo filter empties the awaiting section for a foreign repo.
+    let (_, v) = get_json(port, "/api/tasks/debt?repo=/nowhere");
+    assert_eq!(v["awaiting_review"].as_array().unwrap().len(), 0, "{v}");
+
+    // /api/task/{id}: the full projection resolves by unique prefix (uuid v7 ids from the same
+    // millisecond share a long time prefix, so take most of it).
+    let (status, v) = get_json(port, &format!("/api/task/{}", &id[..30]));
+    assert_eq!(status, 200, "{v}");
+    assert_eq!(v["task"]["task_id"], json!(id), "{v}");
+    assert_eq!(v["effective_state"], "claimed", "{v}");
+}
+
 /// The Host header must name this machine (DNS-rebinding guard): loopback names in any spelling
 /// pass, a rebound domain is a 403 before any route logic runs.
 #[test]

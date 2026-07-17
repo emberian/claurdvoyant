@@ -284,21 +284,12 @@ fn tasks(query: &str) -> (u16, Value) {
             repo: params.get("repo").map(std::path::PathBuf::from),
             include_terminal: params.get("all").is_some_and(|v| v == "1" || v == "true"),
         };
-        let tasks: Vec<Value> = cv_core::task::list(&outcome.model, &filter)
-            .into_iter()
-            .map(|t| {
-                json!({
-                    "id": t.task_id,
-                    "title": t.title,
-                    "effective_state": cv_core::task::effective_display(t),
-                    "assignee": t.assignee,
-                    "repo": t.repo,
-                    "channel": t.channel,
-                    "opened_at": t.opened_at,
-                    "last_ts": t.last_ts,
-                })
-            })
-            .collect();
+        // An unknown state string is a clear 400 (naming the vocabulary), not a silent [].
+        let tasks: Vec<cv_core::task::TaskRow> =
+            match cv_core::task::list(&outcome.model, &filter) {
+                Ok(tasks) => tasks.into_iter().map(cv_core::task::TaskRow::full).collect(),
+                Err(e) => return err(400, &e),
+            };
         ok(json!({ "tasks": tasks, "warnings": outcome.warnings }))
     })
 }
@@ -333,73 +324,24 @@ fn tasks_debt(query: &str) -> (u16, Value) {
     let params = Query::parse(query);
     with_tasks(|outcome| {
         let want = params.get("repo").map(std::path::PathBuf::from);
-        let mut rows = Vec::new();
-        for (repo, entries) in &cv_core::task::debt(&outcome.model) {
-            if let Some(want) = &want {
-                if repo.as_deref() != Some(want.as_path()) {
-                    continue;
-                }
-            }
-            for e in entries {
-                rows.push(json!({
-                    "id": e.task.task_id,
-                    "title": e.task.title,
-                    "repo": repo,
-                    "revision": e.revision_n,
-                    "branch": e.branch,
-                    "upstream": e.upstream,
-                    "state": e.state,
-                    "since": e.since,
-                    "issues": e.issues,
-                    "suspect": false,
-                }));
-            }
-        }
-        // Aged awaiting-review revisions (G8): reviewer endpoint + propose time, oldest first —
-        // a dead reviewer is honest state that must age somewhere the owner reads.
-        let awaiting: Vec<Value> = cv_core::task::awaiting_review(&outcome.model)
-            .into_iter()
-            .filter(|e| match &want {
-                Some(w) => e.task.repo.as_deref() == Some(w.as_path()),
-                None => true,
-            })
-            .map(|e| {
-                json!({
-                    "id": e.task.task_id,
-                    "title": e.task.title,
-                    "repo": e.task.repo,
-                    "revision": e.revision_n,
-                    "branch": e.branch,
-                    "reviewer": e.reviewer,
-                    "since": e.since,
-                })
-            })
-            .collect();
         let hb = cv_core::task::verify::read_heartbeat(&cv_core::task::tasks_dir());
-        let suspects: Vec<Value> = hb
-            .as_ref()
-            .map(|h| {
-                h.suspect_landed
-                    .iter()
-                    .map(|s| {
-                        json!({
-                            "id": s.task_id,
-                            "title": s.title,
-                            "revision": s.revision,
-                            "upstream": s.upstream,
-                            "detail": s.detail,
-                            "suspect": true,
-                        })
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
+        let report =
+            cv_core::task::DebtReport::compute(&outcome.model, hb.as_ref(), want.as_deref());
+        // This surface has always shipped an explicit `suspect` marker on every row (`false` on
+        // debt rows, `true` on suspect rows — the dashboard keys off it); the MCP shape doesn't.
+        let rows: Vec<cv_core::task::DebtRow> = report
+            .debt
+            .into_iter()
+            .map(|r| cv_core::task::DebtRow { suspect: Some(false), ..r })
+            .collect();
+        let suspects: Vec<cv_core::task::SuspectRow> =
+            report.suspects.iter().map(cv_core::task::SuspectRow::from_suspect).collect();
         ok(json!({
             "debt": rows,
-            "awaiting_review": awaiting,
+            "awaiting_review": report.awaiting_review,
             "suspects": suspects,
-            "verified_as_of": hb.as_ref().map(|h| h.ts),
-            "verify_warning": cv_core::task::verify::heartbeat_warning(hb.as_ref()),
+            "verified_as_of": report.verified_as_of,
+            "verify_warning": report.verify_warning,
             "warnings": outcome.warnings,
         }))
     })
@@ -408,17 +350,7 @@ fn tasks_debt(query: &str) -> (u16, Value) {
 /// `GET /api/tasks/inbox/{who}` — what needs this endpoint.
 fn tasks_inbox(who: &str) -> (u16, Value) {
     with_tasks(|outcome| {
-        let entries: Vec<Value> = cv_core::task::inbox(&outcome.model, who)
-            .into_iter()
-            .map(|e| {
-                json!({
-                    "id": e.task.task_id,
-                    "title": e.task.title,
-                    "reason": e.reason,
-                    "effective_state": cv_core::task::effective_display(e.task),
-                })
-            })
-            .collect();
+        let entries = cv_core::task::InboxRow::compute(&outcome.model, who);
         ok(json!({ "inbox": entries, "warnings": outcome.warnings }))
     })
 }
@@ -942,7 +874,7 @@ fn who(channel: &str, query: &str) -> (u16, Value) {
     let within = params
         .get("within_secs")
         .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(60);
+        .unwrap_or(cv_core::board::WHO_WINDOW_SECS);
     match cv_core::board::who(channel, Duration::from_secs(within)) {
         Ok(names) => ok(json!(names)),
         Err(e) => err(500, &e.to_string()),

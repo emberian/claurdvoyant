@@ -382,6 +382,11 @@ pub fn heartbeat_to_dir(dir: &Path, channel: &str, from: &str) -> Result<BoardMe
     post_to_dir(dir, channel, from, "", Some("presence"), vec![], None)
 }
 
+/// The one presence window every surface (CLI `cv board who`, MCP `board_who`, cvd
+/// `/api/who/{channel}`) defaults to: an agent is "present" if it heartbeat within this many
+/// seconds. Callers can still widen/narrow per call.
+pub const WHO_WINDOW_SECS: u64 = 60;
+
 /// List agents that heartbeat on `channel` within the last `within` (default board dir).
 pub fn who(channel: &str, within: Duration) -> Result<Vec<String>> {
     who_in_dir(&board_dir(), channel, within)

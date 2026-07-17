@@ -22,9 +22,39 @@ pub struct TaskFilter {
     pub include_terminal: bool,
 }
 
+/// The effective-state vocabulary [`TaskFilter::state`] accepts: every base [`TaskState`] plus
+/// every revision-layer [`super::model::RevisionState`] string, as [`list`] matches them.
+pub const STATE_VOCABULARY: [&str; 10] = [
+    "open",
+    "claimed",
+    "done",
+    "abandoned",
+    "superseded",
+    "awaiting_review",
+    "ready",
+    "merged_local",
+    "landed",
+    "refuted",
+];
+
 /// List tasks matching `filter`, oldest first (task ids are time-sortable uuid v7).
-pub fn list<'m>(model: &'m TaskReadModel, filter: &TaskFilter) -> Vec<&'m TaskProjection> {
-    model
+///
+/// An unknown `state` string is an error naming the whole vocabulary, never a silent empty
+/// result — a typo'd `--state redy` used to look exactly like "no matching tasks" on every
+/// surface (CLI, MCP, HTTP), which all inherit this rejection.
+pub fn list<'m>(
+    model: &'m TaskReadModel,
+    filter: &TaskFilter,
+) -> Result<Vec<&'m TaskProjection>, String> {
+    if let Some(state) = &filter.state {
+        if !STATE_VOCABULARY.contains(&state.as_str()) {
+            return Err(format!(
+                "unknown state {state:?} (expected one of {})",
+                STATE_VOCABULARY.join("|")
+            ));
+        }
+    }
+    Ok(model
         .tasks
         .values()
         .filter(|t| {
@@ -47,7 +77,7 @@ pub fn list<'m>(model: &'m TaskReadModel, filter: &TaskFilter) -> Vec<&'m TaskPr
             }
             true
         })
-        .collect()
+        .collect())
 }
 
 /// Why a task appears in someone's inbox.
@@ -387,21 +417,23 @@ mod tests {
         propose_and_pass(&mut log, &ready);
 
         let model = log.model();
-        let all = list(&model, &TaskFilter::default());
+        let all = list(&model, &TaskFilter::default()).unwrap();
         assert_eq!(all.len(), 2, "done task hidden by default");
         assert!(all.iter().any(|t| t.task_id == open));
 
         let ready_only = list(
             &model,
             &TaskFilter { state: Some("ready".into()), ..Default::default() },
-        );
+        )
+        .unwrap();
         assert_eq!(ready_only.len(), 1);
         assert_eq!(ready_only[0].task_id, ready);
 
         let done_only = list(
             &model,
             &TaskFilter { state: Some("done".into()), ..Default::default() },
-        );
+        )
+        .unwrap();
         assert_eq!(done_only.len(), 1);
         assert_eq!(done_only[0].task_id, done);
     }

@@ -27,6 +27,7 @@ pub mod reduce;
 pub mod store;
 #[cfg(not(target_family = "wasm"))]
 pub mod verify;
+pub mod views;
 
 pub use model::{
     harness_family, model_family, IndependenceCheck, MergeFailure, Revision, RevisionState,
@@ -39,9 +40,12 @@ pub use reduce::{
 pub use project::{
     age_short, awaiting_review, branch_carriers, debt, effective_display, inbox, list,
     propose_collision_warnings, resolve_id, AwaitingReviewEntry, DebtEntry, InboxEntry,
-    InboxReason, TaskFilter,
+    InboxReason, TaskFilter, STATE_VOCABULARY,
 };
 pub use store::{new_event, replay, ReplayOutcome, TaskStore};
+#[cfg(not(target_family = "wasm"))]
+pub use views::{DebtReport, SuspectRow};
+pub use views::{AwaitingRow, DebtRow, InboxRow, TaskRow};
 
 /// Advisory reviewer-independence check (law 2): read harness families from cv's catalog for the
 /// reviewer's session and the current revision's recorded author session. Never blocks anything —
@@ -141,6 +145,69 @@ pub fn default_endpoint() -> Option<String> {
     let v = std::env::var("CV_ENDPOINT").ok()?;
     let v = v.trim();
     (!v.is_empty()).then(|| v.to_string())
+}
+
+/// Identity resolution (G4) for verbs where the actor is bookkeeping, not semantics
+/// (open/note/done/abandon/supersede, board chat): explicit actor wins, else the spawner-set
+/// `CV_ENDPOINT`, else the surface's deliberate default sink — `"cv"` for CLI chat-grade verbs
+/// (a human at a shell owes no ceremony), `"agent"` for MCP (the legacy anonymous sink).
+pub fn actor(explicit: Option<String>, default_sink: &str) -> String {
+    explicit
+        .or_else(default_endpoint)
+        .unwrap_or_else(|| default_sink.to_string())
+}
+
+/// Identity resolution for identity-BEARING verbs (claim/release/propose/pass/refute), whose
+/// endpoint string keys inbox and reviewer semantics: no resolvable identity is an error naming
+/// the cure, never a silent fall-through to a shared sink. `flag` is the surface's spelling of
+/// the explicit parameter (`--from` for the CLI, `` `from` `` for MCP), so the error names the
+/// exact knob the caller has.
+pub fn require_actor(explicit: Option<String>, flag: &str) -> anyhow::Result<String> {
+    explicit.or_else(default_endpoint).ok_or_else(|| {
+        anyhow::anyhow!("set CV_ENDPOINT or pass {flag}; identity-bearing events must record who acted")
+    })
+}
+
+/// What one agent-facing append produced: the durable event, the task's new effective state, and
+/// the advisory warnings to surface.
+#[derive(Debug)]
+pub struct AppendOutcome {
+    pub event: TaskEvent,
+    /// `None` only if the appended event's task vanished from the replay (should not happen —
+    /// the append CAS validated against it).
+    pub effective_state: Option<String>,
+    /// The caller's carried-in warnings plus a failed board notification, if any. This is the
+    /// set MCP ships in its JSON reply.
+    pub warnings: Vec<String>,
+    /// Warnings from the post-append replay (log corruption etc.) — kept separate so surfaces
+    /// that already showed the pre-append replay's warnings don't double-report.
+    pub replay_warnings: Vec<String>,
+}
+
+/// The one agent-facing append path shared by the CLI and MCP: append the event through the
+/// store's CAS, replay for the task's channel + new effective state, best-effort notify the
+/// task's board channel (a notification failure is a warning, never an error — task state is
+/// already durable).
+pub fn append_and_notify(
+    store: &TaskStore,
+    task_id: Option<&str>,
+    from: &str,
+    kind: TaskEventKind,
+    mut warnings: Vec<String>,
+) -> anyhow::Result<AppendOutcome> {
+    let event = store.append_agent_event(new_event(task_id, from, kind))?;
+    let outcome = store.replay()?;
+    let proj = outcome.model.tasks.get(&event.task_id);
+    let channel = proj.map(|t| t.channel.clone()).unwrap_or_else(|| "tasks".into());
+    if let Err(e) = notify_board(&event, &channel) {
+        warnings.push(format!("board notification failed (task state is durable): {e}"));
+    }
+    Ok(AppendOutcome {
+        effective_state: proj.map(effective_display),
+        event,
+        warnings,
+        replay_warnings: outcome.warnings,
+    })
 }
 
 use std::path::PathBuf;

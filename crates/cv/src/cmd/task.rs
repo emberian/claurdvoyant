@@ -7,28 +7,21 @@ use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Utc};
 use clap::Subcommand;
 use cv_core::sanitize::sanitize_line;
-use cv_core::task::{self, InboxEntry, TaskEventKind, TaskProjection, TaskStore};
+use cv_core::task::{self, InboxRow, TaskEventKind, TaskRow, TaskStore};
 
 use crate::util::{fmt_local, short_id};
 
-/// Identity resolution (G4): explicit `--from` wins, else the spawner-set `CV_ENDPOINT`, else
-/// the literal `"cv"` — good enough for verbs where the actor is bookkeeping, not semantics
-/// (open/note/done/abandon/supersede: a human opening a task from a shell owes no ceremony).
+/// Identity resolution (G4) for chat-grade verbs: explicit `--from`, else `CV_ENDPOINT`, else
+/// the literal `"cv"` (a human opening a task from a shell owes no ceremony). Shared logic lives
+/// in [`task::actor`]; only the CLI's default sink is chosen here.
 fn from_or_cv(explicit: Option<String>) -> String {
-    explicit
-        .or_else(task::default_endpoint)
-        .unwrap_or_else(|| "cv".into())
+    task::actor(explicit, "cv")
 }
 
-/// Identity resolution for identity-BEARING verbs (claim/release/propose/pass/refute), whose
-/// endpoint string keys inbox and reviewer semantics: no resolvable identity is an error, never
-/// a silent fall-through to a shared sink.
+/// Identity resolution for identity-BEARING verbs (claim/release/propose/pass/refute):
+/// [`task::require_actor`], with the error naming this surface's `--from` flag.
 fn require_from(explicit: Option<String>) -> Result<String> {
-    explicit.or_else(task::default_endpoint).ok_or_else(|| {
-        anyhow::anyhow!(
-            "set CV_ENDPOINT or pass --from; identity-bearing events must record who acted"
-        )
-    })
+    task::require_actor(explicit, "--from")
 }
 
 #[derive(Subcommand)]
@@ -196,8 +189,8 @@ pub(crate) enum TaskCmd {
     },
     /// What needs `<who>`: assigned/claimed tasks, reviews awaiting them, their unlanded work.
     Inbox {
-        #[arg(default_value = "cv")]
-        who: String,
+        /// Endpoint to compute the inbox for. Default: $CV_ENDPOINT, else "cv".
+        who: Option<String>,
         #[arg(long)]
         json: bool,
     },
@@ -219,20 +212,17 @@ fn replay_loud() -> Result<cv_core::task::ReplayOutcome> {
     Ok(outcome)
 }
 
-/// Append an agent event, notify the board, print a one-line confirmation.
+/// Append an agent event through the shared core path, print a one-line confirmation.
 fn append_and_report(task_id: Option<&str>, from: &str, kind: TaskEventKind) -> Result<()> {
     let store = TaskStore::default_store();
-    let event = store.append_agent_event(task::new_event(task_id, from, kind))?;
-    let outcome = replay_loud()?;
-    let proj = outcome.model.tasks.get(&event.task_id);
-    let channel = proj.map(|t| t.channel.clone()).unwrap_or_else(|| "tasks".into());
-    if let Err(e) = task::notify_board(&event, &channel) {
-        eprintln!("⚠ board notification failed (task state is durable): {e}");
+    let report = task::append_and_notify(&store, task_id, from, kind, Vec::new())?;
+    for w in report.replay_warnings.iter().chain(&report.warnings) {
+        eprintln!("⚠ {}", sanitize_line(w));
     }
-    let state = proj.map(task::effective_display).unwrap_or_else(|| "?".into());
-    println!("✦ {} {} → {}", event.kind.tag(), short_id(&event.task_id), state);
-    if matches!(event.kind, TaskEventKind::Opened { .. }) {
-        println!("{}", event.task_id);
+    let state = report.effective_state.unwrap_or_else(|| "?".into());
+    println!("✦ {} {} → {}", report.event.kind.tag(), short_id(&report.event.task_id), state);
+    if matches!(report.event.kind, TaskEventKind::Opened { .. }) {
+        println!("{}", report.event.task_id);
     }
     Ok(())
 }
@@ -241,31 +231,32 @@ fn resolve<'m>(model: &'m cv_core::task::TaskReadModel, prefix: &str) -> Result<
     task::resolve_id(model, prefix).map_err(|e| anyhow::anyhow!(e))
 }
 
-/// One `cv task list` row: id, age since last event (G8), state, assignee, title. All free-text
-/// fields are terminal-sanitized (G5) — the log is forever, so every reader strips.
-fn task_row(t: &TaskProjection, now: DateTime<Utc>) -> String {
-    let assignee = t.assignee.as_deref().unwrap_or("-");
+/// One `cv task list` row: id, age since last event (G8), state, assignee, title — rendered from
+/// the shared [`TaskRow`] shape (built via [`TaskRow::full`], whose `last_ts` anchors the age).
+/// All free-text fields are terminal-sanitized (G5) — the log is forever, so every reader strips.
+fn task_row(r: &TaskRow, now: DateTime<Utc>) -> String {
+    let assignee = r.assignee.as_deref().unwrap_or("-");
     format!(
         "{}  {:>4}  {:16} {:20} {}",
-        short_id(&t.task_id),
-        task::age_short(t.last_ts, now),
-        task::effective_display(t),
+        short_id(&r.id),
+        task::age_short(r.last_ts.unwrap_or(now), now),
+        r.effective_state,
         sanitize_line(assignee),
-        sanitize_line(&t.title)
+        sanitize_line(&r.title)
     )
 }
 
 /// One `cv task inbox` row, stalest first upstream: a `⏰` leads anything waiting > 24h. A
 /// projection of age, not an escalation — the marker is the whole mechanism.
-fn inbox_row(e: &InboxEntry<'_>, now: DateTime<Utc>) -> String {
-    let stale = now.signed_duration_since(e.since) > chrono::Duration::hours(24);
+fn inbox_row(r: &InboxRow, now: DateTime<Utc>) -> String {
+    let stale = now.signed_duration_since(r.since) > chrono::Duration::hours(24);
     format!(
         "{} {}  {:>4}  {:24} {}",
         if stale { "⏰" } else { "  " },
-        short_id(&e.task.task_id),
-        task::age_short(e.since, now),
-        format!("{:?}", e.reason),
-        sanitize_line(&e.task.title)
+        short_id(&r.id),
+        task::age_short(r.since, now),
+        format!("{:?}", r.reason),
+        sanitize_line(&r.title)
     )
 }
 
@@ -301,13 +292,14 @@ pub(crate) fn cmd_task(action: TaskCmd) -> Result<()> {
                 repo,
                 include_terminal: all,
             };
-            let tasks = task::list(&outcome.model, &filter);
+            let tasks = task::list(&outcome.model, &filter).map_err(|e| anyhow::anyhow!(e))?;
             if json {
+                // The full projections, unchanged wire shape (`show --json` sibling).
                 println!("{}", serde_json::to_string_pretty(&tasks)?);
             } else {
                 let now = Utc::now();
                 for t in &tasks {
-                    println!("{}", task_row(t, now));
+                    println!("{}", task_row(&TaskRow::full(t), now));
                 }
                 if tasks.is_empty() {
                     println!("(no matching tasks)");
@@ -495,16 +487,20 @@ pub(crate) fn cmd_task(action: TaskCmd) -> Result<()> {
         }
         TaskCmd::Verify { id, all, fetch, skip_landed } => cmd_verify(id, all, fetch, skip_landed),
         TaskCmd::Inbox { who, json } => {
+            // Bare `cv task inbox` means "my inbox": the spawner-set CV_ENDPOINT, else "cv".
+            let who = from_or_cv(who);
             let outcome = replay_loud()?;
-            let entries = task::inbox(&outcome.model, &who);
             if json {
+                // The full entries, unchanged wire shape.
+                let entries = task::inbox(&outcome.model, &who);
                 println!("{}", serde_json::to_string_pretty(&entries)?);
             } else {
+                let rows = InboxRow::compute(&outcome.model, &who);
                 let now = Utc::now();
-                for e in &entries {
-                    println!("{}", inbox_row(e, now));
+                for r in &rows {
+                    println!("{}", inbox_row(r, now));
                 }
-                if entries.is_empty() {
+                if rows.is_empty() {
                     println!("(inbox empty for {})", sanitize_line(&who));
                 }
             }
@@ -512,90 +508,87 @@ pub(crate) fn cmd_task(action: TaskCmd) -> Result<()> {
         }
         TaskCmd::Debt { repo, json } => {
             let outcome = replay_loud()?;
-            let groups = task::debt(&outcome.model);
-            // Aged awaiting-review revisions ride the debt view (G8): a dead reviewer is honest
-            // state that nobody sees unless it ages on the owner's primary surface.
-            let awaiting: Vec<_> = task::awaiting_review(&outcome.model)
-                .into_iter()
-                .filter(|e| match &repo {
-                    Some(want) => e.task.repo.as_deref() == Some(want.as_path()),
-                    None => true,
-                })
-                .collect();
-            // The debt view is only as honest as the verifier is alive (G1) — render the
-            // heartbeat with it, and re-surface suspect lands (G3) as visible debt.
+            // The debt view is only as honest as the verifier is alive (G1) — the heartbeat
+            // rides it, and suspect lands (G3) re-surface as visible debt. Shaping (repo filter,
+            // aged awaiting-review rows (G8), warning text) is the shared DebtReport.
             let hb = cv_core::task::verify::read_heartbeat(&task::tasks_dir());
-            let verify_warning = cv_core::task::verify::heartbeat_warning(hb.as_ref());
-            let suspects = hb
-                .as_ref()
-                .map(|h| h.suspect_landed.clone())
-                .unwrap_or_default();
-            let mut shown = 0usize;
-            let mut json_rows = Vec::new();
-            for (group_repo, entries) in &groups {
-                if let Some(want) = &repo {
-                    if group_repo.as_deref() != Some(want.as_path()) {
-                        continue;
-                    }
-                }
-                if json {
-                    json_rows.extend(entries.iter());
-                    continue;
-                }
-                let name = group_repo
-                    .as_ref()
-                    .map(|p| p.display().to_string())
-                    .unwrap_or_else(|| "(no repo)".into());
-                println!("{name}:");
-                for e in entries {
-                    let age = chrono::Utc::now().signed_duration_since(e.since);
-                    println!(
-                        "  {}  rev{} {} [{}] unlanded for {}h — {}",
-                        short_id(&e.task.task_id),
-                        e.revision_n,
-                        sanitize_line(&e.branch),
-                        e.state.as_str(),
-                        age.num_hours(),
-                        sanitize_line(&e.task.title)
-                    );
-                    for issue in &e.issues {
-                        println!("      ⚠ {}", sanitize_line(issue));
-                    }
-                    shown += 1;
-                }
-            }
             if json {
+                // The full entries (task projection embedded), unchanged wire shape.
+                let json_rows: Vec<_> = task::debt(&outcome.model)
+                    .iter()
+                    .filter(|(group_repo, _)| match &repo {
+                        Some(want) => group_repo.as_deref() == Some(want.as_path()),
+                        None => true,
+                    })
+                    .flat_map(|(_, entries)| entries.clone())
+                    .collect();
+                let awaiting: Vec<_> = task::awaiting_review(&outcome.model)
+                    .into_iter()
+                    .filter(|e| match &repo {
+                        Some(want) => e.task.repo.as_deref() == Some(want.as_path()),
+                        None => true,
+                    })
+                    .collect();
                 println!(
                     "{}",
                     serde_json::to_string_pretty(&serde_json::json!({
                         "debt": json_rows,
                         "awaiting_review": awaiting,
-                        "suspects": suspects,
+                        "suspects": hb.as_ref().map(|h| h.suspect_landed.clone()).unwrap_or_default(),
                         "verified_as_of": hb.as_ref().map(|h| h.ts),
-                        "verify_warning": verify_warning,
+                        "verify_warning": cv_core::task::verify::heartbeat_warning(hb.as_ref()),
                     }))?
                 );
                 return Ok(());
             }
-            if shown == 0 && suspects.is_empty() {
+            let report =
+                task::DebtReport::compute(&outcome.model, hb.as_ref(), repo.as_deref());
+            // Rows arrive repo-ascending (no-repo first), oldest first within a repo: render a
+            // group header at each repo transition.
+            let mut current: Option<&Option<std::path::PathBuf>> = None;
+            let now = Utc::now();
+            for row in &report.debt {
+                if current != Some(&row.repo) {
+                    let name = row
+                        .repo
+                        .as_ref()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_else(|| "(no repo)".into());
+                    println!("{name}:");
+                    current = Some(&row.repo);
+                }
+                let age = now.signed_duration_since(row.since);
+                println!(
+                    "  {}  rev{} {} [{}] unlanded for {}h — {}",
+                    short_id(&row.id),
+                    row.revision,
+                    sanitize_line(&row.branch),
+                    row.state.as_str(),
+                    age.num_hours(),
+                    sanitize_line(&row.title)
+                );
+                for issue in &row.issues {
+                    println!("      ⚠ {}", sanitize_line(issue));
+                }
+            }
+            if report.debt.is_empty() && report.suspects.is_empty() {
                 println!("✓ no unlanded reviewed work");
             }
-            if !awaiting.is_empty() {
-                let now = Utc::now();
+            if !report.awaiting_review.is_empty() {
                 println!("awaiting review:");
-                for e in &awaiting {
+                for row in &report.awaiting_review {
                     println!(
                         "  {}  rev{} {} → {} waiting {} — {}",
-                        short_id(&e.task.task_id),
-                        e.revision_n,
-                        sanitize_line(&e.branch),
-                        sanitize_line(e.reviewer.as_deref().unwrap_or("(reviewer unbound)")),
-                        task::age_short(e.since, now),
-                        sanitize_line(&e.task.title)
+                        short_id(&row.id),
+                        row.revision,
+                        sanitize_line(&row.branch),
+                        sanitize_line(row.reviewer.as_deref().unwrap_or("(reviewer unbound)")),
+                        task::age_short(row.since, now),
+                        sanitize_line(&row.title)
                     );
                 }
             }
-            for s in &suspects {
+            for s in &report.suspects {
                 println!(
                     "⚠ SUSPECT {}  rev{} {} — {}",
                     short_id(&s.task_id),
@@ -604,18 +597,17 @@ pub(crate) fn cmd_task(action: TaskCmd) -> Result<()> {
                     sanitize_line(&s.title)
                 );
             }
-            match &hb {
-                Some(hb) => println!(
+            if let Some(hb) = &hb {
+                println!(
                     "verified as of {}{}",
                     fmt_local(hb.ts, "%Y-%m-%d %H:%M:%S"),
                     hb.interval_secs
                         .map(|i| format!(" (every {i}s)"))
                         .unwrap_or_default()
-                ),
-                None => {}
+                );
             }
-            if let Some(w) = verify_warning {
-                eprintln!("⚠ {}", sanitize_line(&w));
+            if let Some(w) = &report.verify_warning {
+                eprintln!("⚠ {}", sanitize_line(w));
             }
             Ok(())
         }
@@ -652,7 +644,7 @@ fn cmd_verify(id: Option<String>, all: bool, fetch: bool, skip_landed: bool) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cv_core::task::{InboxReason, TaskState};
+    use cv_core::task::{InboxEntry, InboxReason, TaskProjection, TaskState};
 
     fn proj(title: &str, last_ts: &str) -> TaskProjection {
         TaskProjection {
@@ -680,7 +672,7 @@ mod tests {
     fn task_row_shows_age_and_strips_ansi() {
         let t = proj("evil\u{1b}]0;pwn\u{7}title\u{1b}[31m!", "2026-07-13T00:00:00Z");
         let now: DateTime<Utc> = "2026-07-16T00:00:00Z".parse().unwrap();
-        let row = task_row(&t, now);
+        let row = task_row(&TaskRow::full(&t), now);
         assert!(row.contains("  3d  "), "age column from last_ts: {row}");
         assert!(row.contains("eviltitle!"), "payload stripped: {row}");
         assert!(!row.contains('\u{1b}'), "no ESC survives: {row}");
@@ -690,20 +682,20 @@ mod tests {
     fn inbox_row_marks_older_than_24h_and_strips_ansi() {
         let t = proj("t\u{1b}[31mred", "2026-07-13T00:00:00Z");
         let now: DateTime<Utc> = "2026-07-16T00:00:00Z".parse().unwrap();
-        let stale = InboxEntry {
+        let stale = InboxRow::from_entry(&InboxEntry {
             task: &t,
             reason: InboxReason::ClaimedByYou,
             since: "2026-07-13T00:00:00Z".parse().unwrap(),
-        };
+        });
         let row = inbox_row(&stale, now);
         assert!(row.starts_with("⏰"), "24h+ rows lead with the marker: {row}");
         assert!(row.contains("tred") && !row.contains('\u{1b}'), "{row}");
 
-        let fresh = InboxEntry {
+        let fresh = InboxRow::from_entry(&InboxEntry {
             task: &t,
             reason: InboxReason::ClaimedByYou,
             since: "2026-07-15T12:00:00Z".parse().unwrap(),
-        };
+        });
         let row = inbox_row(&fresh, now);
         assert!(!row.contains('⏰'), "young rows carry no marker: {row}");
         assert!(row.contains("12h"), "{row}");

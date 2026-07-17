@@ -6,6 +6,7 @@
 use crate::util::{dim_cwd, home_rel, parse_harness, short_id};
 use anyhow::Result;
 use cv_core::ir::{truncate, SessionRef};
+use cv_core::sanitize::sanitize_line;
 
 /// Apply a parsed query to a ref list in place: prune with the catalog-cheap prefilter, then — if
 /// the query has any parse/index/events term — parse each survivor and keep only full matches. Used
@@ -92,6 +93,8 @@ pub(crate) fn cmd_ls(
     // The exists() check guards the catalog read path's one residual lie — a session deleted since
     // the probe last looked — and is bounded by `limit`, not the fleet (it stats only listed rows).
     for r in refs.iter().filter(|r| r.path.exists()).take(limit) {
+        // Titles/cwds are transcript-derived (untrusted, replayed forever) — sanitize at the
+        // terminal seam (G5), exactly like task/board rows.
         println!(
             "{:8}  {:8}  {}  {:>4} msg  {}",
             r.harness.as_str(),
@@ -99,9 +102,9 @@ pub(crate) fn cmd_ls(
             crate::util::fmt_span(r.created_at, r.updated_at),
             r.message_count,
             r.title
-                .clone()
-                .map(|t| truncate(&t, 60))
-                .unwrap_or_else(|| dim_cwd(r.cwd.as_deref())),
+                .as_deref()
+                .map(|t| truncate(&sanitize_line(t), 60))
+                .unwrap_or_else(|| sanitize_line(&dim_cwd(r.cwd.as_deref())).into_owned()),
         );
     }
     if total > limit {
@@ -162,11 +165,12 @@ pub(crate) fn cmd_timeline(
         let time = when
             .map(|d| crate::util::fmt_local(d, "%H:%M"))
             .unwrap_or_else(|| "--:--".into());
+        // Transcript-derived text — sanitize at the terminal seam (G5).
         let title = r
             .title
-            .clone()
-            .map(|t| truncate(&t, 50))
-            .unwrap_or_else(|| dim_cwd(r.cwd.as_deref()));
+            .as_deref()
+            .map(|t| truncate(&sanitize_line(t), 50))
+            .unwrap_or_else(|| sanitize_line(&dim_cwd(r.cwd.as_deref())).into_owned());
         let since = match (r.created_at, when) {
             (Some(c), Some(u))
                 if c.with_timezone(&chrono::Local).date_naive() != u.with_timezone(&chrono::Local).date_naive() =>
@@ -180,7 +184,7 @@ pub(crate) fn cmd_timeline(
             time,
             r.harness.as_str(),
             short_id(&r.id),
-            truncate(&dim_cwd(r.cwd.as_deref()), 24),
+            truncate(&sanitize_line(&dim_cwd(r.cwd.as_deref())), 24),
             title,
             since,
         );

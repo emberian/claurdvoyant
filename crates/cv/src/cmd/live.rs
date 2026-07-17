@@ -98,7 +98,7 @@ pub(crate) enum BoardCmd {
     /// List agents that heartbeat on a channel recently (also posts your own heartbeat).
     Who {
         channel: String,
-        #[arg(long = "within-secs", default_value_t = 60)]
+        #[arg(long = "within-secs", default_value_t = cv_core::board::WHO_WINDOW_SECS)]
         within_secs: u64,
     },
     /// Acknowledge a message id with a tiny ack note.
@@ -142,11 +142,10 @@ pub(crate) fn cmd_scry(harness: Option<String>, cwd: Option<String>, interval: f
 
 /// Board identity (G4): explicit `--from`, else the spawner-set `CV_ENDPOINT`, else `"cv"`. The
 /// board is chat, so unlike identity-bearing task verbs an unresolvable identity is never an
-/// error — the env var just makes the bare command attribute correctly.
+/// error — the env var just makes the bare command attribute correctly. Shared resolution lives
+/// in [`cv_core::task::actor`]; only the CLI's default sink is chosen here.
 fn board_from(explicit: Option<String>) -> String {
-    explicit
-        .or_else(cv_core::task::default_endpoint)
-        .unwrap_or_else(|| "cv".into())
+    cv_core::task::actor(explicit, "cv")
 }
 
 pub(crate) fn cmd_board(action: BoardCmd) -> Result<()> {

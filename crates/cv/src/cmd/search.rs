@@ -3,6 +3,7 @@
 use crate::util::{dirs_home, home_rel, parse_harness, short_id};
 use anyhow::{Context, Result};
 use cv_core::ir::{truncate, Harness};
+use cv_core::sanitize::sanitize_line;
 use std::path::{Path, PathBuf};
 
 pub(crate) fn cmd_search(query: &str, harness: Option<String>, limit: usize, semantic: bool) -> Result<()> {
@@ -103,16 +104,18 @@ fn render_search_hits(hits: &[cv_search::Hit], want: Option<Harness>, limit: usi
             }
             None => (short_id(&h.id), String::new()),
         };
+        // Titles and snippets are transcript-derived (untrusted) — sanitize at the terminal
+        // seam (G5); JSON surfaces stay raw.
         println!(
             "{:8}  {:8}  {:10}  {}{}",
             h.harness,
             id_disp,
             date,
-            h.title.clone().unwrap_or_default(),
+            sanitize_line(h.title.as_deref().unwrap_or_default()),
             provenance,
         );
         if !h.snippet.trim().is_empty() {
-            println!("          … {}", truncate(&h.snippet, 120));
+            println!("          … {}", truncate(&sanitize_line(&h.snippet), 120));
         }
     }
 }
@@ -164,11 +167,11 @@ fn cmd_search_live(query: &str, want: Option<Harness>, limit: usize) -> Result<(
                     r.updated_at
                         .map(|d| crate::util::fmt_local(d, "%Y-%m-%d"))
                         .unwrap_or_else(|| "----------".into()),
-                    label,
+                    sanitize_line(&label),
                 );
                 println!(
                     "          … {}",
-                    snippet(&sink.hay, pos.min(sink.hay.len()), needle.len())
+                    sanitize_line(&snippet(&sink.hay, pos.min(sink.hay.len()), needle.len()))
                 );
                 if hits >= limit {
                     println!("\n(stopped at {limit} hits; use --limit)");
@@ -222,12 +225,12 @@ pub(crate) fn cmd_recall(query: &str, k: usize, harness: Option<String>) -> Resu
             hit.harness,
             short_id(&hit.id),
             hit.score,
-            truncate(&hit.title.clone().unwrap_or_default(), 50),
-            truncate(&cwd, 40),
+            truncate(&sanitize_line(hit.title.as_deref().unwrap_or_default()), 50),
+            truncate(&sanitize_line(&cwd), 40),
         );
         let excerpt = recall_excerpt(hit, query);
         for line in excerpt.lines() {
-            println!("      {line}");
+            println!("      {}", sanitize_line(line));
         }
     }
     Ok(())

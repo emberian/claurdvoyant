@@ -182,8 +182,10 @@ fn show_subagents(r: &SessionRef, json: bool) -> Result<()> {
             wf,
             s.session.message_count,
         );
+        // Task descriptions and returns are transcript-derived (untrusted) — sanitize at the
+        // terminal seam (G5); the `--json` path stays raw.
         if let Some(d) = &s.description {
-            println!("  task: {}", truncate(d, 200));
+            println!("  task: {}", truncate(&cv_core::sanitize::sanitize_line(d), 200));
         }
         // The real return value: the journaled summary (workflow) or the agent's last text turn.
         let ret = s
@@ -191,7 +193,7 @@ fn show_subagents(r: &SessionRef, json: bool) -> Result<()> {
             .clone()
             .or_else(|| cv_core::harness::claude::subagent_return(&s.session.path));
         if let Some(ret) = ret {
-            println!("  ↩ {}", truncate(&ret, 400));
+            println!("  ↩ {}", truncate(&cv_core::sanitize::sanitize_line(&ret), 400));
         }
         println!();
     }
