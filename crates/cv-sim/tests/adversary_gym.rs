@@ -723,21 +723,27 @@ fn receipts_remain_a_heuristic_by_design() {
     );
 }
 
-/// KNOWN HOLE (pinned). The `by` field on every event is a self-asserted string (`CV_ENDPOINT` or
-/// a `--sender` flag). Nothing binds it to the actor that actually wrote the line: a seat running
-/// as agent:attacker can append events stamped `by: "agent:victim"`; the store accepts them and
-/// replay raises no identity/impersonation warning.
+/// DEFENSE (was a pinned hole). The `by` field is still a self-asserted string, but an endpoint may
+/// now opt in to a TOFU per-endpoint token (`CV_TOKEN`/`--token`): the first token seen binds the
+/// endpoint (`endpoint -> sha256(token)` in `tasks/endpoints.json`), and thereafter every
+/// identity-bearing event stamped as that endpoint must present the matching token or the append is
+/// REJECTED at the store seam. This makes impersonation of an opted-in endpoint detectable — a seat
+/// running as agent:attacker can no longer append `by: "agent:victim"` once the victim has bound a
+/// token, without holding that token.
 ///
-/// Source: codex red-team ("env strings are not identities").
-///
-/// Future fix that FLIPS this: short-lived per-worker credentials the store verifies before
-/// accepting `by` — then an impersonated append is rejected and this becomes a defense test.
+/// Source: codex red-team ("env strings are not identities") — blessed fix: short-lived per-worker
+/// credentials, no seats. This asserts (a) an unbound endpoint's events still apply (backward
+/// compat), (b) after binding, a tokenless / wrong-token append as that endpoint is rejected, and
+/// (c) an append WITH the bound token applies.
 #[test]
-fn pin_identity_impersonation_is_currently_undetected() {
-    let store = TaskStore::at(tmp_dir("store"));
-    // The victim owns a task; the attacker acts under the victim's endpoint string.
-    let task = open_in(&store, None, "agent:victim", Some("agent:victim"), "victim work");
-    let claimed = store
+fn identity_impersonation_is_rejected_when_endpoint_is_bound() {
+    let dir = tmp_dir("store");
+
+    // (a) Backward compat: the victim binds its endpoint on first use with a token. The bind itself
+    // is a normal, successful claim — TOFU never blocks the first appearance.
+    let victim = TaskStore::at(&dir).with_token(Some("victim-secret".into()));
+    let task = open_in(&victim, None, "agent:victim", Some("agent:victim"), "victim work");
+    victim
         .append_agent_event(new_event(
             Some(&task),
             "agent:victim",
@@ -745,27 +751,87 @@ fn pin_identity_impersonation_is_currently_undetected() {
                 assignee: "agent:victim".into(),
             },
         ))
-        .unwrap();
-    assert_eq!(
-        claimed.by, "agent:victim",
-        "the store records the CLAIMED identity verbatim"
+        .expect("first-use token binds the endpoint and the claim applies");
+
+    // (b) The attacker, holding NO token, stamps an identity-bearing event as the (now bound)
+    // victim: rejected at the store seam, nothing lands.
+    let before = TaskStore::at(&dir).replay().unwrap().events.len();
+    let attacker = TaskStore::at(&dir); // no token
+    let err = attacker
+        .append_agent_event(new_event(
+            Some(&task),
+            "agent:victim",
+            TaskEventKind::Released {},
+        ))
+        .expect_err("a bound endpoint requires its token — a tokenless append is rejected");
+    assert!(
+        err.to_string().contains("token-bound"),
+        "the rejection names the cause: {err}"
     );
 
-    propose(&store, &task, "agent:victim", fake_revision(1, "agent:victim"));
-    pass(&store, &task, "agent:victim", None);
+    // …and the same with a WRONG token is rejected too (impersonation, not just a missing flag).
+    let wrong = TaskStore::at(&dir).with_token(Some("guessed-wrong".into()));
+    let err = wrong
+        .append_agent_event(new_event(
+            Some(&task),
+            "agent:victim",
+            TaskEventKind::Released {},
+        ))
+        .expect_err("a wrong token is rejected");
+    assert!(err.to_string().contains("does not match"), "{err}");
 
-    // Replay is clean: nothing flags that these events might be impersonated.
+    assert_eq!(
+        TaskStore::at(&dir).replay().unwrap().events.len(),
+        before,
+        "neither forged append wrote anything"
+    );
+
+    // (c) The genuine victim, holding the bound token, still appends normally.
+    victim
+        .append_agent_event(new_event(
+            Some(&task),
+            "agent:victim",
+            TaskEventKind::Released {},
+        ))
+        .expect("the real victim, with its token, appends normally");
+    let outcome = TaskStore::at(&dir).replay().unwrap();
+    assert!(outcome.warnings.is_empty(), "clean log: {:?}", outcome.warnings);
+    assert_eq!(
+        outcome.model.tasks[&task].state,
+        TaskState::Open,
+        "the victim's own release applied (claim → release)"
+    );
+}
+
+/// DESIGN NOTE (deliberate, not a hole). An endpoint that never presented a token stays fully
+/// trusted: solo CLI use and the human-at-a-shell path keep working with no token and no binding.
+/// TOFU closes the hole for opt-in endpoints only — the durable record has no seats, and an
+/// unbound `by` is taken at face value by design (law 3). `phoenix` opts fleet workers in by
+/// minting `CV_TOKEN` at spawn beside `CV_ENDPOINT`.
+#[test]
+fn pin_identity_unbound_is_trusted_by_design() {
+    let store = TaskStore::at(tmp_dir("store")); // no token anywhere
+    let task = open_in(&store, None, "agent:solo", Some("agent:solo"), "solo work");
+    // A full identity-bearing lifecycle with no token at all: every append applies, no warning.
+    store
+        .append_agent_event(new_event(
+            Some(&task),
+            "agent:solo",
+            TaskEventKind::Claimed {
+                assignee: "agent:solo".into(),
+            },
+        ))
+        .expect("an unbound endpoint needs no token — backward compatible");
+    propose(&store, &task, "agent:solo", fake_revision(1, "agent:solo"));
+    pass(&store, &task, "agent:solo", None);
+
     let outcome = store.replay().unwrap();
     assert!(
         outcome.warnings.is_empty(),
-        "PINNED HOLE: impersonation raises no warning — env strings are not identities. If a \
-         warning now appears the hole was closed; flip this pin. Got: {:?}",
+        "unbound = trusted by design: no impersonation machinery fires. Got: {:?}",
         outcome.warnings
     );
-    assert!(
-        outcome.events.iter().all(|e| e.by == "agent:victim"),
-        "every event is on the record under the claimed identity, indistinguishable from genuine"
-    );
+    assert!(outcome.events.iter().all(|e| e.by == "agent:solo"));
 }
 
 /// DEFENSE (formerly `pin_done_completion_is_self_reported`, codex red-team item 3). A non-code

@@ -154,6 +154,23 @@ impl TaskEventKind {
         )
     }
 
+    /// Kinds whose `by` endpoint carries semantics (keys inbox, reviewer, and land bookkeeping),
+    /// matching the identity-BEARING verbs claim/release/propose/pass/refute (see
+    /// [`crate::task::require_actor`]). The store's TOFU token gate ([`crate::task::identity`])
+    /// applies only to these: a bound endpoint must present its token to stamp one of them, and a
+    /// first-use token binds on one of them. Bookkeeping kinds (open/note/done/abandon/supersede/
+    /// reroute) stay token-optional by design — impersonating them changes no lifecycle authority.
+    pub fn is_identity_bearing(&self) -> bool {
+        matches!(
+            self,
+            TaskEventKind::Claimed { .. }
+                | TaskEventKind::Released {}
+                | TaskEventKind::RevisionProposed { .. }
+                | TaskEventKind::ReviewPassed { .. }
+                | TaskEventKind::ReviewRefuted { .. }
+        )
+    }
+
     /// The wire tag for this kind (the serde `event` field), for logs and board notifications.
     pub fn tag(&self) -> &'static str {
         match self {
@@ -637,6 +654,55 @@ mod tests {
         }
         for k in &agent_facing {
             assert!(!k.is_verifier_only(), "{} should be agent-facing", k.tag());
+        }
+    }
+
+    /// The identity-bearing partition (the TOFU token gate's scope) is exactly the five verbs whose
+    /// endpoint keys inbox/reviewer/land semantics — claim/release/propose/pass/refute.
+    #[test]
+    fn identity_bearing_partition_is_exact() {
+        let identity_bearing = [
+            TaskEventKind::Claimed { assignee: String::new() },
+            TaskEventKind::Released {},
+            TaskEventKind::RevisionProposed { revision: revision() },
+            TaskEventKind::ReviewPassed {
+                reviewer: String::new(),
+                session_ref: None,
+                independence: None,
+                receipts: None,
+            },
+            TaskEventKind::ReviewRefuted {
+                reviewer: String::new(),
+                session_ref: None,
+                receipts: None,
+            },
+        ];
+        let bookkeeping = [
+            TaskEventKind::Opened {
+                title: String::new(),
+                body: String::new(),
+                repo: None,
+                issue: None,
+                channel: String::new(),
+                assignee: None,
+            },
+            TaskEventKind::Noted {
+                text: String::new(),
+                session_ref: None,
+            },
+            TaskEventKind::Done { observed: None },
+            TaskEventKind::Abandoned { reason: String::new() },
+            TaskEventKind::Superseded { by_task: String::new() },
+            TaskEventKind::ReviewRerouted {
+                from: String::new(),
+                to: String::new(),
+            },
+        ];
+        for k in &identity_bearing {
+            assert!(k.is_identity_bearing(), "{} should be identity-bearing", k.tag());
+        }
+        for k in &bookkeeping {
+            assert!(!k.is_identity_bearing(), "{} should be bookkeeping (token-optional)", k.tag());
         }
     }
 

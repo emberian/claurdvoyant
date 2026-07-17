@@ -76,6 +76,10 @@ pub(crate) enum TaskCmd {
         /// Acting endpoint recorded in `by`. Default: $CV_ENDPOINT.
         #[arg(long)]
         from: Option<String>,
+        /// TOFU per-endpoint token authenticating the `--from` claim. Default: $CV_TOKEN. First use
+        /// binds the endpoint to this token; thereafter it is required.
+        #[arg(long)]
+        token: Option<String>,
     },
     /// Release a claim back to open.
     Release {
@@ -83,6 +87,9 @@ pub(crate) enum TaskCmd {
         /// Acting endpoint recorded in `by`. Default: $CV_ENDPOINT.
         #[arg(long)]
         from: Option<String>,
+        /// TOFU per-endpoint token authenticating the `--from` claim. Default: $CV_TOKEN.
+        #[arg(long)]
+        token: Option<String>,
     },
     /// Record a progress note.
     Note {
@@ -158,6 +165,9 @@ pub(crate) enum TaskCmd {
         /// Acting endpoint recorded in `by`. Default: $CV_ENDPOINT.
         #[arg(long)]
         from: Option<String>,
+        /// TOFU per-endpoint token authenticating the `--from` claim. Default: $CV_TOKEN.
+        #[arg(long)]
+        token: Option<String>,
     },
     /// Reroute the active review to another reviewer.
     Reroute {
@@ -177,6 +187,9 @@ pub(crate) enum TaskCmd {
         /// Acting endpoint recorded in `by`. Default: $CV_ENDPOINT.
         #[arg(long)]
         from: Option<String>,
+        /// TOFU per-endpoint token authenticating the `--from` claim. Default: $CV_TOKEN.
+        #[arg(long)]
+        token: Option<String>,
     },
     /// Record a review REFUTE (terminal for the revision; propose a new revision to continue).
     Refute {
@@ -186,6 +199,9 @@ pub(crate) enum TaskCmd {
         /// Acting endpoint recorded in `by`. Default: $CV_ENDPOINT.
         #[arg(long)]
         from: Option<String>,
+        /// TOFU per-endpoint token authenticating the `--from` claim. Default: $CV_TOKEN.
+        #[arg(long)]
+        token: Option<String>,
     },
     /// Run the git verifier over Ready/MergedLocal revisions and record what it observes.
     Verify {
@@ -234,9 +250,11 @@ fn replay_loud() -> Result<cv_core::task::ReplayOutcome> {
     Ok(outcome)
 }
 
-/// Append an agent event through the shared core path, print a one-line confirmation.
-fn append_and_report(task_id: Option<&str>, from: &str, kind: TaskEventKind) -> Result<()> {
-    let store = TaskStore::default_store();
+/// Append an agent event through the shared core path, print a one-line confirmation. `token` is
+/// the TOFU credential presented on identity-bearing appends (`--token`, else `$CV_TOKEN`); it is
+/// inert for bookkeeping verbs and for endpoints that have never bound a token.
+fn append_and_report(task_id: Option<&str>, from: &str, kind: TaskEventKind, token: Option<String>) -> Result<()> {
+    let store = TaskStore::default_store().with_token(task::token(token));
     let report = task::append_and_notify(&store, task_id, from, kind, Vec::new())?;
     for w in report.replay_warnings.iter().chain(&report.warnings) {
         eprintln!("⚠ {}", sanitize_line(w));
@@ -316,6 +334,7 @@ pub(crate) fn cmd_task(action: TaskCmd) -> Result<()> {
                     channel,
                     assignee,
                 },
+                None,
             )
         }
         TaskCmd::List {
@@ -460,17 +479,17 @@ pub(crate) fn cmd_task(action: TaskCmd) -> Result<()> {
             }
             Ok(())
         }
-        TaskCmd::Claim { id, from } => {
+        TaskCmd::Claim { id, from, token } => {
             let from = require_from(from)?;
             let outcome = replay_loud()?;
             let id = resolve(&outcome.model, &id)?.to_string();
-            append_and_report(Some(&id), &from, TaskEventKind::Claimed { assignee: from.clone() })
+            append_and_report(Some(&id), &from, TaskEventKind::Claimed { assignee: from.clone() }, token)
         }
-        TaskCmd::Release { id, from } => {
+        TaskCmd::Release { id, from, token } => {
             let from = require_from(from)?;
             let outcome = replay_loud()?;
             let id = resolve(&outcome.model, &id)?.to_string();
-            append_and_report(Some(&id), &from, TaskEventKind::Released {})
+            append_and_report(Some(&id), &from, TaskEventKind::Released {}, token)
         }
         TaskCmd::Note {
             id,
@@ -480,7 +499,7 @@ pub(crate) fn cmd_task(action: TaskCmd) -> Result<()> {
         } => {
             let outcome = replay_loud()?;
             let id = resolve(&outcome.model, &id)?.to_string();
-            append_and_report(Some(&id), &from_or_cv(from), TaskEventKind::Noted { text, session_ref })
+            append_and_report(Some(&id), &from_or_cv(from), TaskEventKind::Noted { text, session_ref }, None)
         }
         TaskCmd::Done {
             id,
@@ -510,18 +529,18 @@ pub(crate) fn cmd_task(action: TaskCmd) -> Result<()> {
                 }
                 None => (observed, None),
             };
-            append_and_report(Some(&id), &from_or_cv(from), TaskEventKind::Done { observed, check })
+            append_and_report(Some(&id), &from_or_cv(from), TaskEventKind::Done { observed, check }, None)
         }
         TaskCmd::Abandon { id, reason, from } => {
             let outcome = replay_loud()?;
             let id = resolve(&outcome.model, &id)?.to_string();
-            append_and_report(Some(&id), &from_or_cv(from), TaskEventKind::Abandoned { reason })
+            append_and_report(Some(&id), &from_or_cv(from), TaskEventKind::Abandoned { reason }, None)
         }
         TaskCmd::Supersede { id, by_task, from } => {
             let outcome = replay_loud()?;
             let id = resolve(&outcome.model, &id)?.to_string();
             let by_task = resolve(&outcome.model, &by_task)?.to_string();
-            append_and_report(Some(&id), &from_or_cv(from), TaskEventKind::Superseded { by_task })
+            append_and_report(Some(&id), &from_or_cv(from), TaskEventKind::Superseded { by_task }, None)
         }
         TaskCmd::Propose {
             id,
@@ -532,6 +551,7 @@ pub(crate) fn cmd_task(action: TaskCmd) -> Result<()> {
             reviewer,
             session_ref,
             from,
+            token,
         } => {
             let from = require_from(from)?;
             let outcome = replay_loud()?;
@@ -563,7 +583,7 @@ pub(crate) fn cmd_task(action: TaskCmd) -> Result<()> {
             for w in task::propose_collision_warnings(&outcome.model, &id, &repo, &revision) {
                 eprintln!("⚠ WARNING: {}", sanitize_line(&w));
             }
-            append_and_report(Some(&id), &from, TaskEventKind::RevisionProposed { revision })
+            append_and_report(Some(&id), &from, TaskEventKind::RevisionProposed { revision }, token)
         }
         TaskCmd::Reroute { id, to, from } => {
             let outcome = replay_loud()?;
@@ -576,9 +596,15 @@ pub(crate) fn cmd_task(action: TaskCmd) -> Result<()> {
                 Some(&id),
                 &from_or_cv(from),
                 TaskEventKind::ReviewRerouted { from: current, to },
+                None,
             )
         }
-        TaskCmd::Pass { id, session, from } => {
+        TaskCmd::Pass {
+            id,
+            session,
+            from,
+            token,
+        } => {
             let from = require_from(from)?;
             let outcome = replay_loud()?;
             let id = resolve(&outcome.model, &id)?.to_string();
@@ -600,9 +626,15 @@ pub(crate) fn cmd_task(action: TaskCmd) -> Result<()> {
                     independence: obs.independence,
                     receipts: obs.receipts,
                 },
+                token,
             )
         }
-        TaskCmd::Refute { id, session, from } => {
+        TaskCmd::Refute {
+            id,
+            session,
+            from,
+            token,
+        } => {
             let from = require_from(from)?;
             let outcome = replay_loud()?;
             let id = resolve(&outcome.model, &id)?.to_string();
@@ -618,6 +650,7 @@ pub(crate) fn cmd_task(action: TaskCmd) -> Result<()> {
                     session_ref: session,
                     receipts,
                 },
+                token,
             )
         }
         TaskCmd::Verify {
