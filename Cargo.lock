@@ -334,6 +334,7 @@ dependencies = [
  "clustervision-core",
  "cv-llm",
  "cv-search",
+ "libc",
  "serde_json",
 ]
 

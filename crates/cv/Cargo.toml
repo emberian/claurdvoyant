@@ -12,6 +12,10 @@ name = "cv"
 path = "src/main.rs"
 
 [dependencies]
+# SIGPIPE reset: a Rust binary piped into `head`/`grep -q` panics on broken pipe by
+# default; a CLI whose output is made for pipes must die quietly like every other
+# unix tool. Unix-only (no-op dep elsewhere).
+libc = "0.2"
 cv-core = { path = "../cv-core", version = "0.9.21", package = "clustervision-core" }
 cv-search = { path = "../cv-search", version = "0.9.21" }
 cv-llm = { path = "../cv-llm", version = "0.9.21" }

@@ -637,6 +637,12 @@ enum Cmd {
 }
 
 fn main() -> Result<()> {
+    // Die quietly on a closed pipe (`cv task list | head`) instead of panicking:
+    // Rust ignores SIGPIPE by default, which turns EPIPE into a write panic.
+    #[cfg(unix)]
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
     let cli = Cli::parse();
     match cli.cmd {
         Cmd::Ls {
