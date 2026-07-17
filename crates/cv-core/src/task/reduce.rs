@@ -28,8 +28,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use super::model::{
-    IndependenceCheck, MergeFailure, ReviewReceipts, Revision, RevisionState, TaskEvent,
-    TaskEventKind, TaskState,
+    IndependenceCheck, MergeFailure, ReviewReceipts, Revision, RevisionState, TaskEvent, TaskEventKind, TaskState,
 };
 
 /// Errors from applying an event. During a CAS append these reject the candidate event; during
@@ -334,7 +333,9 @@ impl TaskReducer {
             });
         }
         if self.model.tasks.contains_key(&event.task_id) {
-            return Err(ReduceError::DuplicateOpen { task_id: event.task_id.clone() });
+            return Err(ReduceError::DuplicateOpen {
+                task_id: event.task_id.clone(),
+            });
         }
         self.model
             .tasks
@@ -352,7 +353,9 @@ impl TaskReducer {
 
         match kind {
             TaskEventKind::Opened { .. } => {
-                return Err(ReduceError::DuplicateOpen { task_id: task.task_id.clone() });
+                return Err(ReduceError::DuplicateOpen {
+                    task_id: task.task_id.clone(),
+                });
             }
 
             // ── base lifecycle ────────────────────────────────────────────
@@ -467,7 +470,11 @@ impl TaskReducer {
                 });
                 rev.state = RevisionState::Ready;
             }
-            TaskEventKind::ReviewRefuted { reviewer, session_ref, receipts } => {
+            TaskEventKind::ReviewRefuted {
+                reviewer,
+                session_ref,
+                receipts,
+            } => {
                 let task_id = task.task_id.clone();
                 let rev = require_revision(task, kind)?;
                 require_revision_state(
@@ -537,12 +544,7 @@ impl TaskReducer {
                 let task_id = task.task_id.clone();
                 let rev = require_revision(task, kind)?;
                 // Deviation 2: Ready → Landed is legal (forge-PR lands skip local integration).
-                require_revision_state(
-                    &task_id,
-                    rev,
-                    kind,
-                    &[RevisionState::Ready, RevisionState::MergedLocal],
-                )?;
+                require_revision_state(&task_id, rev, kind, &[RevisionState::Ready, RevisionState::MergedLocal])?;
                 if !observed_patch_id.eq_ignore_ascii_case(&rev.revision.patch_id) {
                     return Err(ReduceError::PatchIdMismatch {
                         task_id,
@@ -567,11 +569,7 @@ impl TaskEventKind {
     }
 }
 
-fn require_base(
-    task: &TaskProjection,
-    kind: &TaskEventKind,
-    allowed: &[TaskState],
-) -> Result<(), ReduceError> {
+fn require_base(task: &TaskProjection, kind: &TaskEventKind, allowed: &[TaskState]) -> Result<(), ReduceError> {
     if allowed.contains(&task.state) {
         Ok(())
     } else {
@@ -588,12 +586,10 @@ fn require_revision<'t>(
     kind: &TaskEventKind,
 ) -> Result<&'t mut RevisionProjection, ReduceError> {
     let task_id = task.task_id.clone();
-    task.revisions
-        .last_mut()
-        .ok_or(ReduceError::MissingRevision {
-            task_id,
-            event: kind.tag_static(),
-        })
+    task.revisions.last_mut().ok_or(ReduceError::MissingRevision {
+        task_id,
+        event: kind.tag_static(),
+    })
 }
 
 fn require_revision_state(
@@ -616,11 +612,7 @@ fn require_revision_state(
 /// Reviewer binding: only the active reviewer's verdict counts. If no reviewer is bound yet
 /// (revision proposed without one), the first verdict binds — recorded, visible, and law 2 makes
 /// independence advisory rather than the reducer's job.
-fn require_reviewer(
-    task_id: &str,
-    rev: &RevisionProjection,
-    actual: &str,
-) -> Result<(), ReduceError> {
+fn require_reviewer(task_id: &str, rev: &RevisionProjection, actual: &str) -> Result<(), ReduceError> {
     match &rev.active_reviewer {
         None => Ok(()),
         Some(expected) if expected == actual => Ok(()),
@@ -636,7 +628,10 @@ fn require_reviewer(
 
 fn require_nonempty(field: &'static str, value: &str) -> Result<(), ReduceError> {
     if value.trim().is_empty() {
-        Err(ReduceError::InvalidField { field, value: value.to_string() })
+        Err(ReduceError::InvalidField {
+            field,
+            value: value.to_string(),
+        })
     } else {
         Ok(())
     }
@@ -646,7 +641,10 @@ fn require_hex(field: &'static str, value: &str, lens: &[usize]) -> Result<(), R
     if lens.contains(&value.len()) && value.chars().all(|c| c.is_ascii_hexdigit()) {
         Ok(())
     } else {
-        Err(ReduceError::InvalidField { field, value: value.to_string() })
+        Err(ReduceError::InvalidField {
+            field,
+            value: value.to_string(),
+        })
     }
 }
 
@@ -662,7 +660,10 @@ fn require_patch_id(field: &'static str, value: &str) -> Result<(), ReduceError>
 
 fn validate_revision(revision: &Revision) -> Result<(), ReduceError> {
     if revision.n == 0 {
-        return Err(ReduceError::InvalidField { field: "revision.n", value: "0".to_string() });
+        return Err(ReduceError::InvalidField {
+            field: "revision.n",
+            value: "0".to_string(),
+        });
     }
     require_nonempty("revision.branch", &revision.branch)?;
     require_nonempty("revision.upstream", &revision.upstream)?;
@@ -680,7 +681,12 @@ fn validate_event_shape(event: &TaskEvent) -> Result<(), ReduceError> {
     require_nonempty("task_id", &event.task_id)?;
     require_nonempty("by", &event.by)?;
     match &event.kind {
-        TaskEventKind::Opened { title, channel, assignee, .. } => {
+        TaskEventKind::Opened {
+            title,
+            channel,
+            assignee,
+            ..
+        } => {
             require_nonempty("title", title)?;
             require_nonempty("channel", channel)?;
             if let Some(a) = assignee {
@@ -715,7 +721,10 @@ fn validate_event_shape(event: &TaskEvent) -> Result<(), ReduceError> {
             Ok(())
         }
         TaskEventKind::ReconcileFailed { detail } => require_nonempty("detail", detail),
-        TaskEventKind::Landed { upstream_head, observed_patch_id } => {
+        TaskEventKind::Landed {
+            upstream_head,
+            observed_patch_id,
+        } => {
             require_git_oid("upstream_head", upstream_head)?;
             require_patch_id("observed_patch_id", observed_patch_id)
         }
@@ -741,7 +750,10 @@ mod tests {
 
     impl Log {
         fn new() -> Self {
-            Log { events: Vec::new(), n: 0 }
+            Log {
+                events: Vec::new(),
+                n: 0,
+            }
         }
 
         fn next_id(&mut self) -> String {
@@ -805,7 +817,9 @@ mod tests {
         log.push(
             task,
             AUTHOR,
-            TaskEventKind::RevisionProposed { revision: revision(n, Some(REVIEWER)) },
+            TaskEventKind::RevisionProposed {
+                revision: revision(n, Some(REVIEWER)),
+            },
         );
     }
 
@@ -828,13 +842,22 @@ mod tests {
     fn happy_path_is_replay_equal_and_local_merge_is_not_landed() {
         let mut log = Log::new();
         let task = log.open(AUTHOR);
-        log.push(&task, AUTHOR, TaskEventKind::Claimed { assignee: AUTHOR.into() });
+        log.push(
+            &task,
+            AUTHOR,
+            TaskEventKind::Claimed {
+                assignee: AUTHOR.into(),
+            },
+        );
         propose(&mut log, &task, 1);
         pass(&mut log, &task, REVIEWER);
         log.push(
             &task,
             "verifier",
-            TaskEventKind::MergedLocal { from_sha: sha('e'), to_sha: sha('1') },
+            TaskEventKind::MergedLocal {
+                from_sha: sha('e'),
+                to_sha: sha('1'),
+            },
         );
 
         // Live fold == replay fold.
@@ -851,13 +874,19 @@ mod tests {
         assert_eq!(rev.state, RevisionState::MergedLocal);
         assert!(rev.state.is_actionable() && !rev.state.is_terminal());
         assert!(rev.landed.is_none());
-        assert_eq!(t.effective_state(), EffectiveState::Revision(RevisionState::MergedLocal));
+        assert_eq!(
+            t.effective_state(),
+            EffectiveState::Revision(RevisionState::MergedLocal)
+        );
 
         // Then the verifier observes the land; only now is it terminal.
         log.push(
             &task,
             "verifier",
-            TaskEventKind::Landed { upstream_head: sha('f'), observed_patch_id: sha('b') },
+            TaskEventKind::Landed {
+                upstream_head: sha('f'),
+                observed_patch_id: sha('b'),
+            },
         );
         let m = log.reduce().unwrap();
         let rev = m.tasks[&task].current_revision().unwrap().clone();
@@ -872,11 +901,19 @@ mod tests {
         let task = log.open(AUTHOR);
         propose(&mut log, &task, 1);
         pass(&mut log, &task, REVIEWER);
-        log.push(&task, "verifier", TaskEventKind::SourceUnavailable { detail: "worktree gone".into() });
         log.push(
             &task,
             "verifier",
-            TaskEventKind::MergeFailed { reason: MergeFailure::NonFastForward {} },
+            TaskEventKind::SourceUnavailable {
+                detail: "worktree gone".into(),
+            },
+        );
+        log.push(
+            &task,
+            "verifier",
+            TaskEventKind::MergeFailed {
+                reason: MergeFailure::NonFastForward {},
+            },
         );
         let m = log.reduce().unwrap();
         let rev = m.tasks[&task].current_revision().unwrap();
@@ -894,7 +931,11 @@ mod tests {
         log.push(
             &task,
             REVIEWER,
-            TaskEventKind::ReviewRefuted { reviewer: REVIEWER.into(), session_ref: None, receipts: None },
+            TaskEventKind::ReviewRefuted {
+                reviewer: REVIEWER.into(),
+                session_ref: None,
+                receipts: None,
+            },
         );
         let m = log.reduce().unwrap();
         assert_eq!(m.tasks[&task].current_revision().unwrap().state, RevisionState::Refuted);
@@ -916,7 +957,10 @@ mod tests {
         log.push(
             &task,
             REVIEWER,
-            TaskEventKind::ReviewRerouted { from: REVIEWER.into(), to: OTHER.into() },
+            TaskEventKind::ReviewRerouted {
+                from: REVIEWER.into(),
+                to: OTHER.into(),
+            },
         );
 
         // Old reviewer's verdict no longer applies.
@@ -940,15 +984,30 @@ mod tests {
         let task = log.open(AUTHOR);
         propose(&mut log, &task, 1);
         pass(&mut log, &task, REVIEWER);
-        log.push(&task, AUTHOR, TaskEventKind::Superseded { by_task: "other-task".into() });
+        log.push(
+            &task,
+            AUTHOR,
+            TaskEventKind::Superseded {
+                by_task: "other-task".into(),
+            },
+        );
         let m = log.reduce().unwrap();
         let t = &m.tasks[&task];
         assert_eq!(t.state, TaskState::Superseded);
         assert!(t.state.is_terminal());
 
         // Nothing further applies to a superseded task.
-        log.push(&task, AUTHOR, TaskEventKind::Claimed { assignee: AUTHOR.into() });
-        assert!(matches!(log.reduce().unwrap_err(), ReduceError::InvalidTransition { .. }));
+        log.push(
+            &task,
+            AUTHOR,
+            TaskEventKind::Claimed {
+                assignee: AUTHOR.into(),
+            },
+        );
+        assert!(matches!(
+            log.reduce().unwrap_err(),
+            ReduceError::InvalidTransition { .. }
+        ));
     }
 
     #[test]
@@ -960,9 +1019,18 @@ mod tests {
         log.push(
             &task,
             "verifier",
-            TaskEventKind::MergedLocal { from_sha: sha('e'), to_sha: sha('1') },
+            TaskEventKind::MergedLocal {
+                from_sha: sha('e'),
+                to_sha: sha('1'),
+            },
         );
-        log.push(&task, "verifier", TaskEventKind::ReconcileFailed { detail: "torn log tail".into() });
+        log.push(
+            &task,
+            "verifier",
+            TaskEventKind::ReconcileFailed {
+                detail: "torn log tail".into(),
+            },
+        );
         let m = log.reduce().unwrap();
         let rev = m.tasks[&task].current_revision().unwrap();
         assert_eq!(rev.state, RevisionState::MergedLocal);
@@ -972,15 +1040,27 @@ mod tests {
         log.push(
             &task,
             "verifier",
-            TaskEventKind::MergedLocal { from_sha: sha('e'), to_sha: sha('1') },
+            TaskEventKind::MergedLocal {
+                from_sha: sha('e'),
+                to_sha: sha('1'),
+            },
         );
-        assert!(matches!(log.reduce().unwrap_err(), ReduceError::InvalidTransition { .. }));
+        assert!(matches!(
+            log.reduce().unwrap_err(),
+            ReduceError::InvalidTransition { .. }
+        ));
     }
 
     #[test]
     fn unknown_request_and_wrong_open_id_fail_closed() {
         let mut log = Log::new();
-        log.push("no-such-task", AUTHOR, TaskEventKind::Claimed { assignee: AUTHOR.into() });
+        log.push(
+            "no-such-task",
+            AUTHOR,
+            TaskEventKind::Claimed {
+                assignee: AUTHOR.into(),
+            },
+        );
         assert!(matches!(log.reduce().unwrap_err(), ReduceError::UnknownTask { .. }));
         log.events.clear();
 
@@ -1009,7 +1089,13 @@ mod tests {
     fn exact_duplicate_is_idempotent_but_id_reuse_is_loud() {
         let mut log = Log::new();
         let task = log.open(AUTHOR);
-        let claim = log.push(&task, AUTHOR, TaskEventKind::Claimed { assignee: AUTHOR.into() });
+        let claim = log.push(
+            &task,
+            AUTHOR,
+            TaskEventKind::Claimed {
+                assignee: AUTHOR.into(),
+            },
+        );
 
         // Byte-identical re-append: no-op.
         let mut reducer = TaskReducer::new();
@@ -1039,16 +1125,25 @@ mod tests {
         log.push(
             &task,
             "verifier",
-            TaskEventKind::MergedLocal { from_sha: sha('e'), to_sha: sha('9') },
+            TaskEventKind::MergedLocal {
+                from_sha: sha('e'),
+                to_sha: sha('9'),
+            },
         );
-        assert!(matches!(log.reduce().unwrap_err(), ReduceError::MergeTargetMismatch { .. }));
+        assert!(matches!(
+            log.reduce().unwrap_err(),
+            ReduceError::MergeTargetMismatch { .. }
+        ));
         log.events.pop();
 
         // Landed whose patch-id is not the reviewed revision's: refused.
         log.push(
             &task,
             "verifier",
-            TaskEventKind::Landed { upstream_head: sha('f'), observed_patch_id: sha('9') },
+            TaskEventKind::Landed {
+                upstream_head: sha('f'),
+                observed_patch_id: sha('9'),
+            },
         );
         assert!(matches!(log.reduce().unwrap_err(), ReduceError::PatchIdMismatch { .. }));
     }
@@ -1060,8 +1155,21 @@ mod tests {
         let mut log = Log::new();
         let task = log.open(AUTHOR);
         log.push(&task, OTHER, TaskEventKind::Claimed { assignee: OTHER.into() });
-        log.push(&task, OTHER, TaskEventKind::Noted { text: "halfway".into(), session_ref: None });
-        log.push(&task, OTHER, TaskEventKind::Done { observed: Some("screenshot.png".into()) });
+        log.push(
+            &task,
+            OTHER,
+            TaskEventKind::Noted {
+                text: "halfway".into(),
+                session_ref: None,
+            },
+        );
+        log.push(
+            &task,
+            OTHER,
+            TaskEventKind::Done {
+                observed: Some("screenshot.png".into()),
+            },
+        );
         let m = log.reduce().unwrap();
         let t = &m.tasks[&task];
         assert_eq!(t.state, TaskState::Done);
@@ -1072,24 +1180,48 @@ mod tests {
 
         // Claim races: a second Claimed on a claimed task is refused (CAS at the store makes
         // this "first writer wins").
-        log.push(&task, AUTHOR, TaskEventKind::Claimed { assignee: AUTHOR.into() });
-        assert!(matches!(log.reduce().unwrap_err(), ReduceError::InvalidTransition { .. }));
+        log.push(
+            &task,
+            AUTHOR,
+            TaskEventKind::Claimed {
+                assignee: AUTHOR.into(),
+            },
+        );
+        assert!(matches!(
+            log.reduce().unwrap_err(),
+            ReduceError::InvalidTransition { .. }
+        ));
     }
 
     #[test]
     fn done_is_blocked_while_a_revision_is_live() {
         let mut log = Log::new();
         let task = log.open(AUTHOR);
-        log.push(&task, AUTHOR, TaskEventKind::Claimed { assignee: AUTHOR.into() });
+        log.push(
+            &task,
+            AUTHOR,
+            TaskEventKind::Claimed {
+                assignee: AUTHOR.into(),
+            },
+        );
         propose(&mut log, &task, 1);
         pass(&mut log, &task, REVIEWER);
 
         log.push(&task, AUTHOR, TaskEventKind::Done { observed: None });
-        assert!(matches!(log.reduce().unwrap_err(), ReduceError::DoneWithLiveRevision { .. }));
+        assert!(matches!(
+            log.reduce().unwrap_err(),
+            ReduceError::DoneWithLiveRevision { .. }
+        ));
         log.events.pop();
 
         // But you can always kill it.
-        log.push(&task, AUTHOR, TaskEventKind::Abandoned { reason: "wrong approach".into() });
+        log.push(
+            &task,
+            AUTHOR,
+            TaskEventKind::Abandoned {
+                reason: "wrong approach".into(),
+            },
+        );
         assert_eq!(log.reduce().unwrap().tasks[&task].state, TaskState::Abandoned);
         log.events.pop();
 
@@ -1097,7 +1229,10 @@ mod tests {
         log.push(
             &task,
             "verifier",
-            TaskEventKind::Landed { upstream_head: sha('f'), observed_patch_id: sha('b') },
+            TaskEventKind::Landed {
+                upstream_head: sha('f'),
+                observed_patch_id: sha('b'),
+            },
         );
         log.push(&task, AUTHOR, TaskEventKind::Done { observed: None });
         let m = log.reduce().unwrap();
@@ -1112,7 +1247,11 @@ mod tests {
         log.push(
             &task,
             REVIEWER,
-            TaskEventKind::ReviewRefuted { reviewer: REVIEWER.into(), session_ref: None, receipts: None },
+            TaskEventKind::ReviewRefuted {
+                reviewer: REVIEWER.into(),
+                session_ref: None,
+                receipts: None,
+            },
         );
         propose(&mut log, &task, 2);
         pass(&mut log, &task, REVIEWER);
@@ -1142,7 +1281,10 @@ mod tests {
         log.push(
             &task,
             "verifier",
-            TaskEventKind::Landed { upstream_head: sha('f'), observed_patch_id: sha('b') },
+            TaskEventKind::Landed {
+                upstream_head: sha('f'),
+                observed_patch_id: sha('b'),
+            },
         );
         let m = log.reduce().unwrap();
         let rev = m.tasks[&task].current_revision().unwrap();

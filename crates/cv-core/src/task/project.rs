@@ -42,10 +42,7 @@ pub const STATE_VOCABULARY: [&str; 10] = [
 /// An unknown `state` string is an error naming the whole vocabulary, never a silent empty
 /// result — a typo'd `--state redy` used to look exactly like "no matching tasks" on every
 /// surface (CLI, MCP, HTTP), which all inherit this rejection.
-pub fn list<'m>(
-    model: &'m TaskReadModel,
-    filter: &TaskFilter,
-) -> Result<Vec<&'m TaskProjection>, String> {
+pub fn list<'m>(model: &'m TaskReadModel, filter: &TaskFilter) -> Result<Vec<&'m TaskProjection>, String> {
     if let Some(state) = &filter.state {
         if !STATE_VOCABULARY.contains(&state.as_str()) {
             return Err(format!(
@@ -113,14 +110,11 @@ pub fn inbox<'m>(model: &'m TaskReadModel, endpoint: &str) -> Vec<InboxEntry<'m>
         }
         let reason_since = if let Some(rev) = task.current_revision() {
             match rev.state {
-                RevisionState::AwaitingReview
-                    if rev.active_reviewer.as_deref() == Some(endpoint) =>
-                {
+                RevisionState::AwaitingReview if rev.active_reviewer.as_deref() == Some(endpoint) => {
                     Some((InboxReason::AwaitingYourReview, rev.proposed_at))
                 }
                 RevisionState::Ready | RevisionState::MergedLocal
-                    if task.assignee.as_deref() == Some(endpoint)
-                        || task.opened_by == endpoint =>
+                    if task.assignee.as_deref() == Some(endpoint) || task.opened_by == endpoint =>
                 {
                     let since = rev.pass.as_ref().map(|p| p.ts).unwrap_or(task.last_ts);
                     Some((InboxReason::YourUnlandedWork, since))
@@ -138,10 +132,7 @@ pub fn inbox<'m>(model: &'m TaskReadModel, endpoint: &str) -> Vec<InboxEntry<'m>
     entries
 }
 
-fn base_inbox_reason(
-    task: &TaskProjection,
-    endpoint: &str,
-) -> Option<(InboxReason, DateTime<Utc>)> {
+fn base_inbox_reason(task: &TaskProjection, endpoint: &str) -> Option<(InboxReason, DateTime<Utc>)> {
     match task.state {
         TaskState::Open if task.assignee.as_deref() == Some(endpoint) => {
             Some((InboxReason::AssignedOpen, task.last_ts))
@@ -259,8 +250,7 @@ pub fn branch_carriers<'m>(
         .filter(|t| t.repo.as_deref() == Some(repo))
         .filter(|t| {
             t.current_revision().is_some_and(|r| {
-                r.revision.branch == branch
-                    || (worktree.is_some() && r.revision.worktree.as_deref() == worktree)
+                r.revision.branch == branch || (worktree.is_some() && r.revision.worktree.as_deref() == worktree)
             })
         })
         .collect()
@@ -334,7 +324,10 @@ mod tests {
 
     impl Log {
         fn new() -> Self {
-            Log { events: Vec::new(), n: 0 }
+            Log {
+                events: Vec::new(),
+                n: 0,
+            }
         }
         fn next_id(&mut self) -> String {
             self.n += 1;
@@ -414,7 +407,13 @@ mod tests {
         log.push(&done, "a", TaskEventKind::Claimed { assignee: "a".into() });
         log.push(&done, "a", TaskEventKind::Done { observed: None });
         let ready = log.open("h", Some("/tmp/repo"), None);
-        log.push(&ready, "agent:author", TaskEventKind::Claimed { assignee: "agent:author".into() });
+        log.push(
+            &ready,
+            "agent:author",
+            TaskEventKind::Claimed {
+                assignee: "agent:author".into(),
+            },
+        );
         propose_and_pass(&mut log, &ready);
 
         let model = log.model();
@@ -424,7 +423,10 @@ mod tests {
 
         let ready_only = list(
             &model,
-            &TaskFilter { state: Some("ready".into()), ..Default::default() },
+            &TaskFilter {
+                state: Some("ready".into()),
+                ..Default::default()
+            },
         )
         .unwrap();
         assert_eq!(ready_only.len(), 1);
@@ -432,7 +434,10 @@ mod tests {
 
         let done_only = list(
             &model,
-            &TaskFilter { state: Some("done".into()), ..Default::default() },
+            &TaskFilter {
+                state: Some("done".into()),
+                ..Default::default()
+            },
         )
         .unwrap();
         assert_eq!(done_only.len(), 1);
@@ -444,9 +449,21 @@ mod tests {
         let mut log = Log::new();
         let assigned = log.open("human", None, Some("agent:a"));
         let claimed = log.open("human", None, None);
-        log.push(&claimed, "agent:a", TaskEventKind::Claimed { assignee: "agent:a".into() });
+        log.push(
+            &claimed,
+            "agent:a",
+            TaskEventKind::Claimed {
+                assignee: "agent:a".into(),
+            },
+        );
         let review = log.open("human", Some("/tmp/r"), None);
-        log.push(&review, "agent:a", TaskEventKind::Claimed { assignee: "agent:a".into() });
+        log.push(
+            &review,
+            "agent:a",
+            TaskEventKind::Claimed {
+                assignee: "agent:a".into(),
+            },
+        );
         log.push(
             &review,
             "agent:a",
@@ -465,16 +482,19 @@ mod tests {
             },
         );
         let unlanded = log.open("human", Some("/tmp/r"), None);
-        log.push(&unlanded, "agent:a", TaskEventKind::Claimed { assignee: "agent:a".into() });
+        log.push(
+            &unlanded,
+            "agent:a",
+            TaskEventKind::Claimed {
+                assignee: "agent:a".into(),
+            },
+        );
         propose_and_pass(&mut log, &unlanded);
 
         let model = log.model();
 
         let a: Vec<_> = inbox(&model, "agent:a");
-        let reasons: Vec<(String, InboxReason)> = a
-            .iter()
-            .map(|e| (e.task.task_id.clone(), e.reason))
-            .collect();
+        let reasons: Vec<(String, InboxReason)> = a.iter().map(|e| (e.task.task_id.clone(), e.reason)).collect();
         assert!(reasons.contains(&(assigned.clone(), InboxReason::AssignedOpen)));
         assert!(reasons.contains(&(claimed.clone(), InboxReason::ClaimedByYou)));
         assert!(reasons.contains(&(unlanded.clone(), InboxReason::YourUnlandedWork)));
@@ -495,7 +515,10 @@ mod tests {
         log.push(
             &landed,
             "verifier",
-            TaskEventKind::Landed { upstream_head: sha('f'), observed_patch_id: sha('b') },
+            TaskEventKind::Landed {
+                upstream_head: sha('f'),
+                observed_patch_id: sha('b'),
+            },
         );
         let owed = log.open("h", Some("/tmp/r1"), None);
         propose_and_pass(&mut log, &owed);
@@ -504,7 +527,10 @@ mod tests {
         log.push(
             &owed2,
             "verifier",
-            TaskEventKind::MergedLocal { from_sha: sha('e'), to_sha: sha('1') },
+            TaskEventKind::MergedLocal {
+                from_sha: sha('e'),
+                to_sha: sha('1'),
+            },
         );
 
         let model = log.model();
@@ -556,14 +582,18 @@ mod tests {
             &old,
             "agent:author",
             "2026-07-13T12:00:00Z",
-            TaskEventKind::RevisionProposed { revision: revision(1, Some("agent:reviewer")) },
+            TaskEventKind::RevisionProposed {
+                revision: revision(1, Some("agent:reviewer")),
+            },
         );
         let newer = log.open("h", Some("/tmp/r"), None);
         log.push_at(
             &newer,
             "agent:author",
             "2026-07-16T09:00:00Z",
-            TaskEventKind::RevisionProposed { revision: revision(1, None) },
+            TaskEventKind::RevisionProposed {
+                revision: revision(1, None),
+            },
         );
 
         let model = log.model();
@@ -591,7 +621,11 @@ mod tests {
         log.push(
             &newer,
             "agent:b",
-            TaskEventKind::ReviewRefuted { reviewer: "agent:b".into(), session_ref: None, receipts: None },
+            TaskEventKind::ReviewRefuted {
+                reviewer: "agent:b".into(),
+                session_ref: None,
+                receipts: None,
+            },
         );
         let model = log.model();
         assert!(awaiting_review(&model).is_empty());
@@ -605,14 +639,18 @@ mod tests {
             &t,
             "agent:author",
             "2026-07-10T00:00:00Z",
-            TaskEventKind::RevisionProposed { revision: revision(1, Some("agent:reviewer")) },
+            TaskEventKind::RevisionProposed {
+                revision: revision(1, Some("agent:reviewer")),
+            },
         );
         // Re-propose: rev1 is auto-superseded, only rev2 should age.
         log.push_at(
             &t,
             "agent:author",
             "2026-07-15T00:00:00Z",
-            TaskEventKind::RevisionProposed { revision: revision(2, Some("agent:reviewer")) },
+            TaskEventKind::RevisionProposed {
+                revision: revision(2, Some("agent:reviewer")),
+            },
         );
         let model = log.model();
         let rows = awaiting_review(&model);
@@ -626,12 +664,20 @@ mod tests {
         let mut log = Log::new();
         // Reviewed-unlanded work: `since` must be the PASS time, not the propose time.
         let unlanded = log.open("h", Some("/tmp/r"), None);
-        log.push(&unlanded, "agent:a", TaskEventKind::Claimed { assignee: "agent:a".into() });
+        log.push(
+            &unlanded,
+            "agent:a",
+            TaskEventKind::Claimed {
+                assignee: "agent:a".into(),
+            },
+        );
         log.push_at(
             &unlanded,
             "agent:a",
             "2026-07-14T00:00:00Z",
-            TaskEventKind::RevisionProposed { revision: revision(1, Some("agent:r")) },
+            TaskEventKind::RevisionProposed {
+                revision: revision(1, Some("agent:r")),
+            },
         );
         log.push_at(
             &unlanded,
@@ -650,7 +696,9 @@ mod tests {
             &review,
             "agent:b",
             "2026-07-12T00:00:00Z",
-            TaskEventKind::RevisionProposed { revision: revision(1, Some("agent:a")) },
+            TaskEventKind::RevisionProposed {
+                revision: revision(1, Some("agent:a")),
+            },
         );
 
         let model = log.model();
@@ -686,7 +734,9 @@ mod tests {
             log.push(
                 task,
                 "agent:author",
-                TaskEventKind::RevisionProposed { revision: rev_on(branch, wt) },
+                TaskEventKind::RevisionProposed {
+                    revision: rev_on(branch, wt),
+                },
             );
         };
 
@@ -711,7 +761,10 @@ mod tests {
 
         let by_worktree = branch_carriers(&model, &repo, "task/z", Some(Path::new("/wt/x")));
         let ids: Vec<&str> = by_worktree.iter().map(|t| t.task_id.as_str()).collect();
-        assert!(ids.contains(&carrier.as_str()) && ids.contains(&wt_clash.as_str()), "{ids:?}");
+        assert!(
+            ids.contains(&carrier.as_str()) && ids.contains(&wt_clash.as_str()),
+            "{ids:?}"
+        );
 
         // The warning builder excludes the proposing task itself and names the carrier.
         let proposing = log.open("h", Some("/tmp/r"), None);

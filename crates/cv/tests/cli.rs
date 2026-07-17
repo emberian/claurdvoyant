@@ -357,7 +357,10 @@ fn search_json_emits_machine_readable_hits() {
     // Provenance keys ride on indexed hits too (null: the fixture has no sub-agent lanes).
     let obj = rows[0].as_object().unwrap();
     for key in ["agentId", "parentId", "workflow"] {
-        assert!(obj.contains_key(key) && obj[key].is_null(), "{key} present+null:\n{out}");
+        assert!(
+            obj.contains_key(key) && obj[key].is_null(),
+            "{key} present+null:\n{out}"
+        );
     }
     assert!(
         rows[0]["updatedAt"].as_str().unwrap().starts_with("2026-06-01"),
@@ -835,7 +838,10 @@ fn task_identity_resolution_order() {
     );
     assert!(ok);
     let (json, _) = w.cv_ok(&["task", "show", &id, "--json", "--events"]);
-    assert!(json.contains(r#""by": "agent:explicit""#), "explicit --from wins:\n{json}");
+    assert!(
+        json.contains(r#""by": "agent:explicit""#),
+        "explicit --from wins:\n{json}"
+    );
 
     // Whitespace-only CV_ENDPOINT is no identity.
     let (ok, _, _, err) = w.cv_env(&["task", "claim", &id], &[("CV_ENDPOINT", "   ")]);
@@ -890,7 +896,11 @@ fn task_propose_warns_on_branch_collision() {
             .args(args)
             .output()
             .unwrap();
-        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
     };
     git(&["init", "-q", "-b", "main"]);
     git(&["config", "user.email", "t@example.com"]);
@@ -948,7 +958,11 @@ fn task_receipts_and_stats_end_to_end() {
             .args(args)
             .output()
             .unwrap();
-        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
     };
     git(&["init", "-q", "-b", "main"]);
     git(&["config", "user.email", "t@example.com"]);
@@ -986,12 +1000,28 @@ fn task_receipts_and_stats_end_to_end() {
     let (ok, ..) = w.cv_env(&["task", "claim", &t1], &[("CV_ENDPOINT", "agent:author")]);
     assert!(ok);
     let (ok, _, _, err) = w.cv_env(
-        &["task", "propose", &t1, "--branch", "task/receipts", "--upstream", "main"],
+        &[
+            "task",
+            "propose",
+            &t1,
+            "--branch",
+            "task/receipts",
+            "--upstream",
+            "main",
+        ],
         &[("CV_ENDPOINT", "agent:author")],
     );
     assert!(ok, "{err}");
     let (ok, code, out, err) = w.cv_env(
-        &["task", "pass", &t1, "--session", "reviewsess", "--from", "agent:reviewer"],
+        &[
+            "task",
+            "pass",
+            &t1,
+            "--session",
+            "reviewsess",
+            "--from",
+            "agent:reviewer",
+        ],
         &[],
     );
     assert!(ok, "pass with session exited {code}\n{out}\n{err}");
@@ -1013,7 +1043,15 @@ fn task_receipts_and_stats_end_to_end() {
     let (ok, ..) = w.cv_env(&["task", "claim", &t2], &[("CV_ENDPOINT", "agent:author")]);
     assert!(ok);
     let (ok, _, _, err) = w.cv_env(
-        &["task", "propose", &t2, "--branch", "task/receipts", "--upstream", "main"],
+        &[
+            "task",
+            "propose",
+            &t2,
+            "--branch",
+            "task/receipts",
+            "--upstream",
+            "main",
+        ],
         &[("CV_ENDPOINT", "agent:author")],
     );
     assert!(ok, "{err}");
@@ -1024,15 +1062,27 @@ fn task_receipts_and_stats_end_to_end() {
         "missing receipts warning:\n{err}"
     );
     let (out, _) = w.cv_ok(&["task", "show", &t2]);
-    assert!(!out.contains("receipts (pass)"), "no receipts recorded → no line:\n{out}");
+    assert!(
+        !out.contains("receipts (pass)"),
+        "no receipts recorded → no line:\n{out}"
+    );
 
     // Fleet stats: both endpoints appear with honest counts and the trust footer.
     let (out, err) = w.cv_ok(&["task", "stats"]);
     assert!(out.contains("agent:author"), "{out}");
     assert!(out.contains("agent:reviewer"), "{out}");
-    assert!(out.contains("computed from observed events only; landed = git-verified"), "{out}");
-    assert!(out.contains("verified: NEVER"), "no verify pass ran in this world:\n{out}");
-    assert!(err.contains("NEVER been verified"), "freshness warning on stderr:\n{err}");
+    assert!(
+        out.contains("computed from observed events only; landed = git-verified"),
+        "{out}"
+    );
+    assert!(
+        out.contains("verified: NEVER"),
+        "no verify pass ran in this world:\n{out}"
+    );
+    assert!(
+        err.contains("NEVER been verified"),
+        "freshness warning on stderr:\n{err}"
+    );
     // The reviewer row counts the session-less pass as a no-receipts pass (rubber-stamp signal).
     let reviewer_row = out.lines().find(|l| l.contains("agent:reviewer")).unwrap();
     assert!(reviewer_row.contains("2/0"), "two passes, zero refutes: {reviewer_row}");

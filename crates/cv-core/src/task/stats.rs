@@ -127,11 +127,7 @@ impl FleetStats {
     /// Compute the fleet stats from a replayed model; `repo` restricts to tasks recorded against
     /// that repo path. Pass the heartbeat read from the tasks dir (or `None`, which is itself
     /// loud: the warning names the never-verified state).
-    pub fn compute(
-        model: &TaskReadModel,
-        heartbeat: Option<&VerifyHeartbeat>,
-        repo: Option<&Path>,
-    ) -> FleetStats {
+    pub fn compute(model: &TaskReadModel, heartbeat: Option<&VerifyHeartbeat>, repo: Option<&Path>) -> FleetStats {
         let mut endpoints: BTreeMap<String, EndpointAcc> = BTreeMap::new();
         let mut reviewers: BTreeMap<String, ReviewerAcc> = BTreeMap::new();
         let mut families: BTreeMap<String, FamilyAcc> = BTreeMap::new();
@@ -210,14 +206,14 @@ impl FleetStats {
 }
 
 /// Fold one revision into its author's endpoint accumulator.
-fn fold_revision(
-    task: &TaskProjection,
-    rev: &RevisionProjection,
-    endpoints: &mut BTreeMap<String, EndpointAcc>,
-) {
+fn fold_revision(task: &TaskProjection, rev: &RevisionProjection, endpoints: &mut BTreeMap<String, EndpointAcc>) {
     // `proposed_by` is always stamped by the reducer; "(unknown)" only appears for models
     // deserialized from a pre-field snapshot, never for a fresh replay.
-    let author = if rev.proposed_by.is_empty() { "(unknown)" } else { &rev.proposed_by };
+    let author = if rev.proposed_by.is_empty() {
+        "(unknown)"
+    } else {
+        &rev.proposed_by
+    };
     let acc = endpoints.entry(author.to_string()).or_default();
     acc.proposed += 1;
     match rev.state {
@@ -299,9 +295,7 @@ fn median(mut sample: Vec<i64>) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::task::model::{
-        IndependenceCheck, ReviewReceipts, Revision, TaskEvent, TaskEventKind,
-    };
+    use crate::task::model::{IndependenceCheck, ReviewReceipts, Revision, TaskEvent, TaskEventKind};
     use crate::task::reduce::TaskReducer;
     use std::path::PathBuf;
 
@@ -316,7 +310,10 @@ mod tests {
 
     impl Log {
         fn new() -> Self {
-            Log { events: Vec::new(), n: 0 }
+            Log {
+                events: Vec::new(),
+                n: 0,
+            }
         }
         fn next_id(&mut self) -> String {
             self.n += 1;
@@ -369,11 +366,7 @@ mod tests {
         }
     }
 
-    fn pass_kind(
-        reviewer: &str,
-        independent: Option<bool>,
-        receipts: Option<ReviewReceipts>,
-    ) -> TaskEventKind {
+    fn pass_kind(reviewer: &str, independent: Option<bool>, receipts: Option<ReviewReceipts>) -> TaskEventKind {
         TaskEventKind::ReviewPassed {
             reviewer: reviewer.into(),
             session_ref: None,
@@ -399,17 +392,43 @@ mod tests {
 
         // Task 1 (agent:a): propose 00:00 → pass (no receipts) 01:00 → landed 02:00.
         let t1 = log.open("h", "/tmp/r1");
-        log.push_at(&t1, "agent:a", "2026-07-01T00:00:00Z", TaskEventKind::Claimed { assignee: "agent:a".into() });
-        log.push_at(&t1, "agent:a", "2026-07-02T00:00:00Z", TaskEventKind::RevisionProposed { revision: revision(1, "agent:r") });
+        log.push_at(
+            &t1,
+            "agent:a",
+            "2026-07-01T00:00:00Z",
+            TaskEventKind::Claimed {
+                assignee: "agent:a".into(),
+            },
+        );
+        log.push_at(
+            &t1,
+            "agent:a",
+            "2026-07-02T00:00:00Z",
+            TaskEventKind::RevisionProposed {
+                revision: revision(1, "agent:r"),
+            },
+        );
         log.push_at(&t1, "agent:r", "2026-07-02T01:00:00Z", pass_kind("agent:r", None, None));
-        log.push_at(&t1, "cv-verify", "2026-07-02T02:00:00Z", TaskEventKind::Landed {
-            upstream_head: sha('f'),
-            observed_patch_id: sha('b'),
-        });
+        log.push_at(
+            &t1,
+            "cv-verify",
+            "2026-07-02T02:00:00Z",
+            TaskEventKind::Landed {
+                upstream_head: sha('f'),
+                observed_patch_id: sha('b'),
+            },
+        );
 
         // Task 2 (agent:a): propose 00:00 → same-family pass with contact 03:00 → landed 06:00.
         let t2 = log.open("h", "/tmp/r1");
-        log.push_at(&t2, "agent:a", "2026-07-03T00:00:00Z", TaskEventKind::RevisionProposed { revision: revision(1, "agent:r") });
+        log.push_at(
+            &t2,
+            "agent:a",
+            "2026-07-03T00:00:00Z",
+            TaskEventKind::RevisionProposed {
+                revision: revision(1, "agent:r"),
+            },
+        );
         log.push_at(
             &t2,
             "agent:r",
@@ -417,30 +436,65 @@ mod tests {
             pass_kind(
                 "agent:r",
                 Some(false),
-                Some(ReviewReceipts { saw_change: Some(true), ran_checks: Some(true), turns: Some(9) }),
+                Some(ReviewReceipts {
+                    saw_change: Some(true),
+                    ran_checks: Some(true),
+                    turns: Some(9),
+                }),
             ),
         );
-        log.push_at(&t2, "cv-verify", "2026-07-03T06:00:00Z", TaskEventKind::Landed {
-            upstream_head: sha('f'),
-            observed_patch_id: sha('b'),
-        });
+        log.push_at(
+            &t2,
+            "cv-verify",
+            "2026-07-03T06:00:00Z",
+            TaskEventKind::Landed {
+                upstream_head: sha('f'),
+                observed_patch_id: sha('b'),
+            },
+        );
 
         // Task 3 (agent:a): live revision, still awaiting review — unlanded.
         let t3 = log.open("h", "/tmp/r2");
-        log.push_at(&t3, "agent:a", "2026-07-04T00:00:00Z", TaskEventKind::RevisionProposed { revision: revision(1, "agent:r") });
+        log.push_at(
+            &t3,
+            "agent:a",
+            "2026-07-04T00:00:00Z",
+            TaskEventKind::RevisionProposed {
+                revision: revision(1, "agent:r"),
+            },
+        );
 
         // Task 4 (agent:b): refuted 30m after propose.
         let t4 = log.open("h", "/tmp/r1");
-        log.push_at(&t4, "agent:b", "2026-07-05T00:00:00Z", TaskEventKind::RevisionProposed { revision: revision(1, "agent:r") });
-        log.push_at(&t4, "agent:r", "2026-07-05T00:30:00Z", TaskEventKind::ReviewRefuted {
-            reviewer: "agent:r".into(),
-            session_ref: None,
-            receipts: None,
-        });
+        log.push_at(
+            &t4,
+            "agent:b",
+            "2026-07-05T00:00:00Z",
+            TaskEventKind::RevisionProposed {
+                revision: revision(1, "agent:r"),
+            },
+        );
+        log.push_at(
+            &t4,
+            "agent:r",
+            "2026-07-05T00:30:00Z",
+            TaskEventKind::ReviewRefuted {
+                reviewer: "agent:r".into(),
+                session_ref: None,
+                receipts: None,
+            },
+        );
 
         // Task 5 (agent:b): no-contact pass, then the task is abandoned with the revision live.
         let t5 = log.open("h", "/tmp/r1");
-        log.push_at(&t5, "agent:b", "2026-07-06T00:00:00Z", TaskEventKind::RevisionProposed { revision: revision(1, "agent:r") });
+        log.push_at(
+            &t5,
+            "agent:b",
+            "2026-07-06T00:00:00Z",
+            TaskEventKind::RevisionProposed {
+                revision: revision(1, "agent:r"),
+            },
+        );
         log.push_at(
             &t5,
             "agent:r",
@@ -448,14 +502,32 @@ mod tests {
             pass_kind(
                 "agent:r",
                 Some(true),
-                Some(ReviewReceipts { saw_change: Some(false), ran_checks: Some(false), turns: Some(1) }),
+                Some(ReviewReceipts {
+                    saw_change: Some(false),
+                    ran_checks: Some(false),
+                    turns: Some(1),
+                }),
             ),
         );
-        log.push_at(&t5, "h", "2026-07-07T00:00:00Z", TaskEventKind::Abandoned { reason: "path abandoned".into() });
+        log.push_at(
+            &t5,
+            "h",
+            "2026-07-07T00:00:00Z",
+            TaskEventKind::Abandoned {
+                reason: "path abandoned".into(),
+            },
+        );
 
         // Task 6 (agent:c): claimed, nothing proposed.
         let t6 = log.open("h", "/tmp/r2");
-        log.push_at(&t6, "agent:c", "2026-07-08T00:00:00Z", TaskEventKind::Claimed { assignee: "agent:c".into() });
+        log.push_at(
+            &t6,
+            "agent:c",
+            "2026-07-08T00:00:00Z",
+            TaskEventKind::Claimed {
+                assignee: "agent:c".into(),
+            },
+        );
 
         log.model()
     }
@@ -482,7 +554,11 @@ mod tests {
         assert_eq!((b.proposed, b.landed, b.refuted), (2, 0, 1));
         assert_eq!(b.abandoned_live, 1, "task 5's live revision rides an abandoned task");
         assert_eq!(b.unlanded, 0);
-        assert_eq!(b.landed_rate, Some(0.0), "0 landed / 1 terminal outcome — printed as counts");
+        assert_eq!(
+            b.landed_rate,
+            Some(0.0),
+            "0 landed / 1 terminal outcome — printed as counts"
+        );
         assert_eq!(b.median_secs_to_land, None, "no landed revision → no median, never 0");
 
         // Small-n honesty: agent:c has no revision history at all — no rate, no medians.
@@ -512,7 +588,10 @@ mod tests {
         assert_eq!(stats.families.len(), 1, "only passes with a recorded reviewer family");
         let f = &stats.families[0];
         assert_eq!(f.family, "openai");
-        assert_eq!((f.reviews_given, f.cross_family, f.same_family, f.undetermined), (2, 1, 1, 0));
+        assert_eq!(
+            (f.reviews_given, f.cross_family, f.same_family, f.undetermined),
+            (2, 1, 1, 0)
+        );
     }
 
     #[test]
@@ -561,7 +640,12 @@ mod tests {
             keys,
             ["endpoints", "reviewers", "families", "verified_as_of", "verify_warning"]
         );
-        let keys: Vec<&str> = v["endpoints"][0].as_object().unwrap().keys().map(String::as_str).collect();
+        let keys: Vec<&str> = v["endpoints"][0]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
         assert_eq!(
             keys,
             [
@@ -577,7 +661,12 @@ mod tests {
                 "median_secs_to_land",
             ]
         );
-        let keys: Vec<&str> = v["reviewers"][0].as_object().unwrap().keys().map(String::as_str).collect();
+        let keys: Vec<&str> = v["reviewers"][0]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
         assert_eq!(
             keys,
             [
@@ -591,7 +680,15 @@ mod tests {
                 "median_review_latency_secs",
             ]
         );
-        let keys: Vec<&str> = v["families"][0].as_object().unwrap().keys().map(String::as_str).collect();
-        assert_eq!(keys, ["family", "reviews_given", "cross_family", "same_family", "undetermined"]);
+        let keys: Vec<&str> = v["families"][0]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            keys,
+            ["family", "reviews_given", "cross_family", "same_family", "undetermined"]
+        );
     }
 }

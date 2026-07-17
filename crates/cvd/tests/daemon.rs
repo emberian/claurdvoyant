@@ -387,7 +387,10 @@ fn spawn_serve_cfg(w: &World, extra: &[&str], envs: &[(&str, &str)]) -> (u16, Re
         if let Some(status) = reaper.0.try_wait().expect("try_wait cvd serve") {
             panic!("cvd serve died after its banner ({status})");
         }
-        assert!(Instant::now() < deadline, "cvd serve banner printed :{port} but it never accepts");
+        assert!(
+            Instant::now() < deadline,
+            "cvd serve banner printed :{port} but it never accepts"
+        );
         std::thread::sleep(Duration::from_millis(20));
     }
     (port, reaper)
@@ -803,7 +806,9 @@ fn serve_tasks_routes() {
         .append_agent_event(new_event(
             Some(&id),
             "agent:a",
-            TaskEventKind::Claimed { assignee: "agent:a".into() },
+            TaskEventKind::Claimed {
+                assignee: "agent:a".into(),
+            },
         ))
         .expect("seed claim");
     // A code task with a proposed revision (fabricated shas — the event log is the fixture; no

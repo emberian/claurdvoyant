@@ -85,8 +85,7 @@ pub fn content_is_on_upstream(repo: &Path, sha: &str, upstream: &str) -> Result<
     let Some(first) = stdout.lines().next() else {
         bail!("git cherry produced no output for {sha} — cannot verify the land");
     };
-    cherry_line_says_upstream(first)
-        .with_context(|| format!("unparseable git cherry output: {first:?}"))
+    cherry_line_says_upstream(first).with_context(|| format!("unparseable git cherry output: {first:?}"))
 }
 
 /// Range patch-id between two fixed commits: `git diff <base> <sha> | git patch-id --stable`.
@@ -149,8 +148,7 @@ pub fn observe_revision(
     reviewer: Option<String>,
     session_ref: Option<String>,
 ) -> Result<Revision> {
-    git(repo, &["rev-parse", "--git-dir"])
-        .with_context(|| format!("{} is not a git repository", repo.display()))?;
+    git(repo, &["rev-parse", "--git-dir"]).with_context(|| format!("{} is not a git repository", repo.display()))?;
     let tip = git(repo, &["rev-parse", "--verify", &format!("{branch}^{{commit}}")])
         .with_context(|| format!("branch '{branch}' not found in {}", repo.display()))?;
     let review_sha = match sha_override {
@@ -191,13 +189,17 @@ pub fn observe_revision(
 /// events to append (possibly none). Never errors on "git said no" — those become findings; only
 /// infrastructure failure (e.g. cannot spawn git at all) errors.
 pub fn verify_task(task: &TaskProjection, fetch: bool) -> Result<Vec<TaskEventKind>> {
-    let Some(rev) = task.current_revision() else { return Ok(Vec::new()) };
+    let Some(rev) = task.current_revision() else {
+        return Ok(Vec::new());
+    };
     if !matches!(rev.state, RevisionState::Ready | RevisionState::MergedLocal) {
         return Ok(Vec::new());
     }
 
     // Repo reachable at all?
-    let Some(repo) = task.repo.as_deref() else { return Ok(Vec::new()) };
+    let Some(repo) = task.repo.as_deref() else {
+        return Ok(Vec::new());
+    };
     if !repo.is_dir() || git(repo, &["rev-parse", "--git-dir"]).is_err() {
         return Ok(finding(
             task,
@@ -234,15 +236,14 @@ pub fn verify_task(task: &TaskProjection, fetch: bool) -> Result<Vec<TaskEventKi
                 }
             };
             let upstream_head = git(repo, &["rev-parse", &r.upstream])?;
-            return Ok(vec![TaskEventKind::Landed { upstream_head, observed_patch_id }]);
+            return Ok(vec![TaskEventKind::Landed {
+                upstream_head,
+                observed_patch_id,
+            }]);
         }
         Ok(false) => {}
         Err(e) => {
-            return Ok(finding(
-                task,
-                rev.state,
-                merge_or_reconcile(rev.state, e.to_string()),
-            ));
+            return Ok(finding(task, rev.state, merge_or_reconcile(rev.state, e.to_string())));
         }
     }
 
@@ -275,7 +276,9 @@ pub fn verify_task(task: &TaskProjection, fetch: bool) -> Result<Vec<TaskEventKi
             return Ok(finding(
                 task,
                 rev.state,
-                TaskEventKind::MergeFailed { reason: MergeFailure::MissingWorktree {} },
+                TaskEventKind::MergeFailed {
+                    reason: MergeFailure::MissingWorktree {},
+                },
             ));
         }
     }
@@ -284,14 +287,18 @@ pub fn verify_task(task: &TaskProjection, fetch: bool) -> Result<Vec<TaskEventKi
             return Ok(finding(
                 task,
                 rev.state,
-                TaskEventKind::MergeFailed { reason: MergeFailure::MissingBranch {} },
+                TaskEventKind::MergeFailed {
+                    reason: MergeFailure::MissingBranch {},
+                },
             ))
         }
         Ok(tip) if !tip.eq_ignore_ascii_case(&r.review_sha) => {
             return Ok(finding(
                 task,
                 rev.state,
-                TaskEventKind::MergeFailed { reason: MergeFailure::BranchTipChanged {} },
+                TaskEventKind::MergeFailed {
+                    reason: MergeFailure::BranchTipChanged {},
+                },
             ))
         }
         Ok(_) => {}
@@ -302,7 +309,9 @@ pub fn verify_task(task: &TaskProjection, fetch: bool) -> Result<Vec<TaskEventKi
         return Ok(finding(
             task,
             rev.state,
-            TaskEventKind::MergeFailed { reason: MergeFailure::NonFastForward {} },
+            TaskEventKind::MergeFailed {
+                reason: MergeFailure::NonFastForward {},
+            },
         ));
     }
 
@@ -363,8 +372,7 @@ pub fn read_heartbeat(tasks_dir: &Path) -> Option<VerifyHeartbeat> {
 }
 
 fn write_heartbeat(tasks_dir: &Path, hb: &VerifyHeartbeat) -> Result<()> {
-    std::fs::create_dir_all(tasks_dir)
-        .with_context(|| format!("creating tasks dir {}", tasks_dir.display()))?;
+    std::fs::create_dir_all(tasks_dir).with_context(|| format!("creating tasks dir {}", tasks_dir.display()))?;
     let tmp = tasks_dir.join(format!("{HEARTBEAT_FILE}.tmp"));
     std::fs::write(&tmp, serde_json::to_vec_pretty(hb).context("serializing heartbeat")?)
         .with_context(|| format!("writing {}", tmp.display()))?;
@@ -471,8 +479,7 @@ pub fn run_verify(
         };
         for kind in kinds {
             let tag = kind.tag();
-            match store.append_verifier_event(super::store::new_event(Some(&tid), VERIFIER_BY, kind))
-            {
+            match store.append_verifier_event(super::store::new_event(Some(&tid), VERIFIER_BY, kind)) {
                 Ok(ev) => {
                     if !opts.quiet {
                         if let Err(e) = super::notify_board(&ev, &task.channel) {
@@ -522,7 +529,9 @@ fn merge_or_reconcile(state: RevisionState, detail: String) -> TaskEventKind {
     if state == RevisionState::MergedLocal {
         TaskEventKind::ReconcileFailed { detail }
     } else {
-        TaskEventKind::MergeFailed { reason: MergeFailure::GitFailed { detail } }
+        TaskEventKind::MergeFailed {
+            reason: MergeFailure::GitFailed { detail },
+        }
     }
 }
 
@@ -540,7 +549,9 @@ fn finding(task: &TaskProjection, state: RevisionState, kind: TaskEventKind) -> 
         }
         other => other,
     };
-    let Some(rev) = task.current_revision() else { return vec![kind] };
+    let Some(rev) = task.current_revision() else {
+        return vec![kind];
+    };
     let same = |issue: &TaskIssue| match (&kind, issue) {
         (TaskEventKind::SourceUnavailable { detail }, TaskIssue::SourceUnavailable { detail: d, .. }) => detail == d,
         (TaskEventKind::MergeFailed { reason }, TaskIssue::MergeFailed { reason: r, .. }) => reason == r,
@@ -723,7 +734,9 @@ mod tests {
         assert!(
             matches!(
                 events.as_slice(),
-                [TaskEventKind::MergeFailed { reason: MergeFailure::MissingBranch {} }]
+                [TaskEventKind::MergeFailed {
+                    reason: MergeFailure::MissingBranch {}
+                }]
             ),
             "{events:?}"
         );
@@ -743,7 +756,9 @@ mod tests {
         assert!(
             matches!(
                 events.as_slice(),
-                [TaskEventKind::MergeFailed { reason: MergeFailure::BranchTipChanged {} }]
+                [TaskEventKind::MergeFailed {
+                    reason: MergeFailure::BranchTipChanged {}
+                }]
             ),
             "{events:?}"
         );
@@ -763,7 +778,9 @@ mod tests {
         assert!(
             matches!(
                 events.as_slice(),
-                [TaskEventKind::MergeFailed { reason: MergeFailure::NonFastForward {} }]
+                [TaskEventKind::MergeFailed {
+                    reason: MergeFailure::NonFastForward {}
+                }]
             ),
             "{events:?}"
         );
@@ -790,13 +807,17 @@ mod tests {
 
         // Apply the finding, verify again: identical finding is suppressed (anti-spam).
         let t = model.tasks.get_mut(&tid).unwrap();
-        t.revisions.last_mut().unwrap().issues.push(TaskIssue::SourceUnavailable {
-            detail: match &events[0] {
-                TaskEventKind::SourceUnavailable { detail } => detail.clone(),
-                _ => unreachable!(),
-            },
-            event_id: "x".into(),
-        });
+        t.revisions
+            .last_mut()
+            .unwrap()
+            .issues
+            .push(TaskIssue::SourceUnavailable {
+                detail: match &events[0] {
+                    TaskEventKind::SourceUnavailable { detail } => detail.clone(),
+                    _ => unreachable!(),
+                },
+                event_id: "x".into(),
+            });
         let again = verify_task(the_task(&model), false).unwrap();
         assert!(again.is_empty(), "identical finding must not spam the log: {again:?}");
 
@@ -818,7 +839,9 @@ mod tests {
         let t = model.tasks.get_mut(&tid).unwrap();
         for i in 0..5 {
             t.revisions.last_mut().unwrap().issues.push(TaskIssue::MergeFailed {
-                reason: MergeFailure::GitFailed { detail: format!("distinct {i}") },
+                reason: MergeFailure::GitFailed {
+                    detail: format!("distinct {i}"),
+                },
                 event_id: format!("z{i}"),
             });
         }
@@ -906,7 +929,12 @@ mod tests {
         )
         .unwrap();
         apply(
-            TaskEventKind::ReviewPassed { reviewer: "t".into(), session_ref: None, independence: None, receipts: None },
+            TaskEventKind::ReviewPassed {
+                reviewer: "t".into(),
+                session_ref: None,
+                independence: None,
+                receipts: None,
+            },
             &tid,
         )
         .unwrap();
@@ -933,14 +961,12 @@ mod tests {
 
         // A sha override that isn't the tip is refused.
         let base = git(&repo, &["rev-parse", "main"]).unwrap();
-        let err =
-            observe_revision(&repo, "task/x", "main", Some(&base), 2, None, None, None).unwrap_err();
+        let err = observe_revision(&repo, "task/x", "main", Some(&base), 2, None, None, None).unwrap_err();
         assert!(err.to_string().contains("not the tip"), "{err}");
 
         // An empty branch (no commits over upstream) is refused.
         run(&repo, &["checkout", "-q", "-b", "task/empty", "main"]);
-        let err =
-            observe_revision(&repo, "task/empty", "main", None, 1, None, None, None).unwrap_err();
+        let err = observe_revision(&repo, "task/empty", "main", None, 1, None, None, None).unwrap_err();
         assert!(err.to_string().contains("no commits over"), "{err}");
     }
 
@@ -1012,7 +1038,10 @@ mod tests {
     }
 
     fn quiet() -> VerifyOptions {
-        VerifyOptions { quiet: true, ..Default::default() }
+        VerifyOptions {
+            quiet: true,
+            ..Default::default()
+        }
     }
 
     #[test]
@@ -1024,8 +1053,7 @@ mod tests {
         // verifier's Landed observation hits PatchIdMismatch and the append is rejected.
         run(&repo, &["checkout", "-q", "-b", "task/poison"]);
         commit(&repo, "p.txt", "p", "feat p");
-        let mut rev_p =
-            observe_revision(&repo, "task/poison", "main", None, 1, None, None, None).unwrap();
+        let mut rev_p = observe_revision(&repo, "task/poison", "main", None, 1, None, None, None).unwrap();
         rev_p.patch_id = "f".repeat(40);
         let poisoned = open_in(&store, &repo, "poisoned");
         propose_and_pass_in(&store, &poisoned, rev_p);
@@ -1034,8 +1062,7 @@ mod tests {
         run(&repo, &["checkout", "-q", "main"]);
         run(&repo, &["checkout", "-q", "-b", "task/good"]);
         commit(&repo, "g.txt", "g", "feat g");
-        let rev_g =
-            observe_revision(&repo, "task/good", "main", None, 1, None, None, None).unwrap();
+        let rev_g = observe_revision(&repo, "task/good", "main", None, 1, None, None, None).unwrap();
         let good = open_in(&store, &repo, "good");
         propose_and_pass_in(&store, &good, rev_g);
 
@@ -1045,7 +1072,11 @@ mod tests {
         run(&repo, &["merge", "-q", "--no-edit", "task/good"]);
 
         let (appended, warnings) = run_verify(&store, None, &quiet()).unwrap();
-        assert_eq!(appended.len(), 1, "good task still verified: {appended:?}\n{warnings:?}");
+        assert_eq!(
+            appended.len(),
+            1,
+            "good task still verified: {appended:?}\n{warnings:?}"
+        );
         assert_eq!(appended[0].task_id, good);
         assert!(matches!(appended[0].kind, TaskEventKind::Landed { .. }));
         assert!(
@@ -1114,7 +1145,9 @@ mod tests {
         let (appended, warnings) = run_verify(&store, None, &quiet()).unwrap();
         assert!(appended.is_empty(), "{appended:?}");
         assert!(
-            warnings.iter().any(|w| w.contains("possible forged or rolled-back land")),
+            warnings
+                .iter()
+                .any(|w| w.contains("possible forged or rolled-back land")),
             "{warnings:?}"
         );
         let hb = read_heartbeat(store.dir()).unwrap();
@@ -1122,7 +1155,15 @@ mod tests {
         assert_eq!(hb.suspect_landed[0].task_id, task);
 
         // A --skip-landed pass must not launder the suspect away.
-        run_verify(&store, None, &VerifyOptions { skip_landed: true, ..quiet() }).unwrap();
+        run_verify(
+            &store,
+            None,
+            &VerifyOptions {
+                skip_landed: true,
+                ..quiet()
+            },
+        )
+        .unwrap();
         assert_eq!(read_heartbeat(store.dir()).unwrap().suspect_landed.len(), 1);
     }
 

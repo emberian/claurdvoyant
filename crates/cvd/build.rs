@@ -23,11 +23,9 @@ fn main() {
         .ok()
         .filter(|s| !s.trim().is_empty())
         .or_else(|| {
-            git(&["rev-parse", "--short=12", "HEAD"]).map(|short| {
-                match git(&["status", "--porcelain"]) {
-                    Some(st) if !st.is_empty() => format!("{short}-dirty"),
-                    _ => short,
-                }
+            git(&["rev-parse", "--short=12", "HEAD"]).map(|short| match git(&["status", "--porcelain"]) {
+                Some(st) if !st.is_empty() => format!("{short}-dirty"),
+                _ => short,
             })
         })
         .unwrap_or_else(|| "unknown".to_string());

@@ -16,9 +16,9 @@ use chrono::{DateTime, Utc};
 use serde::Serialize;
 
 use super::model::RevisionState;
+use super::project::{self, InboxEntry, InboxReason};
 #[cfg(not(target_family = "wasm"))]
 use super::project::{AwaitingReviewEntry, DebtEntry};
-use super::project::{self, InboxEntry, InboxReason};
 use super::reduce::{TaskProjection, TaskReadModel};
 
 /// One task-list row (`cv task list`, MCP `task_list`, `GET /api/tasks`).
@@ -315,7 +315,16 @@ mod tests {
         let keys: Vec<&str> = full.as_object().unwrap().keys().map(String::as_str).collect();
         assert_eq!(
             keys,
-            ["id", "title", "effective_state", "assignee", "repo", "channel", "opened_at", "last_ts"],
+            [
+                "id",
+                "title",
+                "effective_state",
+                "assignee",
+                "repo",
+                "channel",
+                "opened_at",
+                "last_ts"
+            ],
         );
 
         let report = DebtReport::compute(&model, None, None);
@@ -342,7 +351,11 @@ mod tests {
         assert_eq!(rows[0].id, id);
         let v = serde_json::to_value(&rows[0]).unwrap();
         let keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
-        assert_eq!(keys, ["id", "title", "reason", "effective_state"], "since never on the wire");
+        assert_eq!(
+            keys,
+            ["id", "title", "reason", "effective_state"],
+            "since never on the wire"
+        );
         assert_eq!(v["reason"], "your_unlanded_work");
         assert_eq!(v["effective_state"], "rev:ready");
     }

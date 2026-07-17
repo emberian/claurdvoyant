@@ -304,10 +304,7 @@ pub fn replies_to_dir(dir: &Path, channel: &str, request_id: &str) -> Result<Vec
 
 /// Requests on `channel` with zero replies, oldest first (default board dir). See
 /// [`unanswered_requests_in_dir`].
-pub fn unanswered_requests(
-    channel: &str,
-    within: Duration,
-) -> Result<Vec<(BoardMessage, chrono::Duration)>> {
+pub fn unanswered_requests(channel: &str, within: Duration) -> Result<Vec<(BoardMessage, chrono::Duration)>> {
     unanswered_requests_in_dir(&board_dir(), channel, within)
 }
 
@@ -881,8 +878,15 @@ mod tests {
 
         let got = unanswered_requests_in_dir(&dir, "ch", day).unwrap();
         let ids: Vec<&str> = got.iter().map(|(m, _)| m.id.as_str()).collect();
-        assert_eq!(ids, vec![open1.id.as_str(), open2.id.as_str()], "oldest first, answered gone");
-        assert!(got.iter().all(|(_, age)| age.num_seconds() >= 0), "ages are non-negative");
+        assert_eq!(
+            ids,
+            vec![open1.id.as_str(), open2.id.as_str()],
+            "oldest first, answered gone"
+        );
+        assert!(
+            got.iter().all(|(_, age)| age.num_seconds() >= 0),
+            "ages are non-negative"
+        );
 
         // A request older than the window is not surfaced (hand-crafted old ts, appended raw).
         let old = BoardMessage {
@@ -905,8 +909,16 @@ mod tests {
         assert!(got[0].1.num_days() >= 29, "age reflects the old ts: {:?}", got[0].1);
 
         // A tag-only reply (no session_ref) still answers it.
-        post_to_dir(&dir, "ch", "dave", "tagged", Some("reply"), vec![reply_to_tag(&open2.id)], None)
-            .unwrap();
+        post_to_dir(
+            &dir,
+            "ch",
+            "dave",
+            "tagged",
+            Some("reply"),
+            vec![reply_to_tag(&open2.id)],
+            None,
+        )
+        .unwrap();
         let got = unanswered_requests_in_dir(&dir, "ch", day).unwrap();
         assert!(!got.iter().any(|(m, _)| m.id == open2.id), "{got:?}");
         fs::remove_dir_all(&dir).ok();

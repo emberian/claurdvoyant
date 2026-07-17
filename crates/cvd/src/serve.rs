@@ -287,11 +287,10 @@ fn tasks(query: &str) -> (u16, Value) {
             include_terminal: params.get("all").is_some_and(|v| v == "1" || v == "true"),
         };
         // An unknown state string is a clear 400 (naming the vocabulary), not a silent [].
-        let tasks: Vec<cv_core::task::TaskRow> =
-            match cv_core::task::list(&outcome.model, &filter) {
-                Ok(tasks) => tasks.into_iter().map(cv_core::task::TaskRow::full).collect(),
-                Err(e) => return err(400, &e),
-            };
+        let tasks: Vec<cv_core::task::TaskRow> = match cv_core::task::list(&outcome.model, &filter) {
+            Ok(tasks) => tasks.into_iter().map(cv_core::task::TaskRow::full).collect(),
+            Err(e) => return err(400, &e),
+        };
         ok(json!({ "tasks": tasks, "warnings": outcome.warnings }))
     })
 }
@@ -304,8 +303,7 @@ fn task_one(id: &str, events: bool) -> (u16, Value) {
             Err(e) => return err(404, &e),
         };
         if events {
-            let history: Vec<&cv_core::task::TaskEvent> =
-                outcome.events.iter().filter(|e| e.task_id == id).collect();
+            let history: Vec<&cv_core::task::TaskEvent> = outcome.events.iter().filter(|e| e.task_id == id).collect();
             ok(json!({ "events": history, "warnings": outcome.warnings }))
         } else {
             let t = &outcome.model.tasks[&id];
@@ -327,17 +325,22 @@ fn tasks_debt(query: &str) -> (u16, Value) {
     with_tasks(|outcome| {
         let want = params.get("repo").map(std::path::PathBuf::from);
         let hb = cv_core::task::verify::read_heartbeat(&cv_core::task::tasks_dir());
-        let report =
-            cv_core::task::DebtReport::compute(&outcome.model, hb.as_ref(), want.as_deref());
+        let report = cv_core::task::DebtReport::compute(&outcome.model, hb.as_ref(), want.as_deref());
         // This surface has always shipped an explicit `suspect` marker on every row (`false` on
         // debt rows, `true` on suspect rows — the dashboard keys off it); the MCP shape doesn't.
         let rows: Vec<cv_core::task::DebtRow> = report
             .debt
             .into_iter()
-            .map(|r| cv_core::task::DebtRow { suspect: Some(false), ..r })
+            .map(|r| cv_core::task::DebtRow {
+                suspect: Some(false),
+                ..r
+            })
             .collect();
-        let suspects: Vec<cv_core::task::SuspectRow> =
-            report.suspects.iter().map(cv_core::task::SuspectRow::from_suspect).collect();
+        let suspects: Vec<cv_core::task::SuspectRow> = report
+            .suspects
+            .iter()
+            .map(cv_core::task::SuspectRow::from_suspect)
+            .collect();
         ok(json!({
             "debt": rows,
             "awaiting_review": report.awaiting_review,
@@ -357,8 +360,7 @@ fn tasks_stats(query: &str) -> (u16, Value) {
     with_tasks(|outcome| {
         let want = params.get("repo").map(std::path::PathBuf::from);
         let hb = cv_core::task::verify::read_heartbeat(&cv_core::task::tasks_dir());
-        let stats =
-            cv_core::task::FleetStats::compute(&outcome.model, hb.as_ref(), want.as_deref());
+        let stats = cv_core::task::FleetStats::compute(&outcome.model, hb.as_ref(), want.as_deref());
         let mut v = match serde_json::to_value(&stats) {
             Ok(v) => v,
             Err(e) => return err(500, &e.to_string()),
