@@ -14,8 +14,10 @@ use std::path::Path;
 use std::process::Command;
 
 use anyhow::{bail, Context, Result};
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 
-use super::model::{MergeFailure, Revision, RevisionState, TaskEventKind};
+use super::model::{MergeFailure, Revision, RevisionState, TaskEventKind, VERIFIER_BY};
 use super::reduce::{TaskIssue, TaskProjection};
 
 /// Run git in `repo` with `args`; return trimmed stdout on success, Err with stderr otherwise.
@@ -308,14 +310,131 @@ pub fn verify_task(task: &TaskProjection, fetch: bool) -> Result<Vec<TaskEventKi
     Ok(Vec::new())
 }
 
+/// Options for [`run_verify`].
+#[derive(Clone, Debug, Default)]
+pub struct VerifyOptions {
+    /// `git fetch` each revision's upstream remote before observing.
+    pub fetch: bool,
+    /// Skip re-observation of Landed revisions (opt-out for huge histories; suspects recorded by
+    /// earlier passes are preserved, not cleared).
+    pub skip_landed: bool,
+    /// The periodic interval when driven by `cvd watch`, recorded in the heartbeat so readers can
+    /// call the verifier stale (age > 2x interval). `None` for one-shot CLI/MCP passes.
+    pub interval_secs: Option<u64>,
+    /// Suppress board notifications (tests and embedded runs).
+    pub quiet: bool,
+}
+
+/// A Landed revision whose reviewed content is *no longer observed* on its upstream — either a
+/// forged Landed event or a genuinely rolled-back land. Not an event (the grammar has no un-land
+/// transition and law 1 doesn't need one): a per-pass observation, persisted in the heartbeat so
+/// the debt view can render it as visible debt again.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SuspectLanded {
+    pub task_id: String,
+    pub revision: u32,
+    pub upstream: String,
+    pub title: String,
+    pub detail: String,
+}
+
+/// The verifier's liveness marker, written to `<tasks dir>/last_verify.json` after every pass.
+/// Its absence means landing state has NEVER been verified; a stale one means the periodic
+/// verifier is dead — both are loud on the debt surfaces (G1: silence is never evidence of
+/// health).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct VerifyHeartbeat {
+    pub ts: DateTime<Utc>,
+    pub tasks_checked: usize,
+    pub events_appended: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interval_secs: Option<u64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub suspect_landed: Vec<SuspectLanded>,
+}
+
+const HEARTBEAT_FILE: &str = "last_verify.json";
+
+/// Read the heartbeat under `tasks_dir`, if a valid one exists (a torn/absent/foreign file is
+/// simply "no heartbeat" — the warning path handles it).
+pub fn read_heartbeat(tasks_dir: &Path) -> Option<VerifyHeartbeat> {
+    let raw = std::fs::read_to_string(tasks_dir.join(HEARTBEAT_FILE)).ok()?;
+    serde_json::from_str(&raw).ok()
+}
+
+fn write_heartbeat(tasks_dir: &Path, hb: &VerifyHeartbeat) -> Result<()> {
+    std::fs::create_dir_all(tasks_dir)
+        .with_context(|| format!("creating tasks dir {}", tasks_dir.display()))?;
+    let tmp = tasks_dir.join(format!("{HEARTBEAT_FILE}.tmp"));
+    std::fs::write(&tmp, serde_json::to_vec_pretty(hb).context("serializing heartbeat")?)
+        .with_context(|| format!("writing {}", tmp.display()))?;
+    std::fs::rename(&tmp, tasks_dir.join(HEARTBEAT_FILE)).context("publishing heartbeat")?;
+    Ok(())
+}
+
+/// The loud line for a missing or stale heartbeat, if one is warranted. `None` heartbeat is the
+/// loudest case; a present one is stale when older than 2x its own recorded interval (one-shot
+/// heartbeats with no interval can't be judged stale and never warn).
+pub fn heartbeat_warning(hb: Option<&VerifyHeartbeat>) -> Option<String> {
+    let Some(hb) = hb else {
+        return Some(
+            "landing state has NEVER been verified — run `cv task verify --all` or enable \
+             `cvd watch --verify-interval`"
+                .to_string(),
+        );
+    };
+    let interval = hb.interval_secs?;
+    let age = Utc::now().signed_duration_since(hb.ts).num_seconds().max(0) as u64;
+    (age > interval.saturating_mul(2)).then(|| {
+        format!(
+            "verifier heartbeat is STALE: last pass {} ({age}s ago, expected every {interval}s) \
+             — the periodic verifier may be dead and the landing state out of date",
+            hb.ts.to_rfc3339()
+        )
+    })
+}
+
+/// Re-observe a task whose current revision is recorded Landed (G3): landed-ness is monotone-true
+/// for genuine lands, so `Ok(false)` — the reviewed content is NOT on upstream — contradicts the
+/// record: a forged Landed event or a rolled-back land. A git error observes nothing (a pruned
+/// replayed sha is indistinguishable from tampering) and is never treated as forged.
+fn reobserve_landed(task: &TaskProjection) -> Option<SuspectLanded> {
+    let rev = task.current_revision()?;
+    if rev.state != RevisionState::Landed {
+        return None;
+    }
+    let repo = task.repo.as_deref()?;
+    if !repo.is_dir() {
+        return None;
+    }
+    let r = &rev.revision;
+    match content_is_on_upstream(repo, &r.review_sha, &r.upstream) {
+        Ok(false) => Some(SuspectLanded {
+            task_id: task.task_id.clone(),
+            revision: r.n,
+            upstream: r.upstream.clone(),
+            title: task.title.clone(),
+            detail: format!(
+                "recorded Landed but content is not observed on {} — possible forged or \
+                 rolled-back land",
+                r.upstream
+            ),
+        }),
+        Ok(true) | Err(_) => None,
+    }
+}
+
 /// Run the verifier over `ids` (or every task when `ids` is `None`) against `store`: verify each
-/// task, append what was observed, post board notifications. Returns the appended events plus
-/// non-fatal warnings. The shared engine behind `cv task verify`, the MCP `task_verify` tool, and
-/// cvd's periodic pass.
+/// task, append what was observed, post board notifications, re-observe Landed revisions, and
+/// write the heartbeat. Returns the appended events plus non-fatal warnings. The shared engine
+/// behind `cv task verify`, the MCP `task_verify` tool, and cvd's periodic pass.
+///
+/// One bad task never aborts the pass: a rejected append (e.g. a tampered stored patch-id turning
+/// the Landed fold into `PatchIdMismatch`) becomes a per-task warning and the loop continues.
 pub fn run_verify(
     store: &super::store::TaskStore,
     ids: Option<&[String]>,
-    fetch: bool,
+    opts: &VerifyOptions,
 ) -> Result<(Vec<super::model::TaskEvent>, Vec<String>)> {
     let outcome = store.replay()?;
     let mut warnings = outcome.warnings.clone();
@@ -324,12 +443,26 @@ pub fn run_verify(
         None => outcome.model.tasks.keys().cloned().collect(),
     };
     let mut appended = Vec::new();
+    let mut suspects: Vec<SuspectLanded> = Vec::new();
+    let mut checked: Vec<String> = Vec::new();
     for tid in all_ids {
         let Some(task) = outcome.model.tasks.get(&tid) else {
             warnings.push(format!("unknown task {tid}"));
             continue;
         };
-        let kinds = match verify_task(task, fetch) {
+        checked.push(tid.clone());
+        if !opts.skip_landed {
+            if let Some(s) = reobserve_landed(task) {
+                warnings.push(format!(
+                    "task {} rev {} {}",
+                    &s.task_id[..s.task_id.len().min(8)],
+                    s.revision,
+                    s.detail
+                ));
+                suspects.push(s);
+            }
+        }
+        let kinds = match verify_task(task, opts.fetch) {
             Ok(kinds) => kinds,
             Err(e) => {
                 warnings.push(format!("verify {tid}: {e}"));
@@ -337,16 +470,48 @@ pub fn run_verify(
             }
         };
         for kind in kinds {
-            let ev = store.append_verifier_event(super::store::new_event(
-                Some(&tid),
-                "cv-verify",
-                kind,
-            ))?;
-            if let Err(e) = super::notify_board(&ev, &task.channel) {
-                warnings.push(format!("board notification failed: {e}"));
+            let tag = kind.tag();
+            match store.append_verifier_event(super::store::new_event(Some(&tid), VERIFIER_BY, kind))
+            {
+                Ok(ev) => {
+                    if !opts.quiet {
+                        if let Err(e) = super::notify_board(&ev, &task.channel) {
+                            warnings.push(format!("board notification failed: {e}"));
+                        }
+                    }
+                    appended.push(ev);
+                }
+                Err(e) => {
+                    // A persistently-invalid append must not wedge the pass for every other task.
+                    warnings.push(format!(
+                        "task {tid}: observed '{tag}' but the append was rejected ({e}) — \
+                         continuing with remaining tasks"
+                    ));
+                }
             }
-            appended.push(ev);
         }
+    }
+
+    // Heartbeat (G1). Suspects observed by earlier passes stay recorded unless this pass actually
+    // re-observed their task (a partial or --skip-landed pass must not launder a suspect away).
+    if let Some(prev) = read_heartbeat(store.dir()) {
+        for s in prev.suspect_landed {
+            let reobserved_now = !opts.skip_landed && checked.iter().any(|id| *id == s.task_id);
+            if !reobserved_now && !suspects.iter().any(|n| n.task_id == s.task_id) {
+                suspects.push(s);
+            }
+        }
+    }
+    suspects.sort_by(|a, b| a.task_id.cmp(&b.task_id));
+    let hb = VerifyHeartbeat {
+        ts: Utc::now(),
+        tasks_checked: checked.len(),
+        events_appended: appended.len(),
+        interval_secs: opts.interval_secs,
+        suspect_landed: suspects,
+    };
+    if let Err(e) = write_heartbeat(store.dir(), &hb) {
+        warnings.push(format!("could not write verifier heartbeat: {e}"));
     }
     Ok((appended, warnings))
 }
@@ -758,5 +923,188 @@ mod tests {
         assert!(observe_revision(&repo, "nope", "main", None, 1, None, None, None).is_err());
         let not_repo = tmp_dir("notrepo");
         assert!(observe_revision(&not_repo, "main", "main", None, 1, None, None, None).is_err());
+    }
+
+    // ── run_verify: resilience, heartbeat, forged-land re-observation ──
+
+    use crate::task::store::{new_event, TaskStore};
+
+    fn open_in(store: &TaskStore, repo: &Path, title: &str) -> String {
+        store
+            .append_agent_event(new_event(
+                None,
+                "agent:author",
+                TaskEventKind::Opened {
+                    title: title.into(),
+                    body: String::new(),
+                    repo: Some(repo.to_path_buf()),
+                    issue: None,
+                    channel: "tasks".into(),
+                    assignee: None,
+                },
+            ))
+            .unwrap()
+            .task_id
+    }
+
+    fn propose_and_pass_in(store: &TaskStore, task: &str, revision: Revision) {
+        store
+            .append_agent_event(new_event(
+                Some(task),
+                "agent:author",
+                TaskEventKind::RevisionProposed { revision },
+            ))
+            .unwrap();
+        store
+            .append_agent_event(new_event(
+                Some(task),
+                "agent:reviewer",
+                TaskEventKind::ReviewPassed {
+                    reviewer: "agent:reviewer".into(),
+                    session_ref: None,
+                    independence: None,
+                },
+            ))
+            .unwrap();
+    }
+
+    fn quiet() -> VerifyOptions {
+        VerifyOptions { quiet: true, ..Default::default() }
+    }
+
+    #[test]
+    fn run_verify_continues_past_poisoned_task_and_writes_heartbeat() {
+        let repo = tmp_repo();
+        let store = TaskStore::at(tmp_dir("store"));
+
+        // Poisoned task: honest branch, but the RECORDED patch_id is tampered, so folding the
+        // verifier's Landed observation hits PatchIdMismatch and the append is rejected.
+        run(&repo, &["checkout", "-q", "-b", "task/poison"]);
+        commit(&repo, "p.txt", "p", "feat p");
+        let mut rev_p =
+            observe_revision(&repo, "task/poison", "main", None, 1, None, None, None).unwrap();
+        rev_p.patch_id = "f".repeat(40);
+        let poisoned = open_in(&store, &repo, "poisoned");
+        propose_and_pass_in(&store, &poisoned, rev_p);
+
+        // Good task on its own branch.
+        run(&repo, &["checkout", "-q", "main"]);
+        run(&repo, &["checkout", "-q", "-b", "task/good"]);
+        commit(&repo, "g.txt", "g", "feat g");
+        let rev_g =
+            observe_revision(&repo, "task/good", "main", None, 1, None, None, None).unwrap();
+        let good = open_in(&store, &repo, "good");
+        propose_and_pass_in(&store, &good, rev_g);
+
+        // Land both on main.
+        run(&repo, &["checkout", "-q", "main"]);
+        run(&repo, &["merge", "-q", "--no-edit", "task/poison"]);
+        run(&repo, &["merge", "-q", "--no-edit", "task/good"]);
+
+        let (appended, warnings) = run_verify(&store, None, &quiet()).unwrap();
+        assert_eq!(appended.len(), 1, "good task still verified: {appended:?}\n{warnings:?}");
+        assert_eq!(appended[0].task_id, good);
+        assert!(matches!(appended[0].kind, TaskEventKind::Landed { .. }));
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("append was rejected") && w.contains(&poisoned)),
+            "the poisoned task is a warning, not an abort: {warnings:?}"
+        );
+
+        let hb = read_heartbeat(store.dir()).expect("heartbeat written after the pass");
+        assert_eq!(hb.tasks_checked, 2);
+        assert_eq!(hb.events_appended, 1);
+        assert!(hb.suspect_landed.is_empty());
+        assert_eq!(hb.interval_secs, None);
+    }
+
+    #[test]
+    fn forged_landed_warns_on_provenance_and_reobservation_flags_it() {
+        let repo = tmp_repo();
+        let store = TaskStore::at(tmp_dir("store"));
+        run(&repo, &["checkout", "-q", "-b", "task/forge"]);
+        commit(&repo, "f.txt", "f", "feat f");
+        let rev = observe_revision(&repo, "task/forge", "main", None, 1, None, None, None).unwrap();
+        run(&repo, &["checkout", "-q", "main"]); // NOT merged — the land is a lie
+
+        let task = open_in(&store, &repo, "forged land");
+        let patch_id = rev.patch_id.clone();
+        propose_and_pass_in(&store, &task, rev);
+
+        // The forgery: echo a self-consistent Landed line (patch_id copied from the revision's
+        // own record) straight into events.jsonl, exactly as a seat with Bash could.
+        let forged = new_event(
+            Some(&task),
+            "agent:sneaky",
+            TaskEventKind::Landed {
+                upstream_head: head(&repo),
+                observed_patch_id: patch_id,
+            },
+        );
+        {
+            use std::io::Write as _;
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(store.dir().join("events.jsonl"))
+                .unwrap();
+            writeln!(f, "{}", serde_json::to_string(&forged).unwrap()).unwrap();
+        }
+
+        // Replay folds it (self-consistent) but the provenance scan is loud.
+        let outcome = store.replay().unwrap();
+        assert_eq!(outcome.quarantined, 0);
+        assert!(
+            outcome
+                .warnings
+                .iter()
+                .any(|w| w.contains("attested, not observed") && w.contains("agent:sneaky")),
+            "{:?}",
+            outcome.warnings
+        );
+        assert_eq!(
+            outcome.model.tasks[&task].current_revision().unwrap().state,
+            RevisionState::Landed
+        );
+
+        // The periodic pass re-observes Landed: the content is NOT on upstream → suspect.
+        let (appended, warnings) = run_verify(&store, None, &quiet()).unwrap();
+        assert!(appended.is_empty(), "{appended:?}");
+        assert!(
+            warnings.iter().any(|w| w.contains("possible forged or rolled-back land")),
+            "{warnings:?}"
+        );
+        let hb = read_heartbeat(store.dir()).unwrap();
+        assert_eq!(hb.suspect_landed.len(), 1);
+        assert_eq!(hb.suspect_landed[0].task_id, task);
+
+        // A --skip-landed pass must not launder the suspect away.
+        run_verify(&store, None, &VerifyOptions { skip_landed: true, ..quiet() }).unwrap();
+        assert_eq!(read_heartbeat(store.dir()).unwrap().suspect_landed.len(), 1);
+    }
+
+    #[test]
+    fn heartbeat_warning_covers_absent_stale_fresh_and_oneshot() {
+        assert!(heartbeat_warning(None).unwrap().contains("NEVER"), "absence is loudest");
+        let fresh = VerifyHeartbeat {
+            ts: chrono::Utc::now(),
+            tasks_checked: 1,
+            events_appended: 0,
+            interval_secs: Some(300),
+            suspect_landed: Vec::new(),
+        };
+        assert_eq!(heartbeat_warning(Some(&fresh)), None);
+        let stale = VerifyHeartbeat {
+            ts: chrono::Utc::now() - chrono::Duration::seconds(1000),
+            ..fresh.clone()
+        };
+        assert!(heartbeat_warning(Some(&stale)).unwrap().contains("STALE"));
+        // One-shot passes record no interval: age alone can't call them stale.
+        let oneshot = VerifyHeartbeat {
+            ts: chrono::Utc::now() - chrono::Duration::seconds(100_000),
+            interval_secs: None,
+            ..fresh
+        };
+        assert_eq!(heartbeat_warning(Some(&oneshot)), None);
     }
 }

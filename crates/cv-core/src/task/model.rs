@@ -16,6 +16,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::ir::Harness;
 
+/// The `by` identity the cv-side git verifier stamps on verifier-only events. Not authority —
+/// anyone can type it — but replay warns when a verifier-only event carries any *other* author,
+/// and the periodic pass re-observes Landed revisions, so a forged land is loud and self-defeating.
+pub const VERIFIER_BY: &str = "cv-verify";
+
 /// A single durable task event. One per line of `tasks/events.jsonl`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct TaskEvent {

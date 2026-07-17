@@ -15,11 +15,15 @@ use cv_core::{Harness, SessionRef};
 use std::path::PathBuf;
 use std::time::Duration;
 
+/// Version with the embedded build commit (set by build.rs; "unknown" outside git) — a
+/// long-running daemon must be checkable against source ("is the running verifier the new one").
+const BUILD_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " (", env!("CV_BUILD_SHA"), ")");
+
 #[derive(Parser)]
 #[command(
     name = "cvd",
     about = "clustervision daemon — archive agent sessions into a central store",
-    version
+    version = BUILD_VERSION
 )]
 struct Cli {
     /// Archive home (default: $CLUSTERVISION_HOME or ~/.clustervision).
@@ -45,9 +49,10 @@ enum Command {
         /// Only sessions whose cwd contains this substring.
         #[arg(long)]
         cwd: Option<String>,
-        /// Also run the task git-verifier every N seconds (0 = off). The daemon becomes the
-        /// engine that keeps landing state and the debt view honest without anyone asking.
-        #[arg(long = "verify-interval", default_value_t = 0)]
+        /// Also run the task git-verifier every N seconds (0 disables). On by default: the
+        /// daemon is the engine that keeps landing state and the debt view honest without
+        /// anyone asking, and it writes the heartbeat the debt view's trust is judged by.
+        #[arg(long = "verify-interval", default_value_t = 300)]
         verify_interval: u64,
     },
     /// Serve fleet state as JSON over HTTP for a live browser dashboard.
@@ -78,6 +83,7 @@ enum Command {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    eprintln!("cvd {BUILD_VERSION}");
     let archive = Archive::resolve(cli.home.clone())?;
 
     match cli.command {
@@ -208,7 +214,11 @@ fn cmd_watch(
         if verify_interval > 0 && last_verify.elapsed().as_secs() >= verify_interval {
             last_verify = std::time::Instant::now();
             let store = cv_core::task::TaskStore::default_store();
-            match cv_core::task::verify::run_verify(&store, None, false) {
+            let opts = cv_core::task::verify::VerifyOptions {
+                interval_secs: Some(verify_interval),
+                ..Default::default()
+            };
+            match cv_core::task::verify::run_verify(&store, None, &opts) {
                 Ok((appended, warnings)) => {
                     for w in warnings {
                         eprintln!("cvd: verify: {w}");

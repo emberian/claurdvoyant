@@ -30,7 +30,7 @@ pub mod verify;
 
 pub use model::{
     harness_family, IndependenceCheck, MergeFailure, Revision, RevisionState, TaskEvent,
-    TaskEventKind, TaskState,
+    TaskEventKind, TaskState, VERIFIER_BY,
 };
 pub use reduce::{
     EffectiveState, Note, PassEvidence, ReduceError, RefuteEvidence, RerouteEvidence,

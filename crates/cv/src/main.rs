@@ -38,10 +38,14 @@ The list above is the common path. Everything below still works — run `cv <com
   Live               scry · board
   System             config · query";
 
+/// Version with the embedded build commit (set by build.rs; "unknown" outside git), so the
+/// binary in your PATH is checkable against source.
+const BUILD_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " (", env!("CV_BUILD_SHA"), ")");
+
 #[derive(Parser)]
 #[command(
     name = "cv",
-    version,
+    version = BUILD_VERSION,
     about = "clustervision — search, read, and port AI agent sessions across harnesses",
     after_help = MORE_COMMANDS
 )]

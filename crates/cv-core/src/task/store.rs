@@ -33,17 +33,31 @@ use chrono::Utc;
 
 use crate::lockfile::FileLock;
 
-use super::model::{TaskEvent, TaskEventKind};
+use super::model::{TaskEvent, TaskEventKind, VERIFIER_BY};
 use super::reduce::{TaskReadModel, TaskReducer};
+
+/// The log-format header record: the first line of every log this cv creates. Readers skip a
+/// valid header; a header-less file is an implicit v1 (pre-header logs exist); a header with a
+/// version above [`LOG_VERSION`] refuses replay loudly (written by a newer cv).
+const LOG_FORMAT: &str = "cv-task-log";
+const LOG_VERSION: u64 = 1;
+const HEADER_LINE: &str = r#"{"format":"cv-task-log","v":1}"#;
 
 /// A parsed replay of the whole log: the read model plus any loud warnings about interior
 /// garbage. Every read surface must show `warnings` to its caller — a corrupted coordination log
 /// is a finding, not a detail.
+///
+/// Read paths are **best effort + loud**: an interior event the reducer refuses is *quarantined*
+/// (skipped, counted, warned about) rather than bricking every consumer at once. The append path
+/// stays strict — see [`TaskStore::append`].
 #[derive(Debug)]
 pub struct ReplayOutcome {
     pub model: TaskReadModel,
+    /// The events that actually folded into `model` (quarantined events are excluded).
     pub events: Vec<TaskEvent>,
     pub warnings: Vec<String>,
+    /// Parseable events the reducer refused on replay; each also produced a warning.
+    pub quarantined: usize,
 }
 
 /// Handle on a task log directory. Cheap to construct; every operation opens files fresh.
@@ -77,12 +91,42 @@ impl TaskStore {
 
     /// Replay the log without holding the lock (readers never block writers; a concurrent append
     /// is either wholly visible or wholly absent thanks to single-`write_all` O_APPEND lines).
+    ///
+    /// Events the reducer refuses are **quarantined**: skipped with a loud warning (line number +
+    /// reason) and counted, so one poisoned interior line degrades the model instead of bricking
+    /// the CLI, cvd, and every append at once. Verifier-only events whose `by` is not the
+    /// verifier identity get a provenance warning (never a rejection — old logs and tests exist).
     pub fn replay(&self) -> Result<ReplayOutcome> {
-        let (events, warnings) = self.read_events()?;
-        let model = TaskReducer::reduce(&events).map_err(|e| {
-            anyhow::anyhow!("task log {} fails replay: {e}", self.events_path().display())
-        })?;
-        Ok(ReplayOutcome { model, events, warnings })
+        let (raw, mut warnings) = self.read_events()?;
+        let path = self.events_path();
+        let mut reducer = TaskReducer::new();
+        let mut events = Vec::with_capacity(raw.len());
+        let mut quarantined = 0usize;
+        for (line_no, ev) in raw {
+            match reducer.apply(&ev) {
+                Ok(()) => events.push(ev),
+                Err(e) => {
+                    quarantined += 1;
+                    warnings.push(format!(
+                        "task log {}: line {line_no} quarantined — the reducer refused it ({e}); \
+                         event skipped, model is best-effort",
+                        path.display()
+                    ));
+                }
+            }
+        }
+        for ev in &events {
+            if ev.kind.is_verifier_only() && ev.by != VERIFIER_BY {
+                warnings.push(format!(
+                    "task {}: verifier-only event '{}' appended by '{}' — landing state may be \
+                     attested, not observed",
+                    &ev.task_id[..ev.task_id.len().min(8)],
+                    ev.kind.tag(),
+                    ev.by
+                ));
+            }
+        }
+        Ok(ReplayOutcome { model: reducer.into_model(), events, warnings, quarantined })
     }
 
     /// Agent-facing append: rejects verifier-only kinds (law 1), then CAS-appends.
@@ -103,6 +147,11 @@ impl TaskStore {
     }
 
     /// The locked CAS: replay → apply candidate → append. Returns the appended event.
+    ///
+    /// Unlike the read path, the append path is **strict and fails closed on degraded reads**:
+    /// any read warning (interior garbage) or reducer-refused line means this binary's model of
+    /// the log is incomplete — a stale binary must not write against an incomplete model, so the
+    /// append is refused with the problem named instead of being validated against a lie.
     fn append(&self, event: TaskEvent) -> Result<TaskEvent> {
         fs::create_dir_all(&self.dir)
             .with_context(|| format!("creating tasks dir {}", self.dir.display()))?;
@@ -110,23 +159,43 @@ impl TaskStore {
 
         // Replay under the lock: the candidate is validated against the exact state it will
         // land after.
-        let (events, _warnings) = self.read_events()?;
+        let (raw, warnings) = self.read_events()?;
+        if let Some(first) = warnings.first() {
+            bail!(
+                "refusing to append: task log {} is degraded ({} warning(s); first: {first}) — \
+                 repair the log or upgrade cv before writing",
+                self.events_path().display(),
+                warnings.len()
+            );
+        }
         let mut reducer = TaskReducer::new();
-        for ev in &events {
+        for (line_no, ev) in &raw {
             reducer.apply(ev).map_err(|e| {
-                anyhow::anyhow!("task log {} fails replay: {e}", self.events_path().display())
+                anyhow::anyhow!(
+                    "refusing to append: task log {} line {line_no} fails replay ({e}) — an \
+                     incomplete model must not be written against",
+                    self.events_path().display()
+                )
             })?;
         }
         reducer
             .apply(&event)
             .map_err(|e| anyhow::anyhow!("event rejected: {e}"))?;
 
-        let mut line = serde_json::to_string(&event).context("serializing task event")?;
+        // First append to a fresh log stamps the format header (older, header-less logs stay
+        // valid: readers treat them as implicit v1).
+        let path = self.events_path();
+        let mut line = String::new();
+        if !path.exists() {
+            line.push_str(HEADER_LINE);
+            line.push('\n');
+        }
+        line.push_str(&serde_json::to_string(&event).context("serializing task event")?);
         line.push('\n');
         let mut f = OpenOptions::new()
             .create(true)
             .append(true)
-            .open(self.events_path())
+            .open(&path)
             .with_context(|| format!("opening task log {}", self.events_path().display()))?;
         f.write_all(line.as_bytes())
             .with_context(|| format!("appending to task log {}", self.events_path().display()))?;
@@ -135,9 +204,11 @@ impl TaskStore {
         Ok(event)
     }
 
-    /// Read raw events. Interior unparseable lines are collected as warnings; a trailing partial
-    /// line (no terminating newline, fails to parse) is tolerated silently.
-    fn read_events(&self) -> Result<(Vec<TaskEvent>, Vec<String>)> {
+    /// Read raw events as `(1-based line number, event)` pairs. Interior unparseable lines are
+    /// collected as warnings; a trailing partial line (no terminating newline, fails to parse) is
+    /// tolerated silently. A format header is skipped when current, and refused loudly when it
+    /// declares a version this cv does not read (a log written by a newer cv).
+    fn read_events(&self) -> Result<(Vec<(usize, TaskEvent)>, Vec<String>)> {
         let path = self.events_path();
         let file = match File::open(&path) {
             Ok(f) => f,
@@ -149,7 +220,7 @@ impl TaskStore {
             }
         };
 
-        let mut events: Vec<TaskEvent> = Vec::new();
+        let mut events: Vec<(usize, TaskEvent)> = Vec::new();
         let mut bad: Vec<(usize, String)> = Vec::new(); // (1-based line no, snippet)
         let mut reader = BufReader::new(file);
         let mut raw = String::new();
@@ -169,12 +240,22 @@ impl TaskStore {
                 continue;
             }
             match serde_json::from_str::<TaskEvent>(line) {
-                Ok(ev) => events.push(ev),
-                Err(_) if !terminated => {
-                    // Trailing torn line: the only shape a crashed locked writer leaves behind.
-                    break;
-                }
+                Ok(ev) => events.push((line_no, ev)),
                 Err(_) => {
+                    if let Some(v) = header_version(line) {
+                        if v > LOG_VERSION {
+                            bail!(
+                                "task log {} declares format v{v} (this cv reads v{LOG_VERSION}) \
+                                 — the log was written by a newer cv; upgrade before touching it",
+                                path.display()
+                            );
+                        }
+                        continue; // current (or ancient) header: skip
+                    }
+                    if !terminated {
+                        // Trailing torn line: the only shape a crashed locked writer leaves behind.
+                        break;
+                    }
                     let snippet: String = line.chars().take(80).collect();
                     bad.push((line_no, snippet));
                 }
@@ -194,6 +275,14 @@ impl TaskStore {
             .collect();
         Ok((events, warnings))
     }
+}
+
+/// If `line` is a log-format header record, its declared version (`v` missing reads as 0, which
+/// is ≤ current and therefore skipped — keep it dumb).
+fn header_version(line: &str) -> Option<u64> {
+    let v: serde_json::Value = serde_json::from_str(line).ok()?;
+    (v.get("format")?.as_str()? == LOG_FORMAT)
+        .then(|| v.get("v").and_then(serde_json::Value::as_u64).unwrap_or(0))
 }
 
 /// Build a new event with a fresh uuid v7 id and `ts = now`. For `Opened`, pass
@@ -381,6 +470,137 @@ mod tests {
         assert_eq!(outcome.events.len(), 1);
         assert_eq!(outcome.warnings.len(), 1);
         assert!(outcome.warnings[0].contains("line 1"), "{}", outcome.warnings[0]);
+    }
+
+    #[test]
+    fn interior_reducer_refused_event_is_quarantined_and_replay_continues() {
+        let dir = tmp_tasks();
+        let store = TaskStore::at(&dir);
+        let task = open_task(&store);
+        store
+            .append_agent_event(new_event(
+                Some(&task),
+                "agent:a",
+                TaskEventKind::Claimed { assignee: "agent:a".into() },
+            ))
+            .unwrap();
+
+        // Hand-write a parseable event the reducer refuses (claim on an unknown task), then a
+        // valid trailing event — the poisoned line must not take the rest of the log with it.
+        let refused = new_event(
+            Some("00000000-0000-7000-8000-00000000dead"),
+            "agent:evil",
+            TaskEventKind::Claimed { assignee: "agent:evil".into() },
+        );
+        let good = new_event(
+            Some(&task),
+            "agent:a",
+            TaskEventKind::Noted { text: "still here".into(), session_ref: None },
+        );
+        let mut f = OpenOptions::new().append(true).open(store.events_path()).unwrap();
+        writeln!(f, "{}", serde_json::to_string(&refused).unwrap()).unwrap();
+        writeln!(f, "{}", serde_json::to_string(&good).unwrap()).unwrap();
+        drop(f);
+
+        let outcome = store.replay().unwrap();
+        assert_eq!(outcome.quarantined, 1);
+        assert_eq!(outcome.events.len(), 3, "open + claim + trailing note all survive");
+        assert_eq!(outcome.warnings.len(), 1);
+        // Line 1 is the header, so the refused event landed on line 4.
+        assert!(
+            outcome.warnings[0].contains("line 4") && outcome.warnings[0].contains("quarantined"),
+            "{}",
+            outcome.warnings[0]
+        );
+        let t = &outcome.model.tasks[&task];
+        assert_eq!(t.state, TaskState::Claimed);
+        assert_eq!(t.notes.len(), 1, "events after the quarantined line still reduce");
+    }
+
+    #[test]
+    fn append_fails_closed_on_degraded_log() {
+        // Degraded by a reducer-refused interior event.
+        let dir = tmp_tasks();
+        let store = TaskStore::at(&dir);
+        let task = open_task(&store);
+        let refused = new_event(
+            Some("00000000-0000-7000-8000-00000000dead"),
+            "agent:evil",
+            TaskEventKind::Claimed { assignee: "agent:evil".into() },
+        );
+        let mut f = OpenOptions::new().append(true).open(store.events_path()).unwrap();
+        writeln!(f, "{}", serde_json::to_string(&refused).unwrap()).unwrap();
+        drop(f);
+        let err = store
+            .append_agent_event(new_event(
+                Some(&task),
+                "agent:a",
+                TaskEventKind::Claimed { assignee: "agent:a".into() },
+            ))
+            .unwrap_err();
+        assert!(err.to_string().contains("refusing to append"), "{err}");
+        assert_eq!(store.replay().unwrap().events.len(), 1, "the refused append wrote nothing");
+
+        // Degraded by interior garbage (a read warning): same refusal.
+        let dir2 = tmp_tasks();
+        let store2 = TaskStore::at(&dir2);
+        let task2 = open_task(&store2);
+        let mut f = OpenOptions::new().append(true).open(store2.events_path()).unwrap();
+        writeln!(f, "not json at all").unwrap();
+        drop(f);
+        let err = store2
+            .append_agent_event(new_event(
+                Some(&task2),
+                "agent:a",
+                TaskEventKind::Claimed { assignee: "agent:a".into() },
+            ))
+            .unwrap_err();
+        assert!(err.to_string().contains("refusing to append"), "{err}");
+    }
+
+    #[test]
+    fn header_is_written_once_and_skipped_on_read() {
+        let dir = tmp_tasks();
+        let store = TaskStore::at(&dir);
+        let task = open_task(&store);
+        store
+            .append_agent_event(new_event(
+                Some(&task),
+                "agent:a",
+                TaskEventKind::Claimed { assignee: "agent:a".into() },
+            ))
+            .unwrap();
+
+        let content = fs::read_to_string(store.events_path()).unwrap();
+        let lines: Vec<&str> = content.lines().collect();
+        assert_eq!(lines[0], HEADER_LINE, "first line of a fresh log is the format header");
+        assert_eq!(
+            content.matches(LOG_FORMAT).count(),
+            1,
+            "the header is written exactly once, not per append"
+        );
+
+        let outcome = store.replay().unwrap();
+        assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
+        assert_eq!(outcome.events.len(), 2, "the header is not an event");
+    }
+
+    #[test]
+    fn newer_format_header_refuses_replay_and_append() {
+        let dir = tmp_tasks();
+        let store = TaskStore::at(&dir);
+        let good = serde_json::to_string(&new_event(None, "agent:a", open_kind())).unwrap();
+        let mut f = File::create(store.events_path()).unwrap();
+        writeln!(f, "{{\"format\":\"cv-task-log\",\"v\":2}}").unwrap();
+        writeln!(f, "{good}").unwrap();
+        drop(f);
+
+        let err = store.replay().unwrap_err();
+        assert!(err.to_string().contains("newer cv"), "{err}");
+        let err = store
+            .append_agent_event(new_event(None, "agent:a", open_kind()))
+            .unwrap_err();
+        assert!(err.to_string().contains("newer cv"), "{err}");
     }
 
     #[test]

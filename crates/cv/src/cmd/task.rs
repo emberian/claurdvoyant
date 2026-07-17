@@ -156,6 +156,10 @@ pub(crate) enum TaskCmd {
         /// git fetch the upstream's remote first.
         #[arg(long)]
         fetch: bool,
+        /// Skip re-observation of Landed revisions (opt-out for huge histories; previously
+        /// recorded suspects are preserved, not cleared).
+        #[arg(long = "skip-landed")]
+        skip_landed: bool,
     },
     /// What needs `<who>`: assigned/claimed tasks, reviews awaiting them, their unlanded work.
     Inbox {
@@ -422,7 +426,7 @@ pub(crate) fn cmd_task(action: TaskCmd) -> Result<()> {
                 TaskEventKind::ReviewRefuted { reviewer: from.clone(), session_ref: session },
             )
         }
-        TaskCmd::Verify { id, all, fetch } => cmd_verify(id, all, fetch),
+        TaskCmd::Verify { id, all, fetch, skip_landed } => cmd_verify(id, all, fetch, skip_landed),
         TaskCmd::Inbox { who, json } => {
             let outcome = replay_loud()?;
             let entries = task::inbox(&outcome.model, &who);
@@ -446,6 +450,14 @@ pub(crate) fn cmd_task(action: TaskCmd) -> Result<()> {
         TaskCmd::Debt { repo, json } => {
             let outcome = replay_loud()?;
             let groups = task::debt(&outcome.model);
+            // The debt view is only as honest as the verifier is alive (G1) — render the
+            // heartbeat with it, and re-surface suspect lands (G3) as visible debt.
+            let hb = cv_core::task::verify::read_heartbeat(&task::tasks_dir());
+            let verify_warning = cv_core::task::verify::heartbeat_warning(hb.as_ref());
+            let suspects = hb
+                .as_ref()
+                .map(|h| h.suspect_landed.clone())
+                .unwrap_or_default();
             let mut shown = 0usize;
             let mut json_rows = Vec::new();
             for (group_repo, entries) in &groups {
@@ -481,9 +493,41 @@ pub(crate) fn cmd_task(action: TaskCmd) -> Result<()> {
                 }
             }
             if json {
-                println!("{}", serde_json::to_string_pretty(&json_rows)?);
-            } else if shown == 0 {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "debt": json_rows,
+                        "suspects": suspects,
+                        "verified_as_of": hb.as_ref().map(|h| h.ts),
+                        "verify_warning": verify_warning,
+                    }))?
+                );
+                return Ok(());
+            }
+            if shown == 0 && suspects.is_empty() {
                 println!("✓ no unlanded reviewed work");
+            }
+            for s in &suspects {
+                println!(
+                    "⚠ SUSPECT {}  rev{} {} — {}",
+                    short_id(&s.task_id),
+                    s.revision,
+                    s.detail,
+                    s.title
+                );
+            }
+            match &hb {
+                Some(hb) => println!(
+                    "verified as of {}{}",
+                    fmt_local(hb.ts, "%Y-%m-%d %H:%M:%S"),
+                    hb.interval_secs
+                        .map(|i| format!(" (every {i}s)"))
+                        .unwrap_or_default()
+                ),
+                None => {}
+            }
+            if let Some(w) = verify_warning {
+                eprintln!("⚠ {w}");
             }
             Ok(())
         }
@@ -491,7 +535,7 @@ pub(crate) fn cmd_task(action: TaskCmd) -> Result<()> {
 }
 
 /// `cv task verify` — the observation pass, shared with MCP/cvd via `verify::run_verify`.
-fn cmd_verify(id: Option<String>, all: bool, fetch: bool) -> Result<()> {
+fn cmd_verify(id: Option<String>, all: bool, fetch: bool, skip_landed: bool) -> Result<()> {
     if id.is_none() && !all {
         bail!("pass a task id or --all");
     }
@@ -503,7 +547,8 @@ fn cmd_verify(id: Option<String>, all: bool, fetch: bool) -> Result<()> {
         }
         None => None,
     };
-    let (appended, warnings) = cv_core::task::verify::run_verify(&store, ids.as_deref(), fetch)?;
+    let opts = cv_core::task::verify::VerifyOptions { fetch, skip_landed, ..Default::default() };
+    let (appended, warnings) = cv_core::task::verify::run_verify(&store, ids.as_deref(), &opts)?;
     for w in &warnings {
         eprintln!("⚠ {w}");
     }

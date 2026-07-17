@@ -319,7 +319,10 @@ fn task_one(id: &str, events: bool) -> (u16, Value) {
     })
 }
 
-/// `GET /api/tasks/debt?repo=` — reviewed-but-unlanded work, grouped by repo, oldest first.
+/// `GET /api/tasks/debt?repo=` — reviewed-but-unlanded work, grouped by repo, oldest first,
+/// plus the verifier heartbeat (`verified_as_of` / `verify_warning`) and any suspect lands
+/// (revisions recorded Landed whose content the verifier no longer observes on upstream) —
+/// the debt view is only as honest as the verifier is alive.
 fn tasks_debt(query: &str) -> (u16, Value) {
     let params = Query::parse(query);
     with_tasks(|outcome| {
@@ -342,10 +345,36 @@ fn tasks_debt(query: &str) -> (u16, Value) {
                     "state": e.state,
                     "since": e.since,
                     "issues": e.issues,
+                    "suspect": false,
                 }));
             }
         }
-        ok(json!({ "debt": rows, "warnings": outcome.warnings }))
+        let hb = cv_core::task::verify::read_heartbeat(&cv_core::task::tasks_dir());
+        let suspects: Vec<Value> = hb
+            .as_ref()
+            .map(|h| {
+                h.suspect_landed
+                    .iter()
+                    .map(|s| {
+                        json!({
+                            "id": s.task_id,
+                            "title": s.title,
+                            "revision": s.revision,
+                            "upstream": s.upstream,
+                            "detail": s.detail,
+                            "suspect": true,
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        ok(json!({
+            "debt": rows,
+            "suspects": suspects,
+            "verified_as_of": hb.as_ref().map(|h| h.ts),
+            "verify_warning": cv_core::task::verify::heartbeat_warning(hb.as_ref()),
+            "warnings": outcome.warnings,
+        }))
     })
 }
 

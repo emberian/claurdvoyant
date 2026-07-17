@@ -1243,7 +1243,8 @@ fn task_verify(args: &Value) -> anyhow::Result<String> {
         None => None,
     };
     let fetch = args.get("fetch").and_then(Value::as_bool).unwrap_or(false);
-    let (appended, warnings) = cv_core::task::verify::run_verify(&store, ids.as_deref(), fetch)?;
+    let opts = cv_core::task::verify::VerifyOptions { fetch, ..Default::default() };
+    let (appended, warnings) = cv_core::task::verify::run_verify(&store, ids.as_deref(), &opts)?;
     Ok(serde_json::to_string_pretty(&json!({
         "observed": appended,
         "warnings": warnings,
@@ -1292,7 +1293,16 @@ fn task_debt(args: &Value) -> anyhow::Result<String> {
             }));
         }
     }
-    Ok(serde_json::to_string_pretty(&json!({ "debt": rows, "warnings": warnings }))?)
+    // The debt view is only as honest as the verifier is alive: attach the heartbeat and any
+    // suspect lands (recorded Landed, content no longer observed on upstream).
+    let hb = cv_core::task::verify::read_heartbeat(&cv_core::task::tasks_dir());
+    Ok(serde_json::to_string_pretty(&json!({
+        "debt": rows,
+        "suspects": hb.as_ref().map(|h| h.suspect_landed.clone()).unwrap_or_default(),
+        "verified_as_of": hb.as_ref().map(|h| h.ts),
+        "verify_warning": cv_core::task::verify::heartbeat_warning(hb.as_ref()),
+        "warnings": warnings,
+    }))?)
 }
 
 /// Build a JSON view of a `Lease` from its public fields (the struct isn't directly Serialize).
