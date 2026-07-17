@@ -85,7 +85,9 @@ pub struct TaskStore {
 impl TaskStore {
     /// The default store at [`super::tasks_dir`].
     pub fn default_store() -> TaskStore {
-        TaskStore { dir: super::tasks_dir() }
+        TaskStore {
+            dir: super::tasks_dir(),
+        }
     }
 
     /// A store rooted at `dir` (testing and embedding).
@@ -142,7 +144,12 @@ impl TaskStore {
                 ));
             }
         }
-        Ok(ReplayOutcome { model: reducer.into_model(), events, warnings, quarantined })
+        Ok(ReplayOutcome {
+            model: reducer.into_model(),
+            events,
+            warnings,
+            quarantined,
+        })
     }
 
     /// Agent-facing append: rejects verifier-only kinds (law 1), then CAS-appends.
@@ -169,8 +176,7 @@ impl TaskStore {
     /// the log is incomplete — a stale binary must not write against an incomplete model, so the
     /// append is refused with the problem named instead of being validated against a lie.
     fn append(&self, event: TaskEvent) -> Result<TaskEvent> {
-        fs::create_dir_all(&self.dir)
-            .with_context(|| format!("creating tasks dir {}", self.dir.display()))?;
+        fs::create_dir_all(&self.dir).with_context(|| format!("creating tasks dir {}", self.dir.display()))?;
         let _lock = FileLock::acquire(self.lock_path())?;
 
         // Replay under the lock: the candidate is validated against the exact state it will
@@ -228,12 +234,8 @@ impl TaskStore {
         let path = self.events_path();
         let file = match File::open(&path) {
             Ok(f) => f,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return Ok((Vec::new(), Vec::new()))
-            }
-            Err(e) => {
-                return Err(e).with_context(|| format!("opening task log {}", path.display()))
-            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((Vec::new(), Vec::new())),
+            Err(e) => return Err(e).with_context(|| format!("opening task log {}", path.display())),
         };
 
         let mut events: Vec<(usize, TaskEvent)> = Vec::new();
@@ -297,8 +299,7 @@ impl TaskStore {
 /// is ≤ current and therefore skipped — keep it dumb).
 fn header_version(line: &str) -> Option<u64> {
     let v: serde_json::Value = serde_json::from_str(line).ok()?;
-    (v.get("format")?.as_str()? == LOG_FORMAT)
-        .then(|| v.get("v").and_then(serde_json::Value::as_u64).unwrap_or(0))
+    (v.get("format")?.as_str()? == LOG_FORMAT).then(|| v.get("v").and_then(serde_json::Value::as_u64).unwrap_or(0))
 }
 
 /// Build a new event with a fresh uuid v7 id and `ts = now`. For `Opened`, pass
@@ -368,7 +369,9 @@ mod tests {
             .append_agent_event(new_event(
                 Some(&task),
                 "agent:a",
-                TaskEventKind::Claimed { assignee: "agent:a".into() },
+                TaskEventKind::Claimed {
+                    assignee: "agent:a".into(),
+                },
             ))
             .unwrap();
 
@@ -386,7 +389,11 @@ mod tests {
 
         // Done on an Open task with no live revision is fine…
         store
-            .append_agent_event(new_event(Some(&task), "agent:a", TaskEventKind::Done { observed: None }))
+            .append_agent_event(new_event(
+                Some(&task),
+                "agent:a",
+                TaskEventKind::Done { observed: None },
+            ))
             .unwrap();
         // …after which nothing else applies, and crucially the log did NOT grow.
         let before = store.replay().unwrap().events.len();
@@ -394,7 +401,9 @@ mod tests {
             .append_agent_event(new_event(
                 Some(&task),
                 "agent:a",
-                TaskEventKind::Claimed { assignee: "agent:a".into() },
+                TaskEventKind::Claimed {
+                    assignee: "agent:a".into(),
+                },
             ))
             .unwrap_err();
         assert!(err.to_string().contains("event rejected"), "{err}");
@@ -438,7 +447,9 @@ mod tests {
                             .append_agent_event(new_event(
                                 Some(&task),
                                 &format!("agent:{i}"),
-                                TaskEventKind::Claimed { assignee: format!("agent:{i}") },
+                                TaskEventKind::Claimed {
+                                    assignee: format!("agent:{i}"),
+                                },
                             ))
                             .is_ok()
                     })
@@ -462,7 +473,10 @@ mod tests {
             .append_agent_event(new_event(
                 Some(&task),
                 "agent:a",
-                TaskEventKind::Noted { text: "hi".into(), session_ref: None },
+                TaskEventKind::Noted {
+                    text: "hi".into(),
+                    session_ref: None,
+                },
             ))
             .unwrap();
 
@@ -496,7 +510,9 @@ mod tests {
             .append_agent_event(new_event(
                 Some(&task),
                 "agent:a",
-                TaskEventKind::Claimed { assignee: "agent:a".into() },
+                TaskEventKind::Claimed {
+                    assignee: "agent:a".into(),
+                },
             ))
             .unwrap();
 
@@ -505,12 +521,17 @@ mod tests {
         let refused = new_event(
             Some("00000000-0000-7000-8000-00000000dead"),
             "agent:evil",
-            TaskEventKind::Claimed { assignee: "agent:evil".into() },
+            TaskEventKind::Claimed {
+                assignee: "agent:evil".into(),
+            },
         );
         let good = new_event(
             Some(&task),
             "agent:a",
-            TaskEventKind::Noted { text: "still here".into(), session_ref: None },
+            TaskEventKind::Noted {
+                text: "still here".into(),
+                session_ref: None,
+            },
         );
         let mut f = OpenOptions::new().append(true).open(store.events_path()).unwrap();
         writeln!(f, "{}", serde_json::to_string(&refused).unwrap()).unwrap();
@@ -541,7 +562,9 @@ mod tests {
         let refused = new_event(
             Some("00000000-0000-7000-8000-00000000dead"),
             "agent:evil",
-            TaskEventKind::Claimed { assignee: "agent:evil".into() },
+            TaskEventKind::Claimed {
+                assignee: "agent:evil".into(),
+            },
         );
         let mut f = OpenOptions::new().append(true).open(store.events_path()).unwrap();
         writeln!(f, "{}", serde_json::to_string(&refused).unwrap()).unwrap();
@@ -550,11 +573,17 @@ mod tests {
             .append_agent_event(new_event(
                 Some(&task),
                 "agent:a",
-                TaskEventKind::Claimed { assignee: "agent:a".into() },
+                TaskEventKind::Claimed {
+                    assignee: "agent:a".into(),
+                },
             ))
             .unwrap_err();
         assert!(err.to_string().contains("refusing to append"), "{err}");
-        assert_eq!(store.replay().unwrap().events.len(), 1, "the refused append wrote nothing");
+        assert_eq!(
+            store.replay().unwrap().events.len(),
+            1,
+            "the refused append wrote nothing"
+        );
 
         // Degraded by interior garbage (a read warning): same refusal.
         let dir2 = tmp_tasks();
@@ -567,7 +596,9 @@ mod tests {
             .append_agent_event(new_event(
                 Some(&task2),
                 "agent:a",
-                TaskEventKind::Claimed { assignee: "agent:a".into() },
+                TaskEventKind::Claimed {
+                    assignee: "agent:a".into(),
+                },
             ))
             .unwrap_err();
         assert!(err.to_string().contains("refusing to append"), "{err}");
@@ -582,7 +613,9 @@ mod tests {
             .append_agent_event(new_event(
                 Some(&task),
                 "agent:a",
-                TaskEventKind::Claimed { assignee: "agent:a".into() },
+                TaskEventKind::Claimed {
+                    assignee: "agent:a".into(),
+                },
             ))
             .unwrap();
 
@@ -631,7 +664,9 @@ mod tests {
             .append_agent_event(new_event(
                 Some(&task),
                 "agent:b",
-                TaskEventKind::Claimed { assignee: "agent:b".into() },
+                TaskEventKind::Claimed {
+                    assignee: "agent:b".into(),
+                },
             ))
             .unwrap();
         let outcome = store2.replay().unwrap();

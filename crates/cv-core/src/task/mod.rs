@@ -32,32 +32,28 @@ pub mod verify;
 pub mod views;
 
 pub use model::{
-    harness_family, model_family, IndependenceCheck, MergeFailure, ReviewReceipts, Revision,
-    RevisionState, TaskEvent, TaskEventKind, TaskState, VERIFIER_BY,
+    harness_family, model_family, IndependenceCheck, MergeFailure, ReviewReceipts, Revision, RevisionState, TaskEvent,
+    TaskEventKind, TaskState, VERIFIER_BY,
+};
+pub use project::{
+    age_short, awaiting_review, branch_carriers, debt, effective_display, inbox, list, propose_collision_warnings,
+    resolve_id, AwaitingReviewEntry, DebtEntry, InboxEntry, InboxReason, TaskFilter, STATE_VOCABULARY,
+};
+pub use reduce::{
+    EffectiveState, Note, PassEvidence, ReduceError, RefuteEvidence, RerouteEvidence, RevisionProjection, TaskIssue,
+    TaskProjection, TaskReadModel, TaskReducer,
 };
 #[cfg(not(target_family = "wasm"))]
 pub use stats::{EndpointRow, FamilyRow, FleetStats, ReviewerRow};
-pub use reduce::{
-    EffectiveState, Note, PassEvidence, ReduceError, RefuteEvidence, RerouteEvidence,
-    RevisionProjection, TaskIssue, TaskProjection, TaskReadModel, TaskReducer,
-};
-pub use project::{
-    age_short, awaiting_review, branch_carriers, debt, effective_display, inbox, list,
-    propose_collision_warnings, resolve_id, AwaitingReviewEntry, DebtEntry, InboxEntry,
-    InboxReason, TaskFilter, STATE_VOCABULARY,
-};
 pub use store::{new_event, replay, ReplayOutcome, TaskStore};
+pub use views::{AwaitingRow, DebtRow, InboxRow, TaskRow};
 #[cfg(not(target_family = "wasm"))]
 pub use views::{DebtReport, SuspectRow};
-pub use views::{AwaitingRow, DebtRow, InboxRow, TaskRow};
 
 /// Advisory reviewer-independence check (law 2): read harness families from cv's catalog for the
 /// reviewer's session and the current revision's recorded author session. Never blocks anything —
 /// the result is recorded on the pass event and surfaced as a warning by the front-ends.
-pub fn independence_check(
-    t: &reduce::TaskProjection,
-    reviewer_session: Option<&str>,
-) -> Option<IndependenceCheck> {
+pub fn independence_check(t: &reduce::TaskProjection, reviewer_session: Option<&str>) -> Option<IndependenceCheck> {
     let reviewer_session = reviewer_session?;
     let reviewer_family = session_family(reviewer_session);
     Some(independence_from(t, reviewer_family))
@@ -71,16 +67,16 @@ fn session_family(session_id: &str) -> Option<String> {
     if let Some(f) = harness_family(sref.harness) {
         return Some(f.to_string());
     }
-    session_model(&*adapter, &sref).as_deref().and_then(model_family).map(String::from)
+    session_model(&*adapter, &sref)
+        .as_deref()
+        .and_then(model_family)
+        .map(String::from)
 }
 
 /// Assemble the recorded independence observation from the author side of `t` and an
 /// already-determined reviewer family (shared by [`independence_check`] and
 /// [`review_observation`], whose reviewer family comes out of the single receipts scan).
-fn independence_from(
-    t: &reduce::TaskProjection,
-    reviewer_family: Option<String>,
-) -> IndependenceCheck {
+fn independence_from(t: &reduce::TaskProjection, reviewer_family: Option<String>) -> IndependenceCheck {
     let author_family = t
         .current_revision()
         .and_then(|r| r.revision.session_ref.as_deref())
@@ -89,7 +85,11 @@ fn independence_from(
         (Some(a), Some(r)) => Some(a != r),
         _ => None,
     };
-    IndependenceCheck { author_family, reviewer_family, independent }
+    IndependenceCheck {
+        author_family,
+        reviewer_family,
+        independent,
+    }
 }
 
 /// Command substrings that count as "ran checks" for [`ReviewReceipts::ran_checks`]. A **named,
@@ -123,12 +123,12 @@ pub struct ReviewObservation {
 /// Observe reviewer independence AND reviewer receipts for a verdict on `t`'s current revision,
 /// parsing the reviewer's session once. With no session id, both observations are `None`
 /// (recorded as unknown, warned about by the shared wording helpers).
-pub fn review_observation(
-    t: &reduce::TaskProjection,
-    reviewer_session: Option<&str>,
-) -> ReviewObservation {
+pub fn review_observation(t: &reduce::TaskProjection, reviewer_session: Option<&str>) -> ReviewObservation {
     let Some(sid) = reviewer_session else {
-        return ReviewObservation { independence: None, receipts: None };
+        return ReviewObservation {
+            independence: None,
+            receipts: None,
+        };
     };
     let scanned = scan_reviewer_session(sid, t);
     let reviewer_family = scanned.as_ref().and_then(|(harness, scan)| {
@@ -147,20 +147,18 @@ pub fn review_observation(
 
 /// Receipts-only observation (the refute path, which records no independence check). Same
 /// single-parse scan as [`review_observation`]; `None` only when no session id was given.
-pub fn review_receipts(
-    t: &reduce::TaskProjection,
-    reviewer_session: Option<&str>,
-) -> Option<ReviewReceipts> {
+pub fn review_receipts(t: &reduce::TaskProjection, reviewer_session: Option<&str>) -> Option<ReviewReceipts> {
     let sid = reviewer_session?;
-    Some(scan_reviewer_session(sid, t).map(|(_, scan)| scan.receipts).unwrap_or_default())
+    Some(
+        scan_reviewer_session(sid, t)
+            .map(|(_, scan)| scan.receipts)
+            .unwrap_or_default(),
+    )
 }
 
 /// Resolve the reviewer's session and scan it. `None` when the session can't be found — the
 /// caller records all-None receipts for that.
-fn scan_reviewer_session(
-    session_id: &str,
-    t: &reduce::TaskProjection,
-) -> Option<(crate::ir::Harness, ReviewerScan)> {
+fn scan_reviewer_session(session_id: &str, t: &reduce::TaskProjection) -> Option<(crate::ir::Harness, ReviewerScan)> {
     let (sref, adapter) = crate::find_cheap(session_id, None).ok()??;
     let scan = scan_session(&*adapter, &sref, t)?;
     Some((sref.harness, scan))
@@ -212,7 +210,9 @@ fn scan_session(
         }
         crate::stream::Flow::Continue
     };
-    adapter.stream(sref, &crate::stream::ParseOptions::lazy(), &mut sink).ok()?;
+    adapter
+        .stream(sref, &crate::stream::ParseOptions::lazy(), &mut sink)
+        .ok()?;
     Some(ReviewerScan {
         last_model,
         receipts: ReviewReceipts {
@@ -239,7 +239,9 @@ fn session_model(adapter: &dyn crate::harness::Adapter, sref: &crate::ir::Sessio
         }
         crate::stream::Flow::Continue
     };
-    let session = adapter.stream(sref, &crate::stream::ParseOptions::lazy(), &mut sink).ok()?;
+    let session = adapter
+        .stream(sref, &crate::stream::ParseOptions::lazy(), &mut sink)
+        .ok()?;
     last.or(session.model)
 }
 
@@ -272,10 +274,9 @@ pub fn receipts_warning(receipts: Option<&ReviewReceipts>) -> Option<String> {
         None => Some("no reviewer session given: review receipts not observed".to_string()),
         Some(r) => match r.saw_change {
             Some(true) => None,
-            Some(false) => Some(
-                "reviewer session shows no observable contact with the change — recorded, not blocked"
-                    .to_string(),
-            ),
+            Some(false) => {
+                Some("reviewer session shows no observable contact with the change — recorded, not blocked".to_string())
+            }
             None => Some(
                 "review receipts undetermined (reviewer session unreadable or revision context \
                  missing) — recorded, not blocked"
@@ -296,10 +297,7 @@ pub fn notify_board(event: &TaskEvent, channel: &str) -> anyhow::Result<()> {
         &event.by,
         &body,
         Some("task"),
-        vec![
-            format!("task:{}", event.task_id),
-            format!("ev:{}", event.kind.tag()),
-        ],
+        vec![format!("task:{}", event.task_id), format!("ev:{}", event.kind.tag())],
         Some(event.task_id.clone()),
     )?;
     Ok(())
@@ -332,9 +330,9 @@ pub fn actor(explicit: Option<String>, default_sink: &str) -> String {
 /// the explicit parameter (`--from` for the CLI, `` `from` `` for MCP), so the error names the
 /// exact knob the caller has.
 pub fn require_actor(explicit: Option<String>, flag: &str) -> anyhow::Result<String> {
-    explicit.or_else(default_endpoint).ok_or_else(|| {
-        anyhow::anyhow!("set CV_ENDPOINT or pass {flag}; identity-bearing events must record who acted")
-    })
+    explicit
+        .or_else(default_endpoint)
+        .ok_or_else(|| anyhow::anyhow!("set CV_ENDPOINT or pass {flag}; identity-bearing events must record who acted"))
 }
 
 /// What one agent-facing append produced: the durable event, the task's new effective state, and
@@ -392,8 +390,8 @@ pub fn tasks_dir() -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::default_endpoint;
+    use super::*;
 
     /// All env cases live in ONE test: `set_var` is process-global and lib tests run in
     /// parallel threads, so sequencing inside a single test is the serialization.
@@ -524,7 +522,11 @@ mod tests {
         let s = scan(&sref, &t);
         assert_eq!(
             s.receipts,
-            ReviewReceipts { saw_change: Some(true), ran_checks: Some(true), turns: Some(2) }
+            ReviewReceipts {
+                saw_change: Some(true),
+                ran_checks: Some(true),
+                turns: Some(2)
+            }
         );
         assert_eq!(s.last_model.as_deref(), Some("claude-test-1"));
 
@@ -541,7 +543,11 @@ mod tests {
         let s = scan(&sref, &t);
         assert_eq!(
             s.receipts,
-            ReviewReceipts { saw_change: Some(false), ran_checks: Some(false), turns: Some(1) }
+            ReviewReceipts {
+                saw_change: Some(false),
+                ran_checks: Some(false),
+                turns: Some(1)
+            }
         );
     }
 
@@ -553,7 +559,11 @@ mod tests {
         let s = scan(&sref, &task_without_revision());
         assert_eq!(
             s.receipts,
-            ReviewReceipts { saw_change: None, ran_checks: Some(true), turns: Some(1) }
+            ReviewReceipts {
+                saw_change: None,
+                ran_checks: Some(true),
+                turns: Some(1)
+            }
         );
 
         // Unreadable transcript → no scan at all; callers record all-None receipts.
@@ -569,9 +579,17 @@ mod tests {
             receipts_warning(None).as_deref(),
             Some("no reviewer session given: review receipts not observed")
         );
-        let contact = ReviewReceipts { saw_change: Some(true), ran_checks: Some(false), turns: Some(3) };
+        let contact = ReviewReceipts {
+            saw_change: Some(true),
+            ran_checks: Some(false),
+            turns: Some(3),
+        };
         assert_eq!(receipts_warning(Some(&contact)), None, "contact observed → no warning");
-        let no_contact = ReviewReceipts { saw_change: Some(false), ran_checks: None, turns: Some(1) };
+        let no_contact = ReviewReceipts {
+            saw_change: Some(false),
+            ran_checks: None,
+            turns: Some(1),
+        };
         let w = receipts_warning(Some(&no_contact)).unwrap();
         assert!(w.contains("no observable contact") && w.contains("not blocked"), "{w}");
         let unknown = ReviewReceipts::default();

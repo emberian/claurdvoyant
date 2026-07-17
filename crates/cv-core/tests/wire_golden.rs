@@ -129,7 +129,7 @@ fn golden_log_replays_identically_forever() {
 /// files is that the *repo history* then pins the bytes.
 fn regenerate(log_path: &std::path::Path, snap_path: &std::path::Path) {
     use chrono::{DateTime, Utc};
-    use cv_core::task::{IndependenceCheck, MergeFailure, Revision, ReviewReceipts, TaskEventKind};
+    use cv_core::task::{IndependenceCheck, MergeFailure, ReviewReceipts, Revision, TaskEventKind};
 
     fn hex(c: char) -> String {
         std::iter::repeat_n(c, 40).collect()

@@ -419,12 +419,18 @@ mod tests {
             },
             TaskEventKind::Claimed { assignee: "a".into() },
             TaskEventKind::Released {},
-            TaskEventKind::Noted { text: "n".into(), session_ref: Some("s".into()) },
+            TaskEventKind::Noted {
+                text: "n".into(),
+                session_ref: Some("s".into()),
+            },
             TaskEventKind::Done { observed: None },
             TaskEventKind::Abandoned { reason: "r".into() },
             TaskEventKind::Superseded { by_task: "t2".into() },
             TaskEventKind::RevisionProposed { revision: revision() },
-            TaskEventKind::ReviewRerouted { from: "a".into(), to: "b".into() },
+            TaskEventKind::ReviewRerouted {
+                from: "a".into(),
+                to: "b".into(),
+            },
             TaskEventKind::ReviewPassed {
                 reviewer: "b".into(),
                 session_ref: None,
@@ -442,14 +448,28 @@ mod tests {
             TaskEventKind::ReviewRefuted {
                 reviewer: "b".into(),
                 session_ref: None,
-                receipts: Some(ReviewReceipts { saw_change: None, ran_checks: None, turns: Some(2) }),
+                receipts: Some(ReviewReceipts {
+                    saw_change: None,
+                    ran_checks: None,
+                    turns: Some(2),
+                }),
             },
             TaskEventKind::SourceUnavailable { detail: "gone".into() },
-            TaskEventKind::MergeFailed { reason: MergeFailure::GitFailed { detail: "boom".into() } },
-            TaskEventKind::MergeFailed { reason: MergeFailure::NonFastForward {} },
-            TaskEventKind::MergedLocal { from_sha: "c".repeat(40), to_sha: "a".repeat(40) },
+            TaskEventKind::MergeFailed {
+                reason: MergeFailure::GitFailed { detail: "boom".into() },
+            },
+            TaskEventKind::MergeFailed {
+                reason: MergeFailure::NonFastForward {},
+            },
+            TaskEventKind::MergedLocal {
+                from_sha: "c".repeat(40),
+                to_sha: "a".repeat(40),
+            },
             TaskEventKind::ReconcileFailed { detail: "d".into() },
-            TaskEventKind::Landed { upstream_head: "d".repeat(40), observed_patch_id: "b".repeat(40) },
+            TaskEventKind::Landed {
+                upstream_head: "d".repeat(40),
+                observed_patch_id: "b".repeat(40),
+            },
         ];
         for kind in kinds {
             let ev = event(kind);
@@ -463,14 +483,18 @@ mod tests {
     /// breaking replay of existing logs — add fields instead of renaming.
     #[test]
     fn wire_tags_are_pinned() {
-        let ev = event(TaskEventKind::Claimed { assignee: "agent:a".into() });
+        let ev = event(TaskEventKind::Claimed {
+            assignee: "agent:a".into(),
+        });
         let v: serde_json::Value = serde_json::from_str(&serde_json::to_string(&ev).unwrap()).unwrap();
         assert_eq!(v["event"], "claimed");
         assert_eq!(v["task_id"], "0198c0de-0000-7000-8000-000000000000");
         assert_eq!(v["by"], "agent:test");
         assert_eq!(v["assignee"], "agent:a");
 
-        let ev = event(TaskEventKind::MergeFailed { reason: MergeFailure::BranchTipChanged {} });
+        let ev = event(TaskEventKind::MergeFailed {
+            reason: MergeFailure::BranchTipChanged {},
+        });
         let v: serde_json::Value = serde_json::from_str(&serde_json::to_string(&ev).unwrap()).unwrap();
         assert_eq!(v["event"], "merge_failed");
         assert_eq!(v["reason"]["kind"], "branch_tip_changed");
@@ -484,7 +508,13 @@ mod tests {
         // Tag helper stays in sync with serde.
         for (kind, tag) in [
             (TaskEventKind::Released {}, "released"),
-            (TaskEventKind::Landed { upstream_head: "d".repeat(40), observed_patch_id: "b".repeat(40) }, "landed"),
+            (
+                TaskEventKind::Landed {
+                    upstream_head: "d".repeat(40),
+                    observed_patch_id: "b".repeat(40),
+                },
+                "landed",
+            ),
         ] {
             let v: serde_json::Value =
                 serde_json::from_str(&serde_json::to_string(&event(kind.clone())).unwrap()).unwrap();
@@ -497,10 +527,18 @@ mod tests {
     fn verifier_only_partition_is_exact() {
         let verifier_only = [
             TaskEventKind::SourceUnavailable { detail: String::new() },
-            TaskEventKind::MergeFailed { reason: MergeFailure::MissingBranch {} },
-            TaskEventKind::MergedLocal { from_sha: String::new(), to_sha: String::new() },
+            TaskEventKind::MergeFailed {
+                reason: MergeFailure::MissingBranch {},
+            },
+            TaskEventKind::MergedLocal {
+                from_sha: String::new(),
+                to_sha: String::new(),
+            },
             TaskEventKind::ReconcileFailed { detail: String::new() },
-            TaskEventKind::Landed { upstream_head: String::new(), observed_patch_id: String::new() },
+            TaskEventKind::Landed {
+                upstream_head: String::new(),
+                observed_patch_id: String::new(),
+            },
         ];
         let agent_facing = [
             TaskEventKind::Opened {
@@ -511,21 +549,33 @@ mod tests {
                 channel: String::new(),
                 assignee: None,
             },
-            TaskEventKind::Claimed { assignee: String::new() },
+            TaskEventKind::Claimed {
+                assignee: String::new(),
+            },
             TaskEventKind::Released {},
-            TaskEventKind::Noted { text: String::new(), session_ref: None },
+            TaskEventKind::Noted {
+                text: String::new(),
+                session_ref: None,
+            },
             TaskEventKind::Done { observed: None },
             TaskEventKind::Abandoned { reason: String::new() },
             TaskEventKind::Superseded { by_task: String::new() },
             TaskEventKind::RevisionProposed { revision: revision() },
-            TaskEventKind::ReviewRerouted { from: String::new(), to: String::new() },
+            TaskEventKind::ReviewRerouted {
+                from: String::new(),
+                to: String::new(),
+            },
             TaskEventKind::ReviewPassed {
                 reviewer: String::new(),
                 session_ref: None,
                 independence: None,
                 receipts: None,
             },
-            TaskEventKind::ReviewRefuted { reviewer: String::new(), session_ref: None, receipts: None },
+            TaskEventKind::ReviewRefuted {
+                reviewer: String::new(),
+                session_ref: None,
+                receipts: None,
+            },
         ];
         for k in &verifier_only {
             assert!(k.is_verifier_only(), "{} should be verifier-only", k.tag());

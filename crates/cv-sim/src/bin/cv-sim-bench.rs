@@ -54,26 +54,16 @@ fn main() -> Result<()> {
 
     println!("# cv-sim replay-cost bench");
     println!();
-    println!(
-        "The task log's CAS append replays the whole log before every write, so append cost"
-    );
-    println!(
-        "grows linearly with history and lifetime append cost grows quadratically. Measured,"
-    );
+    println!("The task log's CAS append replays the whole log before every write, so append cost");
+    println!("grows linearly with history and lifetime append cost grows quadratically. Measured,");
     println!("not fixed (the fix is the snapshot+tail compaction plan in `task/store.rs`).");
     println!();
     println!("- machine: {}", machine());
     println!("- profile: {}", profile());
     println!("- date: {}", chrono::Utc::now().format("%Y-%m-%d"));
-    println!(
-        "- method: synthetic fleet (`FleetScenario`, seed 20260716), log written directly at"
-    );
-    println!(
-        "  each size; replay is best of {REPLAY_RUNS} full `TaskStore::replay` calls; append is the mean"
-    );
-    println!(
-        "  of {APPEND_RUNS} `append_agent_event` calls (each one replay + validate + one write)."
-    );
+    println!("- method: synthetic fleet (`FleetScenario`, seed 20260716), log written directly at");
+    println!("  each size; replay is best of {REPLAY_RUNS} full `TaskStore::replay` calls; append is the mean");
+    println!("  of {APPEND_RUNS} `append_agent_event` calls (each one replay + validate + one write).");
     println!();
     println!("| events | log size | full replay | single CAS append |");
     println!("|-------:|---------:|------------:|------------------:|");
@@ -94,7 +84,11 @@ fn main() -> Result<()> {
                 "bench log must replay clean: {:?}",
                 outcome.warnings
             );
-            anyhow::ensure!(outcome.events.len() == size, "replay saw {} events", outcome.events.len());
+            anyhow::ensure!(
+                outcome.events.len() == size,
+                "replay saw {} events",
+                outcome.events.len()
+            );
             replay_ms = replay_ms.min(dt);
         }
 
@@ -155,7 +149,11 @@ fn machine() -> String {
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
         .unwrap_or_else(|| std::env::consts::ARCH.to_string());
     let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(0);
-    format!("{cpu}, {cores} cores, {}/{}", std::env::consts::OS, std::env::consts::ARCH)
+    format!(
+        "{cpu}, {cores} cores, {}/{}",
+        std::env::consts::OS,
+        std::env::consts::ARCH
+    )
 }
 
 fn profile() -> &'static str {

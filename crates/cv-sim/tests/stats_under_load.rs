@@ -3,7 +3,7 @@
 //! probabilities, medians respect the scenario's latency envelopes, rubber-stamp and
 //! same-family counts track their configured rates, and small-n rows still carry raw counts.
 
-use cv_sim::{FleetScenario, Pathology, render_stats_table};
+use cv_sim::{render_stats_table, FleetScenario, Pathology};
 
 /// The load scenario: 12 endpoints, 4 reviewers, 300 tasks — big enough for the configured
 /// rates to show, small enough to run in a test.
@@ -42,7 +42,10 @@ fn rates_are_probabilities_and_counts_are_consistent() {
         assert!(!stats.endpoints.is_empty() && !stats.reviewers.is_empty());
         for e in &stats.endpoints {
             if let Some(rate) = e.landed_rate {
-                assert!((0.0..=1.0).contains(&rate), "seed {seed}: landed_rate {rate} not in [0,1]");
+                assert!(
+                    (0.0..=1.0).contains(&rate),
+                    "seed {seed}: landed_rate {rate} not in [0,1]"
+                );
             }
             assert_eq!(
                 e.landed + e.refuted + e.superseded + e.abandoned_live + e.unlanded,
@@ -73,7 +76,9 @@ fn medians_stay_within_scenario_latency_bounds() {
         let stats = sc.stats().unwrap();
 
         for r in &stats.reviewers {
-            let m = r.median_review_latency_secs.expect("every reviewer has verdicts under load");
+            let m = r
+                .median_review_latency_secs
+                .expect("every reviewer has verdicts under load");
             assert!(
                 (lat_min as i64..=lat_max as i64).contains(&m),
                 "seed {seed}: reviewer {} median latency {m}s outside [{lat_min}, {lat_max}]",

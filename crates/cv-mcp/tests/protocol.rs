@@ -436,7 +436,10 @@ fn task_tools_open_claim_race_done() {
     assert_eq!(rows.len(), 1, "{text}");
     assert_eq!(rows[0]["id"], json!(id), "{text}");
     assert_eq!(rows[0]["effective_state"], "done", "{text}");
-    assert!(rows[0].get("opened_at").is_none(), "MCP rows ship no timestamps: {text}");
+    assert!(
+        rows[0].get("opened_at").is_none(),
+        "MCP rows ship no timestamps: {text}"
+    );
 
     // Debt: the shared report envelope, loud about the never-run verifier.
     let (text, is_err) = s.call_tool(12, "task_debt", json!({}));

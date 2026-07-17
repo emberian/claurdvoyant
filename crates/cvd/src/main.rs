@@ -88,9 +88,12 @@ fn main() -> Result<()> {
 
     match cli.command {
         Command::Sync => cmd_sync(&archive),
-        Command::Watch { interval, harness, cwd, verify_interval } => {
-            cmd_watch(&archive, interval, harness, cwd, verify_interval)
-        }
+        Command::Watch {
+            interval,
+            harness,
+            cwd,
+            verify_interval,
+        } => cmd_watch(&archive, interval, harness, cwd, verify_interval),
         Command::Serve {
             port,
             host,

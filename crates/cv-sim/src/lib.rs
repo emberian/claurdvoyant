@@ -23,8 +23,8 @@
 
 use chrono::{DateTime, Duration, Utc};
 use cv_core::task::{
-    FleetStats, IndependenceCheck, ReduceError, Revision, ReviewReceipts, TaskEvent,
-    TaskEventKind, TaskReadModel, TaskReducer, VERIFIER_BY,
+    FleetStats, IndependenceCheck, ReduceError, ReviewReceipts, Revision, TaskEvent, TaskEventKind, TaskReadModel,
+    TaskReducer, VERIFIER_BY,
 };
 use uuid::Uuid;
 
@@ -149,13 +149,10 @@ impl FleetScenario {
         }
         if p.refute_rate + p.abandon_rate > 1.0 {
             return Err(SimError::InvalidScenario(
-                "refute_rate + abandon_rate exceeds 1.0 (they partition first-revision fates)"
-                    .into(),
+                "refute_rate + abandon_rate exceeds 1.0 (they partition first-revision fates)".into(),
             ));
         }
-        for (name, (min, max)) in
-            [("review_latency", p.review_latency), ("land_delay", p.land_delay)]
-        {
+        for (name, (min, max)) in [("review_latency", p.review_latency), ("land_delay", p.land_delay)] {
             if min > max {
                 return Err(SimError::InvalidScenario(format!("{name} min {min} > max {max}")));
             }
@@ -175,13 +172,15 @@ pub fn render_stats_table(stats: &FleetStats) -> String {
         let _ = writeln!(
             out,
             "  {:16} {:>7} {:>8} {:>7} {:>7} {:>5} {:>6} {:>9} {:>9}",
-            "endpoint", "claimed", "proposed", "landed", "refuted", "live", "aband", "land-rate",
-            "med-land"
+            "endpoint", "claimed", "proposed", "landed", "refuted", "live", "aband", "land-rate", "med-land"
         );
         for e in &stats.endpoints {
             let terminal = e.landed + e.refuted + e.superseded;
-            let rate =
-                if terminal == 0 { "-".to_string() } else { format!("{}/{terminal}", e.landed) };
+            let rate = if terminal == 0 {
+                "-".to_string()
+            } else {
+                format!("{}/{terminal}", e.landed)
+            };
             let _ = writeln!(
                 out,
                 "  {:16} {:>7} {:>8} {:>7} {:>7} {:>5} {:>6} {:>9} {:>9}",
@@ -202,8 +201,7 @@ pub fn render_stats_table(stats: &FleetStats) -> String {
         let _ = writeln!(
             out,
             "  {:16} {:>8} {:>11} {:>9} {:>8} {:>10} {:>11}",
-            "reviewer", "verdicts", "pass/refute", "same-fam", "no-rcpt", "no-contact",
-            "med-latency"
+            "reviewer", "verdicts", "pass/refute", "same-fam", "no-rcpt", "no-contact", "med-latency"
         );
         for r in &stats.reviewers {
             let _ = writeln!(
@@ -276,7 +274,12 @@ impl Rng {
 
     /// 40 lowercase hex chars — a synthetic git oid / patch-id.
     fn hex40(&mut self) -> String {
-        format!("{:016x}{:016x}{:08x}", self.next_u64(), self.next_u64(), self.next_u64() as u32)
+        format!(
+            "{:016x}{:016x}{:08x}",
+            self.next_u64(),
+            self.next_u64(),
+            self.next_u64() as u32
+        )
     }
 }
 
@@ -295,8 +298,7 @@ impl<'a> Sim<'a> {
         Sim {
             sc,
             rng: Rng(sc.seed),
-            clock: DateTime::from_timestamp(SIM_EPOCH_SECS, 0)
-                .expect("the simulated epoch is a valid timestamp"),
+            clock: DateTime::from_timestamp(SIM_EPOCH_SECS, 0).expect("the simulated epoch is a valid timestamp"),
             next_id: 0,
             events: Vec::new(),
         }
@@ -376,7 +378,13 @@ impl<'a> Sim<'a> {
         self.advance(60, 900); // task arrival spacing
         let task = self.open(n, &author);
         self.advance(5, 120);
-        self.push(&task, &author, TaskEventKind::Claimed { assignee: author.clone() });
+        self.push(
+            &task,
+            &author,
+            TaskEventKind::Claimed {
+                assignee: author.clone(),
+            },
+        );
 
         if self.rng.chance(NOTE_RATE) {
             self.advance(60, 1_800);
@@ -405,7 +413,10 @@ impl<'a> Sim<'a> {
             self.push(
                 &task,
                 &reviewer,
-                TaskEventKind::ReviewRerouted { from: reviewer.clone(), to: to.clone() },
+                TaskEventKind::ReviewRerouted {
+                    from: reviewer.clone(),
+                    to: to.clone(),
+                },
             );
             reviewer = to;
         }
@@ -418,7 +429,9 @@ impl<'a> Sim<'a> {
             self.push(
                 &task,
                 &author,
-                TaskEventKind::Abandoned { reason: "sim: path abandoned".to_string() },
+                TaskEventKind::Abandoned {
+                    reason: "sim: path abandoned".to_string(),
+                },
             );
             return;
         }
@@ -492,21 +505,29 @@ impl<'a> Sim<'a> {
             self.push(
                 &task,
                 VERIFIER_BY,
-                TaskEventKind::MergedLocal { from_sha, to_sha: review_sha },
+                TaskEventKind::MergedLocal {
+                    from_sha,
+                    to_sha: review_sha,
+                },
             );
         }
         let upstream_head = self.rng.hex40();
         self.push(
             &task,
             VERIFIER_BY,
-            TaskEventKind::Landed { upstream_head, observed_patch_id: patch_id },
+            TaskEventKind::Landed {
+                upstream_head,
+                observed_patch_id: patch_id,
+            },
         );
 
         self.advance(10, 300);
         self.push(
             &task,
             &author,
-            TaskEventKind::Done { observed: Some("sim: revision landed".to_string()) },
+            TaskEventKind::Done {
+                observed: Some("sim: revision landed".to_string()),
+            },
         );
     }
 }

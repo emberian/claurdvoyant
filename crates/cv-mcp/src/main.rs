@@ -195,7 +195,6 @@ fn tool_list() -> Value {
     tools
 }
 
-
 fn task_tool_list() -> Value {
     json!([
         {
@@ -1061,9 +1060,7 @@ fn board_claims(args: &Value) -> anyhow::Result<String> {
 /// List agents that heartbeat on a channel within the last `within_secs` (default 120).
 fn board_who(args: &Value) -> anyhow::Result<String> {
     let channel = arg_str(args, "channel").context("`channel` is required")?;
-    let within = Duration::from_secs(
-        arg_usize(args, "within_secs", cv_core::board::WHO_WINDOW_SECS as usize)? as u64,
-    );
+    let within = Duration::from_secs(arg_usize(args, "within_secs", cv_core::board::WHO_WINDOW_SECS as usize)? as u64);
     let who = cv_core::board::who(channel, within)?;
     Ok(serde_json::to_string_pretty(&json!(who))?)
 }
@@ -1175,7 +1172,9 @@ fn task_list(args: &Value) -> anyhow::Result<String> {
         .into_iter()
         .map(cv_core::task::TaskRow::brief)
         .collect();
-    Ok(serde_json::to_string_pretty(&json!({ "tasks": tasks, "warnings": warnings }))?)
+    Ok(serde_json::to_string_pretty(
+        &json!({ "tasks": tasks, "warnings": warnings }),
+    )?)
 }
 
 fn task_show(args: &Value) -> anyhow::Result<String> {
@@ -1189,10 +1188,7 @@ fn task_show(args: &Value) -> anyhow::Result<String> {
 }
 
 /// Shared shape for claim/release: resolve id, build the kind from `from`, append.
-fn task_simple(
-    args: &Value,
-    kind: impl FnOnce(String) -> cv_core::task::TaskEventKind,
-) -> anyhow::Result<String> {
+fn task_simple(args: &Value, kind: impl FnOnce(String) -> cv_core::task::TaskEventKind) -> anyhow::Result<String> {
     let (outcome, warnings) = task_replay()?;
     let id = task_resolve(&outcome, arg_str(args, "id").context("`id` is required")?)?;
     let from = require_task_from(args)?;
@@ -1219,7 +1215,9 @@ fn task_done(args: &Value) -> anyhow::Result<String> {
     task_append(
         Some(&id),
         &task_from_or_agent(args),
-        cv_core::task::TaskEventKind::Done { observed: arg_str(args, "observed").map(String::from) },
+        cv_core::task::TaskEventKind::Done {
+            observed: arg_str(args, "observed").map(String::from),
+        },
         warnings,
     )
 }
@@ -1325,8 +1323,7 @@ fn task_stats(args: &Value) -> anyhow::Result<String> {
     let (outcome, warnings) = task_replay()?;
     let repo = arg_str(args, "repo").map(std::path::PathBuf::from);
     let hb = cv_core::task::verify::read_heartbeat(&cv_core::task::tasks_dir());
-    let stats =
-        cv_core::task::FleetStats::compute(&outcome.model, hb.as_ref(), repo.as_deref());
+    let stats = cv_core::task::FleetStats::compute(&outcome.model, hb.as_ref(), repo.as_deref());
     let mut v = serde_json::to_value(&stats)?;
     v["warnings"] = json!(warnings);
     Ok(serde_json::to_string_pretty(&v)?)
@@ -1342,7 +1339,10 @@ fn task_verify(args: &Value) -> anyhow::Result<String> {
         None => None,
     };
     let fetch = args.get("fetch").and_then(Value::as_bool).unwrap_or(false);
-    let opts = cv_core::task::verify::VerifyOptions { fetch, ..Default::default() };
+    let opts = cv_core::task::verify::VerifyOptions {
+        fetch,
+        ..Default::default()
+    };
     let (appended, warnings) = cv_core::task::verify::run_verify(&store, ids.as_deref(), &opts)?;
     Ok(serde_json::to_string_pretty(&json!({
         "observed": appended,
@@ -1358,7 +1358,9 @@ fn task_inbox(args: &Value) -> anyhow::Result<String> {
         .or_else(cv_core::task::default_endpoint)
         .context("`who` is required (or set CV_ENDPOINT)")?;
     let entries = cv_core::task::InboxRow::compute(&outcome.model, &who);
-    Ok(serde_json::to_string_pretty(&json!({ "inbox": entries, "warnings": warnings }))?)
+    Ok(serde_json::to_string_pretty(
+        &json!({ "inbox": entries, "warnings": warnings }),
+    )?)
 }
 
 fn task_debt(args: &Value) -> anyhow::Result<String> {
@@ -1367,8 +1369,7 @@ fn task_debt(args: &Value) -> anyhow::Result<String> {
     // The debt view is only as honest as the verifier is alive: the shared report attaches the
     // heartbeat and any suspect lands (recorded Landed, content no longer observed on upstream).
     let hb = cv_core::task::verify::read_heartbeat(&cv_core::task::tasks_dir());
-    let report =
-        cv_core::task::DebtReport::compute(&outcome.model, hb.as_ref(), want.as_deref());
+    let report = cv_core::task::DebtReport::compute(&outcome.model, hb.as_ref(), want.as_deref());
     Ok(serde_json::to_string_pretty(&json!({
         "debt": report.debt,
         "awaiting_review": report.awaiting_review,
