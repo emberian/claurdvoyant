@@ -2,6 +2,19 @@
 
 ## 0.10.0 (unreleased)
 
+- **Every observed fact now carries its source and freshness — `Unknown` is
+  first-class.** A land is no longer a bare boolean; it is "observed landed,
+  git-verified, as of a pass 4m ago". A new pure `Provenance { observed_at,
+  source, freshness }` shape (cv-core `task/provenance.rs`) rides the debt and
+  show surfaces: `source` distinguishes `git-verify` from a `self-report`ed
+  `Done` (the completion carve-out made structural, never silently equal to a
+  verified land), and `freshness` (`Fresh` / `Stale{age}` / `Unknown`) is
+  derived purely from the verifier heartbeat — a revision the verifier has never
+  checked since it became verifiable reads `Unknown`, not implicitly fine. Human
+  output gains `landed · observed 4m ago` / `ready … · NEVER verified`, `cv task
+  show` labels the landed line `git-verified` and a `Done` `self-reported`, and
+  additive `provenance` keys ride `cv task debt --json`, MCP `task_debt`, and
+  `GET /api/tasks/debt`. No new git calls; freshness takes the heartbeat as input.
 - **The task substrate (`cv task`, `task_*` MCP tools, `/api/tasks*`).** Durable,
   replayable dispatch objects for agent fleets, designed against the failure mode
   that killed a 200k-line predecessor (mission-control): progress trackers that
