@@ -42,6 +42,8 @@ pub mod store;
 pub mod verify;
 pub mod views;
 
+#[cfg(not(target_family = "wasm"))]
+pub use check::CheckSpec;
 pub use model::{
     harness_family, model_family, DoneCheck, DoneCheckKind, IndependenceCheck, MergeFailure, ReviewReceipts, Revision,
     RevisionState, TaskEvent, TaskEventKind, TaskState, VERIFIER_BY,
@@ -50,8 +52,6 @@ pub use project::{
     age_short, awaiting_review, branch_carriers, debt, effective_display, inbox, list, propose_collision_warnings,
     resolve_id, AwaitingReviewEntry, DebtEntry, InboxEntry, InboxReason, TaskFilter, STATE_VOCABULARY,
 };
-#[cfg(not(target_family = "wasm"))]
-pub use check::CheckSpec;
 pub use provenance::{freshness_from_heartbeat, Freshness, Provenance};
 pub use reduce::{
     EffectiveState, Note, PassEvidence, ReduceError, RefuteEvidence, RerouteEvidence, RevisionProjection, TaskIssue,
@@ -123,8 +123,8 @@ pub const CHECK_COMMAND_PATTERNS: &[&str] = &[
 /// [`ReviewReceipts::saw_change`] — the reviewer opened a file in the change's tree, not just quoted
 /// its sha. Deliberately narrow; grow it like [`CHECK_COMMAND_PATTERNS`].
 const READ_COMMANDS: &[&str] = &[
-    "cat", "less", "more", "head", "tail", "bat", "nl", "od", "xxd", "hexdump", "grep", "egrep",
-    "fgrep", "rg", "ag", "sed", "awk", "view",
+    "cat", "less", "more", "head", "tail", "bat", "nl", "od", "xxd", "hexdump", "grep", "egrep", "fgrep", "rg", "ag",
+    "sed", "awk", "view",
 ];
 
 /// Structured tool NAMES (Claude Code / harness read-and-search tools) that carry a file/path in
@@ -136,7 +136,10 @@ const READ_TOOL_NAMES: &[&str] = &["Read", "Grep", "Glob", "NotebookRead"];
 /// segment's COMMAND POSITION (its leading token), never a bare substring — this is what defeats
 /// `echo "git diff"` / `echo <sha>`: the segment's first token is `echo`, not `git`/`cat`.
 fn command_segments(command: &str) -> impl Iterator<Item = &str> {
-    command.split(['\n', ';', '|', '&']).map(str::trim).filter(|s| !s.is_empty())
+    command
+        .split(['\n', ';', '|', '&'])
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
 }
 
 /// A command segment with leading `NAME=value` env-assignments stripped, so `RUST_LOG=x cargo test`
@@ -176,7 +179,9 @@ fn is_git_inspection(segment: &str) -> bool {
 fn reads_under_repo(segment: &str, repo: Option<&str>) -> bool {
     let Some(repo) = repo else { return false };
     let head = command_head(segment);
-    let Some(first) = head.split_whitespace().next() else { return false };
+    let Some(first) = head.split_whitespace().next() else {
+        return false;
+    };
     let cmd = first.rsplit('/').next().unwrap_or(first);
     READ_COMMANDS.contains(&cmd) && segment.contains(repo)
 }
@@ -263,7 +268,11 @@ enum Engagement {
 /// segment in command position; structured read/search tools ([`READ_TOOL_NAMES`]) engage when
 /// their rendered path targets the repo.
 fn classify_engagement(name: &str, input: &serde_json::Value, needles: &[String], repo: Option<&str>) -> Engagement {
-    if let Some(command) = input.get("command").or_else(|| input.get("cmd")).and_then(|v| v.as_str()) {
+    if let Some(command) = input
+        .get("command")
+        .or_else(|| input.get("cmd"))
+        .and_then(|v| v.as_str())
+    {
         if command_segments(command).any(|seg| is_git_inspection(seg) || reads_under_repo(seg, repo)) {
             return Engagement::Engaged;
         }
@@ -291,8 +300,7 @@ fn ran_check_command(input: &serde_json::Value) -> bool {
         .or_else(|| input.get("cmd"))
         .and_then(|v| v.as_str())
         .is_some_and(|command| {
-            command_segments(command)
-                .any(|seg| CHECK_COMMAND_PATTERNS.iter().any(|p| command_head(seg).starts_with(p)))
+            command_segments(command).any(|seg| CHECK_COMMAND_PATTERNS.iter().any(|p| command_head(seg).starts_with(p)))
         })
 }
 

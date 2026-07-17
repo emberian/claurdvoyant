@@ -1214,7 +1214,14 @@ mod tests {
         propose(&mut log, &task, 1);
         pass(&mut log, &task, REVIEWER);
 
-        log.push(&task, AUTHOR, TaskEventKind::Done { observed: None, check: None });
+        log.push(
+            &task,
+            AUTHOR,
+            TaskEventKind::Done {
+                observed: None,
+                check: None,
+            },
+        );
         assert!(matches!(
             log.reduce().unwrap_err(),
             ReduceError::DoneWithLiveRevision { .. }
@@ -1241,7 +1248,14 @@ mod tests {
                 observed_patch_id: sha('b'),
             },
         );
-        log.push(&task, AUTHOR, TaskEventKind::Done { observed: None, check: None });
+        log.push(
+            &task,
+            AUTHOR,
+            TaskEventKind::Done {
+                observed: None,
+                check: None,
+            },
+        );
         let m = log.reduce().unwrap();
         assert_eq!(m.tasks[&task].state, TaskState::Done);
     }

@@ -758,11 +758,7 @@ fn identity_impersonation_is_rejected_when_endpoint_is_bound() {
     let before = TaskStore::at(&dir).replay().unwrap().events.len();
     let attacker = TaskStore::at(&dir); // no token
     let err = attacker
-        .append_agent_event(new_event(
-            Some(&task),
-            "agent:victim",
-            TaskEventKind::Released {},
-        ))
+        .append_agent_event(new_event(Some(&task), "agent:victim", TaskEventKind::Released {}))
         .expect_err("a bound endpoint requires its token — a tokenless append is rejected");
     assert!(
         err.to_string().contains("token-bound"),
@@ -772,11 +768,7 @@ fn identity_impersonation_is_rejected_when_endpoint_is_bound() {
     // …and the same with a WRONG token is rejected too (impersonation, not just a missing flag).
     let wrong = TaskStore::at(&dir).with_token(Some("guessed-wrong".into()));
     let err = wrong
-        .append_agent_event(new_event(
-            Some(&task),
-            "agent:victim",
-            TaskEventKind::Released {},
-        ))
+        .append_agent_event(new_event(Some(&task), "agent:victim", TaskEventKind::Released {}))
         .expect_err("a wrong token is rejected");
     assert!(err.to_string().contains("does not match"), "{err}");
 
@@ -788,11 +780,7 @@ fn identity_impersonation_is_rejected_when_endpoint_is_bound() {
 
     // (c) The genuine victim, holding the bound token, still appends normally.
     victim
-        .append_agent_event(new_event(
-            Some(&task),
-            "agent:victim",
-            TaskEventKind::Released {},
-        ))
+        .append_agent_event(new_event(Some(&task), "agent:victim", TaskEventKind::Released {}))
         .expect("the real victim, with its token, appends normally");
     let outcome = TaskStore::at(&dir).replay().unwrap();
     assert!(outcome.warnings.is_empty(), "clean log: {:?}", outcome.warnings);

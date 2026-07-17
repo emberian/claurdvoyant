@@ -122,7 +122,9 @@ fn run_file(path: &Path, repo: Option<&Path>) -> anyhow::Result<DoneCheck> {
     }
     Ok(DoneCheck {
         // Record the path the caller named (the spec), not the repo-resolved absolute form.
-        kind: DoneCheckKind::File { path: path.to_path_buf() },
+        kind: DoneCheckKind::File {
+            path: path.to_path_buf(),
+        },
         result: format!("exists, {} bytes", meta.len()),
     })
 }
@@ -270,7 +272,12 @@ mod tests {
         std::fs::write(dir.join("out.txt"), "ok").unwrap();
         let check = CheckSpec::File(PathBuf::from("out.txt")).run(Some(&dir)).unwrap();
         // The recorded path is the caller's spec, not the resolved absolute path.
-        assert_eq!(check.kind, DoneCheckKind::File { path: PathBuf::from("out.txt") });
+        assert_eq!(
+            check.kind,
+            DoneCheckKind::File {
+                path: PathBuf::from("out.txt")
+            }
+        );
     }
 
     /// Serve one HTTP request with the given status line, then close. Returns the bound URL.
@@ -313,6 +320,9 @@ mod tests {
     fn https_names_the_curl_escape() {
         let err = CheckSpec::Http("https://example.com".into()).run(None).unwrap_err();
         let msg = format!("{err}");
-        assert!(msg.contains("https is not supported") && msg.contains("--check-cmd"), "{msg}");
+        assert!(
+            msg.contains("https is not supported") && msg.contains("--check-cmd"),
+            "{msg}"
+        );
     }
 }

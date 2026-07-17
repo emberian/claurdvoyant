@@ -483,7 +483,12 @@ pub(crate) fn cmd_task(action: TaskCmd) -> Result<()> {
             let from = require_from(from)?;
             let outcome = replay_loud()?;
             let id = resolve(&outcome.model, &id)?.to_string();
-            append_and_report(Some(&id), &from, TaskEventKind::Claimed { assignee: from.clone() }, token)
+            append_and_report(
+                Some(&id),
+                &from,
+                TaskEventKind::Claimed { assignee: from.clone() },
+                token,
+            )
         }
         TaskCmd::Release { id, from, token } => {
             let from = require_from(from)?;
@@ -499,7 +504,12 @@ pub(crate) fn cmd_task(action: TaskCmd) -> Result<()> {
         } => {
             let outcome = replay_loud()?;
             let id = resolve(&outcome.model, &id)?.to_string();
-            append_and_report(Some(&id), &from_or_cv(from), TaskEventKind::Noted { text, session_ref }, None)
+            append_and_report(
+                Some(&id),
+                &from_or_cv(from),
+                TaskEventKind::Noted { text, session_ref },
+                None,
+            )
         }
         TaskCmd::Done {
             id,
@@ -529,7 +539,12 @@ pub(crate) fn cmd_task(action: TaskCmd) -> Result<()> {
                 }
                 None => (observed, None),
             };
-            append_and_report(Some(&id), &from_or_cv(from), TaskEventKind::Done { observed, check }, None)
+            append_and_report(
+                Some(&id),
+                &from_or_cv(from),
+                TaskEventKind::Done { observed, check },
+                None,
+            )
         }
         TaskCmd::Abandon { id, reason, from } => {
             let outcome = replay_loud()?;
@@ -540,7 +555,12 @@ pub(crate) fn cmd_task(action: TaskCmd) -> Result<()> {
             let outcome = replay_loud()?;
             let id = resolve(&outcome.model, &id)?.to_string();
             let by_task = resolve(&outcome.model, &by_task)?.to_string();
-            append_and_report(Some(&id), &from_or_cv(from), TaskEventKind::Superseded { by_task }, None)
+            append_and_report(
+                Some(&id),
+                &from_or_cv(from),
+                TaskEventKind::Superseded { by_task },
+                None,
+            )
         }
         TaskCmd::Propose {
             id,

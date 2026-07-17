@@ -662,7 +662,9 @@ mod tests {
     #[test]
     fn identity_bearing_partition_is_exact() {
         let identity_bearing = [
-            TaskEventKind::Claimed { assignee: String::new() },
+            TaskEventKind::Claimed {
+                assignee: String::new(),
+            },
             TaskEventKind::Released {},
             TaskEventKind::RevisionProposed { revision: revision() },
             TaskEventKind::ReviewPassed {
@@ -690,7 +692,10 @@ mod tests {
                 text: String::new(),
                 session_ref: None,
             },
-            TaskEventKind::Done { observed: None, check: None },
+            TaskEventKind::Done {
+                observed: None,
+                check: None,
+            },
             TaskEventKind::Abandoned { reason: String::new() },
             TaskEventKind::Superseded { by_task: String::new() },
             TaskEventKind::ReviewRerouted {
@@ -702,7 +707,11 @@ mod tests {
             assert!(k.is_identity_bearing(), "{} should be identity-bearing", k.tag());
         }
         for k in &bookkeeping {
-            assert!(!k.is_identity_bearing(), "{} should be bookkeeping (token-optional)", k.tag());
+            assert!(
+                !k.is_identity_bearing(),
+                "{} should be bookkeeping (token-optional)",
+                k.tag()
+            );
         }
     }
 
@@ -806,7 +815,10 @@ mod tests {
         let back: TaskEvent = serde_json::from_str(&json).unwrap();
         assert_eq!(ev, back);
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(v["check"]["check"], "file", "kind is flattened under the outer check key");
+        assert_eq!(
+            v["check"]["check"], "file",
+            "kind is flattened under the outer check key"
+        );
         assert_eq!(v["check"]["path"], "/repo/design.md");
         assert_eq!(v["check"]["result"], "exists, 42 bytes");
     }

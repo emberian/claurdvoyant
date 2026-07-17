@@ -422,7 +422,10 @@ mod tests {
             .append_agent_event(new_event(
                 Some(&task),
                 "agent:a",
-                TaskEventKind::Done { observed: None, check: None },
+                TaskEventKind::Done {
+                    observed: None,
+                    check: None,
+                },
             ))
             .unwrap();
         // …after which nothing else applies, and crucially the log did NOT grow.
