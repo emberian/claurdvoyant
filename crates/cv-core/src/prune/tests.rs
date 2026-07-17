@@ -679,3 +679,102 @@ fn keep_last_large_spares_everything() {
     assert_eq!(r.pruned_count, 0, "nothing is old enough to snip");
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[test]
+fn declassify_snips_all_security_prose_keeps_benign() {
+    // A safeguard classifier scores the WHOLE loaded context, so security-dense PROSE anywhere — old
+    // OR recent — can downgrade a resumed seat. --declassify snips EVERY security-dense message (user
+    // string + assistant text blocks) into the sidecar (recency does NOT protect it, unlike the
+    // tool/thinking passes), while leaving benign turns verbatim.
+    let dir = tmpdir();
+    let sid = "22222222-2222-4222-8222-222222222222";
+    let secret_user = "We have a cross-tenant auth bypass exploit; the credential exfil risk is high.";
+    let secret_asst = "The vulnerability lets an attacker exfil credentials via the exploit chain.";
+    let benign_user = "Great, unrelated. Remember: my favorite color is teal.";
+    let recent_secret = "Recent turn: the security exploit vulnerability detail is also cleared.";
+    let lines = [
+        serde_json::json!({"type":"user","sessionId":sid,"uuid":"u0","timestamp":"2026-07-01T00:00:00Z",
+            "message":{"role":"user","content":secret_user}}),
+        serde_json::json!({"type":"assistant","sessionId":sid,"uuid":"a1","parentUuid":"u0","timestamp":"2026-07-01T00:00:01Z",
+            "message":{"role":"assistant","content":[{"type":"text","text":secret_asst}]}}),
+        // benign turn -> keep verbatim (0 security terms)
+        serde_json::json!({"type":"user","sessionId":sid,"uuid":"u1","parentUuid":"a1","timestamp":"2026-07-01T00:00:02Z",
+            "message":{"role":"user","content":benign_user}}),
+        serde_json::json!({"type":"assistant","sessionId":sid,"uuid":"a2","parentUuid":"u1","timestamp":"2026-07-01T00:00:03Z",
+            "message":{"role":"assistant","content":[{"type":"text","text":"Noted, teal."}]}}),
+        // RECENT but security-dense -> ALSO snipped (recency does not protect a trigger span)
+        serde_json::json!({"type":"user","sessionId":sid,"uuid":"u2","parentUuid":"a2","timestamp":"2026-07-01T00:00:04Z",
+            "message":{"role":"user","content":recent_secret}}),
+    ];
+    let path = dir.join(format!("{sid}.jsonl"));
+    std::fs::write(&path, lines.iter().map(|l| l.to_string() + "\n").collect::<String>()).unwrap();
+
+    // keep_last default (25) would mark all turns "recent" — declassify must snip regardless.
+    // Tokens are caller-supplied (cv ships no built-in list); supply the ones this session uses.
+    let opts = PruneOptions {
+        declassify: true,
+        declassify_tokens: [
+            "security", "exploit", "vulnerability", "cross-tenant", "auth bypass", "credential",
+            "exfil", "attacker",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect(),
+        ..Default::default()
+    };
+    let r = prune_session(&path, &opts).unwrap();
+    let out = std::fs::read_to_string(&r.new_path).unwrap();
+
+    // ALL security-dense prose is snipped: originals gone, markers present.
+    assert!(!out.contains(secret_user), "security user prose must be snipped");
+    assert!(!out.contains(secret_asst), "security assistant prose must be snipped");
+    assert!(
+        !out.contains(recent_secret),
+        "RECENT security prose is also snipped (recency is no shield)"
+    );
+    assert!(out.contains("tool=declassified"), "a declassify marker must be present");
+    assert!(r.pruned_count >= 3, "all three dense messages snipped");
+    // benign turn is untouched.
+    assert!(out.contains("my favorite color is teal"), "benign prose kept verbatim");
+    // lossless: the snipped user text is retrievable from the sidecar.
+    let sidecar = r.sidecar_path.clone().expect("sidecar written");
+    let got = retrieve(&sidecar, "u0#declass").unwrap();
+    assert_eq!(got.as_str(), Some(secret_user), "snipped prose retrievable verbatim");
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn declassify_spares_benign_sessions_entirely() {
+    // A session with < min_hits security terms per message must be left byte-untouched by declassify.
+    let dir = tmpdir();
+    let sid = "33333333-3333-4333-8333-333333333333";
+    let lines = [
+        serde_json::json!({"type":"user","sessionId":sid,"uuid":"u0","timestamp":"2026-07-01T00:00:00Z",
+            "message":{"role":"user","content":"Let's talk about the security fix we shipped."}}), // 1 term only
+        serde_json::json!({"type":"assistant","sessionId":sid,"uuid":"a1","parentUuid":"u0","timestamp":"2026-07-01T00:00:01Z",
+            "message":{"role":"assistant","content":[{"type":"text","text":"Sounds good, all resolved."}]}}),
+    ];
+    let path = dir.join(format!("{sid}.jsonl"));
+    std::fs::write(&path, lines.iter().map(|l| l.to_string() + "\n").collect::<String>()).unwrap();
+    let opts = PruneOptions {
+        keep_last: 0,
+        declassify: true,
+        declassify_tokens: ["security", "exploit", "vulnerability", "credential", "exfil"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
+        ..Default::default()
+    };
+    let r = prune_session(&path, &opts).unwrap();
+    let out = std::fs::read_to_string(&r.new_path).unwrap();
+    assert_eq!(
+        r.pruned_count, 0,
+        "a single security term (< min_hits=2) must not trip the snip"
+    );
+    assert!(
+        out.contains("the security fix we shipped"),
+        "benign-density prose kept verbatim"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}

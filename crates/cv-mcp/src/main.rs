@@ -809,7 +809,21 @@ fn prune_session(args: &Value) -> anyhow::Result<String> {
         revive: args.get("revive").and_then(Value::as_bool).unwrap_or(true),
         window: args.get("window").and_then(Value::as_u64),
         keep_range: None,
+        declassify: args.get("declassify").and_then(Value::as_bool).unwrap_or(false),
+        // Caller-supplied terms (comma-separated); cv ships no built-in list, so declassify without
+        // tokens is a no-op. min_hits comes from Default (2).
+        declassify_tokens: args
+            .get("declassify_tokens")
+            .and_then(Value::as_str)
+            .map(|s| {
+                s.split(',')
+                    .map(|t| t.trim().to_ascii_lowercase())
+                    .filter(|t| !t.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default(),
         dry_run: args.get("dry_run").and_then(Value::as_bool).unwrap_or(false),
+        ..Default::default()
     };
     let r = cv_core::prune::prune_session(&sref.path, &opts)?;
     Ok(serde_json::to_string_pretty(&json!({

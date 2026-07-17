@@ -26,6 +26,8 @@ pub(crate) fn cmd_prune(
     revive: bool,
     window: Option<u64>,
     keep_range: Option<(usize, Option<usize>)>,
+    declassify: bool,
+    declassify_tokens: Vec<String>,
     dry_run: bool,
     json: bool, // also emit the report as one JSON object on stdout (the human report stays on stderr)
 ) -> Result<()> {
@@ -71,7 +73,9 @@ pub(crate) fn cmd_prune(
         revive,
         window,
         keep_range,
-        dry_run,
+        declassify,
+        declassify_tokens, // caller-supplied (external); cv ships no built-in list. min_hits from Default (2).
+        ..Default::default()
     };
     let res = cv_core::prune::prune_session(&r.path, &opts)?;
 

@@ -33,6 +33,12 @@ use std::path::{Path, PathBuf};
 
 /// Marker prefix stamped where a payload used to be; carries enough to retrieve the original.
 const MARKER_PREFIX: &str = "[PRUNED id=";
+// NOTE: `--declassify` is a token-AGNOSTIC primitive. cv-core ships NO built-in token list — the
+// terms are always caller-supplied (CLI `--declassify-tokens` / `--declassify-tokens-file`, i.e.
+// external config/data). This keeps cv itself free of any domain "shitlist" (Ember, PR #9): a
+// list of security badwords baked into the source would (a) be un-adaptable and (b) trip the very
+// classifier this feature exists to dodge whenever an agent reads cv's own code. `declassify` with
+// no tokens is a safe no-op. Composing a security-declassify tool = supply your token file.
 /// Suffix distinguishing a flattened `toolUseResult` mirror entry from its `content` sibling.
 const TUR_SUFFIX: &str = "#tur";
 /// Token-estimate constants (Claude tokenizer ≈ 3.3–3.7 B/tok; a screenshot tile ≈ 1500 tok).
@@ -76,6 +82,19 @@ pub struct PruneOptions {
     /// Explicit message subrange `[start, end)` (turn indices) to keep, dropping everything outside
     /// it. `end = None` ⇒ through the last turn. Like `window` but selected by index, not budget.
     pub keep_range: Option<(usize, Option<usize>)>,
+    /// `--declassify`: snip conversational message TEXT whose security-token density is high, so a
+    /// resumed session does not carry classifier-tripping PROSE into a fresh (e.g. Fable) seat's context.
+    /// Lossless (stashed in the sidecar like any other payload). Complements tool-payload/`--thinking`
+    /// snipping — the trigger content lives largely in the conversational prose those passes leave
+    /// verbatim. Off by default. Unlike the tool/thinking passes, this does NOT respect `keep_last`: a
+    /// trigger span anywhere in the loaded context downgrades the seat, so recent security prose is
+    /// snipped too (still retrievable). Benign turns (< `declassify_min_hits` terms) are untouched.
+    pub declassify: bool,
+    /// Terms (lowercase) counted for `--declassify` density — ALWAYS caller-supplied (no built-in
+    /// list; empty ⇒ `--declassify` is a no-op). Matched case-insensitively as substrings.
+    pub declassify_tokens: Vec<String>,
+    /// Snip a message iff it holds at least this many DISTINCT `declassify_tokens` (default 2).
+    pub declassify_min_hits: usize,
     /// Compute and report without writing anything.
     pub dry_run: bool,
 }
@@ -92,6 +111,9 @@ impl Default for PruneOptions {
             revive: false,
             window: None,
             keep_range: None,
+            declassify: false,
+            declassify_tokens: Vec::new(), // token-agnostic: caller supplies the terms (no baked-in list)
+            declassify_min_hits: 2,
             dry_run: false,
         }
     }
@@ -453,6 +475,23 @@ pub fn prune_session(src_path: &Path, opts: &PruneOptions) -> Result<PruneResult
             // `--thinking`: flatten the OLDEST assistant reasoning (recent thinking, within
             // keep-last, stays verbatim so the resumed agent keeps its live train of thought).
             prune_assistant_thinking(
+                &mut v,
+                opts,
+                &new_id,
+                &line_key,
+                &mut sidecar,
+                &mut pruned_count,
+                &mut est_tokens_saved,
+                &mut modified,
+            );
+        }
+
+        // `--declassify`: snip security-dense message PROSE (user string or assistant text blocks)
+        // wherever it appears — a classifier scores the WHOLE loaded context, so a trigger span
+        // ANYWHERE downgrades a restricted (e.g. Fable) seat; recency does NOT protect it (unlike the
+        // tool/thinking passes above, which keep recent payloads verbatim for continuity). Retrievable.
+        if is_turn_line && opts.declassify {
+            prune_declassify_text(
                 &mut v,
                 opts,
                 &new_id,
@@ -887,6 +926,118 @@ fn prune_assistant_thinking(
         *block = serde_json::json!({ "type": "text", "text": marker });
         *modified = true;
         *count += 1;
+    }
+}
+
+/// `--declassify`: snip a message's TEXT when its security-token density is high, so the resumed
+/// session does not carry classifier-tripping PROSE into a fresh seat's context. Handles both message
+/// shapes: a user turn's bare-string `content`, and an assistant turn's array of `text` blocks. The
+/// original text is stashed in the sidecar verbatim (lossless, `--retrieve`-able, under `<line_key>#declass`)
+/// and replaced with a `[PRUNED …]` marker. A block is snipped iff it contains at least
+/// `declassify_min_hits` DISTINCT `declassify_tokens` (case-insensitive substring match).
+#[allow(clippy::too_many_arguments)]
+fn prune_declassify_text(
+    v: &mut Value,
+    opts: &PruneOptions,
+    new_id: &str,
+    line_key: &str,
+    sidecar: &mut Vec<SidecarEntry>,
+    count: &mut usize,
+    tokens_saved: &mut u64,
+    modified: &mut bool,
+) {
+    // Distinct security terms present (case-insensitive substring). Density, not raw frequency, so a
+    // single benign mention ("the security fix shipped") never trips the snip.
+    let distinct_hits = |s: &str| -> usize {
+        let low = s.to_lowercase();
+        opts.declassify_tokens
+            .iter()
+            .filter(|t| !t.is_empty() && low.contains(t.as_str()))
+            .count()
+    };
+    let Some(content) = v.pointer_mut("/message/content") else {
+        return;
+    };
+    match content {
+        // User turn: `content` is a bare string.
+        Value::String(s) => {
+            if distinct_hits(s) < opts.declassify_min_hits {
+                return;
+            }
+            let size = s.len();
+            let line_count = s.lines().count().max(1);
+            let original = Value::String(std::mem::take(s));
+            let id = format!("{line_key}#declass");
+            let marker = build_marker(
+                &id,
+                "declassified",
+                &Value::Null,
+                "text",
+                size,
+                line_count,
+                new_id,
+                opts.drop,
+            );
+            *tokens_saved += str_tokens(original.as_str().unwrap_or("")).saturating_sub(str_tokens(&marker));
+            if !opts.drop {
+                sidecar.push(SidecarEntry {
+                    id,
+                    slot: "content".into(),
+                    name: "declassified".into(),
+                    input: Value::Null,
+                    content: original,
+                    size,
+                    line_count,
+                    kind: "text".into(),
+                });
+            }
+            *content = Value::String(marker);
+            *modified = true;
+            *count += 1;
+        }
+        // Assistant turn: `content` is an array of blocks; snip dense `text` blocks in place.
+        Value::Array(blocks) => {
+            for (i, block) in blocks.iter_mut().enumerate() {
+                if block.get("type").and_then(Value::as_str) != Some("text") {
+                    continue;
+                }
+                let text = block.get("text").and_then(Value::as_str).unwrap_or("");
+                if distinct_hits(text) < opts.declassify_min_hits {
+                    continue;
+                }
+                let size = text.len();
+                let line_count = text.lines().count().max(1);
+                let original = block.clone();
+                let id = format!("{line_key}#declass{i}");
+                let marker = build_marker(
+                    &id,
+                    "declassified",
+                    &Value::Null,
+                    "text",
+                    size,
+                    line_count,
+                    new_id,
+                    opts.drop,
+                );
+                *tokens_saved += str_tokens(text).saturating_sub(str_tokens(&marker));
+                if !opts.drop {
+                    sidecar.push(SidecarEntry {
+                        id,
+                        slot: "content".into(),
+                        name: "declassified".into(),
+                        input: Value::Null,
+                        content: original,
+                        size,
+                        line_count,
+                        kind: "text".into(),
+                    });
+                }
+                *block = serde_json::json!({ "type": "text", "text": marker });
+                *modified = true;
+                *count += 1;
+            }
+        }
+        _ => {}
     }
 }
 
