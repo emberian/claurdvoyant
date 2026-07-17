@@ -304,6 +304,63 @@ fn search_fallback_messaging_and_index_path() {
     assert!(out.contains("no matches"), "{out}");
 }
 
+#[test]
+fn search_json_emits_machine_readable_hits() {
+    let w = World::new("searchjson");
+    standard_corpus(&w);
+
+    // Live-scan path (no index yet): the note stays on stderr; stdout is exactly one JSON
+    // array with the FULL session id (the table truncates to "alphases"), the snippet the
+    // table would print, and an explicit null score (a live scan has none).
+    let (out, err) = w.cv_ok(&["search", "zebrafish", "--json"]);
+    assert!(err.contains("scanning live"), "{err}");
+    let rows: Vec<serde_json::Value> = serde_json::from_str(out.trim()).expect("stdout must be pure JSON");
+    assert_eq!(rows.len(), 1, "{out}");
+    assert_eq!(rows[0]["id"], "alphasess", "full id, not the 8-char prefix:\n{out}");
+    assert_eq!(rows[0]["harness"], "claude");
+    assert_eq!(rows[0]["title"], "alpha adventures");
+    assert!(rows[0]["snippet"].as_str().unwrap().contains("zebrafish"), "{out}");
+    assert!(rows[0]["score"].is_null(), "{out}");
+    assert!(
+        rows[0]["updatedAt"].as_str().unwrap().starts_with("2026-06-01"),
+        "{out}"
+    );
+
+    // A live-scan miss is an empty array — valid JSON, no prose on stdout.
+    let (out, _) = w.cv_ok(&["search", "xyzzyplugh", "--json"]);
+    let rows: Vec<serde_json::Value> = serde_json::from_str(out.trim()).unwrap();
+    assert!(rows.is_empty(), "{out}");
+
+    // --limit bounds the array; the "stopped at" footer moves to stderr, keeping stdout pure.
+    // ("the" appears in both fixture sessions on the live path.)
+    let (out, err) = w.cv_ok(&["search", "the", "--json", "--limit", "1"]);
+    let rows: Vec<serde_json::Value> = serde_json::from_str(out.trim()).unwrap();
+    assert_eq!(rows.len(), 1, "{out}");
+    assert!(err.contains("stopped at 1"), "{err}");
+
+    // Indexed path: same hit, still the full id, now with a real BM25 score and dates off
+    // the index.
+    w.cv_ok(&["index"]);
+    let (out, err) = w.cv_ok(&["search", "zebrafish", "--json"]);
+    assert!(!err.contains("scanning live"), "{err}");
+    let rows: Vec<serde_json::Value> = serde_json::from_str(out.trim()).expect("stdout must be pure JSON");
+    assert_eq!(rows.len(), 1, "{out}");
+    assert_eq!(rows[0]["id"], "alphasess", "{out}");
+    assert!(rows[0]["score"].as_f64().unwrap() > 0.0, "{out}");
+    assert!(
+        rows[0]["updatedAt"].as_str().unwrap().starts_with("2026-06-01"),
+        "{out}"
+    );
+
+    // Indexed miss and non-matching --harness filter: empty arrays, still valid JSON.
+    let (out, _) = w.cv_ok(&["search", "xyzzyplugh", "--json"]);
+    let rows: Vec<serde_json::Value> = serde_json::from_str(out.trim()).unwrap();
+    assert!(rows.is_empty(), "{out}");
+    let (out, _) = w.cv_ok(&["search", "zebrafish", "--json", "--harness", "codex"]);
+    let rows: Vec<serde_json::Value> = serde_json::from_str(out.trim()).unwrap();
+    assert!(rows.is_empty(), "{out}");
+}
+
 // ───────────────────────────── show --range ─────────────────────────────
 
 #[test]

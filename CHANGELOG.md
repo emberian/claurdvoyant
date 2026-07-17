@@ -160,6 +160,11 @@ now closed:
   `workflow_launches`/`ghost_launches` + `WorkflowLaunch`. The list form's
   `--json` output is now `{"runs": […], "ghost_launches": […]}` (was a bare
   array).
+- **`cv search --json`** — the hits as one JSON array on stdout (same hits,
+  order, and `--harness`/`--limit`/`--semantic` handling as the table), with
+  camelCase fields, FULL session ids (the table truncates to 8 chars), the
+  untruncated snippet, and the relevance score — so downstream tools can
+  consume hits instead of regex-scraping the table. (@akapug)
 
 ## v0.9.21 (2026-07-02)
 
