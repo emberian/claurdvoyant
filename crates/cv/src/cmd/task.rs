@@ -343,6 +343,22 @@ pub(crate) fn cmd_task(action: TaskCmd) -> Result<()> {
                 // Every free-text field below came from the durable log — sanitize at render
                 // (G5): titles, notes, endpoints, and branch names are all untrusted.
                 println!("task {}  [{}]", t.task_id, task::effective_display(t));
+                // Provenance for the terminal facts: a self-reported completion is labeled as
+                // such (never silently equal to a verified land), and landing carries the
+                // verifier's freshness read.
+                let hb = cv_core::task::verify::read_heartbeat(&task::tasks_dir());
+                let hb_ts = hb.as_ref().map(|h| h.ts);
+                let hb_interval = hb.as_ref().and_then(|h| h.interval_secs);
+                let show_now = Utc::now();
+                if t.state == cv_core::task::TaskState::Done {
+                    let prov = cv_core::task::Provenance::self_reported(Some(t.last_ts));
+                    let observed = t
+                        .done_observed
+                        .as_deref()
+                        .map(|o| format!(" ({})", sanitize_line(o)))
+                        .unwrap_or_default();
+                    println!("  done:     {}{}", freshness_phrase(&prov, show_now), observed);
+                }
                 println!("  title:    {}", sanitize_line(&t.title));
                 if !t.body.is_empty() {
                     println!("  body:     {}", sanitize_line(&t.body));
@@ -381,7 +397,26 @@ pub(crate) fn cmd_task(action: TaskCmd) -> Result<()> {
                         }
                     }
                     if let Some((head, pid)) = &rev.landed {
-                        println!("         landed: upstream {} (patch-id {})", &head[..12], &pid[..12]);
+                        // The land itself was git-observed (that is where landed_at comes from);
+                        // freshness only qualifies whether the latest pass has re-confirmed it.
+                        let observed = rev
+                            .landed_at
+                            .map(|at| format!("observed {} ago", task::age_short(at, show_now)))
+                            .unwrap_or_else(|| "observation time unknown".into());
+                        let qualifier = match rev.landed_at.map(|at| {
+                            cv_core::task::Provenance::git_verified(at, hb_ts, hb_interval, show_now).freshness
+                        }) {
+                            Some(cv_core::task::Freshness::Stale { .. }) => " (verifier stale)",
+                            Some(cv_core::task::Freshness::Unknown) => " (unconfirmed by latest pass)",
+                            _ => "",
+                        };
+                        println!(
+                            "         landed: upstream {} (patch-id {}) · git-verified, {}{}",
+                            &head[..12],
+                            &pid[..12],
+                            observed,
+                            qualifier
+                        );
                     }
                     for issue in &rev.issues {
                         println!("         ⚠ {}", sanitize_line(&issue.describe()));
@@ -570,7 +605,12 @@ pub(crate) fn cmd_task(action: TaskCmd) -> Result<()> {
             // aged awaiting-review rows (G8), warning text) is the shared DebtReport.
             let hb = cv_core::task::verify::read_heartbeat(&task::tasks_dir());
             if json {
-                // The full entries (task projection embedded), unchanged wire shape.
+                // The full entries (task projection embedded), plus an additive `provenance` key
+                // per row deriving landing freshness from the heartbeat — every unlanded fact says
+                // how fresh the verifier's read of it is (Unknown when never checked).
+                let hb_ts = hb.as_ref().map(|h| h.ts);
+                let hb_interval = hb.as_ref().and_then(|h| h.interval_secs);
+                let now = Utc::now();
                 let json_rows: Vec<_> = task::debt(&outcome.model)
                     .iter()
                     .filter(|(group_repo, _)| match &repo {
@@ -578,6 +618,17 @@ pub(crate) fn cmd_task(action: TaskCmd) -> Result<()> {
                         None => true,
                     })
                     .flat_map(|(_, entries)| entries.clone())
+                    .map(|e| {
+                        let prov = cv_core::task::Provenance::awaiting_land(e.since, hb_ts, hb_interval, now);
+                        let mut v = serde_json::to_value(&e).expect("DebtEntry serializes");
+                        if let Some(obj) = v.as_object_mut() {
+                            obj.insert(
+                                "provenance".into(),
+                                serde_json::to_value(prov).expect("Provenance serializes"),
+                            );
+                        }
+                        v
+                    })
                     .collect();
                 let awaiting: Vec<_> = task::awaiting_review(&outcome.model)
                     .into_iter()
@@ -615,12 +666,13 @@ pub(crate) fn cmd_task(action: TaskCmd) -> Result<()> {
                 }
                 let age = now.signed_duration_since(row.since);
                 println!(
-                    "  {}  rev{} {} [{}] unlanded for {}h — {}",
+                    "  {}  rev{} {} [{}] unlanded for {}h · {} — {}",
                     short_id(&row.id),
                     row.revision,
                     sanitize_line(&row.branch),
                     row.state.as_str(),
                     age.num_hours(),
+                    freshness_phrase(&row.provenance, now),
                     sanitize_line(&row.title)
                 );
                 for issue in &row.issues {
@@ -644,12 +696,22 @@ pub(crate) fn cmd_task(action: TaskCmd) -> Result<()> {
                     );
                 }
             }
+            // Suspects were all observed by the current pass — date their freshness off the
+            // heartbeat itself (the debt view is only as fresh as its verifier).
+            let suspect_prov = hb
+                .as_ref()
+                .map(|h| cv_core::task::Provenance::git_verified(h.ts, Some(h.ts), h.interval_secs, now));
             for s in &report.suspects {
+                let fresh = suspect_prov
+                    .as_ref()
+                    .map(|p| format!(" · {}", freshness_phrase(p, now)))
+                    .unwrap_or_default();
                 println!(
-                    "⚠ SUSPECT {}  rev{} {} — {}",
+                    "⚠ SUSPECT {}  rev{} {}{} — {}",
                     short_id(&s.task_id),
                     s.revision,
                     sanitize_line(&s.detail),
+                    fresh,
                     sanitize_line(&s.title)
                 );
             }
@@ -676,6 +738,25 @@ pub(crate) fn cmd_task(action: TaskCmd) -> Result<()> {
             }
             Ok(())
         }
+    }
+}
+
+/// A compact human phrase for a fact's freshness — how it was learned and when. Reused across the
+/// debt and show surfaces so provenance reads the same everywhere: `observed 4m ago` /
+/// `last checked 2h ago (stale)` / `NEVER verified` / `self-reported`.
+fn freshness_phrase(p: &cv_core::task::Provenance, now: DateTime<Utc>) -> String {
+    use cv_core::task::Freshness;
+    match p.freshness {
+        Freshness::Unknown if p.source == cv_core::task::provenance::SOURCE_SELF_REPORT => "self-reported".into(),
+        Freshness::Unknown => "NEVER verified".into(),
+        Freshness::Fresh => match p.observed_at {
+            Some(t) => format!("observed {} ago", task::age_short(t, now)),
+            None => "verified".into(),
+        },
+        Freshness::Stale { .. } => match p.observed_at {
+            Some(t) => format!("last checked {} ago (stale)", task::age_short(t, now)),
+            None => "stale".into(),
+        },
     }
 }
 

@@ -164,6 +164,30 @@ line the reducer refuses is quarantined with a warning naming the line, and ever
 ships those warnings; appends **fail closed** on a degraded log rather than validating against
 an incomplete model.
 
+### Provenance & freshness: every fact knows how it was learned and when
+
+A fact is never just true — it is *observed true, by someone, as of some moment*, and that
+observation has a shelf life. The task substrate makes this structural: every landing and every
+self-reported completion carries a small **provenance** shape — `{ observed_at, source,
+freshness }` — so a reader can always answer "as observed when, by which pass?"
+
+- **`source`** is how the fact was learned: `git-verify` for a land the verifier read from git,
+  or `self-report` for a base-lifecycle `Done`. A self-reported completion is *labeled* as such,
+  never silently equal to a git-verified land — the `Done` carve-out made visible rather than
+  hidden.
+- **`observed_at`** is the moment of observation (the `Landed` event's timestamp; the verifier's
+  last pass over an unlanded row; `null` when nothing has observed it yet).
+- **`freshness`** is derived from the heartbeat, and **`Unknown` is first-class**: `Fresh` (a
+  pass covered it recently), `Stale { age_secs }` (the periodic verifier's last pass is older
+  than 2× its interval — it may be dead), or `Unknown` (the verifier has *never* checked this
+  revision since it became verifiable — not implicitly fine, said out loud).
+
+This surfaces on the debt view (`landed · observed 4m ago` / `SUSPECT · last checked 2h ago` /
+`ready … · NEVER verified`), on `cv task show` (the landed line reads `git-verified, observed 4m
+ago`; a `Done` reads `self-reported`), and as additive `provenance` keys on `cv task debt
+--json`, the MCP `task_debt` tool, and `GET /api/tasks/debt`. Freshness derivation is a **pure**
+function of the heartbeat's fields — no extra git calls, no I/O in the projection layer.
+
 ## The read surfaces
 
 **`cv task list`** — non-terminal tasks by default, oldest first, with an age column off the

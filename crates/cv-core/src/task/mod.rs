@@ -23,6 +23,7 @@
 
 pub mod model;
 pub mod project;
+pub mod provenance;
 pub mod reduce;
 #[cfg(not(target_family = "wasm"))]
 pub mod stats;
@@ -39,6 +40,7 @@ pub use project::{
     age_short, awaiting_review, branch_carriers, debt, effective_display, inbox, list, propose_collision_warnings,
     resolve_id, AwaitingReviewEntry, DebtEntry, InboxEntry, InboxReason, TaskFilter, STATE_VOCABULARY,
 };
+pub use provenance::{freshness_from_heartbeat, Freshness, Provenance};
 pub use reduce::{
     EffectiveState, Note, PassEvidence, ReduceError, RefuteEvidence, RerouteEvidence, RevisionProjection, TaskIssue,
     TaskProjection, TaskReadModel, TaskReducer,

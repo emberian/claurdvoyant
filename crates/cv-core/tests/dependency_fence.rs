@@ -86,6 +86,7 @@ const PURE_MODULES: &[&str] = &[
     "src/task/reduce.rs",
     "src/task/model.rs",
     "src/task/stats.rs",
+    "src/task/provenance.rs",
     "src/sanitize.rs",
 ];
 const FORBIDDEN: &[&str] = &["std::process", "std::net", "std::fs"];
