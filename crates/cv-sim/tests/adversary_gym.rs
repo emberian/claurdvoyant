@@ -615,20 +615,17 @@ fn plant_claude_review_session(home: &Path, sid: &str, cwd: &str, tool_command: 
     std::fs::write(proj.join(format!("{sid}.jsonl")), body).unwrap();
 }
 
-/// KNOWN HOLE (pinned). `saw_change` is a plain substring scan over reviewer tool-call inputs
-/// (`task/mod.rs::scan_session`): the revision's `review_sha` (or its 12-prefix), branch, repo
-/// path, or a `git diff/show/log` invocation appearing ANYWHERE in a tool input reads as
-/// "observable contact with the change." A reviewer that never opened the diff but merely
-/// `echo`s the review sha satisfies it — Goodhart on the contact metric.
+/// DEFENSE (was `pin_goodhart_saw_change_is_currently_gameable`). `saw_change` no longer reads a
+/// bare substring: `task/mod.rs::scan_session` runs an evidence hierarchy in command position, so a
+/// reviewer who merely `echo`s the review sha — quoting the change's identity with no read and no
+/// `git diff/show/log` — lands in the `Mention` tier, which is `saw_change: None` (undetermined),
+/// NOT `Some(true)`. The trivial echo forgery is refused.
 ///
-/// Source: codex red-team + the substrate's own self-audit (the receipts doc-comment already
-/// names the heuristic as "named, documented, not semantic").
-///
-/// Future fix that FLIPS this into a defense: structural/semantic contact evidence — require an
-/// actual diff/file-read whose *target* is the reviewed range, not a token match — then rename to
-/// `goodhart_saw_change_is_refused` and assert `Some(false)`.
+/// Source: codex red-team + self-audit found the substring hole; this closes it. See the honest
+/// residual in `receipts_remain_a_heuristic_by_design` — a determined adversary who pointlessly
+/// opens a repo file still passes, so this is a raised bar, not a guarantee.
 #[test]
-fn pin_goodhart_saw_change_is_currently_gameable() {
+fn saw_change_rejects_bare_sha_echo() {
     let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
     let home = tmp_dir("home7");
@@ -648,12 +645,81 @@ fn pin_goodhart_saw_change_is_currently_gameable() {
     plant_claude_review_session(&home, "reviewsess", "/repo/proj", &format!("echo {review_sha}"));
 
     let receipts = review_receipts(&t, Some("reviewsess")).expect("a session id was given");
+    assert_ne!(
+        receipts.saw_change,
+        Some(true),
+        "echoing the review sha must NOT satisfy the engagement heuristic — the bare mention is \
+         undetermined, not a pass"
+    );
+    assert_eq!(
+        receipts.saw_change, None,
+        "the bare-mention tier is recorded as undetermined (None), distinct from an observed \
+         no-contact rubber stamp (Some(false))"
+    );
+}
+
+/// DEFENSE (the positive half). A reviewer who actually reads a file UNDER the repo — the
+/// structural `Engaged` tier — reads `saw_change: Some(true)`. This is what the echo forgery lacks:
+/// a content read whose target is in the change's tree, not just its sha as an argument.
+#[test]
+fn saw_change_accepts_genuine_file_read() {
+    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    let home = tmp_dir("home7b");
+    std::env::set_var("HOME", &home);
+    std::env::set_var("CLUSTERVISION_HOME", tmp_dir("cvhome7b"));
+    std::env::set_var("CLUSTERVISION_MAX_STALE_SECS", "0");
+    std::env::set_var("XDG_CACHE_HOME", home.join(".cache"));
+    std::env::set_var("XDG_CONFIG_HOME", home.join(".config"));
+    std::env::set_var("XDG_DATA_HOME", home.join(".local/share"));
+    std::env::remove_var("CURSOR_USER_DIR");
+
+    let review_sha = "a".repeat(40);
+    let t = task_with_revision("/repo/proj", "task/demo", &review_sha);
+
+    // Genuine engagement: `cat` a file under the reviewed repo — a content read in command position.
+    plant_claude_review_session(&home, "reviewsess", "/repo/proj", "cat /repo/proj/src/lib.rs");
+
+    let receipts = review_receipts(&t, Some("reviewsess")).expect("a session id was given");
     assert_eq!(
         receipts.saw_change,
         Some(true),
-        "PINNED HOLE: echoing the review sha satisfies the substring contact heuristic — the \
-         attack currently SUCCEEDS. If this now reads Some(false)/None the hole was closed; flip \
-         this pin into a defense and rename it."
+        "a content read of a file under the reviewed repo is structural engagement evidence"
+    );
+}
+
+/// HONEST RESIDUAL (by design). The engagement heuristic raises the cost of a forged review past
+/// the trivial echo, but it does not — and cannot cheaply — prove the reviewer understood the
+/// change. A determined adversary who pointlessly opens ANY file under the repo (here an unrelated
+/// one) still reads `saw_change: Some(true)`. This is acknowledged, not a hole to pin: the bar is
+/// raised, not a guarantee. The stronger future step is computing the changed-file set and
+/// requiring the read to target it (or diff CONTENT to enter the reviewer's context).
+#[test]
+fn receipts_remain_a_heuristic_by_design() {
+    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    let home = tmp_dir("home7c");
+    std::env::set_var("HOME", &home);
+    std::env::set_var("CLUSTERVISION_HOME", tmp_dir("cvhome7c"));
+    std::env::set_var("CLUSTERVISION_MAX_STALE_SECS", "0");
+    std::env::set_var("XDG_CACHE_HOME", home.join(".cache"));
+    std::env::set_var("XDG_CONFIG_HOME", home.join(".config"));
+    std::env::set_var("XDG_DATA_HOME", home.join(".local/share"));
+    std::env::remove_var("CURSOR_USER_DIR");
+
+    let review_sha = "a".repeat(40);
+    let t = task_with_revision("/repo/proj", "task/demo", &review_sha);
+
+    // The residual game: open a file under the repo that has nothing to do with the change. It is a
+    // read under the repo, so it passes — the heuristic cannot tell purposeful from pointless.
+    plant_claude_review_session(&home, "reviewsess", "/repo/proj", "cat /repo/proj/UNRELATED.md");
+
+    let receipts = review_receipts(&t, Some("reviewsess")).expect("a session id was given");
+    assert_eq!(
+        receipts.saw_change,
+        Some(true),
+        "pointlessly opening a repo file still passes — the acknowledged residual; the bar is \
+         raised past echo, not a guarantee"
     );
 }
 

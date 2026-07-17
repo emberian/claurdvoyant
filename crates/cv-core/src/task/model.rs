@@ -242,17 +242,21 @@ pub struct IndependenceCheck {
 /// (law 2's posture: observed and recorded, never a gate). Every field is `Option` because every
 /// field is an honest observation: `None` means "could not determine", never a guess.
 ///
-/// These are a **heuristic signal, not proof**: substring/pattern observations over tool inputs
-/// that show *effort*, never guarantee *review* — echoing the review sha alone satisfies
-/// `saw_change` (pinned by `crates/cv-sim/tests/adversary_gym.rs::pin_goodhart_saw_change_is_currently_gameable`).
+/// These are a **heuristic signal, not proof**: structural observations over tool inputs that raise
+/// the cost of a forged review, never guarantee *review*. `saw_change` requires the reviewer to
+/// have actually engaged the change (a repo-path read or a real `git diff/show/log`), not merely
+/// quoted its sha — but it stays gameable by an adversary who pointlessly opens a repo file. The
+/// bar is raised past the trivial echo, not made a guarantee.
 ///
 /// Semantics when recorded (a reviewer session id was provided):
 /// - all fields `None`: the session was named but could not be found/read — undetermined.
-/// - `saw_change`: whether the transcript shows observable contact with the reviewed change
-///   (tool inputs mentioning the branch, the review sha or its 12-prefix, the repo path, or a
-///   `git diff`/`git show`/`git log` invocation). Heuristic, text-level, advisory.
-/// - `ran_checks`: whether any tool input matches a known test/build command pattern
-///   ([`crate::task::CHECK_COMMAND_PATTERNS`]). Heuristic and deliberately narrow.
+/// - `saw_change`: the reviewer's engagement with the change, over an evidence hierarchy in
+///   `crate::task::scan_session` — `Some(true)` for structural contact (a content read under the
+///   repo, or a `git diff`/`git show`/`git log` invocation); `None` when only the change's identity
+///   (sha/branch/repo path) appears as a bare argument (the `echo <sha>` case — undetermined, not a
+///   pass); `Some(false)` when a revision existed and the scan saw no contact at all.
+/// - `ran_checks`: whether any tool input runs a known test/build command in command position
+///   ([`crate::task::CHECK_COMMAND_PATTERNS`], not merely quoted). Heuristic and deliberately narrow.
 /// - `turns`: the number of assistant messages in the session — a cheap effort signal.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ReviewReceipts {
